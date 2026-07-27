@@ -15,12 +15,15 @@ LIB = $(BUILD)/liboi.a
 
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
+CLI_BIN = $(BUILD)/oi
 
-.PHONY: all lib test clean
+.PHONY: all lib cli test clean
 
-all: lib
+all: lib cli
 
 lib: $(LIB)
+
+cli: $(CLI_BIN)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -31,10 +34,13 @@ $(BUILD)/%.o: src/%.c | $(BUILD)
 $(LIB): $(LIB_OBJS)
 	ar rcs $@ $^
 
+$(CLI_BIN): src/cli.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(LIB) -o $@ $(LDLIBS)
+
 $(BUILD)/test_%: test/test_%.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(LIB) -o $@ $(LDLIBS)
 
-test: $(TEST_BINS)
+test: $(TEST_BINS) $(CLI_BIN)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t =="; $$t; done
 
 clean:
