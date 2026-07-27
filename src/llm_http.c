@@ -33,6 +33,13 @@ struct oi_llm_http_parser {
     oi_llm_http_headers_done_cb on_headers_done;
     oi_llm_http_body_cb on_body;
     void *user_data;
+
+    /* Set by oi_llm_http_parser_feed before invoking on_headers_done or
+     * on_body, so a reentrant oi_llm_http_parser_destroy() from within
+     * one of those (e.g. the caller cancels an in-flight request as
+     * soon as it sees enough data) can signal back to feed()'s
+     * still-running loop that `p` is gone. */
+    int *destroyed_flag;
 };
 
 oi_llm_http_parser *oi_llm_http_parser_create(
@@ -57,12 +64,16 @@ oi_llm_http_parser *oi_llm_http_parser_create(
     p->on_headers_done = on_headers_done;
     p->on_body = on_body;
     p->user_data = user_data;
+    p->destroyed_flag = NULL;
     return p;
 }
 
 void oi_llm_http_parser_destroy(oi_llm_http_parser *p) {
     if (p == NULL) {
         return;
+    }
+    if (p->destroyed_flag) {
+        *p->destroyed_flag = 1;
     }
     free(p->line_buf);
     free(p);
@@ -277,12 +288,20 @@ oi_status oi_llm_http_parser_feed(oi_llm_http_parser *p, const void *bytes,
     }
 
     const unsigned char *buf = bytes;
+    int destroyed = 0;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+    p->destroyed_flag = &destroyed;
+#pragma GCC diagnostic pop
+
     size_t i = 0;
     while (i < len) {
         if (p->state == ST_ERROR) {
+            p->destroyed_flag = NULL;
             return OI_ERR_PARSE;
         }
         if (p->state == ST_DONE) {
+            p->destroyed_flag = NULL;
             return OI_OK; /* trailing bytes beyond the body are ignored */
         }
 
@@ -294,12 +313,17 @@ oi_status oi_llm_http_parser_feed(oi_llm_http_parser *p, const void *bytes,
                     p->line_len--;
                 }
                 oi_status st = on_line_complete(p);
+                if (destroyed) {
+                    return OI_OK; /* `p` was freed by a reentrant destroy */
+                }
                 if (st != OI_OK) {
+                    p->destroyed_flag = NULL;
                     return st;
                 }
             } else {
                 oi_status st = line_append(p, (char)c);
                 if (st != OI_OK) {
+                    p->destroyed_flag = NULL;
                     return st;
                 }
             }
@@ -313,6 +337,9 @@ oi_status oi_llm_http_parser_feed(oi_llm_http_parser *p, const void *bytes,
             (size_t)p->remaining < avail ? (size_t)p->remaining : avail;
         if (p->on_body) {
             p->on_body(buf + i, take, p->user_data);
+            if (destroyed) {
+                return OI_OK; /* `p` was freed by a reentrant destroy */
+            }
         }
         i += take;
         p->remaining -= (long)take;
@@ -321,5 +348,6 @@ oi_status oi_llm_http_parser_feed(oi_llm_http_parser *p, const void *bytes,
                                                      : ST_DONE;
         }
     }
+    p->destroyed_flag = NULL;
     return OI_OK;
 }
