@@ -9,7 +9,7 @@ INCLUDES = -Iinclude -Isrc
 LDLIBS = -lssl -lcrypto
 
 BUILD = build
-LIB_SRCS = src/reactor.c src/reactor_epoll.c src/arena.c src/json_value.c src/json_parse.c src/json_write.c src/llm_http.c src/llm_sse.c src/llm_conn.c src/llm.c src/tool_registry.c src/tool_exec.c src/sesslog.c src/session.c
+LIB_SRCS = src/reactor.c src/reactor_epoll.c src/arena.c src/json_value.c src/json_parse.c src/json_write.c src/llm_http.c src/llm_sse.c src/llm_conn.c src/llm.c src/tool_registry.c src/tool_exec.c src/sesslog.c src/session.c src/config.c
 LIB_OBJS = $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
 LIB = $(BUILD)/liboi.a
 
