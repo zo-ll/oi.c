@@ -5,7 +5,7 @@ CFLAGS ?= -g -O0
 INCLUDES = -Iinclude -Isrc
 
 BUILD = build
-LIB_SRCS = src/reactor.c src/reactor_epoll.c
+LIB_SRCS = src/reactor.c src/reactor_epoll.c src/arena.c
 LIB_OBJS = $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
 LIB = $(BUILD)/liboi.a
 
