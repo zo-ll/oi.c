@@ -11,7 +11,6 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <pty.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +20,12 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <util.h>
+#else
+#include <pty.h>
+#endif
 
 /* The Makefile defines OI_CLI_BIN to match whatever $(BUILD) directory
  * this test binary itself was compiled into (build/, build-asan/, ...)

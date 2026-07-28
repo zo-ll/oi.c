@@ -2,10 +2,15 @@
 #include "test.h"
 
 #include <fcntl.h>
-#include <pty.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <util.h>
+#else
+#include <pty.h>
+#endif
 
 static int read_exact(int fd, char *data, size_t len) {
     size_t received = 0;

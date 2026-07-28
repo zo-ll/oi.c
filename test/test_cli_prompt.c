@@ -2,7 +2,6 @@
 #include "test.h"
 
 #include <poll.h>
-#include <pty.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +9,12 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <util.h>
+#else
+#include <pty.h>
+#endif
 
 struct prompt_result {
     int status;
