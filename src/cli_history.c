@@ -82,6 +82,9 @@ void oi_cli_history_record_free(struct oi_cli_history_record *record) {
         oi_cli_string_free(&record->as.checkpoint.summary);
         oi_cli_string_free(&record->as.checkpoint.model);
         break;
+    case OI_CLI_HISTORY_RECORD_SESSION_SETTING:
+        oi_cli_string_free(&record->as.session_setting.value);
+        break;
     case OI_CLI_HISTORY_RECORD_NONE:
     case OI_CLI_HISTORY_RECORD_TRANSITION:
     case OI_CLI_HISTORY_RECORD_QUEUE_RESOLVED:
@@ -226,6 +229,16 @@ int oi_cli_history_record_is_valid(
                record->as.checkpoint.source_first_record_id <=
                    record->as.checkpoint.source_last_record_id &&
                record->as.checkpoint.source_last_record_id < record->record_id;
+    case OI_CLI_HISTORY_RECORD_SESSION_SETTING:
+        return record->turn_id == 0 &&
+               (record->as.session_setting.field ==
+                    OI_CLI_HISTORY_SESSION_SETTING_MODEL ||
+                record->as.session_setting.field ==
+                    OI_CLI_HISTORY_SESSION_SETTING_CWD) &&
+               record->as.session_setting.value.data != NULL &&
+               record->as.session_setting.value.len > 0 &&
+               record->as.session_setting.value.len <=
+                   OI_CLI_HISTORY_MAX_SETTING_VALUE;
     case OI_CLI_HISTORY_RECORD_NONE:
         return 0;
     }
@@ -430,6 +443,32 @@ oi_status oi_cli_history_record_set_checkpoint(
     return OI_OK;
 }
 
+oi_status oi_cli_history_record_set_session_setting(
+    struct oi_cli_history_record *record, uint64_t record_id,
+    enum oi_cli_history_session_setting_field field, const char *value,
+    size_t value_len) {
+    if (record == NULL) {
+        return OI_ERR_INVAL;
+    }
+    struct oi_cli_history_record replacement;
+    oi_status st = record_begin(&replacement, record_id, 0,
+                                OI_CLI_HISTORY_RECORD_SESSION_SETTING);
+    if (st == OI_OK) {
+        replacement.as.session_setting.field = field;
+        st = oi_cli_string_set(&replacement.as.session_setting.value, value,
+                               value_len);
+    }
+    if (st == OI_OK && !oi_cli_history_record_is_valid(&replacement)) {
+        st = OI_ERR_INVAL;
+    }
+    if (st != OI_OK) {
+        oi_cli_history_record_free(&replacement);
+        return st;
+    }
+    record_replace(record, &replacement);
+    return OI_OK;
+}
+
 oi_status oi_cli_history_record_clone(
     const struct oi_cli_history_record *source,
     struct oi_cli_history_record *destination) {
@@ -488,6 +527,12 @@ oi_status oi_cli_history_record_clone(
             source->as.checkpoint.model.len,
             source->as.checkpoint.source_first_record_id,
             source->as.checkpoint.source_last_record_id);
+        break;
+    case OI_CLI_HISTORY_RECORD_SESSION_SETTING:
+        st = oi_cli_history_record_set_session_setting(
+            destination, source->record_id, source->as.session_setting.field,
+            source->as.session_setting.value.data,
+            source->as.session_setting.value.len);
         break;
     case OI_CLI_HISTORY_RECORD_NONE:
         st = OI_ERR_INVAL;

@@ -129,6 +129,88 @@ TEST(checkpoint_requires_prior_nonempty_range) {
     oi_cli_history_record_free(&checkpoint);
 }
 
+TEST(session_setting_records_model_and_cwd) {
+    struct oi_cli_history_record model_record;
+    struct oi_cli_history_record cwd_record;
+    oi_cli_history_record_init(&model_record);
+    oi_cli_history_record_init(&cwd_record);
+
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &model_record, 5, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
+                 "gpt-test", 8),
+             OI_OK);
+    CHECK(oi_cli_history_record_is_valid(&model_record));
+    CHECK_EQ(model_record.kind, OI_CLI_HISTORY_RECORD_SESSION_SETTING);
+    CHECK_EQ(model_record.turn_id, (uint64_t)0);
+    CHECK_STREQ(model_record.as.session_setting.value.data, "gpt-test");
+
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &cwd_record, 6, OI_CLI_HISTORY_SESSION_SETTING_CWD,
+                 "/home/az/project", 17),
+             OI_OK);
+    CHECK(oi_cli_history_record_is_valid(&cwd_record));
+    CHECK_STREQ(cwd_record.as.session_setting.value.data,
+               "/home/az/project");
+
+    oi_cli_history_record_free(&model_record);
+    oi_cli_history_record_free(&cwd_record);
+}
+
+TEST(session_setting_rejects_empty_and_oversized_values) {
+    struct oi_cli_history_record record;
+    char oversized[OI_CLI_HISTORY_MAX_SETTING_VALUE + 1];
+    oi_cli_history_record_init(&record);
+    memset(oversized, 'a', sizeof oversized);
+
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 5, OI_CLI_HISTORY_SESSION_SETTING_MODEL, "", 0),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 5, OI_CLI_HISTORY_SESSION_SETTING_MODEL, oversized,
+                 sizeof oversized),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 5, OI_CLI_HISTORY_SESSION_SETTING_MODEL, oversized,
+                 OI_CLI_HISTORY_MAX_SETTING_VALUE),
+             OI_OK);
+
+    oi_cli_history_record_free(&record);
+}
+
+TEST(session_setting_rejects_a_nonzero_turn_id) {
+    struct oi_cli_history_record record;
+    oi_cli_history_record_init(&record);
+
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 5, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
+                 "gpt-test", 8),
+             OI_OK);
+    CHECK(oi_cli_history_record_is_valid(&record));
+    record.turn_id = 1;
+    CHECK(!oi_cli_history_record_is_valid(&record));
+
+    oi_cli_history_record_free(&record);
+}
+
+TEST(session_setting_clone_round_trips) {
+    struct oi_cli_history_record record;
+    struct oi_cli_history_record clone;
+    oi_cli_history_record_init(&record);
+    oi_cli_history_record_init(&clone);
+
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 5, OI_CLI_HISTORY_SESSION_SETTING_CWD, "/tmp", 4),
+             OI_OK);
+    CHECK_EQ(oi_cli_history_record_clone(&record, &clone), OI_OK);
+    CHECK_EQ(clone.kind, OI_CLI_HISTORY_RECORD_SESSION_SETTING);
+    CHECK_EQ(clone.as.session_setting.field,
+             OI_CLI_HISTORY_SESSION_SETTING_CWD);
+    CHECK_STREQ(clone.as.session_setting.value.data, "/tmp");
+
+    oi_cli_history_record_free(&record);
+    oi_cli_history_record_free(&clone);
+}
+
 TEST(history_enforces_contiguous_ids_and_owns_records) {
     struct oi_cli_history history;
     struct oi_cli_history_record first;
@@ -204,6 +286,10 @@ int main(void) {
     RUN(partial_assistant_is_audit_only_record);
     RUN(queue_lifecycle_uses_stable_record_reference);
     RUN(checkpoint_requires_prior_nonempty_range);
+    RUN(session_setting_records_model_and_cwd);
+    RUN(session_setting_rejects_empty_and_oversized_values);
+    RUN(session_setting_rejects_a_nonzero_turn_id);
+    RUN(session_setting_clone_round_trips);
     RUN(history_enforces_contiguous_ids_and_owns_records);
     RUN(record_clone_is_deep);
     RUN(assistant_attribution_is_required);

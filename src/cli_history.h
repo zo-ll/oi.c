@@ -11,6 +11,10 @@
 #define OI_CLI_HISTORY_MAX_CONTENT (1024u * 1024u)
 #define OI_CLI_HISTORY_MAX_RECORD (8u * 1024u * 1024u)
 
+/* Shared ceiling for a durable session setting's value (model name or
+ * working directory). Doubles as metadata.json's field ceiling. */
+#define OI_CLI_HISTORY_MAX_SETTING_VALUE 4096u
+
 enum oi_cli_history_record_kind {
     OI_CLI_HISTORY_RECORD_NONE = 0,
     OI_CLI_HISTORY_RECORD_TRANSITION,
@@ -19,7 +23,17 @@ enum oi_cli_history_record_kind {
     OI_CLI_HISTORY_RECORD_PARTIAL_ASSISTANT,
     OI_CLI_HISTORY_RECORD_QUEUED_INPUT,
     OI_CLI_HISTORY_RECORD_QUEUE_RESOLVED,
-    OI_CLI_HISTORY_RECORD_CHECKPOINT
+    OI_CLI_HISTORY_RECORD_CHECKPOINT,
+    OI_CLI_HISTORY_RECORD_SESSION_SETTING
+};
+
+/* Which durable session setting a session_setting record carries. Values
+ * are stable on-disk identifiers (encoded as strings, not these ints, but
+ * kept nonzero so a zeroed/uninitialized field is never mistaken for a
+ * real one). */
+enum oi_cli_history_session_setting_field {
+    OI_CLI_HISTORY_SESSION_SETTING_MODEL = 1,
+    OI_CLI_HISTORY_SESSION_SETTING_CWD
 };
 
 enum oi_cli_history_message_source {
@@ -83,6 +97,10 @@ struct oi_cli_history_record {
             uint64_t source_first_record_id;
             uint64_t source_last_record_id;
         } checkpoint;
+        struct {
+            enum oi_cli_history_session_setting_field field;
+            struct oi_cli_string value;
+        } session_setting;
     } as;
 };
 
@@ -130,6 +148,10 @@ oi_status oi_cli_history_record_set_checkpoint(
     const char *summary, size_t summary_len, const char *model,
     size_t model_len, uint64_t source_first_record_id,
     uint64_t source_last_record_id);
+oi_status oi_cli_history_record_set_session_setting(
+    struct oi_cli_history_record *record, uint64_t record_id,
+    enum oi_cli_history_session_setting_field field, const char *value,
+    size_t value_len);
 
 void oi_cli_history_init(struct oi_cli_history *history);
 void oi_cli_history_free(struct oi_cli_history *history);
