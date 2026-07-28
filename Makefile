@@ -154,8 +154,13 @@ $(BUILD)/test_cli_prompt_state: test/test_cli_prompt_state.c src/cli_prompt_stat
 $(BUILD)/test_cli_render: test/test_cli_render.c src/cli_render.c src/cli_editor.c src/cli_utf8.c src/cli_commands.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_render.c src/cli_editor.c src/cli_utf8.c src/cli_commands.c $(LIB) -o $@ $(LDLIBS)
 
-$(BUILD)/test_cli_sessions: test/test_cli_sessions.c src/cli_sessions.c $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_sessions.c $(LIB) -o $@ $(LDLIBS)
+CLI_SESSIONS_TEST_DEPS = src/cli_sessions.c src/cli_session_metadata.c \
+	src/cli_session_metadata_codec.c src/cli_session_metadata_store.c \
+	src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c \
+	src/cli_history_store.c src/cli_message.c
+
+$(BUILD)/test_cli_sessions: test/test_cli_sessions.c $(CLI_SESSIONS_TEST_DEPS) $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(CLI_SESSIONS_TEST_DEPS) $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/test_cli_session_metadata: test/test_cli_session_metadata.c src/cli_session_metadata.c src/cli_message.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_session_metadata.c src/cli_message.c $(LIB) -o $@ $(LDLIBS)
