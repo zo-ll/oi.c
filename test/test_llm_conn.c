@@ -98,6 +98,9 @@ struct echo_ctx {
 static void echo_on_connected(oi_llm_conn *c, void *ud) {
     struct echo_ctx *ctx = ud;
     ctx->connected = 1;
+    /* An impossible length must fail before reading caller memory and
+     * leave the connection usable for the real write that follows. */
+    CHECK_EQ(oi_llm_conn_write(c, "x", (size_t)-1), OI_ERR_NOMEM);
     oi_status st = oi_llm_conn_write(c, "hello", 5);
     CHECK_EQ(st, OI_OK);
 }

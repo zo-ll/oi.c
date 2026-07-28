@@ -449,6 +449,9 @@ oi_status oi_llm_conn_write(oi_llm_conn *c, const void *data, size_t len) {
         return OI_OK;
     }
 
+    if (len > (size_t)-1 - c->out_len) {
+        return OI_ERR_NOMEM;
+    }
     size_t needed = c->out_len + len;
     if (needed > c->out_cap) {
         size_t new_cap = c->out_cap == 0 ? 4096 : c->out_cap;
