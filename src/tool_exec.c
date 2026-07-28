@@ -158,7 +158,9 @@ static void on_pidfd_event(oi_reactor *r, int fd, int revents, void *ud) {
 }
 
 static void kill_and_reap(pid_t pid) {
-    kill(pid, SIGKILL);
+    if (kill(-pid, SIGKILL) != 0) {
+        kill(pid, SIGKILL);
+    }
     for (;;) {
         if (waitpid(pid, NULL, 0) >= 0) {
             return;
@@ -325,15 +327,19 @@ static oi_status spawn(oi_tool_call *call) {
         close(stdout_pipe[0]);
         close(err_pipe[0]);
 
-        dup2(stdin_pipe[0], STDIN_FILENO);
-        dup2(stdout_pipe[1], STDOUT_FILENO);
-        dup2(stdout_pipe[1], STDERR_FILENO); /* merge stderr into stdout */
+        if (setpgid(0, 0) != 0 ||
+            dup2(stdin_pipe[0], STDIN_FILENO) < 0 ||
+            dup2(stdout_pipe[1], STDOUT_FILENO) < 0 ||
+            dup2(stdout_pipe[1], STDERR_FILENO) < 0) {
+            goto child_failed;
+        }
 
         close(stdin_pipe[0]);
         close(stdout_pipe[1]);
 
         execvp(argv[0], argv);
 
+child_failed:;
         int e = errno;
         ssize_t unused = write(err_pipe[1], &e, sizeof e);
         (void)unused;
@@ -559,7 +565,11 @@ void oi_tool_call_cancel(oi_tool_call *call) {
         return;
     }
     if (call->pid > 0) {
-        kill(call->pid, SIGKILL);
+        /* The child creates a fresh process group before exec, so a tool
+         * cannot leave grandchildren running after its call is cancelled. */
+        if (kill(-call->pid, SIGKILL) != 0) {
+            kill(call->pid, SIGKILL);
+        }
     }
     call->cancelled = 1;
     call->on_output = NULL;

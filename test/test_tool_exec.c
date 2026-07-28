@@ -118,6 +118,22 @@ static oi_status fdcheck_build_argv(const oi_json_value *args,
     return OI_OK;
 }
 
+static oi_status tree_build_argv(const oi_json_value *args, oi_arena *arena,
+                                  void *ud, char ***out_argv) {
+    (void)args;
+    (void)ud;
+    char **argv = oi_arena_alloc(arena, 4 * sizeof(char *));
+    if (argv == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    argv[0] = (char *)"/bin/sh";
+    argv[1] = (char *)"-c";
+    argv[2] = (char *)"sleep 30 & echo $!; wait";
+    argv[3] = NULL;
+    *out_argv = argv;
+    return OI_OK;
+}
+
 static oi_status missing_build_argv(const oi_json_value *args,
                                      oi_arena *arena, void *ud,
                                      char ***out_argv) {
@@ -149,6 +165,7 @@ static oi_tool_registry *make_registry(void) {
     oi_tool_registry_add(reg, "exit", "{}", exit_build_argv, NULL);
     oi_tool_registry_add(reg, "sleep", "{}", sleep_build_argv, NULL);
     oi_tool_registry_add(reg, "fdcheck", "{}", fdcheck_build_argv, NULL);
+    oi_tool_registry_add(reg, "tree", "{}", tree_build_argv, NULL);
     oi_tool_registry_add(reg, "missing", "{}", missing_build_argv, NULL);
     oi_tool_registry_add(reg, "badargv", "{}", build_argv_fails, NULL);
     return reg;
@@ -532,6 +549,70 @@ TEST(cancel_kills_long_running_process) {
     oi_tool_registry_destroy(reg);
 }
 
+struct tree_cancel_ctx {
+    oi_tool_call *call;
+    char output[64];
+    size_t output_len;
+    pid_t descendant;
+};
+
+static void cancel_tree_on_output(const void *data, size_t len, void *ud) {
+    struct tree_cancel_ctx *ctx = ud;
+    size_t available = sizeof ctx->output - 1 - ctx->output_len;
+    size_t copy_len = len < available ? len : available;
+    memcpy(ctx->output + ctx->output_len, data, copy_len);
+    ctx->output_len += copy_len;
+    ctx->output[ctx->output_len] = '\0';
+    if (ctx->descendant == 0 && strchr(ctx->output, '\n') != NULL) {
+        ctx->descendant = (pid_t)strtol(ctx->output, NULL, 10);
+        oi_tool_call_cancel(ctx->call);
+    }
+}
+
+static int process_is_running(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%ld/stat", (long)pid);
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        return 0;
+    }
+    char line[512];
+    int running = 0;
+    if (fgets(line, sizeof line, f) != NULL) {
+        char *comm_end = strrchr(line, ')');
+        running = comm_end != NULL && comm_end[1] == ' ' &&
+                  comm_end[2] != 'Z';
+    }
+    fclose(f);
+    return running;
+}
+
+TEST(cancel_kills_descendant_processes) {
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+
+    struct tree_cancel_ctx ctx = {0};
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "tree", NULL, allow_cb, NULL,
+                                 cancel_tree_on_output, NULL, &ctx,
+                                 &ctx.call),
+              OI_OK);
+
+    for (int i = 0; i < 100; i++) {
+        oi_status st;
+        oi_reactor_step(r, 20, &st);
+        if (ctx.descendant > 0 && !process_is_running(ctx.descendant)) {
+            break;
+        }
+    }
+    CHECK(ctx.descendant > 0);
+    CHECK(!process_is_running(ctx.descendant));
+
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
 TEST(cancel_null_safe) { oi_tool_call_cancel(NULL); }
 
 /* --- concurrent calls don't cross-wire --- */
@@ -710,6 +791,7 @@ int main(void) {
     RUN(write_stdin_before_running_rejected);
     RUN(cancel_from_within_on_output);
     RUN(cancel_kills_long_running_process);
+    RUN(cancel_kills_descendant_processes);
     RUN(cancel_null_safe);
     RUN(concurrent_calls_do_not_cross_wire);
     RUN(child_does_not_inherit_other_tool_descriptors);
