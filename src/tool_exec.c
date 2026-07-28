@@ -10,6 +10,8 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -33,6 +35,7 @@ struct oi_tool_call {
     const oi_json_value *args;
 
     pid_t pid;
+    int pid_fd;     /* pidfd watched by this call's reactor */
     int stdin_fd;  /* -1 once closed */
     int stdin_close_pending; /* close_stdin() called while a write was
                                * still queued; actually closed once
@@ -46,6 +49,7 @@ struct oi_tool_call {
     size_t out_cap;
 
     int child_exited;
+    int cancelled;
     int stdout_eof;
     int exec_failed;
     int exec_errno;
@@ -58,51 +62,6 @@ struct oi_tool_call {
     int *destroyed_flag;
 };
 
-/*
- * SIGCHLD delivery and reaping are inherently process-global (signal
- * handlers aren't per-object), so this is deliberately the one piece of
- * shared mutable state in the module: a self-pipe waking the reactor,
- * plus a pid -> oi_tool_call table for dispatching each reaped exit to
- * the right call.
- */
-static int g_sigchld_pipe[2] = {-1, -1};
-
-struct pid_entry {
-    pid_t pid;
-    oi_tool_call *call;
-};
-static struct pid_entry *g_pid_table = NULL;
-static size_t g_pid_count = 0;
-static size_t g_pid_cap = 0;
-
-static oi_status pid_table_insert(pid_t pid, oi_tool_call *call) {
-    if (g_pid_count == g_pid_cap) {
-        size_t new_cap = g_pid_cap == 0 ? 8 : g_pid_cap * 2;
-        struct pid_entry *ne = realloc(g_pid_table, new_cap * sizeof *ne);
-        if (ne == NULL) {
-            return OI_ERR_NOMEM;
-        }
-        g_pid_table = ne;
-        g_pid_cap = new_cap;
-    }
-    g_pid_table[g_pid_count].pid = pid;
-    g_pid_table[g_pid_count].call = call;
-    g_pid_count++;
-    return OI_OK;
-}
-
-static oi_tool_call *pid_table_remove(pid_t pid) {
-    for (size_t i = 0; i < g_pid_count; i++) {
-        if (g_pid_table[i].pid == pid) {
-            oi_tool_call *call = g_pid_table[i].call;
-            g_pid_table[i] = g_pid_table[g_pid_count - 1];
-            g_pid_count--;
-            return call;
-        }
-    }
-    return NULL;
-}
-
 static oi_status set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
@@ -111,65 +70,21 @@ static oi_status set_nonblocking(int fd) {
     return OI_OK;
 }
 
-static void sigchld_handler(int sig) {
-    (void)sig;
-    int saved_errno = errno;
-    char b = 0;
-    ssize_t unused = write(g_sigchld_pipe[1], &b, 1); /* async-signal-safe */
-    (void)unused;                                      /* best-effort */
-    errno = saved_errno;
-}
-
-static void on_sigchld_readable(oi_reactor *r, int fd, int revents,
-                                 void *ud);
-
-/*
- * PLAN.md's design has exactly one reactor per process for the whole
- * run, but nothing stops an embedder (or a test suite) from tearing one
- * down and creating another later -- in that case the self-pipe's old
- * registration is simply gone (oi_reactor_destroy doesn't need to be
- * told about each fd individually), so a later call needs to
- * re-register it with the new reactor.
- *
- * This deliberately does NOT try to remember "the" reactor and compare
- * pointers to decide whether re-registration is needed: a freed
- * oi_reactor can have its memory immediately reused by the next
- * oi_reactor_create, so a stale cached pointer can alias a live one
- * (ABA problem) and wrongly look unchanged. Instead this just always
- * attempts oi_reactor_add and treats OI_ERR_EXISTS -- meaning the fd is
- * already registered on *this* reactor's live epoll instance, the only
- * case that actually matters -- as success.
- */
-static oi_status ensure_sigchld_setup(oi_reactor *r) {
-    if (g_sigchld_pipe[0] < 0) {
-        signal(SIGPIPE, SIG_IGN); /* writing to a child's closed stdin must not kill us */
-
-        if (pipe2(g_sigchld_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
-            return OI_ERR_IO;
-        }
-
-        struct sigaction sa;
-        memset(&sa, 0, sizeof sa);
-        sa.sa_handler = sigchld_handler;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-        if (sigaction(SIGCHLD, &sa, NULL) != 0) {
-            close(g_sigchld_pipe[0]);
-            close(g_sigchld_pipe[1]);
-            g_sigchld_pipe[0] = g_sigchld_pipe[1] = -1;
-            return OI_ERR_IO;
-        }
-    }
-
-    oi_status st = oi_reactor_add(r, g_sigchld_pipe[0], OI_EV_READ,
-                                   on_sigchld_readable, NULL);
-    if (st != OI_OK && st != OI_ERR_EXISTS) {
-        return st;
-    }
-    return OI_OK;
+static int open_pidfd(pid_t pid) {
+#ifdef SYS_pidfd_open
+    return (int)syscall(SYS_pidfd_open, pid, 0);
+#else
+    (void)pid;
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 
 static void free_call(oi_tool_call *call) {
+    if (call->pid_fd >= 0) {
+        oi_reactor_remove(call->reactor, call->pid_fd);
+        close(call->pid_fd);
+    }
     if (call->stdin_fd >= 0) {
         oi_reactor_remove(call->reactor, call->stdin_fd);
         close(call->stdin_fd);
@@ -190,7 +105,13 @@ static void free_call(oi_tool_call *call) {
 }
 
 static void maybe_finish(oi_tool_call *call) {
-    if (!call->child_exited || !call->stdout_eof) {
+    if (!call->child_exited ||
+        (!call->cancelled && !call->stdout_eof)) {
+        return;
+    }
+
+    if (call->cancelled) {
+        free_call(call);
         return;
     }
 
@@ -213,29 +134,38 @@ static void maybe_finish(oi_tool_call *call) {
     free_call(call);
 }
 
-static void on_sigchld_readable(oi_reactor *r, int fd, int revents,
-                                 void *ud) {
+static void on_pidfd_event(oi_reactor *r, int fd, int revents, void *ud) {
     (void)r;
-    (void)ud;
+    (void)fd;
     (void)revents;
-    char buf[64];
-    while (read(fd, buf, sizeof buf) > 0) {
-        /* drain */
+    oi_tool_call *call = ud;
+
+    int status;
+    pid_t rc;
+    do {
+        rc = waitpid(call->pid, &status, WNOHANG);
+    } while (rc < 0 && errno == EINTR);
+    if (rc != call->pid) {
+        return;
     }
 
+    oi_reactor_remove(call->reactor, call->pid_fd);
+    close(call->pid_fd);
+    call->pid_fd = -1;
+    call->child_exited = 1;
+    call->exit_status = status;
+    maybe_finish(call);
+}
+
+static void kill_and_reap(pid_t pid) {
+    kill(pid, SIGKILL);
     for (;;) {
-        int status;
-        pid_t pid = waitpid(-1, &status, WNOHANG);
-        if (pid <= 0) {
-            break;
+        if (waitpid(pid, NULL, 0) >= 0) {
+            return;
         }
-        oi_tool_call *call = pid_table_remove(pid);
-        if (call == NULL) {
-            continue; /* not one of ours, or already abandoned via cancel */
+        if (errno != EINTR) {
+            return;
         }
-        call->child_exited = 1;
-        call->exit_status = status;
-        maybe_finish(call);
     }
 }
 
@@ -321,8 +251,8 @@ static void on_stdin_event(oi_reactor *r, int fd, int revents, void *ud) {
     oi_tool_call *call = ud;
 
     while (call->out_off < call->out_len) {
-        ssize_t n = write(call->stdin_fd, call->out_buf + call->out_off,
-                           call->out_len - call->out_off);
+        ssize_t n = send(call->stdin_fd, call->out_buf + call->out_off,
+                          call->out_len - call->out_off, MSG_NOSIGNAL);
         if (n > 0) {
             call->out_off += (size_t)n;
             continue;
@@ -351,12 +281,6 @@ static void on_stdin_event(oi_reactor *r, int fd, int revents, void *ud) {
     }
 }
 
-/* Kills a just-forked child we're abandoning before it's registered
- * anywhere durable (pid table / reactor). Non-blocking: reaping is left
- * to the normal SIGCHLD path, which will find no matching call and
- * silently discard it. */
-static void abandon_child(pid_t pid) { kill(pid, SIGKILL); }
-
 static oi_status spawn(oi_tool_call *call) {
     char **argv;
     oi_status st =
@@ -368,13 +292,8 @@ static oi_status spawn(oi_tool_call *call) {
         return OI_ERR_INVAL;
     }
 
-    st = ensure_sigchld_setup(call->reactor);
-    if (st != OI_OK) {
-        return st;
-    }
-
     int stdin_pipe[2], stdout_pipe[2], err_pipe[2];
-    if (pipe2(stdin_pipe, O_CLOEXEC) != 0) {
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stdin_pipe) != 0) {
         return OI_ERR_IO;
     }
     if (pipe2(stdout_pipe, O_CLOEXEC) != 0) {
@@ -425,17 +344,28 @@ static oi_status spawn(oi_tool_call *call) {
     close(stdout_pipe[1]);
     close(err_pipe[1]);
 
-    if (set_nonblocking(stdin_pipe[1]) != OI_OK ||
-        set_nonblocking(stdout_pipe[0]) != OI_OK ||
-        set_nonblocking(err_pipe[0]) != OI_OK) {
+    int pid_fd = open_pidfd(pid);
+    if (pid_fd < 0) {
         close(stdin_pipe[1]);
         close(stdout_pipe[0]);
         close(err_pipe[0]);
-        abandon_child(pid);
+        kill_and_reap(pid);
+        return OI_ERR_IO;
+    }
+
+    if (set_nonblocking(stdin_pipe[1]) != OI_OK ||
+        set_nonblocking(stdout_pipe[0]) != OI_OK ||
+        set_nonblocking(err_pipe[0]) != OI_OK) {
+        close(pid_fd);
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        close(err_pipe[0]);
+        kill_and_reap(pid);
         return OI_ERR_IO;
     }
 
     call->pid = pid;
+    call->pid_fd = pid_fd;
     call->stdin_fd = stdin_pipe[1];
     call->stdout_fd = stdout_pipe[0];
     call->err_fd = err_pipe[0];
@@ -446,7 +376,9 @@ static oi_status spawn(oi_tool_call *call) {
         close(call->stdin_fd);
         close(call->stdout_fd);
         close(call->err_fd);
-        abandon_child(pid);
+        close(call->pid_fd);
+        call->pid_fd = -1;
+        kill_and_reap(pid);
         return st;
     }
     st = oi_reactor_add(call->reactor, call->err_fd, OI_EV_READ, on_err_event,
@@ -456,18 +388,23 @@ static oi_status spawn(oi_tool_call *call) {
         close(call->stdin_fd);
         close(call->stdout_fd);
         close(call->err_fd);
-        abandon_child(pid);
+        close(call->pid_fd);
+        call->pid_fd = -1;
+        kill_and_reap(pid);
         return st;
     }
 
-    st = pid_table_insert(pid, call);
+    st = oi_reactor_add(call->reactor, call->pid_fd, OI_EV_READ,
+                         on_pidfd_event, call);
     if (st != OI_OK) {
         oi_reactor_remove(call->reactor, call->stdout_fd);
         oi_reactor_remove(call->reactor, call->err_fd);
         close(call->stdin_fd);
         close(call->stdout_fd);
         close(call->err_fd);
-        abandon_child(pid);
+        close(call->pid_fd);
+        call->pid_fd = -1;
+        kill_and_reap(pid);
         return st;
     }
 
@@ -516,6 +453,7 @@ oi_status oi_tool_call_start(oi_tool_registry *reg, oi_reactor *r,
     call->stdin_fd = -1;
     call->stdout_fd = -1;
     call->err_fd = -1;
+    call->pid_fd = -1;
 
     if (decision == OI_TOOL_ASK) {
         call->state = CALL_PENDING_PERMISSION;
@@ -622,7 +560,31 @@ void oi_tool_call_cancel(oi_tool_call *call) {
     }
     if (call->pid > 0) {
         kill(call->pid, SIGKILL);
-        pid_table_remove(call->pid); /* let SIGCHLD reap it silently */
     }
-    free_call(call);
+    call->cancelled = 1;
+    call->on_output = NULL;
+    call->on_done = NULL;
+    if (call->destroyed_flag) {
+        *call->destroyed_flag = 1;
+        call->destroyed_flag = NULL;
+    }
+    if (call->stdin_fd >= 0) {
+        oi_reactor_remove(call->reactor, call->stdin_fd);
+        close(call->stdin_fd);
+        call->stdin_fd = -1;
+    }
+    if (call->stdout_fd >= 0) {
+        oi_reactor_remove(call->reactor, call->stdout_fd);
+        close(call->stdout_fd);
+        call->stdout_fd = -1;
+    }
+    if (call->err_fd >= 0) {
+        oi_reactor_remove(call->reactor, call->err_fd);
+        close(call->err_fd);
+        call->err_fd = -1;
+    }
+    free(call->out_buf);
+    call->out_buf = NULL;
+    call->out_len = call->out_off = call->out_cap = 0;
+    maybe_finish(call);
 }

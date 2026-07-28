@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static oi_json_value *parse_json(oi_arena *a, const char *text) {
     oi_json_parser *p = oi_json_parser_create(a);
@@ -626,6 +629,72 @@ TEST(child_does_not_inherit_other_tool_descriptors) {
     oi_tool_registry_destroy(reg);
 }
 
+TEST(tool_execution_does_not_reap_unrelated_children) {
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+
+    pid_t unrelated = fork();
+    CHECK(unrelated >= 0);
+    if (unrelated == 0) {
+        _exit(0);
+    }
+
+    struct out_ctx ctx = {0};
+    oi_tool_call *call = NULL;
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "echo", NULL, allow_cb, NULL,
+                                 capture_output, capture_done, &ctx, &call),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+    CHECK(ctx.done);
+
+    int status = 0;
+    CHECK_EQ(waitpid(unrelated, &status, 0), unrelated);
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), 0);
+
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
+static void test_signal_handler(int sig) { (void)sig; }
+
+TEST(tool_execution_preserves_signal_dispositions) {
+    struct sigaction custom;
+    memset(&custom, 0, sizeof custom);
+    custom.sa_handler = test_signal_handler;
+    sigemptyset(&custom.sa_mask);
+
+    struct sigaction old_chld;
+    struct sigaction old_pipe;
+    CHECK_EQ(sigaction(SIGCHLD, &custom, &old_chld), 0);
+    CHECK_EQ(sigaction(SIGPIPE, &custom, &old_pipe), 0);
+
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct out_ctx ctx = {0};
+    oi_tool_call *call = NULL;
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "echo", NULL, allow_cb, NULL,
+                                 capture_output, capture_done, &ctx, &call),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+    CHECK(ctx.done);
+
+    struct sigaction current;
+    CHECK_EQ(sigaction(SIGCHLD, NULL, &current), 0);
+    CHECK(current.sa_handler == test_signal_handler);
+    CHECK_EQ(sigaction(SIGPIPE, NULL, &current), 0);
+    CHECK(current.sa_handler == test_signal_handler);
+
+    CHECK_EQ(sigaction(SIGCHLD, &old_chld, NULL), 0);
+    CHECK_EQ(sigaction(SIGPIPE, &old_pipe, NULL), 0);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
 int main(void) {
     RUN(run_echo_captures_output_and_normal_exit);
     RUN(nonzero_exit_code_reported);
@@ -644,5 +713,7 @@ int main(void) {
     RUN(cancel_null_safe);
     RUN(concurrent_calls_do_not_cross_wire);
     RUN(child_does_not_inherit_other_tool_descriptors);
+    RUN(tool_execution_does_not_reap_unrelated_children);
+    RUN(tool_execution_preserves_signal_dispositions);
     return oi_test_report();
 }
