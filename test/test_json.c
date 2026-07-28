@@ -727,6 +727,25 @@ TEST(writer_create_destroy_null_safe) {
     oi_json_writer_destroy(NULL);
 }
 
+TEST(writer_rejects_invalid_and_overflowing_inputs) {
+    size_t len = 123;
+    CHECK_EQ(oi_json_write_null(NULL), OI_ERR_INVAL);
+    CHECK_EQ(oi_json_write_array_end(NULL), OI_ERR_INVAL);
+    CHECK(oi_json_writer_data(NULL, &len) == NULL);
+    CHECK_EQ(len, 0u);
+
+    oi_json_writer *w = oi_json_writer_create();
+    CHECK_EQ(oi_json_write_string(w, NULL, 1), OI_ERR_INVAL);
+    CHECK_EQ(oi_json_write_string(w, "", (size_t)-1), OI_ERR_NOMEM);
+    oi_json_writer_destroy(w);
+
+    w = oi_json_writer_create();
+    CHECK_EQ(oi_json_write_object_begin(w), OI_OK);
+    CHECK_EQ(oi_json_write_object_key(w, NULL, 1), OI_ERR_INVAL);
+    CHECK_EQ(oi_json_write_object_key(w, "", (size_t)-1), OI_ERR_NOMEM);
+    oi_json_writer_destroy(w);
+}
+
 TEST(write_many_elements_grows_buffer_and_frames) {
     oi_json_writer *w = oi_json_writer_create();
     CHECK_EQ(oi_json_write_array_begin(w), OI_OK);
@@ -790,6 +809,7 @@ int main(void) {
     RUN(write_output_round_trips_through_parser);
     RUN(write_structural_misuse_is_rejected);
     RUN(writer_create_destroy_null_safe);
+    RUN(writer_rejects_invalid_and_overflowing_inputs);
     RUN(write_many_elements_grows_buffer_and_frames);
 
     return oi_test_report();

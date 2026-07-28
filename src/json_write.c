@@ -62,6 +62,9 @@ void oi_json_writer_destroy(oi_json_writer *w) {
 }
 
 static oi_status ensure_buf(oi_json_writer *w, size_t additional) {
+    if (additional > (size_t)-1 - w->len - 1) {
+        return OI_ERR_NOMEM;
+    }
     size_t needed = w->len + additional + 1; /* +1 for trailing NUL */
     if (needed <= w->cap) {
         return OI_OK;
@@ -123,6 +126,9 @@ static oi_status push_frame(oi_json_writer *w, int is_object) {
  * elements. Object members insert their own comma in
  * oi_json_write_object_key, since it precedes the key, not the value. */
 static oi_status begin_value(oi_json_writer *w) {
+    if (w == NULL) {
+        return OI_ERR_INVAL;
+    }
     if (w->failed) {
         return OI_ERR_INVAL;
     }
@@ -211,6 +217,11 @@ oi_status oi_json_write_number(oi_json_writer *w, double value) {
 
 static oi_status append_escaped_string(oi_json_writer *w, const char *s,
                                         size_t len) {
+    /* Each byte can expand to six bytes as a \u00XX escape, plus quotes.
+     * Reject impossible lengths before reading from caller memory. */
+    if (len > ((size_t)-1 - 2) / 6) {
+        return OI_ERR_NOMEM;
+    }
     oi_status st = append_bytes(w, "\"", 1);
     if (st != OI_OK) {
         return st;
@@ -273,6 +284,9 @@ static oi_status append_escaped_string(oi_json_writer *w, const char *s,
 }
 
 oi_status oi_json_write_string(oi_json_writer *w, const char *s, size_t len) {
+    if (w == NULL || (s == NULL && len > 0)) {
+        return OI_ERR_INVAL;
+    }
     oi_status st = begin_value(w);
     if (st != OI_OK) {
         return st;
@@ -299,6 +313,9 @@ static oi_status begin_container(oi_json_writer *w, int is_object) {
 }
 
 static oi_status end_container(oi_json_writer *w, int is_object) {
+    if (w == NULL) {
+        return OI_ERR_INVAL;
+    }
     if (w->failed) {
         return OI_ERR_INVAL;
     }
@@ -339,6 +356,9 @@ oi_status oi_json_write_object_end(oi_json_writer *w) {
 
 oi_status oi_json_write_object_key(oi_json_writer *w, const char *key,
                                     size_t len) {
+    if (w == NULL || (key == NULL && len > 0)) {
+        return OI_ERR_INVAL;
+    }
     if (w->failed) {
         return OI_ERR_INVAL;
     }
@@ -371,6 +391,12 @@ oi_status oi_json_write_object_key(oi_json_writer *w, const char *key,
 }
 
 const char *oi_json_writer_data(const oi_json_writer *w, size_t *out_len) {
+    if (w == NULL) {
+        if (out_len != NULL) {
+            *out_len = 0;
+        }
+        return NULL;
+    }
     if (out_len != NULL) {
         *out_len = w->len;
     }
