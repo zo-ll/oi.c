@@ -21,8 +21,8 @@ oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
     memset(out_result, 0, sizeof *out_result);
     struct oi_cli_present present;
     oi_status st = oi_cli_present_init(
-        &present, config->out, config->err, 1, config->on_event,
-        config->event_user_data);
+        &present, config->out, config->err, 1, /*styling_enabled=*/0,
+        config->on_event, config->event_user_data);
     if (st != OI_OK) {
         return st;
     }

@@ -60,8 +60,8 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         goto cleanup_history;
     }
     status = oi_cli_present_init(
-        &present, config->out, config->err, 0, config->on_event,
-        config->event_user_data);
+        &present, config->out, config->err, 0, /*styling_enabled=*/1,
+        config->on_event, config->event_user_data);
     if (status != OI_OK) {
         goto cleanup_history;
     }

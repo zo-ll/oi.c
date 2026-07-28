@@ -44,10 +44,18 @@ static oi_status assistant_append(struct oi_cli_present *present,
 static oi_status write_tool_start(FILE *stream,
                                   const struct oi_cli_string *name) {
     static const char prefix[] = "oi: running tool ";
-    if (fwrite(prefix, 1, sizeof prefix - 1, stream) != sizeof prefix - 1 ||
-        (name->len > 0 &&
-         fwrite(name->data, 1, name->len, stream) != name->len) ||
-        putc('\n', stream) == EOF || fflush(stream) != 0) {
+    oi_status status;
+
+    if (fwrite(prefix, 1, sizeof prefix - 1, stream) != sizeof prefix - 1) {
+        return OI_ERR_IO;
+    }
+    if (name->len > 0) {
+        status = oi_cli_render_sanitize_write(stream, name->data, name->len);
+        if (status != OI_OK) {
+            return status;
+        }
+    }
+    if (putc('\n', stream) == EOF || fflush(stream) != 0) {
         return OI_ERR_IO;
     }
     return OI_OK;
@@ -59,14 +67,22 @@ static oi_status write_model_error(
     int header_len = snprintf(header, sizeof header,
                               "oi: model error body (http=%d): ",
                               event->as.model_error.http_status);
+    oi_status status;
+
     if (header_len < 0 || (size_t)header_len >= sizeof header ||
         fwrite(header, 1, (size_t)header_len, stream) !=
-            (size_t)header_len ||
-        (event->as.model_error.body_len > 0 &&
-         fwrite(event->as.model_error.body, 1,
-                event->as.model_error.body_len, stream) !=
-             event->as.model_error.body_len) ||
-        putc('\n', stream) == EOF) {
+            (size_t)header_len) {
+        return OI_ERR_IO;
+    }
+    if (event->as.model_error.body_len > 0) {
+        status = oi_cli_render_sanitize_write(
+            stream, event->as.model_error.body,
+            event->as.model_error.body_len);
+        if (status != OI_OK) {
+            return status;
+        }
+    }
+    if (putc('\n', stream) == EOF) {
         return OI_ERR_IO;
     }
     return OI_OK;
@@ -74,15 +90,24 @@ static oi_status write_model_error(
 
 oi_status oi_cli_present_init(
     struct oi_cli_present *present, FILE *out, FILE *err,
-    int capture_assistant, oi_cli_conversation_event_cb external_event,
+    int capture_assistant, int styling_enabled,
+    oi_cli_conversation_event_cb external_event,
     void *external_user_data) {
+    oi_status status;
+
     if (present == NULL || out == NULL || err == NULL) {
         return OI_ERR_INVAL;
     }
     memset(present, 0, sizeof *present);
+    status = oi_cli_render_stream_init(&present->assistant_stream, out,
+                                       styling_enabled);
+    if (status != OI_OK) {
+        return status;
+    }
     present->out = out;
     present->err = err;
     present->capture_assistant = capture_assistant != 0;
+    present->styling_enabled = styling_enabled != 0;
     present->status = OI_OK;
     present->external_event = external_event;
     present->external_user_data = external_user_data;
@@ -93,6 +118,7 @@ void oi_cli_present_free(struct oi_cli_present *present) {
     if (present == NULL) {
         return;
     }
+    oi_cli_render_stream_free(&present->assistant_stream);
     free(present->assistant);
     memset(present, 0, sizeof *present);
 }
@@ -127,24 +153,43 @@ oi_status oi_cli_present_event(
     }
     switch (event->type) {
     case OI_CLI_CONVERSATION_EVENT_ASSISTANT_DELTA:
-        if ((event->as.bytes.len > 0 &&
-             fwrite(event->as.bytes.data, 1, event->as.bytes.len,
-                    present->out) != event->as.bytes.len) ||
-            fflush(present->out) != 0) {
-            return OI_ERR_IO;
+        status = oi_cli_render_stream_feed(&present->assistant_stream,
+                                           event->as.bytes.data,
+                                           event->as.bytes.len);
+        if (status != OI_OK) {
+            return status;
         }
         return assistant_append(present, event->as.bytes.data,
                                 event->as.bytes.len);
     case OI_CLI_CONVERSATION_EVENT_TOOL_STARTING:
         return write_tool_start(present->err, event->as.tool_starting.name);
     case OI_CLI_CONVERSATION_EVENT_RESPONSE_DONE:
+        status = oi_cli_render_stream_finish(&present->assistant_stream);
+        if (status != OI_OK) {
+            return status;
+        }
+        /* Styled (REPL) output already ends with exactly one newline per
+         * line via cli_markdown_block, including a synthesized one for a
+         * final line the model didn't itself terminate -- an unconditional
+         * newline here would add a spurious blank line. One-shot's plain
+         * passthrough has no such per-line bookkeeping, so it still needs
+         * this to guarantee the response ends on its own line. */
+        if (present->styling_enabled) {
+            return OI_OK;
+        }
         return putc('\n', present->out) == EOF ? OI_ERR_IO : OI_OK;
     case OI_CLI_CONVERSATION_EVENT_MODEL_ERROR:
         return write_model_error(present->err, event);
-    case OI_CLI_CONVERSATION_EVENT_TURN_DONE:
-        present->status = event->as.turn_done.status;
+    case OI_CLI_CONVERSATION_EVENT_TURN_DONE: {
+        oi_status finish_status =
+            oi_cli_render_stream_finish(&present->assistant_stream);
+
+        present->status = event->as.turn_done.status != OI_OK
+                               ? event->as.turn_done.status
+                               : finish_status;
         present->done = 1;
-        return OI_OK;
+        return finish_status;
+    }
     case OI_CLI_CONVERSATION_EVENT_MESSAGE:
     case OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT:
     case OI_CLI_CONVERSATION_EVENT_PARTIAL_ASSISTANT:

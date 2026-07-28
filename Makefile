@@ -142,6 +142,9 @@ $(BUILD)/test_cli_markdown_block: test/test_cli_markdown_block.c src/cli_markdow
 $(BUILD)/test_cli_render_stream: test/test_cli_render_stream.c src/cli_render_stream.c src/cli_render_style.c src/cli_markdown_block.c src/cli_markdown_inline.c src/cli_markdown.c src/cli_render_sanitize.c src/cli_utf8_stream.c src/cli_utf8.c src/cli_bytebuf.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_render_stream.c src/cli_render_style.c src/cli_markdown_block.c src/cli_markdown_inline.c src/cli_markdown.c src/cli_render_sanitize.c src/cli_utf8_stream.c src/cli_utf8.c src/cli_bytebuf.c $(LIB) -o $@ $(LDLIBS)
 
+$(BUILD)/test_cli_present: test/test_cli_present.c src/cli_present.c src/cli_render_stream.c src/cli_render_style.c src/cli_markdown_block.c src/cli_markdown_inline.c src/cli_markdown.c src/cli_render_sanitize.c src/cli_utf8_stream.c src/cli_utf8.c src/cli_bytebuf.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_present.c src/cli_render_stream.c src/cli_render_style.c src/cli_markdown_block.c src/cli_markdown_inline.c src/cli_markdown.c src/cli_render_sanitize.c src/cli_utf8_stream.c src/cli_utf8.c src/cli_bytebuf.c $(LIB) -o $@ $(LDLIBS)
+
 $(BUILD)/test_cli_utf8: test/test_cli_utf8.c src/cli_utf8.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_utf8.c $(LIB) -o $@ $(LDLIBS)
 
