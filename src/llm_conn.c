@@ -117,22 +117,24 @@ void oi_llm_conn_close(oi_llm_conn *c) {
     }
     if (c->resolver != NULL) {
         struct resolver_job *job = c->resolver;
+        pthread_t resolver_thread;
         int finished;
         pthread_mutex_lock(&job->mutex);
+        resolver_thread = job->thread;
         finished = job->finished;
         if (!finished) {
             job->conn = NULL;
         }
         pthread_mutex_unlock(&job->mutex);
         if (finished) {
-            pthread_join(job->thread, NULL);
+            pthread_join(resolver_thread, NULL);
             close(job->notify_write);
             freeaddrinfo(job->result);
             pthread_mutex_destroy(&job->mutex);
             free(job->host);
             free(job);
         } else {
-            pthread_detach(job->thread);
+            pthread_detach(resolver_thread);
         }
     }
     if (c->ssl) {
