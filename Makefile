@@ -56,7 +56,7 @@ endif
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
-CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c
+CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c
 
 .PHONY: all lib so cli install test check abi-check asan ubsan tsan valgrind \
 	fuzz fuzz-run test-integration clean
@@ -109,6 +109,9 @@ $(CLI_BIN): $(CLI_SRCS) $(LIB) | $(BUILD)
 
 $(BUILD)/test_%: test/test_%.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS)
+
+$(BUILD)/test_cli_message: test/test_cli_message.c src/cli_message.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_message.c $(LIB) -o $@ $(LDLIBS)
 
 test: $(TEST_BINS) $(CLI_BIN)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t =="; $$t; done
