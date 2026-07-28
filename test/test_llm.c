@@ -203,6 +203,147 @@ TEST(streaming_success_delivers_deltas) {
     waitpid(child, NULL, 0);
 }
 
+/* --- structured tool-call streaming --- */
+
+struct tool_event_ctx {
+    char id[2][32];
+    size_t id_len[2];
+    char name[2][32];
+    size_t name_len[2];
+    char arguments[2][128];
+    size_t arguments_len[2];
+    char text[32];
+    size_t text_len;
+    int tool_events;
+    int done;
+    oi_status status;
+};
+
+static void append_checked(char *dst, size_t *used, size_t cap,
+                           const char *fragment, size_t len) {
+    CHECK(*used + len < cap);
+    if (len > 0) {
+        memcpy(dst + *used, fragment, len);
+    }
+    *used += len;
+    dst[*used] = '\0';
+}
+
+static void on_event(const oi_llm_event *event, void *ud) {
+    struct tool_event_ctx *ctx = ud;
+    if (event->type == OI_LLM_EVENT_TEXT) {
+        append_checked(ctx->text, &ctx->text_len, sizeof ctx->text,
+                       event->as.text.data, event->as.text.len);
+        return;
+    }
+    CHECK_EQ(event->type, OI_LLM_EVENT_TOOL_CALL);
+    size_t index = event->as.tool_call.index;
+    CHECK(index < 2);
+    append_checked(ctx->id[index], &ctx->id_len[index],
+                   sizeof ctx->id[index], event->as.tool_call.id,
+                   event->as.tool_call.id_len);
+    append_checked(ctx->name[index], &ctx->name_len[index],
+                   sizeof ctx->name[index], event->as.tool_call.name,
+                   event->as.tool_call.name_len);
+    append_checked(ctx->arguments[index], &ctx->arguments_len[index],
+                   sizeof ctx->arguments[index],
+                   event->as.tool_call.arguments,
+                   event->as.tool_call.arguments_len);
+    ctx->tool_events++;
+}
+
+static void tool_event_done(oi_status status, int http_status,
+                            const char *error_body, size_t error_body_len,
+                            void *ud) {
+    (void)http_status;
+    (void)error_body;
+    (void)error_body_len;
+    struct tool_event_ctx *ctx = ud;
+    ctx->status = status;
+    ctx->done = 1;
+}
+
+TEST(structured_tool_call_fragments_are_ordered) {
+    const char *sse_body =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"using "
+        "tools\",\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"type\":"
+        "\"function\",\"function\":{\"name\":\"ec\",\"arguments\":\"{\\\"te\""
+        "}},{\"index\":1,\"id\":\"call_1\",\"type\":\"function\",\"function\":"
+        "{\"name\":\"sum\",\"arguments\":\"{\\\"x\\\":\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":["
+        "{\"index\":0,\"function\":{\"name\":\"ho\",\"arguments\":"
+        "\"xt\\\":\\\"ok\\\"}\"}},{\"index\":1,\"function\":{\"arguments\":"
+        "\"1}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t total;
+    char *response = build_chunked_response(sse_body, strlen(sse_body),
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct tool_event_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, "{}", 2, on_event,
+                                          tool_event_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_EQ(ctx.tool_events, 4);
+    CHECK_STREQ(ctx.text, "using tools");
+    CHECK_STREQ(ctx.id[0], "call_0");
+    CHECK_STREQ(ctx.name[0], "echo");
+    CHECK_STREQ(ctx.arguments[0], "{\"text\":\"ok\"}");
+    CHECK_STREQ(ctx.id[1], "call_1");
+    CHECK_STREQ(ctx.name[1], "sum");
+    CHECK_STREQ(ctx.arguments[1], "{\"x\":1}");
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+TEST(incomplete_tool_call_rejects_stream) {
+    const char *sse_body =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":"
+        "{\"name\":\"echo\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t total;
+    char *response = build_chunked_response(sse_body, strlen(sse_body),
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct tool_event_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, "{}", 2, on_event,
+                                          tool_event_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.status, OI_ERR_PARSE);
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
 /* --- non-2xx status surfaces the error body --- */
 
 struct error_ctx {
@@ -560,6 +701,8 @@ TEST(cancel_null_safe) { oi_llm_request_cancel(NULL); }
 int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(streaming_success_delivers_deltas);
+    RUN(structured_tool_call_fragments_are_ordered);
+    RUN(incomplete_tool_call_rejects_stream);
     RUN(non_2xx_status_reports_error_body);
     RUN(malformed_sse_json_is_reported_not_dropped);
     RUN(success_response_requires_done_sentinel);

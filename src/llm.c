@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "compat.h"
 #include "llm_conn.h"
@@ -22,11 +23,22 @@ struct oi_llm_client {
     int timeout_ms;
 };
 
+struct oi_llm_tool_state {
+    size_t index;
+    char *id;
+    size_t id_len;
+    char *name;
+    size_t name_len;
+    char *arguments;
+    size_t arguments_len;
+};
+
 struct oi_llm_request {
     oi_llm_client *client; /* borrowed */
     oi_arena *arena;       /* borrowed */
 
     oi_llm_delta_cb on_delta;
+    oi_llm_event_cb on_event;
     oi_llm_done_cb on_done;
     void *user_data;
 
@@ -53,6 +65,9 @@ struct oi_llm_request {
     int body_cb_failed;
     oi_status body_cb_status;
     int saw_done;
+
+    struct oi_llm_tool_state *tools;
+    size_t tools_len;
 
     int finished;
 
@@ -153,6 +168,12 @@ static void request_teardown(oi_llm_request *req) {
     oi_json_parser_destroy(req->json);
     free(req->error_buf);
     free(req->body);
+    for (size_t i = 0; i < req->tools_len; i++) {
+        free(req->tools[i].id);
+        free(req->tools[i].name);
+        free(req->tools[i].arguments);
+    }
+    free(req->tools);
     if (req->destroyed_flag) {
         *req->destroyed_flag = 1;
     }
@@ -220,6 +241,178 @@ static oi_status error_buf_append(oi_llm_request *req, const void *data,
 
 /* ================= SSE event -> delta extraction ================= */
 
+static oi_status append_fragment(char **buf, size_t *used, const char *data,
+                                  size_t len) {
+    if (len > SIZE_MAX - *used - 1) {
+        return OI_ERR_NOMEM;
+    }
+    char *next = realloc(*buf, *used + len + 1);
+    if (next == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    if (len > 0) {
+        memcpy(next + *used, data, len);
+    }
+    *used += len;
+    next[*used] = '\0';
+    *buf = next;
+    return OI_OK;
+}
+
+static struct oi_llm_tool_state *tool_state(oi_llm_request *req,
+                                             size_t index) {
+    for (size_t i = 0; i < req->tools_len; i++) {
+        if (req->tools[i].index == index) {
+            return &req->tools[i];
+        }
+    }
+    if (req->tools_len == SIZE_MAX / sizeof *req->tools) {
+        return NULL;
+    }
+    size_t count = req->tools_len + 1;
+    struct oi_llm_tool_state *next =
+        realloc(req->tools, count * sizeof *next);
+    if (next == NULL) {
+        return NULL;
+    }
+    req->tools = next;
+    struct oi_llm_tool_state *state = &next[req->tools_len];
+    memset(state, 0, sizeof *state);
+    state->index = index;
+    req->tools_len = count;
+    return state;
+}
+
+static oi_status json_size_index(const oi_json_value *value, size_t *out) {
+    double number;
+    if (oi_json_get_number(value, &number) != OI_OK || number < 0 ||
+        number > (double)SIZE_MAX) {
+        return OI_ERR_PARSE;
+    }
+    size_t index = (size_t)number;
+    if ((double)index != number) {
+        return OI_ERR_PARSE;
+    }
+    *out = index;
+    return OI_OK;
+}
+
+static oi_status optional_string(const oi_json_value *object, const char *key,
+                                  const char **out, size_t *out_len) {
+    oi_json_value *value = oi_json_object_get(object, key);
+    if (value == NULL) {
+        *out = NULL;
+        *out_len = 0;
+        return OI_OK;
+    }
+    return oi_json_get_string(value, out, out_len) == OI_OK ? OI_OK
+                                                            : OI_ERR_PARSE;
+}
+
+static int emit_event(oi_llm_request *req, const oi_llm_event *event) {
+    if (req->on_event == NULL) {
+        return 0;
+    }
+    int *destroyed = req->destroyed_flag;
+    req->on_event(event, req->user_data);
+    return destroyed != NULL && *destroyed;
+}
+
+static oi_status handle_tool_calls(oi_llm_request *req,
+                                    const oi_json_value *tool_calls) {
+    if (tool_calls == NULL) {
+        return OI_OK;
+    }
+    if (oi_json_type_of(tool_calls) != OI_JSON_ARRAY) {
+        return OI_ERR_PARSE;
+    }
+
+    size_t count = oi_json_array_len(tool_calls);
+    for (size_t i = 0; i < count; i++) {
+        oi_json_value *call = oi_json_array_get(tool_calls, i);
+        oi_json_value *function = oi_json_object_get(call, "function");
+        size_t index;
+        if (call == NULL || oi_json_type_of(call) != OI_JSON_OBJECT ||
+            json_size_index(oi_json_object_get(call, "index"), &index) !=
+                OI_OK ||
+            (function != NULL &&
+             oi_json_type_of(function) != OI_JSON_OBJECT)) {
+            return OI_ERR_PARSE;
+        }
+
+        const char *id = NULL;
+        const char *name = NULL;
+        const char *arguments = NULL;
+        const char *type = NULL;
+        size_t id_len = 0;
+        size_t name_len = 0;
+        size_t arguments_len = 0;
+        size_t type_len = 0;
+        if (optional_string(call, "id", &id, &id_len) != OI_OK ||
+            optional_string(call, "type", &type, &type_len) != OI_OK ||
+            (function != NULL &&
+             (optional_string(function, "name", &name, &name_len) != OI_OK ||
+              optional_string(function, "arguments", &arguments,
+                              &arguments_len) != OI_OK)) ||
+            (type != NULL &&
+             (type_len != 8 || memcmp(type, "function", 8) != 0))) {
+            return OI_ERR_PARSE;
+        }
+
+        struct oi_llm_tool_state *state = tool_state(req, index);
+        if (state == NULL) {
+            return OI_ERR_NOMEM;
+        }
+        oi_status st = OI_OK;
+        if (id != NULL) {
+            st = append_fragment(&state->id, &state->id_len, id, id_len);
+        }
+        if (st == OI_OK && name != NULL) {
+            st = append_fragment(&state->name, &state->name_len, name,
+                                 name_len);
+        }
+        if (st == OI_OK && arguments != NULL) {
+            st = append_fragment(&state->arguments, &state->arguments_len,
+                                 arguments, arguments_len);
+        }
+        if (st != OI_OK) {
+            return st;
+        }
+
+        oi_llm_event event = {
+            .type = OI_LLM_EVENT_TOOL_CALL,
+            .as.tool_call = {index, id, id_len, name, name_len, arguments,
+                             arguments_len},
+        };
+        if (emit_event(req, &event)) {
+            return OI_ERR_CLOSED;
+        }
+    }
+    return OI_OK;
+}
+
+static oi_status validate_tool_calls(oi_llm_request *req) {
+    for (size_t i = 0; i < req->tools_len; i++) {
+        struct oi_llm_tool_state *tool = &req->tools[i];
+        if (tool->id_len == 0 || tool->name_len == 0 ||
+            tool->arguments_len == 0) {
+            return OI_ERR_PARSE;
+        }
+        oi_json_parser_reset(req->json);
+        oi_status st =
+            oi_json_parser_feed(req->json, tool->arguments, tool->arguments_len);
+        if (st == OI_OK) {
+            st = oi_json_parser_finish(req->json);
+        }
+        oi_json_value *root = oi_json_parser_root(req->json);
+        if (st != OI_OK || !oi_json_parser_done(req->json) || root == NULL ||
+            oi_json_type_of(root) != OI_JSON_OBJECT) {
+            return OI_ERR_PARSE;
+        }
+    }
+    return OI_OK;
+}
+
 static void handle_sse_event(const char *data, size_t len, void *ud) {
     oi_llm_request *req = ud;
     if (req->body_cb_failed) {
@@ -229,6 +422,12 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
         if (req->saw_done) {
             req->body_cb_failed = 1;
             req->body_cb_status = OI_ERR_PARSE;
+            return;
+        }
+        oi_status st = validate_tool_calls(req);
+        if (st != OI_OK) {
+            req->body_cb_failed = 1;
+            req->body_cb_status = st;
             return;
         }
         req->saw_done = 1;
@@ -256,17 +455,30 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
     oi_json_value *choice0 = oi_json_array_get(choices, 0);
     oi_json_value *delta = oi_json_object_get(choice0, "delta");
     oi_json_value *content = oi_json_object_get(delta, "content");
+    oi_json_value *tool_calls = oi_json_object_get(delta, "tool_calls");
 
     const char *text;
     size_t text_len;
     if (oi_json_get_string(content, &text, &text_len) == OI_OK) {
+        oi_llm_event event = {
+            .type = OI_LLM_EVENT_TEXT,
+            .as.text = {text, text_len},
+        };
+        if (emit_event(req, &event)) {
+            return;
+        }
         if (req->on_delta) {
             req->on_delta(text, text_len, req->user_data);
         }
     }
-    /* Any other shape (no "choices", a tool-call-only delta, a
-     * finish_reason-only final chunk) is not an error, just nothing to
-     * forward. */
+    oi_status tool_st = handle_tool_calls(req, tool_calls);
+    if (tool_st == OI_ERR_CLOSED) {
+        return; /* request was cancelled reentrantly by on_event */
+    }
+    if (tool_st != OI_OK) {
+        req->body_cb_failed = 1;
+        req->body_cb_status = tool_st;
+    }
 }
 
 /* ================= HTTP parser callbacks ================= */
@@ -411,11 +623,12 @@ static void req_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
 
 /* ================= public entry point ================= */
 
-oi_status oi_llm_request_start(oi_llm_client *client, oi_reactor *reactor,
-                                oi_arena *arena, const char *body,
-                                size_t body_len, oi_llm_delta_cb on_delta,
-                                oi_llm_done_cb on_done, void *user_data,
-                                oi_llm_request **out_request) {
+static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
+                               oi_arena *arena, const char *body,
+                               size_t body_len, oi_llm_delta_cb on_delta,
+                               oi_llm_event_cb on_event,
+                               oi_llm_done_cb on_done, void *user_data,
+                               oi_llm_request **out_request) {
     if (client == NULL || reactor == NULL || arena == NULL || body == NULL ||
         out_request == NULL) {
         return OI_ERR_INVAL;
@@ -428,6 +641,7 @@ oi_status oi_llm_request_start(oi_llm_client *client, oi_reactor *reactor,
     req->client = client;
     req->arena = arena;
     req->on_delta = on_delta;
+    req->on_event = on_event;
     req->on_done = on_done;
     req->user_data = user_data;
 
@@ -481,4 +695,21 @@ oi_status oi_llm_request_start(oi_llm_client *client, oi_reactor *reactor,
 
     *out_request = req;
     return OI_OK;
+}
+
+oi_status oi_llm_request_start(oi_llm_client *client, oi_reactor *reactor,
+                                oi_arena *arena, const char *body,
+                                size_t body_len, oi_llm_delta_cb on_delta,
+                                oi_llm_done_cb on_done, void *user_data,
+                                oi_llm_request **out_request) {
+    return request_start(client, reactor, arena, body, body_len, on_delta, NULL,
+                         on_done, user_data, out_request);
+}
+
+oi_status oi_llm_request_start_events(
+    oi_llm_client *client, oi_reactor *reactor, oi_arena *arena,
+    const char *body, size_t body_len, oi_llm_event_cb on_event,
+    oi_llm_done_cb on_done, void *user_data, oi_llm_request **out_request) {
+    return request_start(client, reactor, arena, body, body_len, NULL, on_event,
+                         on_done, user_data, out_request);
 }

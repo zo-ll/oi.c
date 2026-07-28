@@ -29,6 +29,39 @@ typedef struct oi_llm_request oi_llm_request;
 typedef void (*oi_llm_delta_cb)(const char *text, size_t len,
                                  void *user_data);
 
+typedef enum {
+    OI_LLM_EVENT_TEXT,
+    OI_LLM_EVENT_TOOL_CALL
+} oi_llm_event_type;
+
+/*
+ * One borrowed streaming event. Every pointer is valid only until the
+ * callback returns. TOOL_CALL fields are fragments from one indexed call:
+ * a field with length zero was absent from this delta. Callers that need a
+ * complete call append fragments by `index`; the stream is rejected unless
+ * every call finishes with a non-empty id/name and JSON-object arguments.
+ */
+typedef struct {
+    oi_llm_event_type type;
+    union {
+        struct {
+            const char *data;
+            size_t len;
+        } text;
+        struct {
+            size_t index;
+            const char *id;
+            size_t id_len;
+            const char *name;
+            size_t name_len;
+            const char *arguments;
+            size_t arguments_len;
+        } tool_call;
+    } as;
+} oi_llm_event;
+
+typedef void (*oi_llm_event_cb)(const oi_llm_event *event, void *user_data);
+
 /*
  * Fires exactly once, terminating the request (oi_llm_request itself is
  * freed right after this returns -- don't touch it from inside). `status`
@@ -78,6 +111,16 @@ oi_status oi_llm_request_start(oi_llm_client *client, oi_reactor *reactor,
                                 size_t body_len, oi_llm_delta_cb on_delta,
                                 oi_llm_done_cb on_done, void *user_data,
                                 oi_llm_request **out_request);
+
+/*
+ * Event-capable variant of oi_llm_request_start. Text and structured
+ * tool-call fragments are delivered through `on_event`; completion and
+ * ownership rules are otherwise identical.
+ */
+oi_status oi_llm_request_start_events(
+    oi_llm_client *client, oi_reactor *reactor, oi_arena *arena,
+    const char *body, size_t body_len, oi_llm_event_cb on_event,
+    oi_llm_done_cb on_done, void *user_data, oi_llm_request **out_request);
 
 /*
  * Aborts an in-flight request; on_done will NOT fire. NULL-safe and a
