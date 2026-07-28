@@ -1,0 +1,248 @@
+#include "cli_render.h"
+
+#include "cli_utf8.h"
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static const char prompt[] = "> ";
+
+struct render_buffer {
+    char *data;
+    size_t len;
+    size_t cap;
+};
+
+struct cursor_position {
+    size_t row;
+    size_t column;
+};
+
+static oi_status buffer_append(struct render_buffer *buffer, const char *data,
+                               size_t len) {
+    size_t required;
+    size_t cap;
+    char *new_data;
+
+    if (len > SIZE_MAX - buffer->len) {
+        return OI_ERR_NOMEM;
+    }
+    required = buffer->len + len;
+    if (required <= buffer->cap) {
+        if (len != 0) {
+            memcpy(buffer->data + buffer->len, data, len);
+        }
+        buffer->len = required;
+        return OI_OK;
+    }
+
+    cap = buffer->cap == 0 ? 128 : buffer->cap;
+    while (cap < required) {
+        if (cap > SIZE_MAX / 2) {
+            return OI_ERR_NOMEM;
+        }
+        cap *= 2;
+    }
+    new_data = realloc(buffer->data, cap);
+    if (new_data == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    buffer->data = new_data;
+    buffer->cap = cap;
+    if (len != 0) {
+        memcpy(buffer->data + buffer->len, data, len);
+    }
+    buffer->len = required;
+    return OI_OK;
+}
+
+static oi_status buffer_control_number(struct render_buffer *buffer,
+                                       size_t number, char suffix) {
+    char sequence[64];
+    int len = snprintf(sequence, sizeof sequence, "\x1b[%zu%c", number,
+                       suffix);
+
+    if (len < 0 || (size_t)len >= sizeof sequence) {
+        return OI_ERR_INVAL;
+    }
+    return buffer_append(buffer, sequence, (size_t)len);
+}
+
+static oi_status write_all(int fd, const char *data, size_t len) {
+    size_t written = 0;
+
+    while (written < len) {
+        ssize_t result = write(fd, data + written, len - written);
+        if (result > 0) {
+            written += (size_t)result;
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return OI_ERR_IO;
+        }
+    }
+    return OI_OK;
+}
+
+static void advance_columns(struct cursor_position *position, size_t columns,
+                            size_t width) {
+    while (width != 0) {
+        size_t available = columns - position->column;
+        if (available == 0) {
+            position->row++;
+            position->column = 0;
+            continue;
+        }
+        if (width < available) {
+            position->column += width;
+            return;
+        }
+        width -= available;
+        position->row++;
+        position->column = 0;
+    }
+}
+
+static oi_status append_prompt(struct render_buffer *buffer,
+                               struct cursor_position *position,
+                               size_t columns) {
+    oi_status status = buffer_append(buffer, prompt, sizeof prompt - 1);
+    if (status == OI_OK) {
+        advance_columns(position, columns, sizeof prompt - 1);
+    }
+    return status;
+}
+
+static oi_status build_frame(const struct oi_cli_editor *editor,
+                             size_t columns, struct render_buffer *buffer,
+                             struct cursor_position *out_cursor,
+                             struct cursor_position *out_end) {
+    const char *data = oi_cli_editor_data(editor);
+    size_t len = oi_cli_editor_length(editor);
+    size_t cursor = oi_cli_editor_cursor(editor);
+    struct cursor_position position = {0};
+    size_t offset = 0;
+    int cursor_recorded = 0;
+    oi_status status;
+
+    status = append_prompt(buffer, &position, columns);
+    if (status != OI_OK) {
+        return status;
+    }
+    while (offset < len) {
+        size_t sequence_len;
+
+        if (!cursor_recorded && offset == cursor) {
+            *out_cursor = position;
+            cursor_recorded = 1;
+        }
+        status = oi_cli_utf8_sequence_length(
+            (const unsigned char *)data + offset, len - offset,
+            &sequence_len);
+        if (status != OI_OK) {
+            return status;
+        }
+        if (data[offset] == '\n') {
+            status = buffer_append(buffer, "\r\n", 2);
+            if (status != OI_OK) {
+                return status;
+            }
+            position.row++;
+            position.column = 0;
+            status = append_prompt(buffer, &position, columns);
+        } else {
+            status = buffer_append(buffer, data + offset, sequence_len);
+            if (status == OI_OK) {
+                advance_columns(&position, columns, 1);
+            }
+        }
+        if (status != OI_OK) {
+            return status;
+        }
+        offset += sequence_len;
+    }
+    if (!cursor_recorded) {
+        *out_cursor = position;
+    }
+    *out_end = position;
+    return OI_OK;
+}
+
+oi_status oi_cli_render_init(struct oi_cli_render *render, int output_fd,
+                             size_t columns) {
+    if (render == NULL || output_fd < 0 || columns < sizeof prompt) {
+        return OI_ERR_INVAL;
+    }
+    render->output_fd = output_fd;
+    render->columns = columns;
+    render->previous_rows = 0;
+    return OI_OK;
+}
+
+void oi_cli_render_set_columns(struct oi_cli_render *render, size_t columns) {
+    if (render != NULL && columns >= sizeof prompt) {
+        render->columns = columns;
+    }
+}
+
+oi_status oi_cli_render_draw(struct oi_cli_render *render,
+                             const struct oi_cli_editor *editor) {
+    struct render_buffer buffer = {0};
+    struct cursor_position cursor = {0};
+    struct cursor_position end = {0};
+    oi_status status;
+
+    if (render == NULL || editor == NULL || render->output_fd < 0 ||
+        render->columns < sizeof prompt) {
+        return OI_ERR_INVAL;
+    }
+
+    status = buffer_append(&buffer, "\r", 1);
+    if (status == OI_OK && render->previous_rows > 1) {
+        status =
+            buffer_control_number(&buffer, render->previous_rows - 1, 'A');
+    }
+    if (status == OI_OK) {
+        status = buffer_append(&buffer, "\x1b[J", 3);
+    }
+    if (status == OI_OK) {
+        status = build_frame(editor, render->columns, &buffer, &cursor, &end);
+    }
+    if (status == OI_OK && end.row > cursor.row) {
+        status = buffer_append(&buffer, "\r", 1);
+        if (status == OI_OK) {
+            status = buffer_control_number(&buffer, end.row - cursor.row, 'A');
+        }
+    } else if (status == OI_OK && end.column != cursor.column) {
+        status = buffer_append(&buffer, "\r", 1);
+    }
+    if (status == OI_OK && cursor.column != 0 &&
+        (end.row != cursor.row || end.column != cursor.column)) {
+        status = buffer_control_number(&buffer, cursor.column, 'C');
+    }
+    if (status == OI_OK) {
+        status = write_all(render->output_fd, buffer.data, buffer.len);
+    }
+    if (status == OI_OK) {
+        render->previous_rows = end.row + 1;
+    }
+    free(buffer.data);
+    return status;
+}
+
+oi_status oi_cli_render_finish(struct oi_cli_render *render) {
+    oi_status status;
+
+    if (render == NULL || render->output_fd < 0) {
+        return OI_ERR_INVAL;
+    }
+    status = write_all(render->output_fd, "\r\n", 2);
+    if (status == OI_OK) {
+        render->previous_rows = 0;
+    }
+    return status;
+}
