@@ -125,17 +125,19 @@ static oi_status line_append(oi_llm_http_parser *p, char c) {
 }
 
 static oi_status handle_status_line(oi_llm_http_parser *p) {
-    size_t i = 0;
-    while (i < p->line_len && p->line_buf[i] != ' ') {
-        i++;
-    }
-    if (i >= p->line_len) {
+    if (p->line_len < 12 ||
+        (memcmp(p->line_buf, "HTTP/1.1 ", 9) != 0 &&
+         memcmp(p->line_buf, "HTTP/1.0 ", 9) != 0)) {
         p->state = ST_ERROR;
         return OI_ERR_PARSE;
     }
-    i++;
-    if (i + 3 > p->line_len || !is_digit_c(p->line_buf[i]) ||
+    size_t i = 9;
+    if (!is_digit_c(p->line_buf[i]) ||
         !is_digit_c(p->line_buf[i + 1]) || !is_digit_c(p->line_buf[i + 2])) {
+        p->state = ST_ERROR;
+        return OI_ERR_PARSE;
+    }
+    if (i + 3 < p->line_len && p->line_buf[i + 3] != ' ') {
         p->state = ST_ERROR;
         return OI_ERR_PARSE;
     }
@@ -147,6 +149,10 @@ static oi_status handle_status_line(oi_llm_http_parser *p) {
 }
 
 static oi_status finish_headers(oi_llm_http_parser *p) {
+    if (p->is_chunked && p->content_length >= 0) {
+        p->state = ST_ERROR;
+        return OI_ERR_PARSE;
+    }
     if (p->is_chunked) {
         p->state = ST_CHUNK_SIZE_LINE;
     } else if (p->content_length >= 0) {
@@ -177,7 +183,7 @@ static oi_status handle_header_line(oi_llm_http_parser *p) {
     while (colon < p->line_len && p->line_buf[colon] != ':') {
         colon++;
     }
-    if (colon >= p->line_len) {
+    if (colon == 0 || colon >= p->line_len) {
         p->state = ST_ERROR;
         return OI_ERR_PARSE;
     }
@@ -190,9 +196,12 @@ static oi_status handle_header_line(oi_llm_http_parser *p) {
 
     if (name_len == 17 &&
         strncasecmp(p->line_buf, "Transfer-Encoding", 17) == 0) {
-        if (value_len >= 7 && strncasecmp(p->line_buf + vi, "chunked", 7) == 0) {
-            p->is_chunked = 1;
+        if (value_len != 7 ||
+            strncasecmp(p->line_buf + vi, "chunked", 7) != 0) {
+            p->state = ST_ERROR;
+            return OI_ERR_PARSE;
         }
+        p->is_chunked = 1;
     } else if (name_len == 14 &&
                strncasecmp(p->line_buf, "Content-Length", 14) == 0) {
         if (value_len == 0) {
@@ -213,6 +222,10 @@ static oi_status handle_header_line(oi_llm_http_parser *p) {
                 return OI_ERR_PARSE;
             }
             v = v * 10 + digit;
+        }
+        if (p->content_length >= 0 && p->content_length != v) {
+            p->state = ST_ERROR;
+            return OI_ERR_PARSE;
         }
         p->content_length = v;
     }

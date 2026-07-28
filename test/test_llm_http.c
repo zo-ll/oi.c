@@ -133,6 +133,15 @@ TEST(malformed_status_line_errors) {
     oi_llm_http_parser_destroy(p);
 }
 
+TEST(non_http_status_line_errors) {
+    struct capture c = {0};
+    oi_llm_http_parser *p =
+        oi_llm_http_parser_create(on_headers_done, on_body, &c);
+    const char *doc = "FAKE/1.1 200 OK\r\n";
+    CHECK_EQ(oi_llm_http_parser_feed(p, doc, strlen(doc)), OI_ERR_PARSE);
+    oi_llm_http_parser_destroy(p);
+}
+
 TEST(malformed_chunk_size_errors) {
     struct capture c = {0};
     oi_llm_http_parser *p =
@@ -285,6 +294,27 @@ TEST(empty_content_length_value_errors) {
     oi_llm_http_parser_destroy(p);
 }
 
+TEST(ambiguous_response_framing_errors) {
+    const char *docs[] = {
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunkedx\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+        "Content-Length: 3\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n"
+        "Content-Length: 4\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n: value\r\n\r\n",
+    };
+    for (size_t i = 0; i < sizeof docs / sizeof docs[0]; i++) {
+        struct capture c = {0};
+        oi_llm_http_parser *p =
+            oi_llm_http_parser_create(on_headers_done, on_body, &c);
+        CHECK_EQ(feed_byte_by_byte(p, docs[i], strlen(docs[i])),
+                  OI_ERR_PARSE);
+        CHECK(oi_llm_http_parser_failed(p));
+        oi_llm_http_parser_destroy(p);
+    }
+}
+
 /* The largest accepted values must still parse, so the bound rejects
  * only genuinely out-of-range input. */
 TEST(large_but_valid_content_length_accepted) {
@@ -312,6 +342,7 @@ int main(void) {
     RUN(header_name_case_insensitive);
     RUN(bare_lf_line_endings_accepted);
     RUN(malformed_status_line_errors);
+    RUN(non_http_status_line_errors);
     RUN(malformed_chunk_size_errors);
     RUN(chunk_missing_trailing_crlf_errors);
     RUN(feed_after_done_is_ignored);
@@ -323,6 +354,7 @@ int main(void) {
     RUN(overlong_content_length_errors);
     RUN(overlong_chunk_size_errors);
     RUN(empty_content_length_value_errors);
+    RUN(ambiguous_response_framing_errors);
     RUN(large_but_valid_content_length_accepted);
     return oi_test_report();
 }
