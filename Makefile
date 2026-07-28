@@ -21,8 +21,10 @@ INCLUDEDIR ?= $(PREFIX)/include
 ifeq ($(UNAME_S),Darwin)
 CSTD += -D_DARWIN_C_SOURCE
 REACTOR_BACKEND = src/reactor_kqueue.c
+PTY_LIBS =
 else
 REACTOR_BACKEND = src/reactor_epoll.c
+PTY_LIBS = -lutil
 endif
 LIB_SRCS = src/reactor.c $(REACTOR_BACKEND) src/arena.c src/json_value.c src/json_parse.c src/json_write.c src/llm_http.c src/llm_sse.c src/llm_conn.c src/llm.c src/tool_registry.c src/tool_exec.c src/sesslog.c src/session.c src/config.c
 LIB_OBJS = $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
@@ -56,7 +58,7 @@ endif
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
-CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c src/cli_conversation.c src/cli_utf8.c src/cli_editor.c src/cli_input_history.c
+CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c src/cli_conversation.c src/cli_utf8.c src/cli_editor.c src/cli_input_history.c src/cli_terminal.c
 
 .PHONY: all lib so cli install test check abi-check asan ubsan tsan valgrind \
 	fuzz fuzz-run test-integration clean
@@ -121,6 +123,9 @@ $(BUILD)/test_cli_editor: test/test_cli_editor.c src/cli_editor.c src/cli_utf8.c
 
 $(BUILD)/test_cli_input_history: test/test_cli_input_history.c src/cli_input_history.c src/cli_utf8.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_input_history.c src/cli_utf8.c $(LIB) -o $@ $(LDLIBS)
+
+$(BUILD)/test_cli_terminal: test/test_cli_terminal.c src/cli_terminal.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_terminal.c $(LIB) -o $@ $(LDLIBS) $(PTY_LIBS)
 
 $(BUILD)/test_cli_history: test/test_cli_history.c src/cli_history.c src/cli_message.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_history.c src/cli_message.c $(LIB) -o $@ $(LDLIBS)
