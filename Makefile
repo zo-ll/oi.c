@@ -9,6 +9,10 @@ INCLUDES = -Iinclude -Isrc
 LDLIBS = -lssl -lcrypto
 
 BUILD = build
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+LIBDIR ?= $(PREFIX)/lib
+INCLUDEDIR ?= $(PREFIX)/include
 LIB_SRCS = src/reactor.c src/reactor_epoll.c src/arena.c src/json_value.c src/json_parse.c src/json_write.c src/llm_http.c src/llm_sse.c src/llm_conn.c src/llm.c src/tool_registry.c src/tool_exec.c src/sesslog.c src/session.c src/config.c
 LIB_OBJS = $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
 LIB = $(BUILD)/liboi.a
@@ -26,8 +30,8 @@ TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
 
-.PHONY: all lib so cli test check asan ubsan tsan valgrind fuzz fuzz-run \
-	test-integration clean
+.PHONY: all lib so cli install test check asan ubsan tsan valgrind fuzz \
+	fuzz-run test-integration clean
 
 all: lib cli
 
@@ -36,6 +40,13 @@ lib: $(LIB) $(LIB_SO)
 so: $(LIB_SO)
 
 cli: $(CLI_BIN)
+
+install: all
+	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" \
+		"$(DESTDIR)$(INCLUDEDIR)/oi"
+	install -m 755 $(CLI_BIN) "$(DESTDIR)$(BINDIR)/oi"
+	install -m 644 $(LIB) $(LIB_SO) "$(DESTDIR)$(LIBDIR)/"
+	install -m 644 include/oi/*.h "$(DESTDIR)$(INCLUDEDIR)/oi/"
 
 $(BUILD):
 	mkdir -p $(BUILD)
