@@ -47,8 +47,29 @@ static const char *record_kind_name(enum oi_cli_history_record_kind kind,
     case OI_CLI_HISTORY_RECORD_CHECKPOINT:
         name = "checkpoint";
         break;
+    case OI_CLI_HISTORY_RECORD_SESSION_SETTING:
+        name = "session_setting";
+        break;
     case OI_CLI_HISTORY_RECORD_NONE:
         return NULL;
+    }
+    if (name == NULL) {
+        return NULL;
+    }
+    *out_len = strlen(name);
+    return name;
+}
+
+static const char *session_setting_field_name(
+    enum oi_cli_history_session_setting_field field, size_t *out_len) {
+    const char *name = NULL;
+    switch (field) {
+    case OI_CLI_HISTORY_SESSION_SETTING_MODEL:
+        name = "model";
+        break;
+    case OI_CLI_HISTORY_SESSION_SETTING_CWD:
+        name = "cwd";
+        break;
     }
     if (name == NULL) {
         return NULL;
@@ -358,6 +379,27 @@ static oi_status write_payload(oi_json_writer *writer,
                 writer, record->as.checkpoint.source_last_record_id);
         }
         break;
+    case OI_CLI_HISTORY_RECORD_SESSION_SETTING: {
+        size_t field_len;
+        const char *field = session_setting_field_name(
+            record->as.session_setting.field, &field_len);
+        if (field == NULL) {
+            return OI_ERR_INVAL;
+        }
+        st = write_key(writer, "field", 5);
+        if (st == OI_OK) {
+            st = oi_json_write_string(writer, field, field_len);
+        }
+        if (st == OI_OK) {
+            st = write_key(writer, "value", 5);
+        }
+        if (st == OI_OK) {
+            st = oi_json_write_string(writer,
+                                      record->as.session_setting.value.data,
+                                      record->as.session_setting.value.len);
+        }
+        break;
+    }
     case OI_CLI_HISTORY_RECORD_NONE:
         st = OI_ERR_INVAL;
         break;
@@ -822,6 +864,27 @@ static oi_status decode_payload(const oi_json_value *object, const char *type,
                 out, record_id, summary, summary_len, model, model_len, first,
                 last);
         }
+    } else if (string_equals(type, type_len, "session_setting")) {
+        const char *field_text;
+        const char *value;
+        size_t field_len;
+        size_t value_len;
+        enum oi_cli_history_session_setting_field field;
+        if (oi_json_object_len(object) != 6 ||
+            get_string_field(object, "field", &field_text, &field_len) !=
+                OI_OK ||
+            get_string_field(object, "value", &value, &value_len) != OI_OK) {
+            return OI_ERR_PARSE;
+        }
+        if (string_equals(field_text, field_len, "model")) {
+            field = OI_CLI_HISTORY_SESSION_SETTING_MODEL;
+        } else if (string_equals(field_text, field_len, "cwd")) {
+            field = OI_CLI_HISTORY_SESSION_SETTING_CWD;
+        } else {
+            return OI_ERR_PARSE;
+        }
+        st = oi_cli_history_record_set_session_setting(out, record_id, field,
+                                                        value, value_len);
     }
     return st == OI_ERR_INVAL ? OI_ERR_PARSE : st;
 }

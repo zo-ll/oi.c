@@ -143,6 +143,19 @@ TEST(audit_and_checkpoint_records_encode_stable_ids) {
     CHECK(strstr(json, "\"source_last_record_id\":\"9\"") != NULL);
 
     free(json);
+    json = NULL;
+
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 7, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
+                 "gpt-test", 8),
+             OI_OK);
+    CHECK_EQ(oi_cli_history_record_encode(&record, &json, &json_len), OI_OK);
+    CHECK_STREQ(json,
+               "{\"version\":1,\"record_id\":\"7\",\"turn_id\":\"0\","
+               "\"type\":\"session_setting\",\"field\":\"model\","
+               "\"value\":\"gpt-test\"}");
+
+    free(json);
     oi_cli_history_record_free(&record);
 }
 
@@ -243,6 +256,11 @@ TEST(all_non_message_record_types_round_trip) {
                  &source, 10, "summary", 7, "model", 5, 2, 8),
              OI_OK);
     ROUND_TRIP();
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &source, 11, OI_CLI_HISTORY_SESSION_SETTING_CWD,
+                 "/home/az/project", 16),
+             OI_OK);
+    ROUND_TRIP();
 
 #undef ROUND_TRIP
     oi_cli_history_record_free(&source);
@@ -286,6 +304,23 @@ TEST(strict_decoder_rejects_field_and_base64_errors) {
         "\"tool_outcome\":\"completed\",\"raw_output_base64\":\"A===\"}");
 }
 
+TEST(strict_decoder_rejects_session_setting_errors) {
+    check_decode_fails(
+        "{\"version\":1,\"record_id\":\"1\",\"turn_id\":\"0\","
+        "\"type\":\"session_setting\",\"field\":\"nonsense\","
+        "\"value\":\"gpt-test\"}");
+    check_decode_fails(
+        "{\"version\":1,\"record_id\":\"1\",\"turn_id\":\"0\","
+        "\"type\":\"session_setting\",\"field\":\"model\",\"value\":\"\"}");
+    check_decode_fails(
+        "{\"version\":1,\"record_id\":\"1\",\"turn_id\":\"0\","
+        "\"type\":\"session_setting\",\"field\":\"model\"}");
+    check_decode_fails(
+        "{\"version\":1,\"record_id\":\"1\",\"turn_id\":\"0\","
+        "\"type\":\"session_setting\",\"field\":\"model\","
+        "\"value\":\"gpt-test\",\"extra\":true}");
+}
+
 int main(void) {
     RUN(user_message_encoding_is_stable);
     RUN(assistant_tool_calls_encode_as_owned_values);
@@ -297,5 +332,6 @@ int main(void) {
     RUN(all_non_message_record_types_round_trip);
     RUN(strict_decoder_rejects_schema_and_id_errors);
     RUN(strict_decoder_rejects_field_and_base64_errors);
+    RUN(strict_decoder_rejects_session_setting_errors);
     return oi_test_report();
 }
