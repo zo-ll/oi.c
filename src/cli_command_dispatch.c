@@ -4,6 +4,11 @@
 #include <string.h>
 #include <unistd.h>
 
+/* UX-level bound for /model NAME, generous for any real model id -- on
+ * top of the shared 4096-byte storage ceiling (OI_CLI_HISTORY_MAX_SETTING_VALUE)
+ * enforced further down the stack. */
+#define OI_CLI_COMMAND_MODEL_MAX_LEN 256u
+
 static const char *permission_name(oi_cli_tool_policy policy) {
     switch (policy) {
     case OI_CLI_TOOLS_ASK:
@@ -96,6 +101,97 @@ static oi_status dispatch_permissions(
                : OI_OK;
 }
 
+static oi_status dispatch_model(
+    const struct oi_cli_command_parse *command,
+    struct oi_cli_command_context *context) {
+    oi_status status;
+
+    if (command->arguments_len == 0) {
+        return fprintf(context->out, "Model: %s\n", context->model) < 0 ||
+                       fflush(context->out) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    if (command->arguments_len > OI_CLI_COMMAND_MODEL_MAX_LEN) {
+        return fputs("oi: model name is too long\n", context->err) == EOF
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    if (context->set_model == NULL) {
+        return fputs("oi: /model is not available in this context\n",
+                     context->err) == EOF
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    status = context->set_model(context->set_model_user_data,
+                                command->arguments, command->arguments_len);
+    if (status == OI_ERR_INVAL) {
+        /* A bad name is a user-input problem, not a structural failure:
+         * report it and stay in the REPL, matching /permissions'
+         * usage-error handling. */
+        return fputs("oi: could not change the model\n", context->err) ==
+                       EOF
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    if (status != OI_OK) {
+        return status; /* structural/storage failure: existing
+                        * session-failure path handles this */
+    }
+    return fprintf(context->out, "Model: %.*s\n", (int)command->arguments_len,
+                   command->arguments) < 0 ||
+                   fflush(context->out) != 0
+               ? OI_ERR_IO
+               : OI_OK;
+}
+
+static oi_status print_cwd(FILE *out) {
+    char *cwd = getcwd(NULL, 0);
+    oi_status status;
+
+    if (cwd == NULL) {
+        return OI_ERR_IO;
+    }
+    status = fprintf(out, "CWD: %s\n", cwd) < 0 || fflush(out) != 0
+                 ? OI_ERR_IO
+                 : OI_OK;
+    free(cwd);
+    return status;
+}
+
+static oi_status dispatch_cwd(const struct oi_cli_command_parse *command,
+                              struct oi_cli_command_context *context) {
+    oi_status status;
+
+    if (command->arguments_len == 0) {
+        return print_cwd(context->out);
+    }
+    if (context->set_cwd == NULL) {
+        return fputs("oi: /cwd is not available in this context\n",
+                     context->err) == EOF
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    status = context->set_cwd(context->set_cwd_user_data, command->arguments,
+                              command->arguments_len);
+    if (status == OI_ERR_INVAL) {
+        /* An invalid/missing/non-directory path is a user-input problem,
+         * not a structural failure: report it and stay in the REPL. */
+        return fputs("oi: could not change the working directory\n",
+                     context->err) == EOF
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    if (status != OI_OK) {
+        return status; /* structural/storage failure: existing
+                        * session-failure path handles this */
+    }
+    /* A successful set_cwd always leaves the process's real cwd at the
+     * new canonical location, so getcwd() is always correct here --
+     * no display value needs threading through the callback. */
+    return print_cwd(context->out);
+}
+
 static oi_status print_deferred(
     const struct oi_cli_command_definition *definition, FILE *err) {
     return fprintf(err, "oi: %s is registered but not implemented yet\n",
@@ -136,10 +232,12 @@ oi_status oi_cli_command_dispatch(
                          : OI_OK;
     case OI_CLI_COMMAND_PERMISSIONS:
         return dispatch_permissions(command, context);
-    case OI_CLI_COMMAND_SESSION:
     case OI_CLI_COMMAND_MODEL:
-    case OI_CLI_COMMAND_COMPACT:
+        return dispatch_model(command, context);
     case OI_CLI_COMMAND_CWD:
+        return dispatch_cwd(command, context);
+    case OI_CLI_COMMAND_SESSION:
+    case OI_CLI_COMMAND_COMPACT:
         return print_deferred(command->command, context->err);
     }
     return OI_ERR_INVAL;
