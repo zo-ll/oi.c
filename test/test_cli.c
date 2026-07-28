@@ -20,7 +20,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define OI_BIN "build/oi"
+/* The Makefile defines OI_CLI_BIN to match whatever $(BUILD) directory
+ * this test binary itself was compiled into (build/, build-asan/, ...)
+ * -- hardcoding "build/oi" here caused a real hang: under `make asan`,
+ * the plain build/oi didn't exist (a stale/absent path after `make
+ * clean`), execv() failed, and the orphaned mock-server helper below
+ * was left blocked in accept() forever with nothing to ever connect to
+ * it, which then hung this test's waitpid() indefinitely. Falls back to
+ * "build/oi" only for a manual/non-Makefile compile. */
+#ifndef OI_CLI_BIN
+#define OI_CLI_BIN "build/oi"
+#endif
+#define OI_BIN OI_CLI_BIN
 
 /* --- mock SSE server, same shape as test_llm.c's --- */
 
@@ -92,7 +103,16 @@ static pid_t start_mock_server(const char *response, size_t response_len,
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
-        int cfd = accept(listen_fd, NULL, NULL);
+        /* Bounded, not accept() outright: if the CLI process we expect
+         * to connect never does (e.g. it failed to even start), this
+         * must not hang forever -- see the OI_CLI_BIN comment above for
+         * exactly the incident that motivated this. */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(listen_fd, &rfds);
+        struct timeval tv = {10, 0};
+        int rc = select(listen_fd + 1, &rfds, NULL, NULL, &tv);
+        int cfd = rc > 0 ? accept(listen_fd, NULL, NULL) : -1;
         if (cfd >= 0) {
             drain_request(cfd);
             size_t off = 0;
