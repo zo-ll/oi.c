@@ -1,5 +1,6 @@
 #include "oi/arena.h"
 #include "oi/json.h"
+#include "json_internal.h"
 #include "test.h"
 
 #include <math.h>
@@ -746,6 +747,22 @@ TEST(writer_rejects_invalid_and_overflowing_inputs) {
     oi_json_writer_destroy(w);
 }
 
+TEST(value_builders_reject_overflowing_lengths) {
+    oi_arena *a = oi_arena_create(0);
+    CHECK(oi_json_new_string(a, "x", (size_t)-1) == NULL);
+    CHECK(oi_json_new_string(a, NULL, 1) == NULL);
+
+    oi_json_value *object = oi_json_new_object(a);
+    CHECK_EQ(oi_json_object_append(a, object, "x", (size_t)-1, NULL),
+              OI_ERR_NOMEM);
+
+    oi_json_value *array = oi_json_new_array(a);
+    array->u.array.capacity = (size_t)-1 / 2 + 1;
+    array->u.array.count = array->u.array.capacity;
+    CHECK_EQ(oi_json_array_push(a, array, NULL), OI_ERR_NOMEM);
+    oi_arena_destroy(a);
+}
+
 TEST(write_many_elements_grows_buffer_and_frames) {
     oi_json_writer *w = oi_json_writer_create();
     CHECK_EQ(oi_json_write_array_begin(w), OI_OK);
@@ -810,6 +827,7 @@ int main(void) {
     RUN(write_structural_misuse_is_rejected);
     RUN(writer_create_destroy_null_safe);
     RUN(writer_rejects_invalid_and_overflowing_inputs);
+    RUN(value_builders_reject_overflowing_lengths);
     RUN(write_many_elements_grows_buffer_and_frames);
 
     return oi_test_report();

@@ -160,6 +160,9 @@ oi_json_value *oi_json_parser_root(const oi_json_parser *p) {
 /* --- scratch buffer growth --- */
 
 static oi_status str_buf_reserve(oi_json_parser *p, size_t additional) {
+    if (additional > (size_t)-1 - p->str_len) {
+        return OI_ERR_NOMEM;
+    }
     size_t needed = p->str_len + additional;
     if (needed <= p->str_cap) {
         return OI_OK;

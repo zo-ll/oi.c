@@ -34,6 +34,9 @@ oi_json_value *oi_json_new_number(oi_arena *a, double value) {
 }
 
 oi_json_value *oi_json_new_string(oi_arena *a, const char *ptr, size_t len) {
+    if (a == NULL || (ptr == NULL && len > 0) || len == (size_t)-1) {
+        return NULL;
+    }
     oi_json_value *v = oi_arena_alloc(a, sizeof *v);
     if (v == NULL) {
         return NULL;
@@ -83,8 +86,12 @@ oi_status oi_json_array_push(oi_arena *a, oi_json_value *array,
     assert(array->type == OI_JSON_ARRAY);
 
     if (array->u.array.count == array->u.array.capacity) {
-        size_t new_capacity =
-            array->u.array.capacity == 0 ? 4 : array->u.array.capacity * 2;
+        if (array->u.array.capacity > (size_t)-1 / 2) {
+            return OI_ERR_NOMEM;
+        }
+        size_t new_capacity = array->u.array.capacity == 0
+                                  ? 4
+                                  : array->u.array.capacity * 2;
         if (new_capacity > (size_t)-1 / sizeof(oi_json_value *)) {
             return OI_ERR_NOMEM;
         }
@@ -110,6 +117,12 @@ oi_status oi_json_object_append(oi_arena *a, oi_json_value *object,
                                  oi_json_value *value) {
     assert(object->type == OI_JSON_OBJECT);
 
+    if (key == NULL && key_len > 0) {
+        return OI_ERR_INVAL;
+    }
+    if (key_len == (size_t)-1) {
+        return OI_ERR_NOMEM;
+    }
     char *key_copy = oi_arena_alloc(a, key_len + 1);
     if (key_copy == NULL) {
         return OI_ERR_NOMEM;
