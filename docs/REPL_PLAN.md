@@ -87,10 +87,9 @@ Each durable session is a private directory containing:
 - `metadata.json`: atomically replaced, rebuildable selector metadata;
 - future derived indexes, which are never authoritative.
 
-Linux uses `$XDG_STATE_HOME/oi/sessions` or
-`~/.local/state/oi/sessions`. macOS uses its per-user application-support
-location. Existing project-local `.oilog` files are imported only after
-selection and confirmation.
+Linux uses `$XDG_STATE_HOME/oi/sessions` or `~/.local/state/oi/sessions`.
+Existing project-local `.oilog` files are imported only after selection
+and confirmation.
 
 New interactive sessions are created lazily on the first submitted message.
 Session IDs are bounded portable ASCII filename stems. Session working
@@ -116,7 +115,7 @@ suite before moving on.
    conversation object; route one-shot mode through it without changing stdout
    behavior.
 5. Add the terminal editor core with pure buffer/cursor tests, then POSIX raw
-   mode and PTY integration tests on Linux and macOS.
+   mode and PTY integration tests on Linux.
 6. Add sanitization, incremental Markdown, and redraw coordination with chunk
    boundary, malformed UTF-8, resize, and control-sequence tests.
 7. Add the REPL controller, startup mode detection, prompt lifecycle, signals,
@@ -139,5 +138,5 @@ suite before moving on.
 - Mock-server integration tests for multi-turn replay, tool history, steering,
   cancellation, queued-input recovery, session switching, and one-shot stdout.
 - Existing ABI export check remains unchanged because the feature is CLI-private.
-- ASan, UBSan, TSan, Valgrind, fuzzers, and native macOS CI pass before the
-  milestone is considered complete.
+- ASan, UBSan, TSan, Valgrind, and fuzzers pass before the milestone is
+  considered complete.

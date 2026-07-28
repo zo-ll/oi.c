@@ -8,15 +8,15 @@ supports running many independent agent sessions concurrently.
 - **Scope**: drives a single LLM tool-use loop (send messages, parse tool calls, execute
   tools, feed results back) and supports multi-agent orchestration — running many such
   sessions concurrently.
-- **Concurrency model**: single-threaded event loop / reactor (epoll on Linux, kqueue on
-  macOS) multiplexing all agent sessions' I/O. Chosen over one-thread-per-agent and
+- **Concurrency model**: single-threaded event loop / reactor (epoll on Linux)
+  multiplexing all agent sessions' I/O. Chosen over one-thread-per-agent and
   one-process-per-agent because the workload is I/O-bound (waiting on LLM API responses,
   subprocess pipes); a single-threaded reactor has no locks/races by construction, the
   lowest memory overhead, and the most predictable scheduling.
-- **Platform target**: Linux (epoll, timerfd, pidfd) and macOS (kqueue with
-  native timer and process-exit filters). Platform-specific behavior stays
-  behind the reactor backend; the project does not claim broader portable
-  POSIX support.
+- **Platform target**: Linux only (epoll, timerfd, pidfd). Platform-specific
+  behavior stays behind the reactor backend; the project does not claim
+  broader portable POSIX support. (A prior macOS/kqueue backend was moved to
+  the `macos-support` branch rather than maintained on `main`.)
 - **Interface**: a C library core (headers + .a/.so) exposing the reactor/session API, plus
   a thin CLI binary that links it for standalone use.
 

@@ -13,19 +13,12 @@ LDLIBS = -pthread $(OPENSSL_LIBS)
 BUILD = build
 VERSION = 0.1.0
 ABI_MAJOR = 0
-UNAME_S := $(shell uname -s)
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
-ifeq ($(UNAME_S),Darwin)
-CSTD += -D_DARWIN_C_SOURCE
-REACTOR_BACKEND = src/reactor_kqueue.c
-PTY_LIBS =
-else
 REACTOR_BACKEND = src/reactor_epoll.c
 PTY_LIBS = -lutil
-endif
 LIB_SRCS = src/reactor.c $(REACTOR_BACKEND) src/arena.c src/json_value.c src/json_parse.c src/json_write.c src/llm_http.c src/llm_sse.c src/llm_conn.c src/llm.c src/tool_registry.c src/tool_exec.c src/sesslog.c src/session.c src/config.c
 LIB_OBJS = $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
 LIB = $(BUILD)/liboi.a
@@ -37,23 +30,12 @@ LIB = $(BUILD)/liboi.a
 # touch the .so).
 PIC_BUILD = $(BUILD)/pic
 PIC_OBJS = $(LIB_SRCS:src/%.c=$(PIC_BUILD)/%.o)
-ifeq ($(UNAME_S),Darwin)
-LIB_SO = $(BUILD)/liboi.dylib
-LIB_SO_SONAME = $(BUILD)/liboi.$(ABI_MAJOR).dylib
-LIB_SO_REAL = $(BUILD)/liboi.$(VERSION).dylib
-SHARED_DEPS = src/liboi.exports.macos
-SHARED_FLAGS = -dynamiclib \
-	-Wl,-install_name,$(LIBDIR)/liboi.$(ABI_MAJOR).dylib \
-	-Wl,-current_version,$(VERSION) -Wl,-compatibility_version,$(VERSION) \
-	-Wl,-exported_symbols_list,src/liboi.exports.macos
-else
 LIB_SO = $(BUILD)/liboi.so
 LIB_SO_SONAME = $(BUILD)/liboi.so.$(ABI_MAJOR)
 LIB_SO_REAL = $(BUILD)/liboi.so.$(VERSION)
 SHARED_DEPS = src/liboi.map
 SHARED_FLAGS = -shared -Wl,-soname,liboi.so.$(ABI_MAJOR) \
 	-Wl,--version-script=src/liboi.map
-endif
 
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
@@ -228,14 +210,9 @@ test-integration: $(INTEGRATION_BINS)
 check: test test-integration
 
 abi-check: $(LIB_SO_REAL)
-ifeq ($(UNAME_S),Darwin)
-	@nm -gUj $(LIB_SO_REAL) | sed 's/^_//' | sort -u | \
-		diff -u test/abi_exports.txt -
-else
 	@nm -D --defined-only --format=posix $(LIB_SO_REAL) | \
 		awk '$$1 ~ /^oi_/ { sub(/@.*/, "", $$1); print $$1 }' | \
 		sort -u | diff -u test/abi_exports.txt -
-endif
 
 # Sanitizer variants each recurse into a separate BUILD dir with
 # overridden CFLAGS, reusing every rule above unchanged rather than

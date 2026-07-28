@@ -11,9 +11,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Both compilers, because the project targets Linux and macOS and
-  # macOS means clang -- a GCC-only construct in the library would
-  # otherwise only surface on someone else's machine.
+  # Both compilers: a GCC-only construct in the library would otherwise
+  # only surface on someone else's machine.
   test:
     name: test (${{ matrix.cc }})
     runs-on: ubuntu-latest
@@ -29,16 +28,6 @@ jobs:
         run: make CC=${{ matrix.cc }} check
       - name: Verify shared-library exports
         run: make CC=${{ matrix.cc }} abi-check
-
-  macos:
-    name: test (macOS clang)
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: brew install openssl@3 pkg-config
-      - name: Build and run the full suite
-        run: PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig" make CC=clang check abi-check
 
   sanitizers:
     name: ${{ matrix.target }}

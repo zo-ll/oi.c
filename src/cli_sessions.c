@@ -92,11 +92,7 @@ static oi_status home_root(char **out_root) {
     if (home == NULL || home[0] == '\0') {
         return OI_ERR_NOTFOUND;
     }
-#ifdef __APPLE__
-    status = join_path(home, "Library/Application Support", &base);
-#else
     status = join_path(home, ".local/state", &base);
-#endif
     if (status == OI_OK) {
         status = join_path(base, "oi/sessions", out_root);
     }
@@ -129,14 +125,12 @@ oi_status oi_cli_sessions_default_root(char **out_root) {
     if (out_root == NULL) {
         return OI_ERR_INVAL;
     }
-#ifndef __APPLE__
     {
         const char *xdg = getenv("XDG_STATE_HOME");
         if (xdg != NULL && xdg[0] == '/') {
             return join_path(xdg, "oi/sessions", out_root);
         }
     }
-#endif
     return home_root(out_root);
 }
 

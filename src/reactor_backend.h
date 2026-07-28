@@ -11,9 +11,7 @@
  * run/stop bookkeeping) and an OS-specific polling mechanism. A backend
  * knows nothing about oi_reactor_cb/user_data — it only tracks fd,
  * interest, and an opaque registration token reported with readiness.
- * Exactly one backend is
- * compiled in per platform (reactor_epoll.c on Linux; reactor_kqueue.c on
- * macOS is a best-effort, not-tested-here counterpart).
+ * reactor_epoll.c is the only backend; the project targets Linux.
  */
 
 typedef struct oi_reactor_backend oi_reactor_backend;

@@ -5,10 +5,10 @@ responses, running approved subprocess tools, and persisting independent
 agent sessions. Its core is a single-threaded reactor: network sockets,
 tool pipes, child exits, and deadlines share one event loop without locks.
 
-The implementation supports Linux and macOS. Linux uses epoll, timerfd,
-and pidfd (`pidfd_open` requires Linux 5.3 or newer); macOS uses kqueue
-with native timer and process-exit filters. OpenSSL and POSIX threads are
-the only external runtime dependencies.
+The implementation targets Linux, using epoll, timerfd, and pidfd
+(`pidfd_open` requires Linux 5.3 or newer). OpenSSL and POSIX threads are
+the only external runtime dependencies. (A prior macOS/kqueue backend
+lives on the `macos-support` branch rather than `main`.)
 
 ## Build and verify
 
@@ -38,10 +38,9 @@ make DESTDIR=/tmp/package-root PREFIX=/usr install
 ```
 
 This installs the CLI, both libraries, and public headers under
-`$PREFIX/{bin,lib,include/oi}`. On Linux, the shared library is installed
-as `liboi.so.0.1.0` with `liboi.so.0` (runtime) and `liboi.so`
-(development) symlinks. macOS uses the equivalent `liboi.0.1.0.dylib`,
-`liboi.0.dylib`, and `liboi.dylib` chain.
+`$PREFIX/{bin,lib,include/oi}`. The shared library is installed as
+`liboi.so.0.1.0` with `liboi.so.0` (runtime) and `liboi.so` (development)
+symlinks.
 
 The project follows semantic release versions and is currently `0.1.0`.
 Its public C ABI is deliberately exported through an allowlist and carries

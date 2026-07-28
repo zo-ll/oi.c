@@ -14,15 +14,11 @@ TEST(default_root_uses_xdg_state_home) {
              (long)getpid());
     CHECK_EQ(setenv("XDG_STATE_HOME", state_home, 1), 0);
     CHECK_EQ(oi_cli_sessions_default_root(&root), OI_OK);
-#ifdef __APPLE__
-    CHECK(root != NULL);
-#else
     {
         char expected[160];
         snprintf(expected, sizeof expected, "%s/oi/sessions", state_home);
         CHECK_STREQ(root, expected);
     }
-#endif
     free(root);
 }
 
