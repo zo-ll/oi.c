@@ -56,7 +56,7 @@ endif
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
-CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c
+CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c
 
 .PHONY: all lib so cli install test check abi-check asan ubsan tsan valgrind \
 	fuzz fuzz-run test-integration clean
@@ -118,6 +118,9 @@ $(BUILD)/test_cli_history: test/test_cli_history.c src/cli_history.c src/cli_mes
 
 $(BUILD)/test_cli_history_codec: test/test_cli_history_codec.c src/cli_history_codec.c src/cli_history.c src/cli_message.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_history_codec.c src/cli_history.c src/cli_message.c $(LIB) -o $@ $(LDLIBS)
+
+$(BUILD)/test_cli_history_replay: test/test_cli_history_replay.c src/cli_history_replay.c src/cli_history.c src/cli_message.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_history_replay.c src/cli_history.c src/cli_message.c $(LIB) -o $@ $(LDLIBS)
 
 test: $(TEST_BINS) $(CLI_BIN)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t =="; $$t; done

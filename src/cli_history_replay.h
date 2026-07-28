@@ -1,0 +1,57 @@
+#ifndef OI_CLI_HISTORY_REPLAY_H
+#define OI_CLI_HISTORY_REPLAY_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "cli_history.h"
+#include "cli_message.h"
+#include "oi/status.h"
+
+struct oi_cli_history_context_item {
+    uint64_t record_id;
+    struct oi_cli_message message;
+};
+
+struct oi_cli_history_unresolved_tool {
+    struct oi_cli_string tool_call_id;
+    int may_have_started;
+};
+
+struct oi_cli_history_replay_state {
+    struct oi_cli_history_context_item *context;
+    size_t context_len;
+    size_t context_cap;
+
+    struct oi_cli_string pending_input;
+    uint64_t pending_input_record_id;
+    uint64_t pending_input_turn_id;
+    int has_pending_input;
+
+    struct oi_cli_history_unresolved_tool *unresolved_tools;
+    size_t unresolved_tools_len;
+
+    uint64_t repair_turn_id;
+    uint64_t next_record_id;
+    uint64_t next_turn_id;
+    int needs_transition;
+    int needs_repair;
+    int has_partial_assistant;
+};
+
+void oi_cli_history_replay_state_init(
+    struct oi_cli_history_replay_state *state);
+void oi_cli_history_replay_state_free(
+    struct oi_cli_history_replay_state *state);
+
+/*
+ * Validates the complete typed history and rebuilds model-visible context.
+ * `legacy_messages`, when non-NULL, contains the old alternating records in
+ * their original order. The output is replaced only on success.
+ */
+oi_status oi_cli_history_replay(
+    const struct oi_cli_message_list *legacy_messages,
+    const struct oi_cli_history *typed_history,
+    struct oi_cli_history_replay_state *out_state);
+
+#endif
