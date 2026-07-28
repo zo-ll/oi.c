@@ -1,6 +1,7 @@
 #include "reactor_backend.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,6 +71,13 @@ static struct fd_watch *find_fd(oi_reactor_backend *backend, int fd) {
     return NULL;
 }
 
+static oi_status missing_fd_status(int fd) {
+    if (fcntl(fd, F_GETFD) < 0 && errno == EBADF) {
+        return OI_ERR_IO;
+    }
+    return OI_ERR_NOTFOUND;
+}
+
 static oi_status update_filter(oi_reactor_backend *backend, int fd,
                                int16_t filter, int old_enabled,
                                int new_enabled, uint64_t token) {
@@ -119,7 +127,7 @@ oi_status oi_reactor_backend_modify(oi_reactor_backend *backend, int fd,
                                      int interest, uint64_t token) {
     struct fd_watch *watch = find_fd(backend, fd);
     if (watch == NULL) {
-        return OI_ERR_NOTFOUND;
+        return missing_fd_status(fd);
     }
     int old = watch->interest;
     oi_status st = update_filter(backend, fd, EVFILT_READ,
@@ -148,7 +156,7 @@ oi_status oi_reactor_backend_remove(oi_reactor_backend *backend, int fd) {
         link = &(*link)->next;
     }
     if (*link == NULL) {
-        return OI_ERR_NOTFOUND;
+        return missing_fd_status(fd);
     }
     struct fd_watch *watch = *link;
     if (watch->interest & OI_BACKEND_EV_READ) {
