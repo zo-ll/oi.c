@@ -147,7 +147,7 @@ static oi_status error_buf_append(oi_llm_request *req, const void *data,
         return OI_OK; /* silently truncated; we already have plenty */
     }
     size_t take = len;
-    if (req->error_len + take > OI_LLM_MAX_ERROR_BODY) {
+    if (take > OI_LLM_MAX_ERROR_BODY - req->error_len) {
         take = OI_LLM_MAX_ERROR_BODY - req->error_len;
     }
 
