@@ -53,4 +53,26 @@ void oi_cli_md_delim_list_free(struct oi_cli_md_delim_list *list);
 oi_status oi_cli_markdown_tokenize(const char *text, size_t len,
                                    struct oi_cli_md_delim_list *out_delims);
 
+/*
+ * Resolves code spans and CommonMark-accurate emphasis over one complete
+ * bounded chunk of inline text, producing plain output text (all `` ` ``/
+ * `*`/`_` delimiters that were actually matched are stripped) plus a flat,
+ * non-overlapping span list over that output text (oi_cli_md_span_list_
+ * covers holds for the result).
+ *
+ * Known, documented simplification: a delimiter run can act as an opener
+ * for one closer and later (if leftover characters remain) as an opener
+ * again for a further closer, or close then reopen; when the exact same
+ * run is consumed from both its "closer" and "opener" role, this
+ * implementation strips consumed characters from each end independently
+ * (closer-consumed from the run's start, opener-consumed from its end)
+ * rather than tracking the precise chronological sub-position of each
+ * partial consumption. This only affects which literal punctuation
+ * character(s) survive in the rare case of such a hybrid partial match --
+ * never emphasis correctness or memory safety.
+ */
+oi_status oi_cli_markdown_inline_parse(const char *text, size_t len,
+                                       struct oi_cli_bytebuf *out_text,
+                                       struct oi_cli_md_span_list *out_spans);
+
 #endif
