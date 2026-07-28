@@ -26,6 +26,7 @@ struct fd_entry {
     void *user_data;
     int interest;
     int in_use;
+    uint32_t generation;
 };
 
 struct oi_reactor {
@@ -104,6 +105,10 @@ static oi_status validate_fd_interest(int fd, int interest) {
     return OI_OK;
 }
 
+static uint64_t registration_token(int fd, uint32_t generation) {
+    return ((uint64_t)generation << 32) | (uint32_t)fd;
+}
+
 oi_status oi_reactor_add(oi_reactor *r, int fd, int interest,
                           oi_reactor_cb cb, void *user_data) {
     if (r == NULL || cb == NULL) {
@@ -119,7 +124,12 @@ oi_status oi_reactor_add(oi_reactor *r, int fd, int interest,
         return st;
     }
 
-    st = oi_reactor_backend_add(r->backend, fd, interest);
+    uint32_t generation = r->entries[fd].generation + 1;
+    if (generation == 0) {
+        generation = 1;
+    }
+    st = oi_reactor_backend_add(r->backend, fd, interest,
+                                 registration_token(fd, generation));
     if (st != OI_OK) {
         return st;
     }
@@ -128,6 +138,7 @@ oi_status oi_reactor_add(oi_reactor *r, int fd, int interest,
     r->entries[fd].user_data = user_data;
     r->entries[fd].interest = interest;
     r->entries[fd].in_use = 1;
+    r->entries[fd].generation = generation;
     r->registered_count++;
     return OI_OK;
 }
@@ -141,7 +152,10 @@ oi_status oi_reactor_modify(oi_reactor *r, int fd, int interest) {
         return st;
     }
 
-    st = oi_reactor_backend_modify(r->backend, fd, interest);
+    uint32_t generation =
+        (size_t)fd < r->capacity ? r->entries[fd].generation : 0;
+    st = oi_reactor_backend_modify(
+        r->backend, fd, interest, registration_token(fd, generation));
     if (st != OI_OK) {
         return st;
     }
@@ -178,11 +192,11 @@ int oi_reactor_step(oi_reactor *r, int timeout_ms, oi_status *out_status) {
         return -1;
     }
 
-    int fds[OI_REACTOR_MAX_EVENTS];
+    uint64_t tokens[OI_REACTOR_MAX_EVENTS];
     int revents[OI_REACTOR_MAX_EVENTS];
     int n = 0;
 
-    oi_status st = oi_reactor_backend_wait(r->backend, timeout_ms, fds,
+    oi_status st = oi_reactor_backend_wait(r->backend, timeout_ms, tokens,
                                             revents, OI_REACTOR_MAX_EVENTS,
                                             &n);
     if (out_status) {
@@ -194,9 +208,11 @@ int oi_reactor_step(oi_reactor *r, int timeout_ms, oi_status *out_status) {
 
     int dispatched = 0;
     for (int i = 0; i < n; i++) {
-        int fd = fds[i];
-        if ((size_t)fd >= r->capacity || !r->entries[fd].in_use) {
-            /* Removed by an earlier callback in this same batch. */
+        int fd = (int)(uint32_t)tokens[i];
+        uint32_t generation = (uint32_t)(tokens[i] >> 32);
+        if ((size_t)fd >= r->capacity || !r->entries[fd].in_use ||
+            r->entries[fd].generation != generation) {
+            /* Removed or replaced by an earlier callback in this batch. */
             continue;
         }
         r->entries[fd].cb(r, fd, revents[i], r->entries[fd].user_data);

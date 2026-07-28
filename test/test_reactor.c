@@ -236,6 +236,81 @@ TEST(remove_during_dispatch_is_safe) {
     oi_reactor_destroy(r);
 }
 
+struct reuse_ctx {
+    int victim_fd;
+    int replacement_source;
+    int old_fired;
+    int replacement_fired;
+};
+
+static void replacement_cb(oi_reactor *r, int fd, int revents, void *ud) {
+    (void)r;
+    (void)fd;
+    (void)revents;
+    struct reuse_ctx *ctx = ud;
+    ctx->replacement_fired++;
+}
+
+static void old_victim_cb(oi_reactor *r, int fd, int revents, void *ud) {
+    (void)r;
+    (void)fd;
+    (void)revents;
+    struct reuse_ctx *ctx = ud;
+    ctx->old_fired++;
+}
+
+static void replace_other_fd_cb(oi_reactor *r, int fd, int revents,
+                                 void *ud) {
+    (void)revents;
+    struct reuse_ctx *ctx = ud;
+    CHECK_EQ(oi_reactor_remove(r, fd), OI_OK);
+    CHECK_EQ(oi_reactor_remove(r, ctx->victim_fd), OI_OK);
+    close(ctx->victim_fd);
+    CHECK_EQ(dup2(ctx->replacement_source, ctx->victim_fd), ctx->victim_fd);
+    close(ctx->replacement_source);
+    ctx->replacement_source = -1;
+    set_nonblocking(ctx->victim_fd);
+    CHECK_EQ(oi_reactor_add(r, ctx->victim_fd, OI_EV_READ, replacement_cb,
+                             ctx),
+              OI_OK);
+}
+
+TEST(stale_event_does_not_target_reused_fd) {
+    oi_reactor *r = oi_reactor_create();
+    int controller[2], victim[2], replacement[2];
+    make_socketpair(controller);
+    make_socketpair(victim);
+    make_socketpair(replacement);
+    struct reuse_ctx ctx = {victim[0], replacement[0], 0, 0};
+
+    CHECK_EQ(oi_reactor_add(r, controller[0], OI_EV_READ,
+                             replace_other_fd_cb, &ctx),
+              OI_OK);
+    CHECK_EQ(oi_reactor_add(r, victim[0], OI_EV_READ, old_victim_cb, &ctx),
+              OI_OK);
+    /* Readiness transitions are queued in this order on epoll, making the
+     * controller replace the victim while its old event is in the batch. */
+    CHECK_EQ(write(controller[1], "c", 1), 1);
+    CHECK_EQ(write(victim[1], "v", 1), 1);
+
+    oi_status st;
+    int n = oi_reactor_step(r, 1000, &st);
+    CHECK_EQ(st, OI_OK);
+    CHECK(n == 1 || n == 2);
+    CHECK_EQ(ctx.replacement_fired, 0);
+
+    CHECK_EQ(write(replacement[1], "r", 1), 1);
+    CHECK_EQ(oi_reactor_step(r, 1000, &st), 1);
+    CHECK_EQ(ctx.replacement_fired, 1);
+
+    close(controller[0]);
+    close(controller[1]);
+    close(ctx.victim_fd);
+    close(victim[1]);
+    close(replacement[1]);
+    oi_reactor_destroy(r);
+}
+
 /* --- HUP detection --- */
 
 TEST(reports_hup_on_peer_close) {
@@ -386,6 +461,7 @@ int main(void) {
     RUN(dispatches_on_writable);
     RUN(modify_changes_interest);
     RUN(remove_during_dispatch_is_safe);
+    RUN(stale_event_does_not_target_reused_fd);
     RUN(reports_hup_on_peer_close);
     RUN(run_stops_on_request);
     RUN(run_returns_immediately_with_no_fds);

@@ -46,11 +46,11 @@ static uint32_t interest_to_epoll(int interest) {
 }
 
 oi_status oi_reactor_backend_add(oi_reactor_backend *b, int fd,
-                                  int interest) {
+                                  int interest, uint64_t token) {
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);
     ev.events = interest_to_epoll(interest);
-    ev.data.fd = fd;
+    ev.data.u64 = token;
 
     if (epoll_ctl(b->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
         return errno == EEXIST ? OI_ERR_EXISTS : OI_ERR_IO;
@@ -59,11 +59,11 @@ oi_status oi_reactor_backend_add(oi_reactor_backend *b, int fd,
 }
 
 oi_status oi_reactor_backend_modify(oi_reactor_backend *b, int fd,
-                                     int interest) {
+                                     int interest, uint64_t token) {
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);
     ev.events = interest_to_epoll(interest);
-    ev.data.fd = fd;
+    ev.data.u64 = token;
 
     if (epoll_ctl(b->epfd, EPOLL_CTL_MOD, fd, &ev) != 0) {
         return errno == ENOENT ? OI_ERR_NOTFOUND : OI_ERR_IO;
@@ -84,7 +84,7 @@ oi_status oi_reactor_backend_remove(oi_reactor_backend *b, int fd) {
 }
 
 oi_status oi_reactor_backend_wait(oi_reactor_backend *b, int timeout_ms,
-                                   int *out_fds, int *out_revents,
+                                   uint64_t *out_tokens, int *out_revents,
                                    int max_events, int *out_n) {
     struct epoll_event evs[OI_REACTOR_MAX_EVENTS];
     int cap = max_events < OI_REACTOR_MAX_EVENTS ? max_events
@@ -113,7 +113,7 @@ oi_status oi_reactor_backend_wait(oi_reactor_backend *b, int timeout_ms,
         if (evs[i].events & EPOLLHUP) {
             revents |= OI_BACKEND_EV_HUP;
         }
-        out_fds[i] = evs[i].data.fd;
+        out_tokens[i] = evs[i].data.u64;
         out_revents[i] = revents;
     }
 
