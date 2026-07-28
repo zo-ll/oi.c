@@ -656,8 +656,9 @@ static oi_status decode_message(const oi_json_value *object,
             st = parse_tool_calls(object, &message);
         }
     } else if (string_equals(role, role_len, "tool")) {
-        size_t expected_fields =
-            source == OI_CLI_HISTORY_MESSAGE_NORMAL ? 10 : 9;
+        oi_json_value *raw_value =
+            oi_json_object_get(object, "raw_output_base64");
+        size_t expected_fields = raw_value == NULL ? 9 : 10;
         const char *tool_call_id;
         const char *outcome_text;
         size_t tool_call_id_len;
@@ -681,18 +682,25 @@ static oi_status decode_message(const oi_json_value *object,
             goto done;
         }
         if (source == OI_CLI_HISTORY_MESSAGE_NORMAL) {
-            const char *encoded;
-            size_t encoded_len;
-            if (outcome != OI_CLI_HISTORY_TOOL_COMPLETED ||
-                get_string_field(object, "raw_output_base64", &encoded,
-                                 &encoded_len) != OI_OK) {
+            if ((outcome == OI_CLI_HISTORY_TOOL_COMPLETED &&
+                 raw_value == NULL) ||
+                (outcome == OI_CLI_HISTORY_TOOL_NOT_EXECUTED &&
+                 raw_value != NULL)) {
                 goto done;
             }
-            st = base64_decode(encoded, encoded_len, &raw, &raw_len);
-            if (st != OI_OK) {
-                goto done;
+            if (raw_value != NULL) {
+                const char *encoded;
+                size_t encoded_len;
+                if (get_string_field(object, "raw_output_base64", &encoded,
+                                     &encoded_len) != OI_OK) {
+                    goto done;
+                }
+                st = base64_decode(encoded, encoded_len, &raw, &raw_len);
+                if (st != OI_OK) {
+                    goto done;
+                }
+                has_raw = 1;
             }
-            has_raw = 1;
         } else if (outcome != OI_CLI_HISTORY_TOOL_OUTCOME_UNKNOWN &&
                    outcome != OI_CLI_HISTORY_TOOL_NOT_EXECUTED) {
             goto done;

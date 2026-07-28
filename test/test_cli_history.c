@@ -44,10 +44,31 @@ TEST(repair_tool_results_have_no_raw_output) {
     CHECK(oi_cli_history_record_is_valid(&record));
     CHECK(!record.as.message.has_raw_tool_output);
 
+    oi_cli_message_free(&message);
+    oi_cli_history_record_free(&record);
+}
+
+TEST(live_tool_failures_preserve_known_execution_state) {
+    static const unsigned char partial[] = {'p', 'a', 'r', 't'};
+    struct oi_cli_message message;
+    struct oi_cli_history_record record;
+    oi_cli_message_init(&message);
+    oi_cli_history_record_init(&record);
+
+    CHECK_EQ(oi_cli_message_set_tool(&message, "call-1", 6, "failed", 6),
+             OI_OK);
     CHECK_EQ(oi_cli_history_record_set_message(
                  &record, 4, 1, &message, OI_CLI_HISTORY_MESSAGE_NORMAL, NULL,
-                 0, OI_CLI_HISTORY_TOOL_OUTCOME_UNKNOWN, NULL, 0, 0),
-             OI_ERR_INVAL);
+                 0, OI_CLI_HISTORY_TOOL_NOT_EXECUTED, NULL, 0, 0),
+             OI_OK);
+    CHECK_EQ(record.as.message.tool_outcome,
+             OI_CLI_HISTORY_TOOL_NOT_EXECUTED);
+    CHECK_EQ(oi_cli_history_record_set_message(
+                 &record, 4, 1, &message, OI_CLI_HISTORY_MESSAGE_NORMAL, NULL,
+                 0, OI_CLI_HISTORY_TOOL_OUTCOME_UNKNOWN, partial,
+                 sizeof partial, 1),
+             OI_OK);
+    CHECK_EQ(record.as.message.raw_tool_output.len, sizeof partial);
 
     oi_cli_message_free(&message);
     oi_cli_history_record_free(&record);
@@ -179,6 +200,7 @@ TEST(assistant_attribution_is_required) {
 int main(void) {
     RUN(normal_tool_result_preserves_raw_bytes);
     RUN(repair_tool_results_have_no_raw_output);
+    RUN(live_tool_failures_preserve_known_execution_state);
     RUN(partial_assistant_is_audit_only_record);
     RUN(queue_lifecycle_uses_stable_record_reference);
     RUN(checkpoint_requires_prior_nonempty_range);

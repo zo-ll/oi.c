@@ -86,6 +86,37 @@ TEST(raw_tool_bytes_are_base64_encoded) {
     oi_cli_history_record_free(&record);
 }
 
+TEST(live_unknown_tool_outcome_round_trips_partial_output) {
+    static const unsigned char raw[] = {'p', 0xff};
+    struct oi_cli_message message;
+    struct oi_cli_history_record source;
+    struct oi_cli_history_record decoded;
+    oi_cli_message_init(&message);
+    oi_cli_history_record_init(&source);
+    oi_cli_history_record_init(&decoded);
+    char *json = NULL;
+    size_t json_len = 0;
+
+    CHECK_EQ(oi_cli_message_set_tool(&message, "call", 4, "partial", 7),
+             OI_OK);
+    CHECK_EQ(oi_cli_history_record_set_message(
+                 &source, 4, 1, &message, OI_CLI_HISTORY_MESSAGE_NORMAL, NULL,
+                 0, OI_CLI_HISTORY_TOOL_OUTCOME_UNKNOWN, raw, sizeof raw, 1),
+             OI_OK);
+    CHECK_EQ(oi_cli_history_record_encode(&source, &json, &json_len), OI_OK);
+    CHECK_EQ(oi_cli_history_record_decode(json, json_len, &decoded), OI_OK);
+    CHECK_EQ(decoded.as.message.tool_outcome,
+             OI_CLI_HISTORY_TOOL_OUTCOME_UNKNOWN);
+    CHECK_EQ(decoded.as.message.raw_tool_output.len, sizeof raw);
+    CHECK(memcmp(decoded.as.message.raw_tool_output.data, raw, sizeof raw) ==
+          0);
+
+    free(json);
+    oi_cli_message_free(&message);
+    oi_cli_history_record_free(&source);
+    oi_cli_history_record_free(&decoded);
+}
+
 TEST(audit_and_checkpoint_records_encode_stable_ids) {
     struct oi_cli_history_record record;
     oi_cli_history_record_init(&record);
@@ -259,6 +290,7 @@ int main(void) {
     RUN(user_message_encoding_is_stable);
     RUN(assistant_tool_calls_encode_as_owned_values);
     RUN(raw_tool_bytes_are_base64_encoded);
+    RUN(live_unknown_tool_outcome_round_trips_partial_output);
     RUN(audit_and_checkpoint_records_encode_stable_ids);
     RUN(invalid_arguments_do_not_publish_output);
     RUN(records_round_trip);

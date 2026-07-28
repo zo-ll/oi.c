@@ -136,13 +136,31 @@ static int history_message_is_valid(
         message->tool_outcome != OI_CLI_HISTORY_TOOL_NOT_EXECUTED) {
         return 0;
     }
-    if (message->tool_outcome == OI_CLI_HISTORY_TOOL_COMPLETED) {
-        return message->source == OI_CLI_HISTORY_MESSAGE_NORMAL &&
-               message->has_raw_tool_output &&
-               message->raw_tool_output.data != NULL &&
-               message->raw_tool_output.len <= OI_CLI_HISTORY_MAX_CONTENT;
+    if (message->source == OI_CLI_HISTORY_MESSAGE_NORMAL) {
+        if (message->tool_outcome == OI_CLI_HISTORY_TOOL_COMPLETED) {
+            return message->has_raw_tool_output &&
+                   message->raw_tool_output.data != NULL &&
+                   message->raw_tool_output.len <=
+                       OI_CLI_HISTORY_MAX_CONTENT;
+        }
+        if (message->tool_outcome ==
+            OI_CLI_HISTORY_TOOL_OUTCOME_UNKNOWN) {
+            return (!message->has_raw_tool_output &&
+                    message->raw_tool_output.data == NULL) ||
+                   (message->has_raw_tool_output &&
+                    message->raw_tool_output.data != NULL &&
+                    message->raw_tool_output.len <=
+                        OI_CLI_HISTORY_MAX_CONTENT);
+        }
+        return message->tool_outcome ==
+                   OI_CLI_HISTORY_TOOL_NOT_EXECUTED &&
+               !message->has_raw_tool_output &&
+               message->raw_tool_output.data == NULL;
     }
-    return message->source == OI_CLI_HISTORY_MESSAGE_REPAIR &&
+    return (message->tool_outcome ==
+                OI_CLI_HISTORY_TOOL_OUTCOME_UNKNOWN ||
+            message->tool_outcome ==
+                OI_CLI_HISTORY_TOOL_NOT_EXECUTED) &&
            !message->has_raw_tool_output &&
            message->raw_tool_output.data == NULL;
 }
