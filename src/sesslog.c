@@ -66,7 +66,7 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log) {
         return OI_ERR_INVAL;
     }
 
-    int fd = open(path, O_RDWR | O_CREAT | O_APPEND, 0600);
+    int fd = open(path, O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (fd < 0) {
         return OI_ERR_IO;
     }
