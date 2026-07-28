@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pty.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,6 +178,97 @@ struct run_result {
     size_t output_len;
     int exit_code;
 };
+
+struct interactive_result {
+    char output[16384];
+    size_t output_len;
+    int exit_code;
+};
+
+static size_t count_text(const char *haystack, const char *needle) {
+    size_t count = 0;
+    size_t needle_len = strlen(needle);
+    const char *cursor = haystack;
+
+    while ((cursor = strstr(cursor, needle)) != NULL) {
+        count++;
+        cursor += needle_len;
+    }
+    return count;
+}
+
+static int interactive_wait_for(int master_fd,
+                                struct interactive_result *result,
+                                const char *text, size_t minimum_count) {
+    while (result->output_len < sizeof result->output - 1) {
+        fd_set reads;
+        struct timeval timeout = {10, 0};
+        ssize_t len;
+
+        if (count_text(result->output, text) >= minimum_count) {
+            return 1;
+        }
+        FD_ZERO(&reads);
+        FD_SET(master_fd, &reads);
+        if (select(master_fd + 1, &reads, NULL, NULL, &timeout) <= 0) {
+            return 0;
+        }
+        len = read(master_fd, result->output + result->output_len,
+                   sizeof result->output - 1 - result->output_len);
+        if (len <= 0) {
+            return 0;
+        }
+        result->output_len += (size_t)len;
+        result->output[result->output_len] = '\0';
+    }
+    return 0;
+}
+
+static int write_interactive(int fd, const char *data, size_t len) {
+    size_t written = 0;
+
+    while (written < len) {
+        ssize_t result = write(fd, data + written, len - written);
+        if (result <= 0) {
+            return 0;
+        }
+        written += (size_t)result;
+    }
+    return 1;
+}
+
+static pid_t start_interactive_cli(unsigned short port, int slave_fd) {
+    pid_t pid = fork();
+
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        char port_text[16];
+        char *argv[11];
+
+        snprintf(port_text, sizeof port_text, "%u", (unsigned)port);
+        if (dup2(slave_fd, STDIN_FILENO) < 0 ||
+            dup2(slave_fd, STDOUT_FILENO) < 0 ||
+            dup2(slave_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        if (slave_fd > STDERR_FILENO) {
+            close(slave_fd);
+        }
+        argv[0] = (char *)OI_BIN;
+        argv[1] = (char *)"--host";
+        argv[2] = (char *)"127.0.0.1";
+        argv[3] = (char *)"--port";
+        argv[4] = port_text;
+        argv[5] = (char *)"--no-tls";
+        argv[6] = (char *)"--api-key";
+        argv[7] = (char *)"test-key";
+        argv[8] = (char *)"--deny-tools";
+        argv[9] = NULL;
+        execv(OI_BIN, argv);
+        _exit(127);
+    }
+    return pid;
+}
 
 static void run_cli(char *const argv[], struct run_result *out) {
     memset(out, 0, sizeof *out);
@@ -603,6 +695,81 @@ TEST(resume_replays_prior_exchange) {
     unlink(log_path);
 }
 
+TEST(interactive_repl_preserves_context_across_prompts) {
+    const char *first_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"first-reply\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *second_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"second-reply\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t first_len;
+    size_t second_len;
+    char *first = build_chunked_response(first_sse, strlen(first_sse),
+                                         "HTTP/1.1 200 OK", &first_len);
+    char *second = build_chunked_response(second_sse, strlen(second_sse),
+                                          "HTTP/1.1 200 OK", &second_len);
+    const char *responses[] = {first, second};
+    size_t lengths[] = {first_len, second_len};
+    char capture_path[160];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+
+    snprintf(capture_path, sizeof capture_path,
+             "/tmp/oi-cli-repl-request-%d", (int)getpid());
+    unlink(capture_path);
+    server = start_mock_server_turns_capture(responses, lengths, 2, &port,
+                                             capture_path);
+    free(first);
+    free(second);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(port, slave_fd);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "first prompt\r", 13));
+    CHECK(interactive_wait_for(master_fd, &result, "first-reply", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
+    CHECK(write_interactive(master_fd, "second prompt\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "second-reply", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code =
+            WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        FILE *capture = fopen(capture_path, "r");
+        char requests[16384];
+        size_t request_len =
+            capture == NULL
+                ? 0
+                : fread(requests, 1, sizeof requests - 1, capture);
+        CHECK(capture != NULL);
+        if (capture != NULL) {
+            fclose(capture);
+        }
+        requests[request_len] = '\0';
+        CHECK(count_text(requests, "first prompt") >= 2);
+        CHECK(strstr(requests, "first-reply") != NULL);
+        CHECK(strstr(requests, "second prompt") != NULL);
+    }
+    unlink(capture_path);
+}
+
 int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(help_exits_zero);
@@ -621,5 +788,6 @@ int main(void) {
     RUN(tool_failure_is_returned_to_model);
     RUN(tool_turn_limit_is_enforced);
     RUN(resume_replays_prior_exchange);
+    RUN(interactive_repl_preserves_context_across_prompts);
     return oi_test_report();
 }

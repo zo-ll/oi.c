@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "cli_loop.h"
+#include "cli_repl.h"
 #include "cli_history_repair.h"
 #include "cli_history_store.h"
 #include "cli_tools.h"
@@ -53,8 +55,8 @@ static void print_usage(void) {
     printf(
         "usage: oi [flags] [\"prompt\"]\n"
         "\n"
-        "Runs one model turn, including requested tools, and prints replies.\n"
-        "If no prompt argument is given, reads the prompt from stdin.\n"
+        "Runs an interactive chat on a terminal, or one model turn when given\n"
+        "a prompt argument or redirected stdin.\n"
         "\n"
         "flags:\n"
         "  --config PATH        config file to load\n"
@@ -267,6 +269,10 @@ static oi_status persist_conversation_event(
     if (st != OI_OK) {
         context->last_error = st;
     }
+    if (st == OI_OK &&
+        event->type == OI_CLI_CONVERSATION_EVENT_TURN_DONE) {
+        context->turn_id = context->state->next_turn_id;
+    }
     return st;
 }
 
@@ -423,8 +429,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    int interactive =
+        prompt == NULL && !dry_run && isatty(STDIN_FILENO) &&
+        isatty(STDOUT_FILENO);
     int owns_prompt = 0;
-    if (prompt == NULL) {
+    if (prompt == NULL && !interactive) {
         oi_status read_status;
         char *stdin_prompt = read_stdin_all(&read_status);
         if (stdin_prompt == NULL) {
@@ -446,19 +455,24 @@ int main(int argc, char **argv) {
     }
 
     oi_json_writer *w = NULL;
-    oi_status st = build_request_body(cfg.model, prompt, &w);
-    if (st != OI_OK) {
-        fprintf(stderr, "oi: failed to build request: %s\n", status_str(st));
-        oi_config_free(&cfg);
-        if (owns_prompt) {
-            free((char *)prompt);
+    oi_status st = OI_OK;
+    if (!interactive) {
+        st = build_request_body(cfg.model, prompt, &w);
+        if (st != OI_OK) {
+            fprintf(stderr, "oi: failed to build request: %s\n",
+                    status_str(st));
+            oi_config_free(&cfg);
+            if (owns_prompt) {
+                free((char *)prompt);
+            }
+            return 1;
         }
-        return 1;
     }
-    size_t body_len;
-    const char *body = oi_json_writer_data(w, &body_len);
 
     if (dry_run) {
+        size_t body_len;
+        const char *body = oi_json_writer_data(w, &body_len);
+        (void)body_len;
         printf("host: %s\nport: %d\nuse_tls: %s\npath: %s\nmodel: %s\n",
                cfg.host, cfg.port, cfg.use_tls ? "true" : "false", cfg.path,
                cfg.model);
@@ -622,8 +636,29 @@ int main(int argc, char **argv) {
         .event_user_data =
             session_id != NULL ? &persistence : NULL,
     };
-    st = oi_cli_loop_run(client, reactor, turn_arena, tools, &loop_config,
-                         prompt, &loop_result);
+    if (interactive) {
+        struct oi_cli_repl_config repl_config = {
+            .model = cfg.model,
+            .max_turns = max_turns,
+            .tool_timeout_ms = cfg.timeout_ms,
+            .permission = &permission,
+            .input_fd = STDIN_FILENO,
+            .output_fd = STDOUT_FILENO,
+            .out = stdout,
+            .err = stderr,
+            .initial_context =
+                session_id != NULL ? &initial_context : NULL,
+            .on_event =
+                session_id != NULL ? persist_conversation_event : NULL,
+            .event_user_data =
+                session_id != NULL ? &persistence : NULL,
+        };
+        st = oi_cli_repl_run(client, reactor, turn_arena, tools,
+                             &repl_config);
+    } else {
+        st = oi_cli_loop_run(client, reactor, turn_arena, tools, &loop_config,
+                             prompt, &loop_result);
+    }
     if (st != OI_OK) {
         fprintf(stderr, "oi: agent loop failed: %s\n", status_str(st));
         if (persistence.last_error != OI_OK && session != NULL) {
