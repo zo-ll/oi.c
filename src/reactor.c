@@ -2,8 +2,12 @@
 
 #include "reactor_backend.h"
 
+#include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
 
 /* The generic layer passes OI_EV_* bits straight through to the backend
  * without translation; keep the two bit-layouts in lockstep. */
@@ -30,6 +34,13 @@ struct oi_reactor {
     size_t capacity;
     size_t registered_count;
     int stop_requested;
+};
+
+struct oi_reactor_timer {
+    oi_reactor *reactor;
+    int fd;
+    oi_reactor_timer_cb cb;
+    void *user_data;
 };
 
 oi_reactor *oi_reactor_create(void) {
@@ -216,4 +227,73 @@ void oi_reactor_stop(oi_reactor *r) {
         return;
     }
     r->stop_requested = 1;
+}
+
+static void on_timer_event(oi_reactor *r, int fd, int revents,
+                            void *user_data) {
+    (void)revents;
+    oi_reactor_timer *timer = user_data;
+    uint64_t expirations;
+    ssize_t n;
+    do {
+        n = read(fd, &expirations, sizeof expirations);
+    } while (n < 0 && errno == EINTR);
+    (void)n;
+
+    oi_reactor_remove(r, fd);
+    close(fd);
+    timer->fd = -1;
+    timer->cb(r, timer->user_data);
+}
+
+oi_status oi_reactor_timer_start(oi_reactor *r, int timeout_ms,
+                                  oi_reactor_timer_cb cb, void *user_data,
+                                  oi_reactor_timer **out_timer) {
+    if (r == NULL || timeout_ms <= 0 || cb == NULL || out_timer == NULL) {
+        return OI_ERR_INVAL;
+    }
+
+    oi_reactor_timer *timer = malloc(sizeof *timer);
+    if (timer == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (fd < 0) {
+        free(timer);
+        return OI_ERR_IO;
+    }
+
+    struct itimerspec spec;
+    memset(&spec, 0, sizeof spec);
+    spec.it_value.tv_sec = timeout_ms / 1000;
+    spec.it_value.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+    if (timerfd_settime(fd, 0, &spec, NULL) != 0) {
+        close(fd);
+        free(timer);
+        return OI_ERR_IO;
+    }
+
+    timer->reactor = r;
+    timer->fd = fd;
+    timer->cb = cb;
+    timer->user_data = user_data;
+    oi_status st = oi_reactor_add(r, fd, OI_EV_READ, on_timer_event, timer);
+    if (st != OI_OK) {
+        close(fd);
+        free(timer);
+        return st;
+    }
+    *out_timer = timer;
+    return OI_OK;
+}
+
+void oi_reactor_timer_cancel(oi_reactor_timer *timer) {
+    if (timer == NULL) {
+        return;
+    }
+    if (timer->fd >= 0) {
+        oi_reactor_remove(timer->reactor, timer->fd);
+        close(timer->fd);
+    }
+    free(timer);
 }

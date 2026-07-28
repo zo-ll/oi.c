@@ -10,6 +10,7 @@
  */
 
 typedef struct oi_reactor oi_reactor;
+typedef struct oi_reactor_timer oi_reactor_timer;
 
 /* Interest bits, ORed together when registering an fd. */
 enum {
@@ -74,5 +75,21 @@ oi_status oi_reactor_run(oi_reactor *r);
 
 /* Requests oi_reactor_run return after the current step. */
 void oi_reactor_stop(oi_reactor *r);
+
+typedef void (*oi_reactor_timer_cb)(oi_reactor *r, void *user_data);
+
+/*
+ * Registers a one-shot monotonic timer. After it fires, the callback runs
+ * once and the timer stops consuming reactor interest, but its handle
+ * remains caller-owned until oi_reactor_timer_cancel. The callback may
+ * cancel its own timer. `timeout_ms` must be positive.
+ */
+oi_status oi_reactor_timer_start(oi_reactor *r, int timeout_ms,
+                                  oi_reactor_timer_cb cb, void *user_data,
+                                  oi_reactor_timer **out_timer);
+
+/* Cancels and frees a timer, whether still pending or already fired.
+ * NULL-safe. Must be called before destroying its reactor. */
+void oi_reactor_timer_cancel(oi_reactor_timer *timer);
 
 #endif /* OI_REACTOR_H */

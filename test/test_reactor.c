@@ -299,6 +299,44 @@ TEST(run_returns_immediately_with_no_fds) {
     oi_reactor_destroy(r);
 }
 
+static void timer_fired(oi_reactor *r, void *ud) {
+    (void)r;
+    int *count = ud;
+    (*count)++;
+}
+
+TEST(one_shot_timer_fires_once) {
+    oi_reactor *r = oi_reactor_create();
+    oi_reactor_timer *timer = NULL;
+    int count = 0;
+    CHECK_EQ(oi_reactor_timer_start(r, 10, timer_fired, &count, &timer),
+              OI_OK);
+    oi_status st;
+    CHECK_EQ(oi_reactor_step(r, 1000, &st), 1);
+    CHECK_EQ(st, OI_OK);
+    CHECK_EQ(count, 1);
+    CHECK_EQ(oi_reactor_step(r, 10, &st), 0);
+    CHECK_EQ(count, 1);
+    oi_reactor_timer_cancel(timer);
+    oi_reactor_destroy(r);
+}
+
+TEST(cancelled_timer_does_not_fire) {
+    oi_reactor *r = oi_reactor_create();
+    oi_reactor_timer *timer = NULL;
+    int count = 0;
+    CHECK_EQ(oi_reactor_timer_start(r, 10, timer_fired, &count, &timer),
+              OI_OK);
+    oi_reactor_timer_cancel(timer);
+    oi_status st;
+    CHECK_EQ(oi_reactor_step(r, 20, &st), 0);
+    CHECK_EQ(count, 0);
+    oi_reactor_timer_cancel(NULL);
+    CHECK_EQ(oi_reactor_timer_start(r, 0, timer_fired, &count, &timer),
+              OI_ERR_INVAL);
+    oi_reactor_destroy(r);
+}
+
 /* --- many fds (exercises fd-table growth) --- */
 
 TEST(many_fds_grow_table) {
@@ -351,6 +389,8 @@ int main(void) {
     RUN(reports_hup_on_peer_close);
     RUN(run_stops_on_request);
     RUN(run_returns_immediately_with_no_fds);
+    RUN(one_shot_timer_fires_once);
+    RUN(cancelled_timer_does_not_fire);
     RUN(many_fds_grow_table);
     return oi_test_report();
 }
