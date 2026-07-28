@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cli_message.h"
 #include "oi/json.h"
 
 #define OI_CLI_MAX_TOOL_OUTPUT (1024u * 1024u)
@@ -21,16 +22,6 @@ struct tool_call {
     struct buffer arguments;
 };
 
-enum message_role { MSG_USER, MSG_ASSISTANT, MSG_TOOL };
-
-struct message {
-    enum message_role role;
-    char *content;
-    char *tool_call_id;
-    struct tool_call *calls;
-    size_t calls_len;
-};
-
 struct loop_state {
     oi_llm_client *client;
     oi_reactor *reactor;
@@ -38,8 +29,7 @@ struct loop_state {
     oi_tool_registry *tools;
     const struct oi_cli_loop_config *config;
 
-    struct message *messages;
-    size_t messages_len;
+    struct oi_cli_message_list messages;
     struct buffer all_assistant;
     struct buffer assistant;
     struct tool_call *calls;
@@ -86,41 +76,14 @@ static void buffer_free(struct buffer *buffer) {
     memset(buffer, 0, sizeof *buffer);
 }
 
-static char *copy_string(const char *data, size_t len) {
-    if (len == SIZE_MAX) {
-        return NULL;
-    }
-    char *copy = malloc(len + 1);
-    if (copy == NULL) {
-        return NULL;
-    }
-    if (len > 0) {
-        memcpy(copy, data, len);
-    }
-    copy[len] = '\0';
-    return copy;
-}
-
 static void tool_call_free(struct tool_call *call) {
     buffer_free(&call->id);
     buffer_free(&call->name);
     buffer_free(&call->arguments);
 }
 
-static void message_free(struct message *message) {
-    free(message->content);
-    free(message->tool_call_id);
-    for (size_t i = 0; i < message->calls_len; i++) {
-        tool_call_free(&message->calls[i]);
-    }
-    free(message->calls);
-}
-
 static void state_free(struct loop_state *state) {
-    for (size_t i = 0; i < state->messages_len; i++) {
-        message_free(&state->messages[i]);
-    }
-    free(state->messages);
+    oi_cli_message_list_free(&state->messages);
     buffer_free(&state->all_assistant);
     buffer_free(&state->assistant);
     for (size_t i = 0; i < state->calls_len; i++) {
@@ -129,51 +92,61 @@ static void state_free(struct loop_state *state) {
     free(state->calls);
 }
 
-static oi_status add_message(struct loop_state *state, enum message_role role,
-                             const char *content, const char *tool_call_id) {
-    if (state->messages_len == SIZE_MAX / sizeof *state->messages) {
-        return OI_ERR_NOMEM;
+static oi_status add_user_message(struct loop_state *state,
+                                  const char *content, size_t content_len) {
+    struct oi_cli_message message;
+    oi_cli_message_init(&message);
+    oi_status st =
+        oi_cli_message_set_user(&message, content, content_len);
+    if (st == OI_OK) {
+        st = oi_cli_message_list_append_take(&state->messages, &message);
     }
-    size_t count = state->messages_len + 1;
-    struct message *messages =
-        realloc(state->messages, count * sizeof *messages);
-    if (messages == NULL) {
-        return OI_ERR_NOMEM;
+    oi_cli_message_free(&message);
+    return st;
+}
+
+static oi_status add_tool_message(struct loop_state *state,
+                                  const char *tool_call_id,
+                                  size_t tool_call_id_len,
+                                  const char *content, size_t content_len) {
+    struct oi_cli_message message;
+    oi_cli_message_init(&message);
+    oi_status st = oi_cli_message_set_tool(
+        &message, tool_call_id, tool_call_id_len, content, content_len);
+    if (st == OI_OK) {
+        st = oi_cli_message_list_append_take(&state->messages, &message);
     }
-    state->messages = messages;
-    struct message *message = &messages[state->messages_len];
-    memset(message, 0, sizeof *message);
-    message->role = role;
-    message->content = copy_string(content, strlen(content));
-    if (tool_call_id != NULL) {
-        message->tool_call_id =
-            copy_string(tool_call_id, strlen(tool_call_id));
-    }
-    if (message->content == NULL ||
-        (tool_call_id != NULL && message->tool_call_id == NULL)) {
-        free(message->content);
-        free(message->tool_call_id);
-        return OI_ERR_NOMEM;
-    }
-    state->messages_len = count;
-    return OI_OK;
+    oi_cli_message_free(&message);
+    return st;
 }
 
 static oi_status add_assistant_message(struct loop_state *state) {
-    oi_status st =
-        add_message(state, MSG_ASSISTANT,
-                    state->assistant.data != NULL ? state->assistant.data : "",
-                    NULL);
-    if (st != OI_OK) {
-        return st;
+    struct oi_cli_message message;
+    oi_cli_message_init(&message);
+    oi_status st = oi_cli_message_set_assistant(
+        &message,
+        state->assistant.data != NULL ? state->assistant.data : "",
+        state->assistant.len);
+    for (size_t i = 0; st == OI_OK && i < state->calls_len; i++) {
+        const struct tool_call *call = &state->calls[i];
+        st = oi_cli_message_add_tool_call(
+            &message, call->id.data, call->id.len, call->name.data,
+            call->name.len, call->arguments.data, call->arguments.len);
     }
-    struct message *message = &state->messages[state->messages_len - 1];
-    message->calls = state->calls;
-    message->calls_len = state->calls_len;
-    state->calls = NULL;
-    state->calls_len = 0;
-    buffer_free(&state->assistant);
-    return OI_OK;
+    if (st == OI_OK) {
+        st = oi_cli_message_list_append_take(&state->messages, &message);
+    }
+    oi_cli_message_free(&message);
+    if (st == OI_OK) {
+        buffer_free(&state->assistant);
+        for (size_t i = 0; i < state->calls_len; i++) {
+            tool_call_free(&state->calls[i]);
+        }
+        free(state->calls);
+        state->calls = NULL;
+        state->calls_len = 0;
+    }
+    return st;
 }
 
 static struct tool_call *find_or_add_call(struct loop_state *state,
@@ -319,28 +292,31 @@ static oi_status build_body(const struct loop_state *state,
     WRITE(oi_json_write_bool(writer, 1));
     WRITE(oi_json_write_object_key(writer, "messages", 8));
     WRITE(oi_json_write_array_begin(writer));
-    for (size_t i = 0; i < state->messages_len; i++) {
-        const struct message *message = &state->messages[i];
-        const char *role = message->role == MSG_USER
+    for (size_t i = 0; i < state->messages.len; i++) {
+        const struct oi_cli_message *message = &state->messages.items[i];
+        const char *role = message->role == OI_CLI_MESSAGE_USER
                                ? "user"
-                               : (message->role == MSG_ASSISTANT ? "assistant"
-                                                                 : "tool");
+                               : (message->role ==
+                                          OI_CLI_MESSAGE_ASSISTANT
+                                      ? "assistant"
+                                      : "tool");
         WRITE(oi_json_write_object_begin(writer));
         WRITE(oi_json_write_object_key(writer, "role", 4));
         WRITE(oi_json_write_string(writer, role, strlen(role)));
         WRITE(oi_json_write_object_key(writer, "content", 7));
-        WRITE(oi_json_write_string(writer, message->content,
-                                   strlen(message->content)));
-        if (message->role == MSG_TOOL) {
+        WRITE(oi_json_write_string(writer, message->content.data,
+                                   message->content.len));
+        if (message->role == OI_CLI_MESSAGE_TOOL) {
             WRITE(oi_json_write_object_key(writer, "tool_call_id", 12));
-            WRITE(oi_json_write_string(writer, message->tool_call_id,
-                                       strlen(message->tool_call_id)));
+            WRITE(oi_json_write_string(writer, message->tool_call_id.data,
+                                       message->tool_call_id.len));
         }
-        if (message->calls_len > 0) {
+        if (message->tool_calls_len > 0) {
             WRITE(oi_json_write_object_key(writer, "tool_calls", 10));
             WRITE(oi_json_write_array_begin(writer));
-            for (size_t j = 0; j < message->calls_len; j++) {
-                const struct tool_call *call = &message->calls[j];
+            for (size_t j = 0; j < message->tool_calls_len; j++) {
+                const struct oi_cli_tool_call_value *call =
+                    &message->tool_calls[j];
                 WRITE(oi_json_write_object_begin(writer));
                 WRITE(oi_json_write_object_key(writer, "id", 2));
                 WRITE(oi_json_write_string(writer, call->id.data,
@@ -489,7 +465,8 @@ static oi_status run_tool(struct loop_state *state,
         buffer_append(&run.output, "", 0, OI_CLI_MAX_TOOL_OUTPUT) != OI_OK) {
         return OI_ERR_NOMEM;
     }
-    st = add_message(state, MSG_TOOL, run.output.data, call->id.data);
+    st = add_tool_message(state, call->id.data, call->id.len,
+                          run.output.data, run.output.len);
     buffer_free(&run.output);
     return st;
 }
@@ -513,7 +490,7 @@ oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
         .tools = tools,
         .config = config,
     };
-    oi_status st = add_message(&state, MSG_USER, prompt, NULL);
+    oi_status st = add_user_message(&state, prompt, strlen(prompt));
 
     for (int turn = 0; st == OI_OK && turn < config->max_turns; turn++) {
         oi_json_writer *writer = NULL;
@@ -551,13 +528,25 @@ oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
         if (st != OI_OK || call_count == 0) {
             break;
         }
-        struct message *assistant = &state.messages[state.messages_len - 1];
-        /* run_tool appends messages and may realloc state.messages, so retain
-         * only the separately allocated call array across that operation. */
-        struct tool_call *assistant_calls = assistant->calls;
-        size_t assistant_calls_len = assistant->calls_len;
+        struct oi_cli_message *assistant =
+            &state.messages.items[state.messages.len - 1];
+        /*
+         * Tool messages may realloc the message list, so retain only the
+         * separately allocated tool-call array across that operation.
+         */
+        struct oi_cli_tool_call_value *assistant_calls =
+            assistant->tool_calls;
+        size_t assistant_calls_len = assistant->tool_calls_len;
         for (size_t i = 0; st == OI_OK && i < assistant_calls_len; i++) {
-            st = run_tool(&state, &assistant_calls[i]);
+            const struct oi_cli_tool_call_value *call = &assistant_calls[i];
+            struct tool_call loop_call = {
+                .id = {call->id.data, call->id.len, call->id.len + 1},
+                .name = {call->name.data, call->name.len,
+                         call->name.len + 1},
+                .arguments = {call->arguments.data, call->arguments.len,
+                              call->arguments.len + 1},
+            };
+            st = run_tool(&state, &loop_call);
         }
         if (st == OI_OK && turn + 1 == config->max_turns) {
             fprintf(config->err, "oi: model tool loop exceeded %d turns\n",
@@ -568,10 +557,7 @@ oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
 
     if (st == OI_OK) {
         if (state.all_assistant.data == NULL) {
-            state.all_assistant.data = copy_string("", 0);
-            if (state.all_assistant.data == NULL) {
-                st = OI_ERR_NOMEM;
-            }
+            st = buffer_append(&state.all_assistant, "", 0, SIZE_MAX);
         }
     }
     if (st == OI_OK) {
