@@ -89,6 +89,14 @@ oi_status oi_cli_conversation_create(
     oi_cli_conversation **out_conversation);
 void oi_cli_conversation_destroy(oi_cli_conversation *conversation);
 
+/*
+ * Replaces the conversation's own model copy (validated like
+ * oi_cli_conversation_create: non-NULL, non-empty). Affects only the
+ * next request this conversation starts; does not touch in-flight state.
+ */
+oi_status oi_cli_conversation_set_model(oi_cli_conversation *conversation,
+                                        const char *model, size_t model_len);
+
 /* Starts one user turn and returns without stepping the reactor. */
 oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
                                     const char *content,

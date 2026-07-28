@@ -27,6 +27,7 @@ struct event_sink {
     int tool_output_position;
     int tool_message_position;
     int tool_message_has_raw;
+    char last_assistant_model[64];
 };
 
 static oi_status collect_event(
@@ -40,6 +41,15 @@ static oi_status collect_event(
             sink->tool_message_position = position;
             sink->tool_message_has_raw =
                 event->as.message.has_raw_tool_output;
+        }
+        if (event->as.message.value->role == OI_CLI_MESSAGE_ASSISTANT &&
+            event->as.message.model != NULL) {
+            size_t len = event->as.message.model_len;
+            if (len >= sizeof sink->last_assistant_model) {
+                len = sizeof sink->last_assistant_model - 1;
+            }
+            memcpy(sink->last_assistant_model, event->as.message.model, len);
+            sink->last_assistant_model[len] = '\0';
         }
         break;
     case OI_CLI_CONVERSATION_EVENT_ASSISTANT_DELTA:
@@ -259,8 +269,113 @@ TEST(tool_start_boundary_precedes_process_output) {
     mock_api_stop(&api);
 }
 
+TEST(set_model_affects_only_the_next_request) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"first answer\"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *second_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"second answer\"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[2] = {
+        {NULL, first_response, 0},
+        {NULL, second_response, 0},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 2));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    struct event_sink sink = {.arena = arena};
+    struct oi_cli_conversation_config config = {
+        .model = "model-one",
+        .max_model_steps = 2,
+        .tool_timeout_ms = 1000,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(client, reactor, arena, tools,
+                                        &config, NULL, &conversation),
+             OI_OK);
+
+    CHECK_EQ(oi_cli_conversation_start(conversation, "question one", 12),
+             OI_OK);
+    for (int i = 0; i < 100 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_STREQ(sink.text, "first answer");
+    CHECK_STREQ(sink.last_assistant_model, "model-one");
+    {
+        size_t request_len = 0;
+        char *request = mock_api_request(&api, 0, &request_len);
+        CHECK(request != NULL);
+        CHECK(strstr(request, "model-one") != NULL);
+        free(request);
+    }
+
+    CHECK_EQ(oi_cli_conversation_set_model(conversation, "model-two", 9),
+             OI_OK);
+    memset(&sink, 0, sizeof sink);
+    sink.arena = arena;
+    CHECK_EQ(oi_cli_conversation_start(conversation, "question two", 12),
+             OI_OK);
+    for (int i = 0; i < 100 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_STREQ(sink.text, "second answer");
+    CHECK_STREQ(sink.last_assistant_model, "model-two");
+    {
+        size_t request_len = 0;
+        char *request = mock_api_request(&api, 1, &request_len);
+        CHECK(request != NULL);
+        CHECK(strstr(request, "model-two") != NULL);
+        CHECK(strstr(request, "\"model\":\"model-one\"") == NULL);
+        free(request);
+    }
+
+    CHECK_EQ(oi_cli_conversation_set_model(NULL, "x", 1), OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_conversation_set_model(conversation, NULL, 0),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_conversation_set_model(conversation, "", 0),
+             OI_ERR_INVAL);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
 int main(void) {
     RUN(start_is_event_driven_and_preserves_context);
     RUN(tool_start_boundary_precedes_process_output);
+    RUN(set_model_affects_only_the_next_request);
     return oi_test_report();
 }

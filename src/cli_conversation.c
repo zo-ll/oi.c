@@ -747,6 +747,15 @@ oi_status oi_cli_conversation_create(
     return OI_OK;
 }
 
+oi_status oi_cli_conversation_set_model(oi_cli_conversation *conversation,
+                                        const char *model,
+                                        size_t model_len) {
+    if (conversation == NULL || model == NULL || model[0] == '\0') {
+        return OI_ERR_INVAL;
+    }
+    return oi_cli_string_set(&conversation->model, model, model_len);
+}
+
 void oi_cli_conversation_destroy(oi_cli_conversation *conversation) {
     if (conversation == NULL) {
         return;
