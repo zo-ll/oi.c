@@ -503,8 +503,10 @@ TEST(reset_allows_parsing_next_value) {
 
 TEST(every_split_point_of_representative_docs) {
     static const char *docs[] = {
-        "{\"model\":\"gpt\",\"messages\":[{\"role\":\"user\",\"content\":"
-        "\"hi\\nthere\"}],\"n\":1,\"temperature\":0.5,\"stream\":true}",
+        /* Parenthesized so the wrap reads as one document rather than
+         * two array elements with a missing comma (-Wstring-concatenation). */
+        ("{\"model\":\"gpt\",\"messages\":[{\"role\":\"user\",\"content\":"
+         "\"hi\\nthere\"}],\"n\":1,\"temperature\":0.5,\"stream\":true}"),
         "\"escaped \\\"quote\\\" and \\u00e9 and \\ud83d\\ude00 end\"",
         "[1,2.5,-3,4e2,null,true,false,\"s\",[1,2],{\"a\":1}]",
         "{}",

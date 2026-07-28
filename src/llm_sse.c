@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "compat.h"
+
 #define OI_SSE_MAX_LINE (1 << 20)
 
 struct oi_llm_sse_parser {
@@ -90,10 +92,9 @@ oi_status oi_llm_sse_parser_feed(oi_llm_sse_parser *p, const void *bytes,
     }
 
     int destroyed = 0;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdangling-pointer"
+OI_DIAG_PUSH_IGNORE_DANGLING
     p->destroyed_flag = &destroyed;
-#pragma GCC diagnostic pop
+OI_DIAG_POP
 
     const unsigned char *buf = bytes;
     for (size_t i = 0; i < len; i++) {

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "compat.h"
 #include "llm_conn.h"
 #include "llm_http.h"
 #include "llm_sse.h"
@@ -294,10 +295,9 @@ static void req_on_data(oi_llm_conn *c, const void *data, size_t len,
     oi_llm_request *req = ud;
 
     int destroyed = 0;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdangling-pointer"
+OI_DIAG_PUSH_IGNORE_DANGLING
     req->destroyed_flag = &destroyed;
-#pragma GCC diagnostic pop
+OI_DIAG_POP
 
     oi_status st = oi_llm_http_parser_feed(req->http, data, len);
     if (destroyed) {

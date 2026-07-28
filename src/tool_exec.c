@@ -13,6 +13,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "compat.h"
+
 enum call_state { CALL_PENDING_PERMISSION, CALL_RUNNING };
 
 struct oi_tool_call {
@@ -282,10 +284,9 @@ static void on_stdout_event(oi_reactor *r, int fd, int revents, void *ud) {
     oi_tool_call *call = ud;
 
     int destroyed = 0;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdangling-pointer"
+OI_DIAG_PUSH_IGNORE_DANGLING
     call->destroyed_flag = &destroyed;
-#pragma GCC diagnostic pop
+OI_DIAG_POP
 
     char buf[16384];
     for (;;) {

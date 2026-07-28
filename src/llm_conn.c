@@ -13,6 +13,8 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include "compat.h"
+
 enum conn_state { CS_TCP_CONNECTING, CS_TLS_HANDSHAKE, CS_ESTABLISHED };
 
 struct oi_llm_conn {
@@ -317,10 +319,9 @@ static void on_fd_event(oi_reactor *r, int fd, int revents, void *user_data) {
      * returns (see below) unless `destroyed` was set, in which case `c`
      * itself was freed and nothing ever dereferences the stale pointer
      * again. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdangling-pointer"
+OI_DIAG_PUSH_IGNORE_DANGLING
     c->destroyed_flag = &destroyed;
-#pragma GCC diagnostic pop
+OI_DIAG_POP
 
     switch (c->state) {
     case CS_TCP_CONNECTING:
