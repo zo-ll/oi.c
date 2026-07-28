@@ -136,7 +136,9 @@ TEST(connect_write_echo_and_reentrant_close) {
     struct oi_llm_conn_callbacks cbs = {echo_on_connected, echo_on_data,
                                          echo_on_error};
 
-    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, 0, NULL, &cbs,
+    /* A hostname exercises asynchronous resolution and address fallback
+     * (localhost commonly returns IPv6 before this IPv4 listener). */
+    oi_status st = oi_llm_conn_connect(r, "localhost", port, 0, NULL, &cbs,
                                         &ctx, &ctx.conn);
     CHECK_EQ(st, OI_OK);
 
@@ -200,6 +202,40 @@ TEST(connection_refused_reports_error) {
     CHECK(ctx.error_fired);
     CHECK_EQ(ctx.reason, OI_ERR_IO);
 
+    oi_reactor_destroy(r);
+}
+
+TEST(resolver_failure_is_reported_asynchronously) {
+    oi_reactor *r = oi_reactor_create();
+    struct error_ctx ctx = {0};
+    struct oi_llm_conn_callbacks cbs = {err_on_connected, err_on_data,
+                                         err_on_error};
+    oi_llm_conn *conn = NULL;
+    CHECK_EQ(oi_llm_conn_connect(r, "does-not-exist.invalid", 443, 0, NULL,
+                                  &cbs, &ctx, &conn),
+              OI_OK);
+    CHECK(!ctx.done); /* connect never blocks to resolve */
+    run_until(r, &ctx.done, 100);
+    CHECK(ctx.error_fired);
+    CHECK_EQ(ctx.reason, OI_ERR_IO);
+    (void)conn; /* terminal callback closes it */
+    oi_reactor_destroy(r);
+}
+
+TEST(cancel_during_resolution_is_silent) {
+    oi_reactor *r = oi_reactor_create();
+    struct error_ctx ctx = {0};
+    struct oi_llm_conn_callbacks cbs = {err_on_connected, err_on_data,
+                                         err_on_error};
+    oi_llm_conn *conn = NULL;
+    CHECK_EQ(oi_llm_conn_connect(r, "localhost", 443, 0, NULL, &cbs, &ctx,
+                                  &conn),
+              OI_OK);
+    oi_llm_conn_close(conn);
+    oi_status st;
+    CHECK_EQ(oi_reactor_step(r, 10, &st), 0);
+    CHECK_EQ(st, OI_OK);
+    CHECK(!ctx.done);
     oi_reactor_destroy(r);
 }
 
@@ -380,6 +416,8 @@ int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(connect_write_echo_and_reentrant_close);
     RUN(connection_refused_reports_error);
+    RUN(resolver_failure_is_reported_asynchronously);
+    RUN(cancel_during_resolution_is_silent);
     RUN(peer_close_reports_closed);
     RUN(connect_rejects_bad_args);
     RUN(write_before_connected_rejected);

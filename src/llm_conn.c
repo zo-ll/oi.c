@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,12 +17,32 @@
 
 #include "compat.h"
 
-enum conn_state { CS_TCP_CONNECTING, CS_TLS_HANDSHAKE, CS_ESTABLISHED };
+enum conn_state {
+    CS_RESOLVING,
+    CS_TCP_CONNECTING,
+    CS_TLS_HANDSHAKE,
+    CS_ESTABLISHED
+};
+
+struct resolver_job {
+    pthread_mutex_t mutex;
+    pthread_t thread;
+    struct oi_llm_conn *conn; /* protected by mutex; NULL once abandoned */
+    char *host;
+    char port[6];
+    int notify_write;
+    struct addrinfo *result;
+    int gai_error;
+    int finished;
+};
 
 struct oi_llm_conn {
     oi_reactor *reactor;
     int fd;
     enum conn_state state;
+    struct resolver_job *resolver;
+    struct addrinfo *addresses;
+    struct addrinfo *next_address;
 
     int use_tls;
     char *host; /* only needed (and non-NULL) when use_tls */
@@ -46,9 +67,19 @@ struct oi_llm_conn {
     int *destroyed_flag;
 };
 
+static void on_fd_event(oi_reactor *r, int fd, int revents, void *user_data);
+
 static oi_status set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return OI_ERR_IO;
+    }
+    return OI_OK;
+}
+
+static oi_status set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
         return OI_ERR_IO;
     }
     return OI_OK;
@@ -71,6 +102,26 @@ void oi_llm_conn_close(oi_llm_conn *c) {
         oi_reactor_remove(c->reactor, c->fd);
         close(c->fd);
     }
+    if (c->resolver != NULL) {
+        struct resolver_job *job = c->resolver;
+        int finished;
+        pthread_mutex_lock(&job->mutex);
+        finished = job->finished;
+        if (!finished) {
+            job->conn = NULL;
+        }
+        pthread_mutex_unlock(&job->mutex);
+        if (finished) {
+            pthread_join(job->thread, NULL);
+            close(job->notify_write);
+            freeaddrinfo(job->result);
+            pthread_mutex_destroy(&job->mutex);
+            free(job->host);
+            free(job);
+        } else {
+            pthread_detach(job->thread);
+        }
+    }
     if (c->ssl) {
         SSL_free(c->ssl);
     }
@@ -78,6 +129,7 @@ void oi_llm_conn_close(oi_llm_conn *c) {
         SSL_CTX_free(c->ssl_ctx);
     }
     free(c->out_buf);
+    freeaddrinfo(c->addresses);
     free(c->host);
     free(c->ca_file);
     if (c->destroyed_flag) {
@@ -345,14 +397,136 @@ static void drive_tls_handshake(oi_llm_conn *c) {
 
 /* --- reactor dispatch --- */
 
+static int begin_tcp_connect(oi_llm_conn *c) {
+    int fd = -1;
+    while (c->next_address != NULL) {
+        struct addrinfo *ai = c->next_address;
+        c->next_address = ai->ai_next;
+        fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC,
+                    ai->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        if (set_nonblocking(fd) != OI_OK) {
+            close(fd);
+            fd = -1;
+            continue;
+        }
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc == 0 || errno == EINPROGRESS) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+    if (fd < 0) {
+        return -1;
+    }
+    c->fd = fd;
+    c->state = CS_TCP_CONNECTING;
+    return 0;
+}
+
+static void resolver_job_free(struct resolver_job *job) {
+    close(job->notify_write);
+    freeaddrinfo(job->result);
+    pthread_mutex_destroy(&job->mutex);
+    free(job->host);
+    free(job);
+}
+
+static void *resolver_main(void *ud) {
+    struct resolver_job *job = ud;
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &blocked, NULL);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *result = NULL;
+    int gai_error = getaddrinfo(job->host, job->port, &hints, &result);
+
+    pthread_mutex_lock(&job->mutex);
+    if (job->conn == NULL) {
+        pthread_mutex_unlock(&job->mutex);
+        freeaddrinfo(result);
+        resolver_job_free(job);
+        return NULL;
+    }
+    job->result = result;
+    job->gai_error = gai_error;
+    job->finished = 1;
+    int notify_write = job->notify_write;
+    pthread_mutex_unlock(&job->mutex);
+
+    char byte = 1;
+    ssize_t n;
+    do {
+        n = write(notify_write, &byte, 1);
+    } while (n < 0 && errno == EINTR);
+    return NULL;
+}
+
+static void handle_resolver_ready(oi_llm_conn *c) {
+    char byte;
+    ssize_t n;
+    do {
+        n = read(c->fd, &byte, 1);
+    } while (n < 0 && errno == EINTR);
+    if (n != 1) {
+        fail_conn(c, OI_ERR_IO);
+        return;
+    }
+
+    oi_reactor_remove(c->reactor, c->fd);
+    close(c->fd);
+    c->fd = -1;
+
+    struct resolver_job *job = c->resolver;
+    pthread_join(job->thread, NULL);
+    c->resolver = NULL;
+    struct addrinfo *result = job->result;
+    int gai_error = job->gai_error;
+    job->result = NULL;
+    resolver_job_free(job);
+
+    c->addresses = result;
+    c->next_address = result;
+    if (gai_error != 0 || begin_tcp_connect(c) != 0) {
+        fail_conn(c, OI_ERR_IO);
+        return;
+    }
+    oi_status st =
+        oi_reactor_add(c->reactor, c->fd, OI_EV_WRITE, on_fd_event, c);
+    if (st != OI_OK) {
+        fail_conn(c, st);
+    }
+}
+
 static void handle_tcp_connecting(oi_llm_conn *c) {
     int err = 0;
     socklen_t len = sizeof err;
     if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 ||
         err != 0) {
+        oi_reactor_remove(c->reactor, c->fd);
+        close(c->fd);
+        c->fd = -1;
+        if (begin_tcp_connect(c) == 0) {
+            oi_status st = oi_reactor_add(c->reactor, c->fd, OI_EV_WRITE,
+                                          on_fd_event, c);
+            if (st == OI_OK) {
+                return;
+            }
+        }
         fail_conn(c, OI_ERR_IO);
         return;
     }
+    freeaddrinfo(c->addresses);
+    c->addresses = NULL;
+    c->next_address = NULL;
 
     if (c->use_tls) {
         if (start_tls_handshake(c) != OI_OK) {
@@ -406,6 +580,9 @@ OI_DIAG_PUSH_IGNORE_DANGLING
 OI_DIAG_POP
 
     switch (c->state) {
+    case CS_RESOLVING:
+        handle_resolver_ready(c);
+        break;
     case CS_TCP_CONNECTING:
         handle_tcp_connecting(c);
         break;
@@ -433,53 +610,15 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
         return OI_ERR_INVAL;
     }
 
-    char port_str[6];
-    snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
-
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    struct addrinfo *res;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-        return OI_ERR_IO;
-    }
-
-    int fd = -1;
-    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC,
-                    ai->ai_protocol);
-        if (fd < 0) {
-            continue;
-        }
-        if (set_nonblocking(fd) != OI_OK) {
-            close(fd);
-            fd = -1;
-            continue;
-        }
-        int cr = connect(fd, ai->ai_addr, ai->ai_addrlen);
-        if (cr == 0 || errno == EINPROGRESS) {
-            break;
-        }
-        close(fd);
-        fd = -1;
-    }
-    freeaddrinfo(res);
-    if (fd < 0) {
-        return OI_ERR_IO;
-    }
-
-    oi_llm_conn *c = malloc(sizeof *c);
+    oi_llm_conn *c = calloc(1, sizeof *c);
     if (c == NULL) {
-        close(fd);
         return OI_ERR_NOMEM;
     }
     c->reactor = r;
-    c->fd = fd;
-    c->state = CS_TCP_CONNECTING;
+    c->fd = -1;
+    c->state = CS_RESOLVING;
     c->use_tls = use_tls;
-    c->host = NULL;
+    c->host = strdup(host);
     c->ca_file = NULL;
     c->ssl_ctx = NULL;
     c->ssl = NULL;
@@ -493,31 +632,84 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
     c->write_needs_read = 0;
     c->destroyed_flag = NULL;
 
-    if (use_tls) {
-        c->host = strdup(host);
-        if (c->host == NULL) {
-            close(fd);
-            free(c);
-            return OI_ERR_NOMEM;
-        }
+    if (c->host == NULL) {
+        free(c);
+        return OI_ERR_NOMEM;
     }
     if (ca_file) {
         c->ca_file = strdup(ca_file);
         if (c->ca_file == NULL) {
             free(c->host);
-            close(fd);
             free(c);
             return OI_ERR_NOMEM;
         }
     }
 
-    oi_status st = oi_reactor_add(r, fd, OI_EV_WRITE, on_fd_event, c);
-    if (st != OI_OK) {
+    int notify[2] = {-1, -1};
+    if (pipe(notify) != 0 || set_nonblocking(notify[0]) != OI_OK ||
+        set_cloexec(notify[0]) != OI_OK || set_cloexec(notify[1]) != OI_OK) {
+        if (notify[0] >= 0) {
+            close(notify[0]);
+        }
+        if (notify[1] >= 0) {
+            close(notify[1]);
+        }
         free(c->host);
         free(c->ca_file);
-        close(fd);
+        free(c);
+        return OI_ERR_IO;
+    }
+
+    struct resolver_job *job = calloc(1, sizeof *job);
+    if (job == NULL) {
+        close(notify[0]);
+        close(notify[1]);
+        free(c->host);
+        free(c->ca_file);
+        free(c);
+        return OI_ERR_NOMEM;
+    }
+    job->host = strdup(host);
+    if (job->host == NULL || pthread_mutex_init(&job->mutex, NULL) != 0) {
+        free(job->host);
+        free(job);
+        close(notify[0]);
+        close(notify[1]);
+        free(c->host);
+        free(c->ca_file);
+        free(c);
+        return OI_ERR_NOMEM;
+    }
+    snprintf(job->port, sizeof job->port, "%u", (unsigned)port);
+    job->conn = c;
+    job->notify_write = notify[1];
+    c->resolver = job;
+    c->fd = notify[0];
+
+    oi_status st =
+        oi_reactor_add(r, c->fd, OI_EV_READ, on_fd_event, c);
+    if (st != OI_OK) {
+        pthread_mutex_destroy(&job->mutex);
+        free(job->host);
+        free(job);
+        close(notify[0]);
+        close(notify[1]);
+        free(c->host);
+        free(c->ca_file);
         free(c);
         return st;
+    }
+    if (pthread_create(&job->thread, NULL, resolver_main, job) != 0) {
+        oi_reactor_remove(r, c->fd);
+        close(notify[0]);
+        close(notify[1]);
+        pthread_mutex_destroy(&job->mutex);
+        free(job->host);
+        free(job);
+        free(c->host);
+        free(c->ca_file);
+        free(c);
+        return OI_ERR_IO;
     }
 
     *out_conn = c;

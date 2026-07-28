@@ -11,10 +11,9 @@
  * multiplexed on the caller's reactor. Knows nothing about HTTP -- it's
  * just a byte pipe with connect/data/error callbacks.
  *
- * DNS resolution (getaddrinfo) is a single blocking call made inside
- * oi_llm_conn_connect itself -- a documented, accepted limitation rather
- * than a silent one. Everything after that (TCP connect, TLS handshake,
- * read, write) is non-blocking through the reactor.
+ * DNS resolution runs on a short-lived worker thread and reports its result
+ * back through the reactor. TCP connect, TLS handshake, reads, and writes
+ * are likewise non-blocking from the reactor thread's perspective.
  */
 
 typedef struct oi_llm_conn oi_llm_conn;
@@ -37,7 +36,7 @@ struct oi_llm_conn_callbacks {
 };
 
 /*
- * Resolves `host` and begins a non-blocking connect to it on `port`,
+ * Begins asynchronous resolution of `host`, then a non-blocking connect,
  * optionally wrapping the connection in TLS once the TCP handshake
  * completes. Certificate verification is always on (hostname + chain);
  * there is no way to disable it. `ca_file` overrides the trust store

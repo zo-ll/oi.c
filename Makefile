@@ -6,7 +6,7 @@ INCLUDES = -Iinclude -Isrc
 # openssl (libssl/libcrypto) is the one deliberate exception to "no
 # build-time dependency beyond a C toolchain" -- see PLAN.md and the
 # issue #4 commit that introduces the LLM client's TLS support.
-LDLIBS = -lssl -lcrypto
+LDLIBS = -pthread -lssl -lcrypto
 
 BUILD = build
 PREFIX ?= /usr/local
