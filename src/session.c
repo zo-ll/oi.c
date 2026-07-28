@@ -79,29 +79,31 @@ oi_status oi_session_create(oi_session_registry *reg, const char *id,
 
     s->arena = oi_arena_create(block_size);
     if (s->arena == NULL) {
-        free(s->id);
-        free(s);
+        free_session(s);
         return OI_ERR_NOMEM;
     }
 
     oi_status st = oi_sesslog_open(log_path, &s->log);
     if (st != OI_OK) {
-        oi_arena_destroy(s->arena);
-        free(s->id);
-        free(s);
+        free_session(s);
         return st;
     }
 
     s->state = OI_SESSION_ACTIVE;
 
     if (reg->count == reg->cap) {
+        if (reg->cap > (size_t)-1 / 2) {
+            free_session(s);
+            return OI_ERR_NOMEM;
+        }
         size_t new_cap = reg->cap == 0 ? 8 : reg->cap * 2;
+        if (new_cap > (size_t)-1 / sizeof *reg->sessions) {
+            free_session(s);
+            return OI_ERR_NOMEM;
+        }
         oi_session **ns = realloc(reg->sessions, new_cap * sizeof *ns);
         if (ns == NULL) {
-            oi_sesslog_close(s->log);
-            oi_arena_destroy(s->arena);
-            free(s->id);
-            free(s);
+            free_session(s);
             return OI_ERR_NOMEM;
         }
         reg->sessions = ns;
