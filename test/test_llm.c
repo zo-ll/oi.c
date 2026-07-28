@@ -433,6 +433,29 @@ TEST(start_rejects_bad_args) {
     oi_reactor_destroy(r);
 }
 
+TEST(client_rejects_unsafe_http_fields) {
+    struct oi_llm_config cfg = {"api.example.com", 443, 1, NULL, "safe-key",
+                                 "/v1/chat?stream=1"};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    CHECK(client != NULL);
+    oi_llm_client_destroy(client);
+
+    cfg.host = "api.example.com\r\nX-Evil: yes";
+    CHECK(oi_llm_client_create(&cfg) == NULL);
+    cfg.host = "api example.com";
+    CHECK(oi_llm_client_create(&cfg) == NULL);
+
+    cfg.host = "api.example.com";
+    cfg.path = "v1/chat";
+    CHECK(oi_llm_client_create(&cfg) == NULL);
+    cfg.path = "/v1/chat HTTP/1.1";
+    CHECK(oi_llm_client_create(&cfg) == NULL);
+
+    cfg.path = "/v1/chat";
+    cfg.api_key = "safe\r\nX-Evil: yes";
+    CHECK(oi_llm_client_create(&cfg) == NULL);
+}
+
 TEST(cancel_null_safe) { oi_llm_request_cancel(NULL); }
 
 int main(void) {
@@ -442,6 +465,7 @@ int main(void) {
     RUN(malformed_sse_json_is_reported_not_dropped);
     RUN(cancel_from_within_on_delta);
     RUN(start_rejects_bad_args);
+    RUN(client_rejects_unsafe_http_fields);
     RUN(cancel_null_safe);
     return oi_test_report();
 }

@@ -64,8 +64,43 @@ struct oi_llm_request {
 
 /* ================= client ================= */
 
+static int valid_http_host(const char *host) {
+    if (host[0] == '\0') {
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)host; *p; p++) {
+        if (*p <= 0x20 || *p == 0x7f) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int valid_http_path(const char *path) {
+    if (path[0] != '/') {
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        if (*p <= 0x20 || *p == 0x7f) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int valid_http_field_value(const char *value) {
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg) {
-    if (cfg == NULL || cfg->host == NULL || cfg->path == NULL) {
+    if (cfg == NULL || cfg->host == NULL || cfg->path == NULL ||
+        !valid_http_host(cfg->host) || !valid_http_path(cfg->path) ||
+        (cfg->api_key != NULL && !valid_http_field_value(cfg->api_key))) {
         return NULL;
     }
 

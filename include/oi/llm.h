@@ -53,8 +53,10 @@ struct oi_llm_config {
 };
 
 /* Copies everything out of `cfg`; it need not outlive this call. Returns
- * NULL on allocation failure or a missing host/path. The returned client
- * must outlive every request started against it. */
+ * NULL on allocation failure, a missing/invalid host or path, or control
+ * characters in an API key (request-header injection is rejected at this
+ * boundary). The returned client must outlive every request started
+ * against it. */
 oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg);
 void oi_llm_client_destroy(oi_llm_client *client);
 
