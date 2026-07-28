@@ -84,7 +84,13 @@ oi_status oi_config_set(oi_config *cfg, const char *key, const char *value) {
         return set_string(&cfg->host, value);
     }
     if (strcmp(key, "port") == 0) {
-        return parse_int(value, &cfg->port);
+        int port;
+        oi_status st = parse_int(value, &port);
+        if (st != OI_OK || port < 1 || port > 65535) {
+            return OI_ERR_PARSE;
+        }
+        cfg->port = port;
+        return OI_OK;
     }
     if (strcmp(key, "use_tls") == 0) {
         return parse_bool(value, &cfg->use_tls);
@@ -99,7 +105,13 @@ oi_status oi_config_set(oi_config *cfg, const char *key, const char *value) {
         return set_string(&cfg->model, value);
     }
     if (strcmp(key, "timeout_ms") == 0) {
-        return parse_int(value, &cfg->timeout_ms);
+        int timeout_ms;
+        oi_status st = parse_int(value, &timeout_ms);
+        if (st != OI_OK || timeout_ms <= 0) {
+            return OI_ERR_PARSE;
+        }
+        cfg->timeout_ms = timeout_ms;
+        return OI_OK;
     }
     return OI_ERR_NOTFOUND;
 }

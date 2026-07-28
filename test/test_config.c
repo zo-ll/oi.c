@@ -83,8 +83,13 @@ TEST(set_int_fields) {
     CHECK_EQ(cfg.port, 8080);
     CHECK_EQ(oi_config_set(&cfg, "timeout_ms", "5000"), OI_OK);
     CHECK_EQ(cfg.timeout_ms, 5000);
-    CHECK_EQ(oi_config_set(&cfg, "port", "-1"), OI_OK); /* negative is syntactically valid */
-    CHECK_EQ(cfg.port, -1);
+    CHECK_EQ(oi_config_set(&cfg, "port", "-1"), OI_ERR_PARSE);
+    CHECK_EQ(oi_config_set(&cfg, "port", "0"), OI_ERR_PARSE);
+    CHECK_EQ(oi_config_set(&cfg, "port", "65536"), OI_ERR_PARSE);
+    CHECK_EQ(cfg.port, 8080);
+    CHECK_EQ(oi_config_set(&cfg, "timeout_ms", "0"), OI_ERR_PARSE);
+    CHECK_EQ(oi_config_set(&cfg, "timeout_ms", "-1"), OI_ERR_PARSE);
+    CHECK_EQ(cfg.timeout_ms, 5000);
     oi_config_free(&cfg);
 }
 

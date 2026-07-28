@@ -27,8 +27,7 @@ typedef struct {
     char *ca_file;   /* NULL = system default trust store */
     char *path;
     char *model;
-    int timeout_ms;  /* resolved but not yet enforced by oi_llm -- no
-                       * timer facility exists yet to act on it */
+    int timeout_ms;  /* positive end-to-end LLM request deadline */
 } oi_config;
 
 /* Fills in built-in defaults, overwriting any existing content -- call
@@ -46,8 +45,9 @@ oi_status oi_config_init_defaults(oi_config *cfg);
  * one) any existing value for string-typed keys.
  *
  * OI_ERR_NOTFOUND for an unrecognized key. OI_ERR_PARSE if `value`
- * doesn't parse for that key's type ("port"/"timeout_ms" need an
- * integer, "use_tls" needs true/false/1/0/yes/no, case-insensitive).
+ * doesn't parse for that key's type or range ("port" is 1..65535,
+ * "timeout_ms" is positive, "use_tls" needs true/false/1/0/yes/no,
+ * case-insensitive).
  */
 oi_status oi_config_set(oi_config *cfg, const char *key, const char *value);
 
