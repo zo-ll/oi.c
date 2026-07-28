@@ -1,0 +1,104 @@
+#ifndef OI_CLI_CONVERSATION_H
+#define OI_CLI_CONVERSATION_H
+
+#include <stddef.h>
+
+#include "cli_message.h"
+#include "oi/arena.h"
+#include "oi/llm.h"
+#include "oi/reactor.h"
+#include "oi/status.h"
+#include "oi/tool.h"
+
+typedef struct oi_cli_conversation oi_cli_conversation;
+
+enum oi_cli_conversation_tool_outcome {
+    OI_CLI_CONVERSATION_TOOL_NONE = 0,
+    OI_CLI_CONVERSATION_TOOL_COMPLETED,
+    OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN,
+    OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED
+};
+
+enum oi_cli_conversation_event_type {
+    OI_CLI_CONVERSATION_EVENT_ASSISTANT_DELTA,
+    OI_CLI_CONVERSATION_EVENT_MESSAGE,
+    OI_CLI_CONVERSATION_EVENT_TOOL_STARTING,
+    OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT,
+    OI_CLI_CONVERSATION_EVENT_PARTIAL_ASSISTANT,
+    OI_CLI_CONVERSATION_EVENT_RESPONSE_DONE,
+    OI_CLI_CONVERSATION_EVENT_MODEL_ERROR,
+    OI_CLI_CONVERSATION_EVENT_TURN_DONE
+};
+
+struct oi_cli_conversation_event {
+    enum oi_cli_conversation_event_type type;
+    union {
+        struct {
+            const char *data;
+            size_t len;
+        } bytes;
+        struct {
+            const struct oi_cli_message *value;
+            const char *model;
+            size_t model_len;
+            enum oi_cli_conversation_tool_outcome tool_outcome;
+            const unsigned char *raw_tool_output;
+            size_t raw_tool_output_len;
+            int has_raw_tool_output;
+        } message;
+        struct {
+            const struct oi_cli_string *id;
+            const struct oi_cli_string *name;
+            const struct oi_cli_string *arguments;
+        } tool_starting;
+        struct {
+            int http_status;
+            const char *body;
+            size_t body_len;
+        } model_error;
+        struct {
+            oi_status status;
+            int http_status;
+        } turn_done;
+    } as;
+};
+
+/*
+ * Called synchronously at conversation boundaries. Returning non-OK aborts
+ * the active turn. TOOL_STARTING is emitted before process spawn, MESSAGE
+ * before the message enters model-visible context.
+ */
+typedef oi_status (*oi_cli_conversation_event_cb)(
+    const struct oi_cli_conversation_event *event, void *user_data);
+
+struct oi_cli_conversation_config {
+    const char *model;
+    int max_model_steps;
+    int tool_timeout_ms;
+    oi_tool_permission_cb permission;
+    void *permission_user_data;
+    oi_cli_conversation_event_cb on_event;
+    void *event_user_data;
+};
+
+oi_status oi_cli_conversation_create(
+    oi_llm_client *client, oi_reactor *reactor, oi_arena *arena,
+    oi_tool_registry *tools,
+    const struct oi_cli_conversation_config *config,
+    const struct oi_cli_message_list *initial_context,
+    oi_cli_conversation **out_conversation);
+void oi_cli_conversation_destroy(oi_cli_conversation *conversation);
+
+/* Starts one user turn and returns without stepping the reactor. */
+oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
+                                    const char *content,
+                                    size_t content_len);
+void oi_cli_conversation_cancel(oi_cli_conversation *conversation);
+
+int oi_cli_conversation_is_busy(const oi_cli_conversation *conversation);
+oi_status oi_cli_conversation_last_status(
+    const oi_cli_conversation *conversation);
+const struct oi_cli_message_list *oi_cli_conversation_messages(
+    const oi_cli_conversation *conversation);
+
+#endif

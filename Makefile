@@ -56,7 +56,7 @@ endif
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
-CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c
+CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c src/cli_conversation.c
 
 .PHONY: all lib so cli install test check abi-check asan ubsan tsan valgrind \
 	fuzz fuzz-run test-integration clean
@@ -145,6 +145,9 @@ $(INTEGRATION_BUILD):
 
 $(INTEGRATION_BUILD)/%: test/integration/%.c $(LIB) | $(INTEGRATION_BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(LIB) -o $@ $(LDLIBS)
+
+$(INTEGRATION_BUILD)/test_cli_conversation: test/integration/test_cli_conversation.c src/cli_conversation.c src/cli_message.c src/cli_tools.c $(LIB) | $(INTEGRATION_BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_conversation.c src/cli_message.c src/cli_tools.c $(LIB) -o $@ $(LDLIBS)
 
 test-integration: $(INTEGRATION_BINS)
 	@if [ -z "$(INTEGRATION_BINS)" ]; then \
