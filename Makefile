@@ -29,6 +29,7 @@ LIB_SO = $(BUILD)/liboi.so
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
+CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c
 
 .PHONY: all lib so cli install test check asan ubsan tsan valgrind fuzz \
 	fuzz-run test-integration clean
@@ -66,8 +67,8 @@ $(LIB): $(LIB_OBJS)
 $(LIB_SO): $(PIC_OBJS)
 	$(CC) -shared -o $@ $^ $(LDLIBS)
 
-$(CLI_BIN): src/cli.c $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(LIB) -o $@ $(LDLIBS)
+$(CLI_BIN): $(CLI_SRCS) $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(CLI_SRCS) $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/test_%: test/test_%.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS)

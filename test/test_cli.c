@@ -81,8 +81,10 @@ static char *build_chunked_response(const char *body, size_t body_len,
     return buf;
 }
 
-static pid_t start_mock_server(const char *response, size_t response_len,
-                                unsigned short *out_port) {
+static pid_t start_mock_server_turns(const char *const *responses,
+                                     const size_t *response_lens,
+                                     size_t response_count,
+                                     unsigned short *out_port) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(listen_fd >= 0);
     int opt = 1;
@@ -94,7 +96,7 @@ static pid_t start_mock_server(const char *response, size_t response_len,
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
     CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
-    CHECK_EQ(listen(listen_fd, 1), 0);
+    CHECK_EQ(listen(listen_fd, (int)response_count), 0);
 
     socklen_t alen = sizeof addr;
     CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
@@ -107,17 +109,22 @@ static pid_t start_mock_server(const char *response, size_t response_len,
          * to connect never does (e.g. it failed to even start), this
          * must not hang forever -- see the OI_CLI_BIN comment above for
          * exactly the incident that motivated this. */
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(listen_fd, &rfds);
-        struct timeval tv = {10, 0};
-        int rc = select(listen_fd + 1, &rfds, NULL, NULL, &tv);
-        int cfd = rc > 0 ? accept(listen_fd, NULL, NULL) : -1;
-        if (cfd >= 0) {
+        for (size_t turn = 0; turn < response_count; turn++) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(listen_fd, &rfds);
+            struct timeval tv = {10, 0};
+            int rc = select(listen_fd + 1, &rfds, NULL, NULL, &tv);
+            int cfd = rc > 0 ? accept(listen_fd, NULL, NULL) : -1;
+            if (cfd < 0) {
+                break;
+            }
             drain_request(cfd);
             size_t off = 0;
-            while (off < response_len) {
-                ssize_t w = write(cfd, response + off, response_len - off);
+            while (off < response_lens[turn]) {
+                ssize_t w =
+                    write(cfd, responses[turn] + off,
+                          response_lens[turn] - off);
                 if (w <= 0) {
                     break;
                 }
@@ -130,6 +137,13 @@ static pid_t start_mock_server(const char *response, size_t response_len,
     }
     close(listen_fd);
     return pid;
+}
+
+static pid_t start_mock_server(const char *response, size_t response_len,
+                                unsigned short *out_port) {
+    const char *responses[] = {response};
+    size_t lengths[] = {response_len};
+    return start_mock_server_turns(responses, lengths, 1, out_port);
 }
 
 /* --- run the built oi binary, capturing stdout+stderr --- */
@@ -348,6 +362,126 @@ TEST(end_to_end_streaming_reply) {
     unlink(log_path);
 }
 
+static void run_tool_cli(const char *first_sse, const char *second_sse,
+                         const char *policy_flag, const char *max_turns,
+                         const char *session_suffix,
+                         struct run_result *out) {
+    size_t first_len;
+    char *first = build_chunked_response(first_sse, strlen(first_sse),
+                                          "HTTP/1.1 200 OK", &first_len);
+    size_t second_len = 0;
+    char *second = NULL;
+    if (second_sse != NULL) {
+        second = build_chunked_response(second_sse, strlen(second_sse),
+                                         "HTTP/1.1 200 OK", &second_len);
+    }
+    const char *responses[] = {first, second};
+    size_t lengths[] = {first_len, second_len};
+    unsigned short port;
+    pid_t child = start_mock_server_turns(
+        responses, lengths, second_sse != NULL ? 2 : 1, &port);
+    free(first);
+    free(second);
+
+    char port_str[16];
+    snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
+    char session_name[96];
+    snprintf(session_name, sizeof session_name, "oi-cli-tool-%s-%d",
+             session_suffix, (int)getpid());
+    char log_path[160];
+    snprintf(log_path, sizeof log_path, "/tmp/%s.oilog", session_name);
+    unlink(log_path);
+    char *argv[] = {(char *)OI_BIN,
+                     (char *)"--host",
+                     (char *)"127.0.0.1",
+                     (char *)"--port",
+                     port_str,
+                     (char *)"--no-tls",
+                     (char *)"--api-key",
+                     (char *)"test-key",
+                     (char *)"--session-dir",
+                     (char *)"/tmp",
+                     (char *)"--session",
+                     session_name,
+                     (char *)"--max-turns",
+                     (char *)max_turns,
+                     (char *)policy_flag,
+                     (char *)"use a tool",
+                     NULL};
+    run_cli(argv, out);
+    waitpid(child, NULL, 0);
+    unlink(log_path);
+}
+
+TEST(tool_loop_executes_and_returns_result) {
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf "
+        "tool-ok\\\"}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"tool completed\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    struct run_result result;
+    run_tool_cli(tool_sse, answer_sse, "--allow-tools", "4", "success",
+                 &result);
+    if (result.exit_code != 0) {
+        fprintf(stderr, "tool success CLI output: %s\n", result.output);
+    }
+    CHECK_EQ(result.exit_code, 0);
+    CHECK(strstr(result.output, "running tool shell") != NULL);
+    CHECK(strstr(result.output, "tool completed") != NULL);
+}
+
+TEST(tool_denial_stops_loop) {
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_2\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\""
+        "}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    struct run_result result;
+    run_tool_cli(tool_sse, NULL, "--deny-tools", "4", "denied", &result);
+    CHECK_EQ(result.exit_code, 1);
+    CHECK(strstr(result.output, "denied") != NULL);
+}
+
+TEST(tool_failure_is_returned_to_model) {
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_3\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"exit 7\\\"}"
+        "\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"observed failure\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    struct run_result result;
+    run_tool_cli(tool_sse, answer_sse, "--allow-tools", "4", "failure",
+                 &result);
+    if (result.exit_code != 0) {
+        fprintf(stderr, "tool failure CLI output: %s\n", result.output);
+    }
+    CHECK_EQ(result.exit_code, 0);
+    CHECK(strstr(result.output, "observed failure") != NULL);
+}
+
+TEST(tool_turn_limit_is_enforced) {
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_4\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\""
+        "}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    struct run_result result;
+    run_tool_cli(tool_sse, NULL, "--allow-tools", "1", "limit", &result);
+    CHECK_EQ(result.exit_code, 1);
+    CHECK(strstr(result.output, "exceeded 1 turns") != NULL);
+}
+
 TEST(resume_replays_prior_exchange) {
     char session_dir[] = "/tmp";
     char session_name[64];
@@ -441,6 +575,10 @@ int main(void) {
     RUN(missing_config_file_fails);
     RUN(overlong_session_path_fails_cleanly);
     RUN(end_to_end_streaming_reply);
+    RUN(tool_loop_executes_and_returns_result);
+    RUN(tool_denial_stops_loop);
+    RUN(tool_failure_is_returned_to_model);
+    RUN(tool_turn_limit_is_enforced);
     RUN(resume_replays_prior_exchange);
     return oi_test_report();
 }

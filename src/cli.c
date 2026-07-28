@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cli_loop.h"
+#include "cli_tools.h"
 #include "oi/config.h"
 #include "oi/json.h"
 #include "oi/llm.h"
@@ -10,12 +12,10 @@
 
 /*
  * Thin standalone CLI: resolves config, opens (or resumes) a session,
- * sends one streaming chat-completion request built from a prompt
- * argument (or stdin), and prints the reply as it streams in. No
- * multi-turn loop, no tool calling -- driving an actual agent turn loop
- * is a session/tool-registry-level concern outside what issues #1-#10
- * chartered; this binary exists to prove the reactor/session/config
- * pieces compose into something runnable, per issue #9's literal scope.
+ * sends a prompt argument (or stdin) through the CLI-owned model/tool
+ * loop, and prints assistant replies as they stream. Configuration and
+ * session lifecycle stay here; loop state and built-in tool policy live
+ * in their own internal modules.
  */
 
 static const char *status_str(oi_status st) {
@@ -51,7 +51,7 @@ static void print_usage(void) {
     printf(
         "usage: oi [flags] [\"prompt\"]\n"
         "\n"
-        "Sends one streaming chat-completion request and prints the reply.\n"
+        "Runs one model turn, including requested tools, and prints replies.\n"
         "If no prompt argument is given, reads the prompt from stdin.\n"
         "\n"
         "flags:\n"
@@ -65,6 +65,9 @@ static void print_usage(void) {
         "  --api-key KEY        API key (or set OI_API_KEY)\n"
         "  --ca-file PATH       custom CA bundle for TLS verification\n"
         "  --timeout-ms MS      end-to-end request timeout\n"
+        "  --max-turns N        maximum model turns (default: 8)\n"
+        "  --allow-tools        run requested tools without prompting\n"
+        "  --deny-tools         reject every requested tool\n"
         "  --tls / --no-tls     use TLS (default: on)\n"
         "  --dry-run            resolve config and print the request, don't send it\n"
         "  -h, --help           show this help\n");
@@ -148,39 +151,6 @@ static char *read_stdin_all(oi_status *out_status) {
     return b.data;
 }
 
-struct cli_ctx {
-    struct strbuf response;
-    oi_llm_request *request;
-    int done;
-    int exit_code;
-};
-
-static void on_delta(const char *text, size_t len, void *ud) {
-    struct cli_ctx *ctx = ud;
-    if (fwrite(text, 1, len, stdout) != len || fflush(stdout) != 0 ||
-        strbuf_append(&ctx->response, text, len) != 0) {
-        fprintf(stderr, "\noi: failed to handle streamed response\n");
-        ctx->done = 1;
-        ctx->exit_code = 1;
-        oi_llm_request_cancel(ctx->request);
-    }
-}
-
-static void on_done(oi_status status, int http_status, const char *error_body,
-                     size_t error_body_len, void *ud) {
-    struct cli_ctx *ctx = ud;
-    ctx->done = 1;
-    if (status != OI_OK) {
-        fprintf(stderr, "\noi: request failed: %s (http status %d)",
-                status_str(status), http_status);
-        if (error_body != NULL && error_body_len > 0) {
-            fprintf(stderr, ": %.*s", (int)error_body_len, error_body);
-        }
-        fprintf(stderr, "\n");
-        ctx->exit_code = 1;
-    }
-}
-
 struct replay_ctx {
     int index;
     int output_failed;
@@ -245,6 +215,8 @@ int main(int argc, char **argv) {
     const char *prompt = NULL;
     int cli_use_tls = -1; /* -1 = not specified on the command line */
     int dry_run = 0;
+    int max_turns = 8;
+    oi_cli_tool_policy tool_policy = OI_CLI_TOOLS_ASK;
 
     struct {
         const char *key;
@@ -261,6 +233,30 @@ int main(int argc, char **argv) {
         }
         if (strcmp(arg, "--dry-run") == 0) {
             dry_run = 1;
+            continue;
+        }
+        if (strcmp(arg, "--allow-tools") == 0) {
+            tool_policy = OI_CLI_TOOLS_ALLOW;
+            continue;
+        }
+        if (strcmp(arg, "--deny-tools") == 0) {
+            tool_policy = OI_CLI_TOOLS_DENY;
+            continue;
+        }
+        if (strcmp(arg, "--max-turns") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "oi: --max-turns requires a value\n");
+                return 1;
+            }
+            char *end = NULL;
+            long value = strtol(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value <= 0 ||
+                value > 1000) {
+                fprintf(stderr, "oi: invalid --max-turns value: %s\n",
+                        argv[i]);
+                return 1;
+            }
+            max_turns = (int)value;
             continue;
         }
         if (strcmp(arg, "--tls") == 0) {
@@ -434,13 +430,22 @@ int main(int argc, char **argv) {
     oi_reactor *reactor = NULL;
     oi_session_registry *sessions = NULL;
     oi_llm_client *client = NULL;
-    struct cli_ctx ctx = {0};
+    oi_tool_registry *tools = NULL;
+    struct oi_cli_loop_result loop_result = {0};
     int exit_code = 0;
 
     reactor = oi_reactor_create();
     sessions = oi_session_registry_create();
-    if (reactor == NULL || sessions == NULL) {
+    tools = oi_tool_registry_create();
+    if (reactor == NULL || sessions == NULL || tools == NULL) {
         fprintf(stderr, "oi: out of memory\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+    st = oi_cli_tools_register(tools);
+    if (st != OI_OK) {
+        fprintf(stderr, "oi: failed to register built-in tools: %s\n",
+                status_str(st));
         exit_code = 1;
         goto cleanup;
     }
@@ -474,45 +479,34 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    oi_llm_request *req;
-    st = oi_llm_request_start(client, reactor, oi_session_arena(session),
-                               body, body_len, on_delta, on_done, &ctx, &req);
-    if (st != OI_OK) {
-        fprintf(stderr, "oi: failed to start request: %s\n", status_str(st));
-        exit_code = 1;
-        goto cleanup;
-    }
-    ctx.request = req;
-
-    while (!ctx.done) {
-        oi_status step_st;
-        oi_reactor_step(reactor, -1, &step_st);
-        if (step_st != OI_OK) {
-            fprintf(stderr, "oi: reactor error: %s\n", status_str(step_st));
-            ctx.exit_code = 1;
-            break;
-        }
-    }
-    printf("\n");
-
-    if (ctx.exit_code == 0) {
+    struct oi_cli_permission permission = {tool_policy};
+    struct oi_cli_loop_config loop_config = {
+        cfg.model, max_turns, cfg.timeout_ms, &permission, stdout, stderr,
+    };
+    st = oi_cli_loop_run(client, reactor, oi_session_arena(session), tools,
+                          &loop_config, prompt, &loop_result);
+    if (st == OI_OK) {
         st = oi_sesslog_append(oi_session_log(session), prompt,
                                 strlen(prompt));
         if (st == OI_OK) {
-            st = oi_sesslog_append(oi_session_log(session), ctx.response.data,
-                                    ctx.response.len);
+            st = oi_sesslog_append(oi_session_log(session),
+                                    loop_result.assistant_text,
+                                    loop_result.assistant_text_len);
         }
         if (st != OI_OK) {
             fprintf(stderr, "oi: failed to persist session: %s\n",
                     status_str(st));
             oi_session_fail(session);
-            ctx.exit_code = 1;
+            exit_code = 1;
         }
+    } else {
+        fprintf(stderr, "oi: agent loop failed: %s\n", status_str(st));
+        exit_code = 1;
     }
-    exit_code = ctx.exit_code;
 
 cleanup:
-    free(ctx.response.data);
+    free(loop_result.assistant_text);
+    oi_tool_registry_destroy(tools);
     oi_llm_client_destroy(client);
     oi_session_registry_destroy(sessions);
     oi_reactor_destroy(reactor);
