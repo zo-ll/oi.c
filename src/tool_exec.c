@@ -144,14 +144,7 @@ static oi_status ensure_sigchld_setup(oi_reactor *r) {
     if (g_sigchld_pipe[0] < 0) {
         signal(SIGPIPE, SIG_IGN); /* writing to a child's closed stdin must not kill us */
 
-        if (pipe(g_sigchld_pipe) != 0) {
-            return OI_ERR_IO;
-        }
-        if (set_nonblocking(g_sigchld_pipe[0]) != OI_OK ||
-            set_nonblocking(g_sigchld_pipe[1]) != OI_OK) {
-            close(g_sigchld_pipe[0]);
-            close(g_sigchld_pipe[1]);
-            g_sigchld_pipe[0] = g_sigchld_pipe[1] = -1;
+        if (pipe2(g_sigchld_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
             return OI_ERR_IO;
         }
 
@@ -381,10 +374,10 @@ static oi_status spawn(oi_tool_call *call) {
     }
 
     int stdin_pipe[2], stdout_pipe[2], err_pipe[2];
-    if (pipe(stdin_pipe) != 0) {
+    if (pipe2(stdin_pipe, O_CLOEXEC) != 0) {
         return OI_ERR_IO;
     }
-    if (pipe(stdout_pipe) != 0) {
+    if (pipe2(stdout_pipe, O_CLOEXEC) != 0) {
         close(stdin_pipe[0]);
         close(stdin_pipe[1]);
         return OI_ERR_IO;

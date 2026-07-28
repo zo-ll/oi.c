@@ -97,6 +97,24 @@ static oi_status sleep_build_argv(const oi_json_value *args, oi_arena *arena,
     return OI_OK;
 }
 
+static oi_status fdcheck_build_argv(const oi_json_value *args,
+                                     oi_arena *arena, void *ud,
+                                     char ***out_argv) {
+    (void)args;
+    (void)ud;
+    char **argv = oi_arena_alloc(arena, 4 * sizeof(char *));
+    if (argv == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    argv[0] = (char *)"/bin/sh";
+    argv[1] = (char *)"-c";
+    argv[2] = (char *)"for f in /proc/self/fd/[3-9]*; do "
+                            "[ -e \"$f\" ] && exit 9; done; exit 0";
+    argv[3] = NULL;
+    *out_argv = argv;
+    return OI_OK;
+}
+
 static oi_status missing_build_argv(const oi_json_value *args,
                                      oi_arena *arena, void *ud,
                                      char ***out_argv) {
@@ -127,6 +145,7 @@ static oi_tool_registry *make_registry(void) {
     oi_tool_registry_add(reg, "cat", "{}", cat_build_argv, NULL);
     oi_tool_registry_add(reg, "exit", "{}", exit_build_argv, NULL);
     oi_tool_registry_add(reg, "sleep", "{}", sleep_build_argv, NULL);
+    oi_tool_registry_add(reg, "fdcheck", "{}", fdcheck_build_argv, NULL);
     oi_tool_registry_add(reg, "missing", "{}", missing_build_argv, NULL);
     oi_tool_registry_add(reg, "badargv", "{}", build_argv_fails, NULL);
     return reg;
@@ -577,6 +596,36 @@ TEST(concurrent_calls_do_not_cross_wire) {
     oi_tool_registry_destroy(reg);
 }
 
+TEST(child_does_not_inherit_other_tool_descriptors) {
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+
+    struct out_ctx sleep_ctx = {0};
+    oi_tool_call *sleep_call = NULL;
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "sleep", NULL, allow_cb, NULL,
+                                 capture_output, capture_done, &sleep_ctx,
+                                 &sleep_call),
+              OI_OK);
+
+    struct out_ctx check_ctx = {0};
+    oi_tool_call *check_call = NULL;
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "fdcheck", NULL, allow_cb, NULL,
+                                 capture_output, capture_done, &check_ctx,
+                                 &check_call),
+              OI_OK);
+    run_until(r, &check_ctx.done, 100);
+
+    CHECK(check_ctx.done);
+    CHECK_EQ(check_ctx.kind, OI_TOOL_EXIT_NORMAL);
+    CHECK_EQ(check_ctx.code, 0);
+    oi_tool_call_cancel(sleep_call);
+
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
 int main(void) {
     RUN(run_echo_captures_output_and_normal_exit);
     RUN(nonzero_exit_code_reported);
@@ -594,5 +643,6 @@ int main(void) {
     RUN(cancel_kills_long_running_process);
     RUN(cancel_null_safe);
     RUN(concurrent_calls_do_not_cross_wire);
+    RUN(child_does_not_inherit_other_tool_descriptors);
     return oi_test_report();
 }
