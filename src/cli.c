@@ -143,15 +143,20 @@ static char *read_stdin_all(void) {
 
 struct cli_ctx {
     struct strbuf response;
+    oi_llm_request *request;
     int done;
     int exit_code;
 };
 
 static void on_delta(const char *text, size_t len, void *ud) {
     struct cli_ctx *ctx = ud;
-    fwrite(text, 1, len, stdout);
-    fflush(stdout);
-    strbuf_append(&ctx->response, text, len); /* best-effort logging copy */
+    if (fwrite(text, 1, len, stdout) != len || fflush(stdout) != 0 ||
+        strbuf_append(&ctx->response, text, len) != 0) {
+        fprintf(stderr, "\noi: failed to handle streamed response\n");
+        ctx->done = 1;
+        ctx->exit_code = 1;
+        oi_llm_request_cancel(ctx->request);
+    }
 }
 
 static void on_done(oi_status status, int http_status, const char *error_body,
@@ -178,6 +183,47 @@ static void replay_cb(const void *data, size_t len, void *ud) {
     const char *role = (ctx->index % 2 == 0) ? "user" : "assistant";
     printf("[resumed %s] %.*s\n", role, (int)len, (const char *)data);
     ctx->index++;
+}
+
+static oi_status build_request_body(const char *model, const char *prompt,
+                                     oi_json_writer **out_writer) {
+    oi_json_writer *w = oi_json_writer_create();
+    if (w == NULL) {
+        return OI_ERR_NOMEM;
+    }
+
+    oi_status st;
+#define WRITE_JSON(expr)          \
+    do {                          \
+        st = (expr);              \
+        if (st != OI_OK) {        \
+            goto fail;            \
+        }                         \
+    } while (0)
+    WRITE_JSON(oi_json_write_object_begin(w));
+    WRITE_JSON(oi_json_write_object_key(w, "model", 5));
+    WRITE_JSON(oi_json_write_string(w, model, strlen(model)));
+    WRITE_JSON(oi_json_write_object_key(w, "stream", 6));
+    WRITE_JSON(oi_json_write_bool(w, 1));
+    WRITE_JSON(oi_json_write_object_key(w, "messages", 8));
+    WRITE_JSON(oi_json_write_array_begin(w));
+    WRITE_JSON(oi_json_write_object_begin(w));
+    WRITE_JSON(oi_json_write_object_key(w, "role", 4));
+    WRITE_JSON(oi_json_write_string(w, "user", 4));
+    WRITE_JSON(oi_json_write_object_key(w, "content", 7));
+    WRITE_JSON(oi_json_write_string(w, prompt, strlen(prompt)));
+    WRITE_JSON(oi_json_write_object_end(w));
+    WRITE_JSON(oi_json_write_array_end(w));
+    WRITE_JSON(oi_json_write_object_end(w));
+#undef WRITE_JSON
+
+    *out_writer = w;
+    return OI_OK;
+
+fail:
+#undef WRITE_JSON
+    oi_json_writer_destroy(w);
+    return st;
 }
 
 int main(int argc, char **argv) {
@@ -327,22 +373,16 @@ int main(int argc, char **argv) {
         owns_prompt = 1;
     }
 
-    oi_json_writer *w = oi_json_writer_create();
-    oi_json_write_object_begin(w);
-    oi_json_write_object_key(w, "model", 5);
-    oi_json_write_string(w, cfg.model, strlen(cfg.model));
-    oi_json_write_object_key(w, "stream", 6);
-    oi_json_write_bool(w, 1);
-    oi_json_write_object_key(w, "messages", 8);
-    oi_json_write_array_begin(w);
-    oi_json_write_object_begin(w);
-    oi_json_write_object_key(w, "role", 4);
-    oi_json_write_string(w, "user", 4);
-    oi_json_write_object_key(w, "content", 7);
-    oi_json_write_string(w, prompt, strlen(prompt));
-    oi_json_write_object_end(w);
-    oi_json_write_array_end(w);
-    oi_json_write_object_end(w);
+    oi_json_writer *w = NULL;
+    oi_status st = build_request_body(cfg.model, prompt, &w);
+    if (st != OI_OK) {
+        fprintf(stderr, "oi: failed to build request: %s\n", status_str(st));
+        oi_config_free(&cfg);
+        if (owns_prompt) {
+            free((char *)prompt);
+        }
+        return 1;
+    }
     size_t body_len;
     const char *body = oi_json_writer_data(w, &body_len);
 
@@ -383,15 +423,13 @@ int main(int argc, char **argv) {
     }
 
     oi_session *session;
-    oi_status st = oi_session_create(sessions, session_id, log_path, 0,
-                                      &session);
+    st = oi_session_create(sessions, session_id, log_path, 0, &session);
     if (st != OI_OK) {
         fprintf(stderr, "oi: failed to open session '%s' at '%s': %s\n",
                 session_id, log_path, status_str(st));
         exit_code = 1;
         goto cleanup;
     }
-
     struct replay_ctx rctx = {0};
     oi_sesslog_replay(oi_session_log(session), replay_cb, &rctx);
 
@@ -415,6 +453,7 @@ int main(int argc, char **argv) {
         exit_code = 1;
         goto cleanup;
     }
+    ctx.request = req;
 
     while (!ctx.done) {
         oi_status step_st;
