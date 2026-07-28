@@ -120,11 +120,11 @@ static int strbuf_append(struct strbuf *b, const char *data, size_t len) {
     return 0;
 }
 
-/* Reads all of stdin. Returns NULL only on allocation failure -- an
- * empty stdin yields a valid, empty (but non-NULL) buffer. */
-static char *read_stdin_all(void) {
+/* Reads all of stdin. An empty stream yields a valid, empty buffer. */
+static char *read_stdin_all(oi_status *out_status) {
     struct strbuf b = {0};
     if (strbuf_append(&b, "", 0) != 0) { /* ensure non-NULL even if EOF immediately */
+        *out_status = OI_ERR_NOMEM;
         return NULL;
     }
     char chunk[4096];
@@ -132,12 +132,19 @@ static char *read_stdin_all(void) {
     while ((n = fread(chunk, 1, sizeof chunk, stdin)) > 0) {
         if (strbuf_append(&b, chunk, n) != 0) {
             free(b.data);
+            *out_status = OI_ERR_NOMEM;
             return NULL;
         }
+    }
+    if (ferror(stdin)) {
+        free(b.data);
+        *out_status = OI_ERR_IO;
+        return NULL;
     }
     if (b.len > 0 && b.data[b.len - 1] == '\n') {
         b.data[--b.len] = '\0';
     }
+    *out_status = OI_OK;
     return b.data;
 }
 
@@ -355,9 +362,11 @@ int main(int argc, char **argv) {
 
     int owns_prompt = 0;
     if (prompt == NULL) {
-        char *stdin_prompt = read_stdin_all();
+        oi_status read_status;
+        char *stdin_prompt = read_stdin_all(&read_status);
         if (stdin_prompt == NULL) {
-            fprintf(stderr, "oi: out of memory reading stdin\n");
+            fprintf(stderr, "oi: failed to read stdin: %s\n",
+                    status_str(read_status));
             oi_config_free(&cfg);
             return 1;
         }
