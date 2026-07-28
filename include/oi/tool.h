@@ -68,7 +68,8 @@ typedef void (*oi_tool_output_cb)(const void *data, size_t len,
 typedef enum {
     OI_TOOL_EXIT_NORMAL,   /* process ran; `code` is its exit status */
     OI_TOOL_EXIT_SIGNALED, /* process was killed; `code` is the signal */
-    OI_TOOL_EXIT_FAILED    /* execvp itself failed; `code` is the errno */
+    OI_TOOL_EXIT_FAILED,   /* execvp itself failed; `code` is the errno */
+    OI_TOOL_EXIT_TIMEOUT   /* configured deadline expired; `code` is zero */
 } oi_tool_exit_kind;
 
 /* Fires exactly once, terminating the call (oi_tool_call is freed right
@@ -131,6 +132,13 @@ oi_status oi_tool_call_write_stdin(oi_tool_call *call, const void *data,
  * everything written before it sees EOF.
  */
 oi_status oi_tool_call_close_stdin(oi_tool_call *call);
+
+/*
+ * Sets a one-shot execution deadline. For an ASK-pending call it starts
+ * when permission is granted and the child is spawned; for a running call
+ * it starts immediately. May be set only once, with a positive value.
+ */
+oi_status oi_tool_call_set_timeout(oi_tool_call *call, int timeout_ms);
 
 /*
  * Kills the process (if one is running) and frees `call`; on_done will

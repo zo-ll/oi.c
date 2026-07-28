@@ -549,6 +549,53 @@ TEST(cancel_kills_long_running_process) {
     oi_tool_registry_destroy(reg);
 }
 
+TEST(tool_deadline_reports_timeout) {
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct out_ctx ctx = {0};
+    oi_tool_call *call = NULL;
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "sleep", NULL, allow_cb, NULL,
+                                 capture_output, capture_done, &ctx, &call),
+              OI_OK);
+    CHECK_EQ(oi_tool_call_set_timeout(call, 10), OI_OK);
+    CHECK_EQ(oi_tool_call_set_timeout(call, 20), OI_ERR_INVAL);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.kind, OI_TOOL_EXIT_TIMEOUT);
+    CHECK_EQ(ctx.code, 0);
+    CHECK_EQ(oi_tool_call_set_timeout(NULL, 10), OI_ERR_INVAL);
+
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
+TEST(pending_tool_deadline_starts_after_permission) {
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct out_ctx ctx = {0};
+    oi_tool_call *call = NULL;
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "sleep", NULL, ask_cb, NULL,
+                                 capture_output, capture_done, &ctx, &call),
+              OI_OK);
+    CHECK_EQ(oi_tool_call_set_timeout(call, 10), OI_OK);
+
+    oi_status step_status;
+    CHECK_EQ(oi_reactor_step(r, 20, &step_status), 0);
+    CHECK(!ctx.done);
+    CHECK_EQ(oi_tool_call_resolve(call, 1), OI_OK);
+    run_until(r, &ctx.done, 100);
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.kind, OI_TOOL_EXIT_TIMEOUT);
+
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
 struct tree_cancel_ctx {
     oi_tool_call *call;
     char output[64];
@@ -791,6 +838,8 @@ int main(void) {
     RUN(write_stdin_before_running_rejected);
     RUN(cancel_from_within_on_output);
     RUN(cancel_kills_long_running_process);
+    RUN(tool_deadline_reports_timeout);
+    RUN(pending_tool_deadline_starts_after_permission);
     RUN(cancel_kills_descendant_processes);
     RUN(cancel_null_safe);
     RUN(concurrent_calls_do_not_cross_wire);

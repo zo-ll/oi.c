@@ -36,6 +36,8 @@ struct oi_tool_call {
 
     pid_t pid;
     int pid_fd;     /* pidfd watched by this call's reactor */
+    oi_reactor_timer *timer;
+    int timeout_ms;
     int stdin_fd;  /* -1 once closed */
     int stdin_close_pending; /* close_stdin() called while a write was
                                * still queued; actually closed once
@@ -50,6 +52,7 @@ struct oi_tool_call {
 
     int child_exited;
     int cancelled;
+    int timed_out;
     int stdout_eof;
     int exec_failed;
     int exec_errno;
@@ -80,24 +83,34 @@ static int open_pidfd(pid_t pid) {
 #endif
 }
 
-static void free_call(oi_tool_call *call) {
-    if (call->pid_fd >= 0) {
-        oi_reactor_remove(call->reactor, call->pid_fd);
-        close(call->pid_fd);
-    }
+static void close_call_io(oi_tool_call *call) {
     if (call->stdin_fd >= 0) {
         oi_reactor_remove(call->reactor, call->stdin_fd);
         close(call->stdin_fd);
+        call->stdin_fd = -1;
     }
     if (call->stdout_fd >= 0) {
         oi_reactor_remove(call->reactor, call->stdout_fd);
         close(call->stdout_fd);
+        call->stdout_fd = -1;
     }
     if (call->err_fd >= 0) {
         oi_reactor_remove(call->reactor, call->err_fd);
         close(call->err_fd);
+        call->err_fd = -1;
     }
     free(call->out_buf);
+    call->out_buf = NULL;
+    call->out_len = call->out_off = call->out_cap = 0;
+}
+
+static void free_call(oi_tool_call *call) {
+    oi_reactor_timer_cancel(call->timer);
+    if (call->pid_fd >= 0) {
+        oi_reactor_remove(call->reactor, call->pid_fd);
+        close(call->pid_fd);
+    }
+    close_call_io(call);
     if (call->destroyed_flag) {
         *call->destroyed_flag = 1;
     }
@@ -106,7 +119,7 @@ static void free_call(oi_tool_call *call) {
 
 static void maybe_finish(oi_tool_call *call) {
     if (!call->child_exited ||
-        (!call->cancelled && !call->stdout_eof)) {
+        (!call->cancelled && !call->timed_out && !call->stdout_eof)) {
         return;
     }
 
@@ -117,7 +130,10 @@ static void maybe_finish(oi_tool_call *call) {
 
     oi_tool_exit_kind kind;
     int code;
-    if (call->exec_failed) {
+    if (call->timed_out) {
+        kind = OI_TOOL_EXIT_TIMEOUT;
+        code = 0;
+    } else if (call->exec_failed) {
         kind = OI_TOOL_EXIT_FAILED;
         code = call->exec_errno;
     } else if (WIFSIGNALED(call->exit_status)) {
@@ -169,6 +185,22 @@ static void kill_and_reap(pid_t pid) {
             return;
         }
     }
+}
+
+static void terminate_process_group(pid_t pid) {
+    if (kill(-pid, SIGKILL) != 0) {
+        kill(pid, SIGKILL);
+    }
+}
+
+static void on_call_timeout(oi_reactor *r, void *ud) {
+    (void)r;
+    oi_tool_call *call = ud;
+    call->timed_out = 1;
+    call->on_output = NULL;
+    terminate_process_group(call->pid);
+    close_call_io(call);
+    maybe_finish(call);
 }
 
 static void on_err_event(oi_reactor *r, int fd, int revents, void *ud) {
@@ -414,6 +446,24 @@ child_failed:;
         return st;
     }
 
+    if (call->timeout_ms > 0) {
+        st = oi_reactor_timer_start(call->reactor, call->timeout_ms,
+                                     on_call_timeout, call, &call->timer);
+        if (st != OI_OK) {
+            oi_reactor_remove(call->reactor, call->stdout_fd);
+            oi_reactor_remove(call->reactor, call->err_fd);
+            oi_reactor_remove(call->reactor, call->pid_fd);
+            close(call->stdin_fd);
+            close(call->stdout_fd);
+            close(call->err_fd);
+            close(call->pid_fd);
+            call->stdin_fd = call->stdout_fd = call->err_fd = -1;
+            call->pid_fd = -1;
+            kill_and_reap(pid);
+            return st;
+        }
+    }
+
     return OI_OK;
 }
 
@@ -556,6 +606,24 @@ oi_status oi_tool_call_close_stdin(oi_tool_call *call) {
     return OI_OK;
 }
 
+oi_status oi_tool_call_set_timeout(oi_tool_call *call, int timeout_ms) {
+    if (call == NULL || timeout_ms <= 0 || call->timeout_ms > 0 ||
+        call->timer != NULL) {
+        return OI_ERR_INVAL;
+    }
+    call->timeout_ms = timeout_ms;
+    if (call->state == CALL_PENDING_PERMISSION) {
+        return OI_OK;
+    }
+    oi_status st = oi_reactor_timer_start(call->reactor, timeout_ms,
+                                           on_call_timeout, call,
+                                           &call->timer);
+    if (st != OI_OK) {
+        call->timeout_ms = 0;
+    }
+    return st;
+}
+
 void oi_tool_call_cancel(oi_tool_call *call) {
     if (call == NULL) {
         return;
@@ -567,9 +635,7 @@ void oi_tool_call_cancel(oi_tool_call *call) {
     if (call->pid > 0) {
         /* The child creates a fresh process group before exec, so a tool
          * cannot leave grandchildren running after its call is cancelled. */
-        if (kill(-call->pid, SIGKILL) != 0) {
-            kill(call->pid, SIGKILL);
-        }
+        terminate_process_group(call->pid);
     }
     call->cancelled = 1;
     call->on_output = NULL;
@@ -578,23 +644,6 @@ void oi_tool_call_cancel(oi_tool_call *call) {
         *call->destroyed_flag = 1;
         call->destroyed_flag = NULL;
     }
-    if (call->stdin_fd >= 0) {
-        oi_reactor_remove(call->reactor, call->stdin_fd);
-        close(call->stdin_fd);
-        call->stdin_fd = -1;
-    }
-    if (call->stdout_fd >= 0) {
-        oi_reactor_remove(call->reactor, call->stdout_fd);
-        close(call->stdout_fd);
-        call->stdout_fd = -1;
-    }
-    if (call->err_fd >= 0) {
-        oi_reactor_remove(call->reactor, call->err_fd);
-        close(call->err_fd);
-        call->err_fd = -1;
-    }
-    free(call->out_buf);
-    call->out_buf = NULL;
-    call->out_len = call->out_off = call->out_cap = 0;
+    close_call_io(call);
     maybe_finish(call);
 }
