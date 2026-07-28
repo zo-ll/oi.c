@@ -319,7 +319,7 @@ TEST(full_tool_use_loop) {
     CHECK(arena != NULL && log != NULL);
 
     struct oi_llm_config cfg = {"127.0.0.1", api.port, 0, NULL, NULL,
-                                 "/v1/chat/completions"};
+                                 "/v1/chat/completions", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
     CHECK(client != NULL);
 
@@ -527,7 +527,7 @@ TEST(api_error_fails_only_its_own_session) {
     CHECK_EQ(oi_session_create(reg, "b", path_b, 0, &b), OI_OK);
 
     struct oi_llm_config cfg = {"127.0.0.1", api.port, 0, NULL, NULL,
-                                 "/v1/chat/completions"};
+                                 "/v1/chat/completions", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
     CHECK(client != NULL);
 

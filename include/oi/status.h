@@ -15,7 +15,8 @@ typedef enum oi_status {
     OI_ERR_CLOSED,  /* peer/resource closed */
     OI_ERR_EXISTS,  /* duplicate id/key */
     OI_ERR_NOTFOUND, /* id/key not found */
-    OI_ERR_DENIED   /* refused by caller-supplied policy, not a fault */
+    OI_ERR_DENIED,  /* refused by caller-supplied policy, not a fault */
+    OI_ERR_TIMEOUT  /* operation exceeded its configured deadline */
 } oi_status;
 
 #endif /* OI_STATUS_H */

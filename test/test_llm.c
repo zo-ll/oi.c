@@ -177,7 +177,7 @@ TEST(streaming_success_delivers_deltas) {
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
     struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
-                                 "/v1/chat/completions"};
+                                 "/v1/chat/completions", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
     CHECK(client != NULL);
 
@@ -248,7 +248,7 @@ TEST(non_2xx_status_reports_error_body) {
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
     struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, "sk-bad",
-                                 "/v1/chat/completions"};
+                                 "/v1/chat/completions", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
 
     struct error_ctx ctx = {0};
@@ -313,7 +313,7 @@ TEST(malformed_sse_json_is_reported_not_dropped) {
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
     struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
-                                 "/v1/chat/completions"};
+                                 "/v1/chat/completions", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
 
     struct malformed_ctx ctx = {0};
@@ -348,7 +348,8 @@ TEST(success_response_requires_done_sentinel) {
 
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
-    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL, "/v1/chat"};
+    struct oi_llm_config cfg = {
+        "127.0.0.1", port, 0, NULL, NULL, "/v1/chat", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
     struct malformed_ctx ctx = {0};
     oi_llm_request *req = NULL;
@@ -380,7 +381,8 @@ TEST(unterminated_done_sentinel_completes_stream) {
 
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
-    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL, "/v1/chat"};
+    struct oi_llm_config cfg = {
+        "127.0.0.1", port, 0, NULL, NULL, "/v1/chat", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
     struct stream_ctx ctx = {0};
     oi_llm_request *req = NULL;
@@ -394,6 +396,30 @@ TEST(unterminated_done_sentinel_completes_stream) {
     CHECK_EQ(ctx.delta_count, 1);
     CHECK_EQ(ctx.text_len, 2u);
     CHECK(memcmp(ctx.text, "ok", 2) == 0);
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+TEST(request_deadline_reports_timeout) {
+    unsigned short port;
+    pid_t child = start_mock_server("", 0, &port);
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {
+        "127.0.0.1", port, 0, NULL, NULL, "/v1/chat", 10};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct malformed_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, mal_on_delta,
+                                   mal_on_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.done_status, OI_ERR_TIMEOUT);
 
     oi_llm_client_destroy(client);
     oi_arena_destroy(a);
@@ -444,7 +470,7 @@ TEST(cancel_from_within_on_delta) {
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
     struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
-                                 "/v1/chat/completions"};
+                                 "/v1/chat/completions", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
 
     struct cancel_ctx ctx = {0};
@@ -471,7 +497,8 @@ TEST(cancel_from_within_on_delta) {
 TEST(start_rejects_bad_args) {
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
-    struct oi_llm_config cfg = {"127.0.0.1", 1, 0, NULL, NULL, "/x"};
+    struct oi_llm_config cfg = {
+        "127.0.0.1", 1, 0, NULL, NULL, "/x", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
     oi_llm_request *req;
 
@@ -500,7 +527,7 @@ TEST(start_rejects_bad_args) {
 
 TEST(client_rejects_unsafe_http_fields) {
     struct oi_llm_config cfg = {"api.example.com", 443, 1, NULL, "safe-key",
-                                 "/v1/chat?stream=1"};
+                                 "/v1/chat?stream=1", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
     CHECK(client != NULL);
     oi_llm_client_destroy(client);
@@ -519,6 +546,13 @@ TEST(client_rejects_unsafe_http_fields) {
     cfg.path = "/v1/chat";
     cfg.api_key = "safe\r\nX-Evil: yes";
     CHECK(oi_llm_client_create(&cfg) == NULL);
+
+    cfg.api_key = "safe";
+    cfg.port = 0;
+    CHECK(oi_llm_client_create(&cfg) == NULL);
+    cfg.port = 443;
+    cfg.timeout_ms = -1;
+    CHECK(oi_llm_client_create(&cfg) == NULL);
 }
 
 TEST(cancel_null_safe) { oi_llm_request_cancel(NULL); }
@@ -530,6 +564,7 @@ int main(void) {
     RUN(malformed_sse_json_is_reported_not_dropped);
     RUN(success_response_requires_done_sentinel);
     RUN(unterminated_done_sentinel_completes_stream);
+    RUN(request_deadline_reports_timeout);
     RUN(cancel_from_within_on_delta);
     RUN(start_rejects_bad_args);
     RUN(client_rejects_unsafe_http_fields);

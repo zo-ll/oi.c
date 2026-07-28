@@ -19,6 +19,7 @@ struct oi_llm_client {
     char *ca_file;
     char *api_key;
     char *path;
+    int timeout_ms;
 };
 
 struct oi_llm_request {
@@ -30,6 +31,7 @@ struct oi_llm_request {
     void *user_data;
 
     oi_llm_conn *conn;
+    oi_reactor_timer *timer;
     oi_llm_http_parser *http;
     oi_llm_sse_parser *sse; /* created lazily once we know status is 2xx */
     oi_json_parser *json;   /* reused (reset) across SSE events */
@@ -100,6 +102,7 @@ static int valid_http_field_value(const char *value) {
 
 oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg) {
     if (cfg == NULL || cfg->host == NULL || cfg->path == NULL ||
+        cfg->port == 0 || cfg->timeout_ms < 0 ||
         !valid_http_host(cfg->host) || !valid_http_path(cfg->path) ||
         (cfg->api_key != NULL && !valid_http_field_value(cfg->api_key))) {
         return NULL;
@@ -116,6 +119,7 @@ oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg) {
     c->use_tls = cfg->use_tls;
     c->ca_file = cfg->ca_file ? strdup(cfg->ca_file) : NULL;
     c->api_key = cfg->api_key ? strdup(cfg->api_key) : NULL;
+    c->timeout_ms = cfg->timeout_ms;
 
     if (c->host == NULL || c->path == NULL ||
         (cfg->ca_file != NULL && c->ca_file == NULL) ||
@@ -140,6 +144,7 @@ void oi_llm_client_destroy(oi_llm_client *c) {
 /* ================= request lifecycle ================= */
 
 static void request_teardown(oi_llm_request *req) {
+    oi_reactor_timer_cancel(req->timer);
     if (req->conn) {
         oi_llm_conn_close(req->conn);
     }
@@ -173,6 +178,13 @@ void oi_llm_request_cancel(oi_llm_request *req) {
     }
     req->finished = 1;
     request_teardown(req);
+}
+
+static void request_timed_out(oi_reactor *reactor, void *ud) {
+    (void)reactor;
+    oi_llm_request *req = ud;
+    finish(req, OI_ERR_TIMEOUT, req->http_status, req->error_buf,
+           req->error_len);
 }
 
 /* ================= error-body accumulation ================= */
@@ -456,6 +468,15 @@ oi_status oi_llm_request_start(oi_llm_client *client, oi_reactor *reactor,
         free(req->body);
         free(req);
         return st;
+    }
+
+    if (client->timeout_ms > 0) {
+        st = oi_reactor_timer_start(reactor, client->timeout_ms,
+                                     request_timed_out, req, &req->timer);
+        if (st != OI_OK) {
+            request_teardown(req);
+            return st;
+        }
     }
 
     *out_request = req;

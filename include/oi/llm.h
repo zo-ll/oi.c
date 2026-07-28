@@ -33,7 +33,8 @@ typedef void (*oi_llm_delta_cb)(const char *text, size_t len,
  * Fires exactly once, terminating the request (oi_llm_request itself is
  * freed right after this returns -- don't touch it from inside). `status`
  * is OI_OK on a clean completion of the stream. Otherwise: OI_ERR_IO for
- * a network/TLS failure, OI_ERR_PARSE for a malformed response.
+ * a network/TLS failure, OI_ERR_PARSE for a malformed response, or
+ * OI_ERR_TIMEOUT when the configured request deadline expires.
  * `http_status` is the HTTP status code (0 if a response was never
  * received at all). `error_body`/`error_body_len` hold the raw response
  * body when the server returned a non-2xx status (truncated at 64KiB;
@@ -50,13 +51,14 @@ struct oi_llm_config {
     const char *ca_file; /* NULL = system default trust store */
     const char *api_key; /* sent as "Authorization: Bearer <key>"; NULL to omit */
     const char *path;    /* e.g. "/v1/chat/completions" */
+    int timeout_ms;      /* end-to-end request deadline; 0 disables */
 };
 
 /* Copies everything out of `cfg`; it need not outlive this call. Returns
- * NULL on allocation failure, a missing/invalid host or path, or control
- * characters in an API key (request-header injection is rejected at this
- * boundary). The returned client must outlive every request started
- * against it. */
+ * NULL on allocation failure, an invalid port/deadline, a missing/invalid
+ * host or path, or control characters in an API key (request-header
+ * injection is rejected at this boundary). The returned client must
+ * outlive every request started against it. */
 oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg);
 void oi_llm_client_destroy(oi_llm_client *client);
 

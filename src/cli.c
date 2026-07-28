@@ -40,6 +40,8 @@ static const char *status_str(oi_status st) {
         return "not found";
     case OI_ERR_DENIED:
         return "denied";
+    case OI_ERR_TIMEOUT:
+        return "timeout";
     default:
         return "unknown error";
     }
@@ -62,7 +64,7 @@ static void print_usage(void) {
         "  --model MODEL        model name\n"
         "  --api-key KEY        API key (or set OI_API_KEY)\n"
         "  --ca-file PATH       custom CA bundle for TLS verification\n"
-        "  --timeout-ms MS      request timeout (resolved, not yet enforced)\n"
+        "  --timeout-ms MS      end-to-end request timeout\n"
         "  --tls / --no-tls     use TLS (default: on)\n"
         "  --dry-run            resolve config and print the request, don't send it\n"
         "  -h, --help           show this help\n");
@@ -396,6 +398,7 @@ int main(int argc, char **argv) {
     struct oi_llm_config llm_cfg = {
         cfg.host, (unsigned short)cfg.port, cfg.use_tls,
         cfg.ca_file, cfg.api_key,           cfg.path,
+        cfg.timeout_ms,
     };
     client = oi_llm_client_create(&llm_cfg);
     if (client == NULL) {
