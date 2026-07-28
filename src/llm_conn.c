@@ -1,5 +1,6 @@
 #include "llm_conn.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -268,7 +269,9 @@ static oi_status start_tls_handshake(oi_llm_conn *c) {
     if (c->ssl_ctx == NULL) {
         return OI_ERR_IO;
     }
-    SSL_CTX_set_min_proto_version(c->ssl_ctx, TLS1_2_VERSION);
+    if (!SSL_CTX_set_min_proto_version(c->ssl_ctx, TLS1_2_VERSION)) {
+        return OI_ERR_IO;
+    }
     SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_PEER, NULL);
 
     int loaded = c->ca_file
@@ -288,9 +291,32 @@ static oi_status start_tls_handshake(oi_llm_conn *c) {
     }
 
     SSL_set_connect_state(c->ssl);
-    SSL_set_tlsext_host_name(c->ssl, c->host); /* SNI */
     X509_VERIFY_PARAM *param = SSL_get0_param(c->ssl);
-    X509_VERIFY_PARAM_set1_host(param, c->host, 0);
+    if (param == NULL) {
+        return OI_ERR_IO;
+    }
+
+    unsigned char address[sizeof(struct in6_addr)];
+    int address_family = 0;
+    size_t address_len = 0;
+    if (inet_pton(AF_INET, c->host, address) == 1) {
+        address_family = AF_INET;
+        address_len = sizeof(struct in_addr);
+    } else if (inet_pton(AF_INET6, c->host, address) == 1) {
+        address_family = AF_INET6;
+        address_len = sizeof(struct in6_addr);
+    }
+
+    if (address_family != 0) {
+        if (!X509_VERIFY_PARAM_set1_ip(param, address, address_len)) {
+            return OI_ERR_IO;
+        }
+    } else {
+        if (!SSL_set_tlsext_host_name(c->ssl, c->host) ||
+            !X509_VERIFY_PARAM_set1_host(param, c->host, 0)) {
+            return OI_ERR_IO;
+        }
+    }
 
     c->state = CS_TLS_HANDSHAKE;
     return OI_OK;
