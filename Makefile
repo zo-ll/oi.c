@@ -293,6 +293,19 @@ $(FUZZ_BUILD)/%: test/fuzz/%.c $(LIB_SRCS) | $(FUZZ_BUILD)
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
 		$(INCLUDES) $< $(LIB_SRCS) -o $@ $(LDLIBS)
 
+# The CLI-private render/Markdown pipeline doesn't touch the public
+# library, so this harness links only its own dependency chain (the
+# generic pattern rule above pulls in $(LIB_SRCS), which it doesn't need).
+CLI_RENDER_STREAM_SRCS = src/cli_render_stream.c src/cli_render_style.c \
+	src/cli_markdown_block.c src/cli_markdown_inline.c src/cli_markdown.c \
+	src/cli_render_sanitize.c src/cli_utf8_stream.c src/cli_utf8.c \
+	src/cli_bytebuf.c
+
+$(FUZZ_BUILD)/fuzz_cli_render_stream: test/fuzz/fuzz_cli_render_stream.c $(CLI_RENDER_STREAM_SRCS) | $(FUZZ_BUILD)
+	$(FUZZ_CC) $(CSTD) $(WARN) -g -O1 \
+		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+		$(INCLUDES) $< $(CLI_RENDER_STREAM_SRCS) -o $@ $(LDLIBS)
+
 fuzz: $(FUZZ_BINS)
 	@if [ -z "$(FUZZ_BINS)" ]; then \
 		echo "no fuzz harnesses yet (test/fuzz/fuzz_*.c)"; \
