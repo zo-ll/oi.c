@@ -830,6 +830,35 @@ TEST(interactive_exit_before_submission_creates_no_session) {
     close(master_fd);
 }
 
+TEST(interactive_help_and_exit_are_dispatched_without_a_session) {
+    int master_fd = -1;
+    int slave_fd = -1;
+    pid_t cli;
+    struct interactive_result result;
+    char session_root[128];
+
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-command-session-%d", (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(9, slave_fd, session_root);
+    close(slave_fd);
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "/help\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "Commands:", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
+    CHECK(write_interactive(master_fd, "/exit\r", 6));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        CHECK(WIFEXITED(status));
+        CHECK_EQ(WEXITSTATUS(status), 0);
+    }
+    CHECK(strstr(result.output, "/permissions") != NULL);
+    CHECK(access(session_root, F_OK) != 0);
+    close(master_fd);
+}
+
 int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(help_exits_zero);
@@ -850,5 +879,6 @@ int main(void) {
     RUN(resume_replays_prior_exchange);
     RUN(interactive_repl_preserves_context_across_prompts);
     RUN(interactive_exit_before_submission_creates_no_session);
+    RUN(interactive_help_and_exit_are_dispatched_without_a_session);
     return oi_test_report();
 }

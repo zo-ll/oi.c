@@ -267,6 +267,11 @@ static oi_status prepare_automatic_session(void *user_data,
     return *out_arena == NULL ? OI_ERR_IO : OI_OK;
 }
 
+static const char *current_session_id(void *user_data) {
+    oi_session *const *session = user_data;
+    return session == NULL ? NULL : oi_session_id(*session);
+}
+
 static enum oi_cli_history_tool_outcome history_tool_outcome(
     enum oi_cli_conversation_tool_outcome outcome) {
     switch (outcome) {
@@ -739,6 +744,8 @@ int main(int argc, char **argv) {
                 automatic_session ? prepare_automatic_session : NULL,
             .prepare_user_data =
                 automatic_session ? &automatic_context : NULL,
+            .session_id = current_session_id,
+            .session_id_user_data = &session,
         };
         st = oi_cli_repl_run(client, reactor, turn_arena, tools,
                              &repl_config);

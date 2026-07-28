@@ -29,6 +29,8 @@ struct oi_cli_repl_config {
     void *event_user_data;
     oi_cli_repl_prepare_cb prepare;
     void *prepare_user_data;
+    const char *(*session_id)(void *user_data);
+    void *session_id_user_data;
 };
 
 oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,

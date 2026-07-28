@@ -1,10 +1,13 @@
 #include "cli_repl.h"
 
+#include "cli_command_dispatch.h"
+#include "cli_commands.h"
 #include "cli_input_history.h"
 #include "cli_present.h"
 #include "cli_prompt.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 static oi_status seed_input_history(
     struct oi_cli_input_history *history,
@@ -75,6 +78,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         char *prompt = NULL;
         size_t prompt_len = 0;
         int exit_requested = 0;
+        struct oi_cli_command_parse parsed;
 
         status = oi_cli_prompt_read(
             config->input_fd, config->output_fd, &input_history, &prompt,
@@ -82,6 +86,48 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         if (status != OI_OK || exit_requested) {
             free(prompt);
             break;
+        }
+        status = oi_cli_command_parse_text(prompt, prompt_len, &parsed);
+        if (status != OI_OK) {
+            free(prompt);
+            break;
+        }
+        if (parsed.kind == OI_CLI_COMMAND_PARSE_UNKNOWN) {
+            if (fprintf(config->err, "oi: unknown command: %.*s\n",
+                        (int)prompt_len, prompt) < 0) {
+                status = OI_ERR_IO;
+                free(prompt);
+                break;
+            }
+            free(prompt);
+            continue;
+        }
+        if (parsed.kind == OI_CLI_COMMAND_PARSE_COMMAND) {
+            struct oi_cli_command_context command_context = {
+                .out = config->out,
+                .err = config->err,
+                .model = config->model,
+                .permission = config->permission,
+                .session_id =
+                    config->session_id == NULL
+                        ? NULL
+                        : config->session_id(
+                              config->session_id_user_data),
+            };
+            enum oi_cli_command_result command_result;
+
+            status = oi_cli_command_dispatch(
+                &parsed, &command_context, &command_result);
+            free(prompt);
+            if (status != OI_OK ||
+                command_result == OI_CLI_COMMAND_EXIT_REPL) {
+                break;
+            }
+            continue;
+        }
+        if (parsed.kind == OI_CLI_COMMAND_PARSE_LITERAL_SLASH) {
+            memmove(prompt, prompt + 1, prompt_len);
+            prompt_len--;
         }
         if (conversation == NULL) {
             oi_arena *conversation_arena = arena;
