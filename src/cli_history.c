@@ -498,6 +498,38 @@ void oi_cli_history_free(struct oi_cli_history *history) {
     memset(history, 0, sizeof *history);
 }
 
+oi_status oi_cli_history_reserve(struct oi_cli_history *history,
+                                 size_t capacity) {
+    if (history == NULL) {
+        return OI_ERR_INVAL;
+    }
+    if (capacity <= history->cap) {
+        return OI_OK;
+    }
+    if (capacity > SIZE_MAX / sizeof *history->records) {
+        return OI_ERR_NOMEM;
+    }
+    size_t cap = history->cap == 0 ? 16 : history->cap;
+    while (cap < capacity) {
+        if (cap > SIZE_MAX / 2) {
+            cap = capacity;
+            break;
+        }
+        cap *= 2;
+    }
+    if (cap > SIZE_MAX / sizeof *history->records) {
+        cap = capacity;
+    }
+    struct oi_cli_history_record *records =
+        realloc(history->records, cap * sizeof *records);
+    if (records == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    history->records = records;
+    history->cap = cap;
+    return OI_OK;
+}
+
 oi_status oi_cli_history_append_take(struct oi_cli_history *history,
                                      struct oi_cli_history_record *record) {
     if (history == NULL || !oi_cli_history_record_is_valid(record)) {
@@ -513,24 +545,9 @@ oi_status oi_cli_history_append_take(struct oi_cli_history *history,
     if (history->len == SIZE_MAX / sizeof *history->records) {
         return OI_ERR_NOMEM;
     }
-    if (history->len == history->cap) {
-        size_t cap = history->cap == 0 ? 16 : history->cap;
-        if (history->cap != 0) {
-            if (cap > SIZE_MAX / 2) {
-                return OI_ERR_NOMEM;
-            }
-            cap *= 2;
-        }
-        if (cap > SIZE_MAX / sizeof *history->records) {
-            cap = SIZE_MAX / sizeof *history->records;
-        }
-        struct oi_cli_history_record *records =
-            realloc(history->records, cap * sizeof *records);
-        if (records == NULL) {
-            return OI_ERR_NOMEM;
-        }
-        history->records = records;
-        history->cap = cap;
+    oi_status st = oi_cli_history_reserve(history, history->len + 1);
+    if (st != OI_OK) {
+        return st;
     }
     history->records[history->len++] = *record;
     oi_cli_history_record_init(record);

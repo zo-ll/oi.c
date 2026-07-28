@@ -133,6 +133,8 @@ oi_status oi_cli_history_record_set_checkpoint(
 
 void oi_cli_history_init(struct oi_cli_history *history);
 void oi_cli_history_free(struct oi_cli_history *history);
+oi_status oi_cli_history_reserve(struct oi_cli_history *history,
+                                 size_t capacity);
 oi_status oi_cli_history_append_take(struct oi_cli_history *history,
                                      struct oi_cli_history_record *record);
 oi_status oi_cli_history_append_clone(
