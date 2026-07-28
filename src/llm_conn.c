@@ -214,6 +214,12 @@ static long conn_raw_write(oi_llm_conn *c, const void *buf, size_t len,
                             int *would_block) {
     *would_block = 0;
     if (c->use_tls) {
+        int rc;
+        int err;
+#ifdef SO_NOSIGPIPE
+        rc = SSL_write(c->ssl, buf, (int)len);
+        err = rc > 0 ? SSL_ERROR_NONE : SSL_get_error(c->ssl, rc);
+#else
         sigset_t sigpipe_set;
         sigset_t old_mask;
         sigset_t pending;
@@ -226,8 +232,8 @@ static long conn_raw_write(oi_llm_conn *c, const void *buf, size_t len,
         if (sigpending(&pending) == 0) {
             had_pending = sigismember(&pending, SIGPIPE);
         }
-        int rc = SSL_write(c->ssl, buf, (int)len);
-        int err = rc > 0 ? SSL_ERROR_NONE : SSL_get_error(c->ssl, rc);
+        rc = SSL_write(c->ssl, buf, (int)len);
+        err = rc > 0 ? SSL_ERROR_NONE : SSL_get_error(c->ssl, rc);
         int saved_errno = errno;
 
         /* SSL_write ultimately writes to a socket without exposing a
@@ -246,6 +252,7 @@ static long conn_raw_write(oi_llm_conn *c, const void *buf, size_t len,
         if (mask_rc != 0) {
             return -2;
         }
+#endif
         if (rc > 0) {
             c->write_needs_read = 0;
             return rc;
