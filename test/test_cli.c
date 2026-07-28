@@ -8,6 +8,7 @@
 #include "test.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pty.h>
@@ -237,13 +238,14 @@ static int write_interactive(int fd, const char *data, size_t len) {
     return 1;
 }
 
-static pid_t start_interactive_cli(unsigned short port, int slave_fd) {
+static pid_t start_interactive_cli(unsigned short port, int slave_fd,
+                                   const char *session_root) {
     pid_t pid = fork();
 
     CHECK(pid >= 0);
     if (pid == 0) {
         char port_text[16];
-        char *argv[11];
+        char *argv[13];
 
         snprintf(port_text, sizeof port_text, "%u", (unsigned)port);
         if (dup2(slave_fd, STDIN_FILENO) < 0 ||
@@ -263,7 +265,9 @@ static pid_t start_interactive_cli(unsigned short port, int slave_fd) {
         argv[6] = (char *)"--api-key";
         argv[7] = (char *)"test-key";
         argv[8] = (char *)"--deny-tools";
-        argv[9] = NULL;
+        argv[9] = (char *)"--session-dir";
+        argv[10] = (char *)session_root;
+        argv[11] = NULL;
         execv(OI_BIN, argv);
         _exit(127);
     }
@@ -719,6 +723,7 @@ TEST(interactive_repl_preserves_context_across_prompts) {
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
+    char session_root[128];
 
     snprintf(capture_path, sizeof capture_path,
              "/tmp/oi-cli-repl-request-%d", (int)getpid());
@@ -729,7 +734,9 @@ TEST(interactive_repl_preserves_context_across_prompts) {
     free(second);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
-    cli = start_interactive_cli(port, slave_fd);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-repl-sessions-%d", (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
     close(slave_fd);
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
@@ -768,6 +775,59 @@ TEST(interactive_repl_preserves_context_across_prompts) {
         CHECK(strstr(requests, "second prompt") != NULL);
     }
     unlink(capture_path);
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char history_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(history_path, sizeof history_path,
+                     "%s/history.oilog", session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+        CHECK(access(history_path, F_OK) == 0);
+        unlink(history_path);
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
+TEST(interactive_exit_before_submission_creates_no_session) {
+    int master_fd = -1;
+    int slave_fd = -1;
+    pid_t cli;
+    struct interactive_result result;
+    char session_root[128];
+
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-lazy-session-%d", (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(9, slave_fd, session_root);
+    close(slave_fd);
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        CHECK(WIFEXITED(status));
+        CHECK_EQ(WEXITSTATUS(status), 0);
+    }
+    CHECK(access(session_root, F_OK) != 0);
+    close(master_fd);
 }
 
 int main(void) {
@@ -789,5 +849,6 @@ int main(void) {
     RUN(tool_turn_limit_is_enforced);
     RUN(resume_replays_prior_exchange);
     RUN(interactive_repl_preserves_context_across_prompts);
+    RUN(interactive_exit_before_submission_creates_no_session);
     return oi_test_report();
 }

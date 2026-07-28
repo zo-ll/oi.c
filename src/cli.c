@@ -5,6 +5,7 @@
 
 #include "cli_loop.h"
 #include "cli_repl.h"
+#include "cli_sessions.h"
 #include "cli_history_repair.h"
 #include "cli_history_store.h"
 #include "cli_tools.h"
@@ -205,6 +206,67 @@ struct persistence_context {
     oi_status last_error;
 };
 
+struct automatic_session_context {
+    oi_session_registry *registry;
+    oi_session **session;
+    const char *root_override;
+    struct oi_cli_session_location *location;
+    struct oi_cli_history_store *store;
+    struct oi_cli_history_replay_state *state;
+    struct persistence_context *persistence;
+    const char *model;
+};
+
+static oi_status prepare_automatic_session(void *user_data,
+                                           oi_arena **out_arena) {
+    struct automatic_session_context *context = user_data;
+    oi_status status;
+
+    if (context == NULL || context->registry == NULL ||
+        context->session == NULL || context->location == NULL ||
+        context->store == NULL || context->state == NULL ||
+        context->persistence == NULL || context->model == NULL ||
+        out_arena == NULL || *context->session != NULL) {
+        return OI_ERR_INVAL;
+    }
+    status = oi_cli_session_location_create(context->root_override,
+                                            context->location);
+    if (status == OI_OK) {
+        status = oi_session_create(
+            context->registry, context->location->id,
+            context->location->history_path, 0, context->session);
+    }
+    if (status == OI_OK) {
+        status = oi_cli_history_store_load(
+            oi_session_log(*context->session), context->store,
+            context->state);
+    }
+    if (status == OI_OK && context->state->needs_transition) {
+        struct oi_cli_history_record transition;
+
+        oi_cli_history_record_init(&transition);
+        status = oi_cli_history_record_set_transition(
+            &transition, context->state->next_record_id,
+            context->store->legacy_messages.len);
+        if (status == OI_OK) {
+            status = oi_cli_history_store_append(
+                context->store, &transition, context->state);
+        }
+        oi_cli_history_record_free(&transition);
+    }
+    if (status != OI_OK) {
+        return status;
+    }
+    context->persistence->store = context->store;
+    context->persistence->state = context->state;
+    context->persistence->turn_id = context->state->next_turn_id;
+    context->persistence->model = context->model;
+    context->persistence->model_len = strlen(context->model);
+    context->persistence->last_error = OI_OK;
+    *out_arena = oi_session_arena(*context->session);
+    return *out_arena == NULL ? OI_ERR_IO : OI_OK;
+}
+
 static enum oi_cli_history_tool_outcome history_tool_outcome(
     enum oi_cli_conversation_tool_outcome outcome) {
     switch (outcome) {
@@ -280,6 +342,7 @@ int main(int argc, char **argv) {
     const char *config_path = NULL;
     const char *session_id = NULL;
     const char *session_dir = ".";
+    int session_dir_set = 0;
     const char *prompt = NULL;
     int cli_use_tls = -1; /* -1 = not specified on the command line */
     int dry_run = 0;
@@ -357,6 +420,7 @@ int main(int argc, char **argv) {
                 return 1;
             }
             session_dir = argv[i];
+            session_dir_set = 1;
             continue;
         }
 
@@ -432,6 +496,7 @@ int main(int argc, char **argv) {
     int interactive =
         prompt == NULL && !dry_run && isatty(STDIN_FILENO) &&
         isatty(STDOUT_FILENO);
+    int automatic_session = interactive && session_id == NULL;
     int owns_prompt = 0;
     if (prompt == NULL && !interactive) {
         oi_status read_status;
@@ -517,6 +582,10 @@ int main(int argc, char **argv) {
     struct oi_cli_history_replay_state replay_state;
     struct oi_cli_message_list initial_context;
     struct persistence_context persistence = {0};
+    struct oi_cli_session_location automatic_location;
+    struct automatic_session_context automatic_context;
+    oi_cli_session_location_init(&automatic_location);
+    memset(&automatic_context, 0, sizeof automatic_context);
     oi_cli_history_store_init(&history_store);
     oi_cli_history_replay_state_init(&replay_state);
     oi_cli_message_list_init(&initial_context);
@@ -599,7 +668,7 @@ int main(int argc, char **argv) {
         persistence.model = cfg.model;
         persistence.model_len = strlen(cfg.model);
         persistence.last_error = OI_OK;
-    } else {
+    } else if (!automatic_session) {
         ephemeral_arena = oi_arena_create(0);
         if (ephemeral_arena == NULL) {
             fprintf(stderr, "oi: out of memory\n");
@@ -607,6 +676,17 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
         turn_arena = ephemeral_arena;
+    }
+    if (automatic_session) {
+        automatic_context.registry = sessions;
+        automatic_context.session = &session;
+        automatic_context.root_override =
+            session_dir_set ? session_dir : NULL;
+        automatic_context.location = &automatic_location;
+        automatic_context.store = &history_store;
+        automatic_context.state = &replay_state;
+        automatic_context.persistence = &persistence;
+        automatic_context.model = cfg.model;
     }
 
     struct oi_llm_config llm_cfg = {
@@ -649,9 +729,16 @@ int main(int argc, char **argv) {
             .initial_context =
                 session_id != NULL ? &initial_context : NULL,
             .on_event =
-                session_id != NULL ? persist_conversation_event : NULL,
+                session_id != NULL || automatic_session
+                    ? persist_conversation_event
+                    : NULL,
             .event_user_data =
-                session_id != NULL ? &persistence : NULL,
+                session_id != NULL || automatic_session ? &persistence
+                                                        : NULL,
+            .prepare =
+                automatic_session ? prepare_automatic_session : NULL,
+            .prepare_user_data =
+                automatic_session ? &automatic_context : NULL,
         };
         st = oi_cli_repl_run(client, reactor, turn_arena, tools,
                              &repl_config);
@@ -672,6 +759,7 @@ cleanup:
     oi_cli_message_list_free(&initial_context);
     oi_cli_history_replay_state_free(&replay_state);
     oi_cli_history_store_free(&history_store);
+    oi_cli_session_location_free(&automatic_location);
     oi_arena_destroy(ephemeral_arena);
     oi_tool_registry_destroy(tools);
     oi_llm_client_destroy(client);

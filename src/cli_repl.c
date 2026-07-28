@@ -40,11 +40,14 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     oi_cli_conversation *conversation = NULL;
     oi_status status;
 
-    if (client == NULL || reactor == NULL || arena == NULL || tools == NULL ||
+    if (client == NULL || reactor == NULL || tools == NULL ||
         config == NULL || config->model == NULL || config->max_turns <= 0 ||
         config->tool_timeout_ms < 0 || config->permission == NULL ||
         config->input_fd < 0 || config->output_fd < 0 ||
         config->out == NULL || config->err == NULL) {
+        return OI_ERR_INVAL;
+    }
+    if (arena == NULL && config->prepare == NULL) {
         return OI_ERR_INVAL;
     }
 
@@ -67,12 +70,6 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     conversation_config.permission_user_data = config->permission;
     conversation_config.on_event = oi_cli_present_event;
     conversation_config.event_user_data = &present;
-    status = oi_cli_conversation_create(
-        client, reactor, arena, tools, &conversation_config,
-        config->initial_context, &conversation);
-    if (status != OI_OK) {
-        goto cleanup_present;
-    }
 
     for (;;) {
         char *prompt = NULL;
@@ -85,6 +82,27 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         if (status != OI_OK || exit_requested) {
             free(prompt);
             break;
+        }
+        if (conversation == NULL) {
+            oi_arena *conversation_arena = arena;
+
+            if (config->prepare != NULL) {
+                status = config->prepare(config->prepare_user_data,
+                                         &conversation_arena);
+            }
+            if (status == OI_OK && conversation_arena == NULL) {
+                status = OI_ERR_INVAL;
+            }
+            if (status == OI_OK) {
+                status = oi_cli_conversation_create(
+                    client, reactor, conversation_arena, tools,
+                    &conversation_config, config->initial_context,
+                    &conversation);
+            }
+            if (status != OI_OK) {
+                free(prompt);
+                break;
+            }
         }
 
         oi_cli_present_reset_turn(&present);
@@ -109,7 +127,6 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     }
 
     oi_cli_conversation_destroy(conversation);
-cleanup_present:
     oi_cli_present_free(&present);
 cleanup_history:
     oi_cli_input_history_free(&input_history);

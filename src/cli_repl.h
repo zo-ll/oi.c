@@ -12,6 +12,9 @@
 #include "oi/status.h"
 #include "oi/tool.h"
 
+typedef oi_status (*oi_cli_repl_prepare_cb)(void *user_data,
+                                            oi_arena **out_arena);
+
 struct oi_cli_repl_config {
     const char *model;
     int max_turns;
@@ -24,6 +27,8 @@ struct oi_cli_repl_config {
     const struct oi_cli_message_list *initial_context;
     oi_cli_conversation_event_cb on_event;
     void *event_user_data;
+    oi_cli_repl_prepare_cb prepare;
+    void *prepare_user_data;
 };
 
 oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
