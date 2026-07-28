@@ -51,7 +51,6 @@ struct oi_tool_call {
     size_t out_cap;
 
     int child_exited;
-    int cancelled;
     int timed_out;
     int stdout_eof;
     int exec_failed;
@@ -118,13 +117,7 @@ static void free_call(oi_tool_call *call) {
 }
 
 static void maybe_finish(oi_tool_call *call) {
-    if (!call->child_exited ||
-        (!call->cancelled && !call->timed_out && !call->stdout_eof)) {
-        return;
-    }
-
-    if (call->cancelled) {
-        free_call(call);
+    if (!call->child_exited || (!call->timed_out && !call->stdout_eof)) {
         return;
     }
 
@@ -645,14 +638,12 @@ void oi_tool_call_cancel(oi_tool_call *call) {
         /* The child creates a fresh process group before exec, so a tool
          * cannot leave grandchildren running after its call is cancelled. */
         terminate_process_group(call->pid);
+        while (waitpid(call->pid, NULL, 0) < 0 && errno == EINTR) {
+            /* SIGKILL has already made termination inevitable. */
+        }
     }
-    call->cancelled = 1;
     call->on_output = NULL;
     call->on_done = NULL;
-    if (call->destroyed_flag) {
-        *call->destroyed_flag = 1;
-        call->destroyed_flag = NULL;
-    }
     close_call_io(call);
-    maybe_finish(call);
+    free_call(call);
 }
