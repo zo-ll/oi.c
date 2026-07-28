@@ -85,4 +85,4 @@ supports running many independent agent sessions concurrently.
 
 - No project name was settled during design; the repo is named `oi.c` as the concrete name
   chosen at repo-creation time.
-- Private repository for now; license decision deferred.
+- Distributed under the MIT License.

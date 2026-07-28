@@ -91,9 +91,8 @@ they do not promise persistence across power loss.
 Public headers are in `include/oi`. Ownership and callback lifetime rules
 are documented beside each API.
 
-## Current limits
+## License
 
-- No license has been selected, so the repository currently grants no
-  redistribution license.
+Licensed under the MIT License. See [LICENSE](LICENSE).
 
 The original architecture notes and rationale are in [PLAN.md](PLAN.md).
