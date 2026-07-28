@@ -1,0 +1,1 @@
+{"tool_calls":[{"id":"c1","type":"function","function":{"name":"sh","arguments":"{\"cmd\":\"ls\"}"}}]}

@@ -1,0 +1,8 @@
+: comment
+event: ping
+data: {"x":1}
+
+retry: 100
+
+data: tail
+
