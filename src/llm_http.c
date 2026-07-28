@@ -4,7 +4,20 @@
 #include <string.h>
 #include <strings.h>
 
+#include "compat.h"
+
 #define OI_HTTP_MAX_LINE 8192
+
+/*
+ * Upper bound on a Content-Length or chunk-size value. These are digit
+ * strings from an untrusted response header, and accumulating them
+ * unbounded overflows the signed accumulator -- undefined behavior, and
+ * in practice a negative `remaining` that makes the body reader treat
+ * the length as effectively unlimited. Anything above this is rejected
+ * as malformed instead; it is orders of magnitude beyond any real
+ * chat-completion response, so a legitimate server never trips it.
+ */
+#define OI_HTTP_MAX_BODY_VALUE ((long)1 << 40) /* 1 TiB */
 
 enum state {
     ST_STATUS_LINE,
@@ -182,13 +195,24 @@ static oi_status handle_header_line(oi_llm_http_parser *p) {
         }
     } else if (name_len == 14 &&
                strncasecmp(p->line_buf, "Content-Length", 14) == 0) {
+        if (value_len == 0) {
+            p->state = ST_ERROR; /* header present but with no digits */
+            return OI_ERR_PARSE;
+        }
         long v = 0;
         for (size_t k = vi; k < p->line_len; k++) {
             if (!is_digit_c(p->line_buf[k])) {
                 p->state = ST_ERROR;
                 return OI_ERR_PARSE;
             }
-            v = v * 10 + (p->line_buf[k] - '0');
+            long digit = p->line_buf[k] - '0';
+            /* Checked before the multiply, so the accumulator never
+             * overflows rather than being detected after the fact. */
+            if (v > (OI_HTTP_MAX_BODY_VALUE - digit) / 10) {
+                p->state = ST_ERROR;
+                return OI_ERR_PARSE;
+            }
+            v = v * 10 + digit;
         }
         p->content_length = v;
     }
@@ -210,6 +234,10 @@ static oi_status handle_chunk_size_line(oi_llm_http_parser *p) {
         } else if (c >= 'A' && c <= 'F') {
             v = 10 + (c - 'A');
         } else {
+            p->state = ST_ERROR;
+            return OI_ERR_PARSE;
+        }
+        if (size > (OI_HTTP_MAX_BODY_VALUE - v) / 16) {
             p->state = ST_ERROR;
             return OI_ERR_PARSE;
         }
@@ -289,10 +317,9 @@ oi_status oi_llm_http_parser_feed(oi_llm_http_parser *p, const void *bytes,
 
     const unsigned char *buf = bytes;
     int destroyed = 0;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdangling-pointer"
+OI_DIAG_PUSH_IGNORE_DANGLING
     p->destroyed_flag = &destroyed;
-#pragma GCC diagnostic pop
+OI_DIAG_POP
 
     size_t i = 0;
     while (i < len) {

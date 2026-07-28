@@ -208,6 +208,81 @@ TEST(create_null_callbacks_ok) {
 
 TEST(destroy_null_safe) { oi_llm_http_parser_destroy(NULL); }
 
+/*
+ * Regression tests for three signed-overflow defects found by
+ * test/fuzz/fuzz_http.c. Content-Length and chunk-size digits arrive
+ * from an untrusted response header and were accumulated into a `long`
+ * with no bound, so a long enough digit run was undefined behavior and
+ * could leave the body reader with a negative byte count.
+ */
+
+TEST(overlong_content_length_errors) {
+    struct capture c = {0};
+    oi_llm_http_parser *p =
+        oi_llm_http_parser_create(on_headers_done, on_body, &c);
+
+    const char *doc =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 99999999999999999999999\r\n"
+        "\r\n";
+    CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_ERR_PARSE);
+    CHECK(oi_llm_http_parser_failed(p));
+
+    oi_llm_http_parser_destroy(p);
+}
+
+TEST(overlong_chunk_size_errors) {
+    struct capture c = {0};
+    oi_llm_http_parser *p =
+        oi_llm_http_parser_create(on_headers_done, on_body, &c);
+
+    const char *doc =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "ffffffffffffffffffff\r\n";
+    CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_ERR_PARSE);
+    CHECK(oi_llm_http_parser_failed(p));
+
+    oi_llm_http_parser_destroy(p);
+}
+
+TEST(empty_content_length_value_errors) {
+    struct capture c = {0};
+    oi_llm_http_parser *p =
+        oi_llm_http_parser_create(on_headers_done, on_body, &c);
+
+    /* Previously parsed as 0, silently framing the response as having
+     * no body rather than rejecting the malformed header. */
+    const char *doc =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length:\r\n"
+        "\r\n";
+    CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_ERR_PARSE);
+    CHECK(oi_llm_http_parser_failed(p));
+
+    oi_llm_http_parser_destroy(p);
+}
+
+/* The largest accepted values must still parse, so the bound rejects
+ * only genuinely out-of-range input. */
+TEST(large_but_valid_content_length_accepted) {
+    struct capture c = {0};
+    oi_llm_http_parser *p =
+        oi_llm_http_parser_create(on_headers_done, on_body, &c);
+
+    const char *doc =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 1099511627776\r\n" /* exactly 1 TiB */
+        "\r\n";
+    CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_OK);
+    CHECK(c.headers_done);
+    CHECK(!oi_llm_http_parser_failed(p));
+    CHECK(!oi_llm_http_parser_body_done(p)); /* still awaiting the body */
+
+    oi_llm_http_parser_destroy(p);
+}
+
 int main(void) {
     RUN(chunked_response);
     RUN(content_length_response);
@@ -223,5 +298,9 @@ int main(void) {
     RUN(every_split_point_of_chunked_doc);
     RUN(create_null_callbacks_ok);
     RUN(destroy_null_safe);
+    RUN(overlong_content_length_errors);
+    RUN(overlong_chunk_size_errors);
+    RUN(empty_content_length_value_errors);
+    RUN(large_but_valid_content_length_accepted);
     return oi_test_report();
 }
