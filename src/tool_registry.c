@@ -62,7 +62,13 @@ oi_status oi_tool_registry_add(oi_tool_registry *reg, const char *name,
     }
 
     if (reg->count == reg->cap) {
+        if (reg->cap > (size_t)-1 / 2) {
+            return OI_ERR_NOMEM;
+        }
         size_t new_cap = reg->cap == 0 ? 8 : reg->cap * 2;
+        if (new_cap > (size_t)-1 / sizeof *reg->entries) {
+            return OI_ERR_NOMEM;
+        }
         struct oi_tool_entry *ne =
             realloc(reg->entries, new_cap * sizeof *ne);
         if (ne == NULL) {
