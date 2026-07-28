@@ -368,7 +368,8 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
 
     int fd = -1;
     for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC,
+                    ai->ai_protocol);
         if (fd < 0) {
             continue;
         }
