@@ -93,9 +93,16 @@ struct strbuf {
 };
 
 static int strbuf_append(struct strbuf *b, const char *data, size_t len) {
-    if (b->len + len + 1 > b->cap) {
+    if (len > (size_t)-1 - b->len - 1) {
+        return -1;
+    }
+    size_t needed = b->len + len + 1;
+    if (needed > b->cap) {
         size_t new_cap = b->cap == 0 ? 256 : b->cap;
-        while (new_cap < b->len + len + 1) {
+        while (new_cap < needed) {
+            if (new_cap > (size_t)-1 / 2) {
+                return -1;
+            }
             new_cap *= 2;
         }
         char *nb = realloc(b->data, new_cap);
