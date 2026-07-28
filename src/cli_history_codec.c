@@ -24,7 +24,7 @@ static oi_status write_uint64_string(oi_json_writer *writer, uint64_t value) {
 
 static const char *record_kind_name(enum oi_cli_history_record_kind kind,
                                     size_t *out_len) {
-    const char *name;
+    const char *name = NULL;
     switch (kind) {
     case OI_CLI_HISTORY_RECORD_TRANSITION:
         name = "transition";
@@ -50,13 +50,16 @@ static const char *record_kind_name(enum oi_cli_history_record_kind kind,
     case OI_CLI_HISTORY_RECORD_NONE:
         return NULL;
     }
+    if (name == NULL) {
+        return NULL;
+    }
     *out_len = strlen(name);
     return name;
 }
 
 static const char *message_role_name(enum oi_cli_message_role role,
                                      size_t *out_len) {
-    const char *name;
+    const char *name = NULL;
     switch (role) {
     case OI_CLI_MESSAGE_USER:
         name = "user";
@@ -70,13 +73,16 @@ static const char *message_role_name(enum oi_cli_message_role role,
     case OI_CLI_MESSAGE_NONE:
         return NULL;
     }
+    if (name == NULL) {
+        return NULL;
+    }
     *out_len = strlen(name);
     return name;
 }
 
 static const char *tool_outcome_name(enum oi_cli_history_tool_outcome outcome,
                                      size_t *out_len) {
-    const char *name;
+    const char *name = NULL;
     switch (outcome) {
     case OI_CLI_HISTORY_TOOL_COMPLETED:
         name = "completed";
@@ -88,6 +94,9 @@ static const char *tool_outcome_name(enum oi_cli_history_tool_outcome outcome,
         name = "not_executed";
         break;
     case OI_CLI_HISTORY_TOOL_OUTCOME_NONE:
+        return NULL;
+    }
+    if (name == NULL) {
         return NULL;
     }
     *out_len = strlen(name);
