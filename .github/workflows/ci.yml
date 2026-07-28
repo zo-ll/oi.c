@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Both compilers, because the project targets Linux and macOS and
+  # macOS means clang -- a GCC-only construct in the library would
+  # otherwise only surface on someone else's machine.
+  test:
+    name: test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Build and run the full suite
+        run: make CC=${{ matrix.cc }} check
+
+  sanitizers:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [asan, ubsan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      # ThreadSanitizer's shadow mapping assumes fewer ASLR bits than
+      # recent kernels hand out; without this it aborts at startup with
+      # "unexpected memory mapping" before running a single test.
+      - name: Narrow ASLR entropy for ThreadSanitizer
+        if: matrix.target == 'tsan'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: make ${{ matrix.target }}
+        run: make ${{ matrix.target }}
+
+  # Secondary memory check: catches what ASan's redzone model doesn't,
+  # and runs against an uninstrumented build since the two allocators
+  # cannot coexist.
+  valgrind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev valgrind
+      - name: make valgrind
+        run: make valgrind
+
+  # A short regression run over the checked-in seed corpora -- enough to
+  # catch a parser change that reintroduces a known crash, not a
+  # substitute for an open-ended campaign.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev clang
+      - name: make fuzz-run
+        run: make fuzz-run FUZZ_RUNS=200000
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: build-fuzz/crash-*
+          if-no-files-found: ignore
