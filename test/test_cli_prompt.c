@@ -93,7 +93,7 @@ static struct prompt_result run_prompt(const char *input, size_t input_len,
         result.status = status;
         result.exit_requested = exit_requested;
         result.text_len = text_len;
-        if (text_len <= sizeof result.text) {
+        if (text_len != 0 && text_len <= sizeof result.text) {
             memcpy(result.text, text, text_len);
         }
         (void)write_all(result_pipe[1], &result, sizeof result);
