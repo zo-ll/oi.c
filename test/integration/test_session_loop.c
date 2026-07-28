@@ -619,11 +619,20 @@ TEST(session_resumes_from_its_log) {
     unlink(log_path);
 }
 
+TEST(mock_cleanup_stops_unused_server) {
+    const struct mock_turn turn = {NULL, "data: [DONE]\n\n", 0};
+    struct mock_api api;
+    CHECK(mock_api_start(&api, &turn, 1));
+    mock_api_stop(&api);
+    CHECK_EQ(api.pid, -1);
+}
+
 int main(void) {
     RUN(full_tool_use_loop);
     RUN(denied_tool_never_executes);
     RUN(deferred_permission_resolves);
     RUN(api_error_fails_only_its_own_session);
     RUN(session_resumes_from_its_log);
+    RUN(mock_cleanup_stops_unused_server);
     return oi_test_report();
 }

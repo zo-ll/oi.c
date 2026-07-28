@@ -21,6 +21,7 @@
  */
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -31,6 +32,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Refuses to buffer a request larger than this; no test sends one. */
@@ -283,7 +285,20 @@ static int mock_api_start(struct mock_api *api, const struct mock_turn *turns,
 
 static void mock_api_stop(struct mock_api *api) {
     if (api->pid > 0) {
-        waitpid(api->pid, NULL, 0);
+        pid_t rc = 0;
+        for (int i = 0; i < 20 && rc == 0; i++) {
+            rc = waitpid(api->pid, NULL, WNOHANG);
+            if (rc == 0) {
+                struct timespec delay = {0, 10000000L};
+                nanosleep(&delay, NULL);
+            }
+        }
+        if (rc == 0) {
+            kill(api->pid, SIGKILL);
+            while (waitpid(api->pid, NULL, 0) < 0 && errno == EINTR) {
+                /* retry */
+            }
+        }
         api->pid = -1;
     }
     if (api->capture_path[0] != '\0') {
