@@ -32,6 +32,9 @@ static oi_status editor_reserve(struct oi_cli_editor *editor,
     if (new_data == NULL) {
         return OI_ERR_NOMEM;
     }
+    if (editor->data == NULL) {
+        new_data[0] = '\0';
+    }
     editor->data = new_data;
     editor->cap = new_cap;
     return OI_OK;

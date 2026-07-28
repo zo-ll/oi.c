@@ -27,6 +27,8 @@ TEST(insert_works_at_code_point_boundaries) {
 
     oi_cli_editor_init(&editor);
     CHECK_EQ(oi_cli_editor_insert(&editor, "AB", 2), OI_OK);
+    CHECK_EQ(oi_cli_editor_data(&editor)[oi_cli_editor_length(&editor)],
+             '\0');
     CHECK_EQ(oi_cli_editor_move_left(&editor), OI_OK);
     CHECK_EQ(oi_cli_editor_insert(&editor, cent, sizeof cent), OI_OK);
     CHECK_EQ(oi_cli_editor_length(&editor), 4);
