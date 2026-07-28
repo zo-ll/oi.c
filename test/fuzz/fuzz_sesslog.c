@@ -43,17 +43,22 @@ struct replay_ctx {
     int last_truncated;
 };
 
+static uint64_t digest_record(uint64_t digest, const void *data, size_t len) {
+    const unsigned char *bytes = data;
+    digest = (digest ^ len) * 1099511628211ull;
+    for (size_t i = 0; i < len; i++) {
+        digest = (digest ^ bytes[i]) * 1099511628211ull;
+    }
+    return digest;
+}
+
 static void on_record(const void *data, size_t len, void *user_data) {
     struct replay_ctx *ctx = user_data;
-    const unsigned char *bytes = data;
 
     ctx->count++;
     /* FNV-1a over the length and the bytes, so record boundaries are
      * part of the digest and not just the concatenated payload. */
-    ctx->digest = (ctx->digest ^ len) * 1099511628211ull;
-    for (size_t i = 0; i < len; i++) {
-        ctx->digest = (ctx->digest ^ bytes[i]) * 1099511628211ull;
-    }
+    ctx->digest = digest_record(ctx->digest, data, len);
 
     if (len <= sizeof ctx->last) {
         /* A zero-length record replays as (NULL, 0), and memcpy from a
@@ -121,6 +126,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 after.digest = 14695981039346656037ull;
                 if (oi_sesslog_replay(log, on_record, &after) == OI_OK) {
                     assert(after.count == before.count + 1);
+                    assert(after.digest ==
+                           digest_record(before.digest, probe_record,
+                                         sizeof probe_record));
                     assert(!after.last_truncated);
                     assert(after.last_len == sizeof probe_record);
                     assert(memcmp(after.last, probe_record,
