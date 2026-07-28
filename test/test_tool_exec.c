@@ -397,6 +397,31 @@ TEST(cat_echoes_stdin) {
     oi_tool_registry_destroy(reg);
 }
 
+TEST(stdin_queue_rejects_overflow_without_corrupting_call) {
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+
+    struct out_ctx ctx = {0};
+    oi_tool_call *call = NULL;
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "cat", NULL, allow_cb, NULL,
+                                 capture_output, capture_done, &ctx, &call),
+              OI_OK);
+    CHECK_EQ(oi_tool_call_write_stdin(call, "x", (size_t)-1), OI_ERR_NOMEM);
+    CHECK_EQ(oi_tool_call_write_stdin(call, "ok", 2), OI_OK);
+    CHECK_EQ(oi_tool_call_close_stdin(call), OI_OK);
+
+    run_until(r, &ctx.done, 100);
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.kind, OI_TOOL_EXIT_NORMAL);
+    CHECK_EQ(ctx.len, 2u);
+    CHECK(memcmp(ctx.buf, "ok", 2) == 0);
+
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
 TEST(write_stdin_before_running_rejected) {
     oi_tool_registry *reg = make_registry();
     oi_reactor *r = oi_reactor_create();
@@ -563,6 +588,7 @@ int main(void) {
     RUN(ask_then_resolve_deny);
     RUN(resolve_on_non_pending_call_rejected);
     RUN(cat_echoes_stdin);
+    RUN(stdin_queue_rejects_overflow_without_corrupting_call);
     RUN(write_stdin_before_running_rejected);
     RUN(cancel_from_within_on_output);
     RUN(cancel_kills_long_running_process);

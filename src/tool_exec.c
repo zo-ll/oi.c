@@ -570,10 +570,16 @@ oi_status oi_tool_call_write_stdin(oi_tool_call *call, const void *data,
 
     int was_empty = call->out_off == call->out_len;
 
+    if (len > (size_t)-1 - call->out_len) {
+        return OI_ERR_NOMEM;
+    }
     size_t needed = call->out_len + len;
     if (needed > call->out_cap) {
         size_t new_cap = call->out_cap == 0 ? 4096 : call->out_cap;
         while (new_cap < needed) {
+            if (new_cap > (size_t)-1 / 2) {
+                return OI_ERR_NOMEM;
+            }
             new_cap *= 2;
         }
         char *nb = realloc(call->out_buf, new_cap);
@@ -590,6 +596,7 @@ oi_status oi_tool_call_write_stdin(oi_tool_call *call, const void *data,
         oi_status st = oi_reactor_add(call->reactor, call->stdin_fd,
                                        OI_EV_WRITE, on_stdin_event, call);
         if (st != OI_OK) {
+            call->out_len -= len;
             return st;
         }
     }
