@@ -346,6 +346,36 @@ TEST(write_before_connected_rejected) {
 
 TEST(close_null_safe) { oi_llm_conn_close(NULL); }
 
+static void custom_sigpipe_handler(int sig) { (void)sig; }
+
+TEST(connection_preserves_sigpipe_disposition) {
+    struct sigaction custom;
+    memset(&custom, 0, sizeof custom);
+    custom.sa_handler = custom_sigpipe_handler;
+    sigemptyset(&custom.sa_mask);
+    struct sigaction old;
+    CHECK_EQ(sigaction(SIGPIPE, &custom, &old), 0);
+
+    unsigned short port;
+    pid_t child = start_echo_server(&port);
+    oi_reactor *r = oi_reactor_create();
+    struct echo_ctx ctx = {0};
+    struct oi_llm_conn_callbacks cbs = {echo_on_connected, echo_on_data,
+                                         echo_on_error};
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, 0, NULL, &cbs, &ctx,
+                                  &ctx.conn),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    struct sigaction current;
+    CHECK_EQ(sigaction(SIGPIPE, NULL, &current), 0);
+    CHECK(current.sa_handler == custom_sigpipe_handler);
+    CHECK_EQ(sigaction(SIGPIPE, &old, NULL), 0);
+
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
 int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(connect_write_echo_and_reentrant_close);
@@ -354,5 +384,6 @@ int main(void) {
     RUN(connect_rejects_bad_args);
     RUN(write_before_connected_rejected);
     RUN(close_null_safe);
+    RUN(connection_preserves_sigpipe_disposition);
     return oi_test_report();
 }
