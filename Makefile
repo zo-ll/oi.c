@@ -19,6 +19,7 @@ BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
 ifeq ($(UNAME_S),Darwin)
+CSTD += -D_DARWIN_C_SOURCE
 REACTOR_BACKEND = src/reactor_kqueue.c
 else
 REACTOR_BACKEND = src/reactor_epoll.c
