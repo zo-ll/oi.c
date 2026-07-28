@@ -37,6 +37,11 @@ struct oi_cli_history_replay_state {
     int needs_transition;
     int needs_repair;
     int has_partial_assistant;
+
+    /* Last-known durable session settings, reconstructed from
+     * session_setting records. Empty (data == NULL) if never set. */
+    struct oi_cli_string last_model;
+    struct oi_cli_string last_cwd;
 };
 
 void oi_cli_history_replay_state_init(

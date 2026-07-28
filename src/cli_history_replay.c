@@ -423,6 +423,22 @@ static oi_status apply_checkpoint(
     return OI_OK;
 }
 
+static oi_status apply_session_setting(
+    struct replay_builder *builder,
+    const struct oi_cli_history_record *record) {
+    if (builder->phase != REPLAY_EXPECT_USER ||
+        builder->state.has_pending_input || builder->queue_consumed ||
+        string_contains_nul(&record->as.session_setting.value)) {
+        return OI_ERR_PARSE;
+    }
+    struct oi_cli_string *target =
+        record->as.session_setting.field == OI_CLI_HISTORY_SESSION_SETTING_MODEL
+            ? &builder->state.last_model
+            : &builder->state.last_cwd;
+    return oi_cli_string_set(target, record->as.session_setting.value.data,
+                             record->as.session_setting.value.len);
+}
+
 static oi_status apply_typed_record(
     struct replay_builder *builder,
     const struct oi_cli_history_record *record) {
@@ -447,6 +463,8 @@ static oi_status apply_typed_record(
         return apply_queue_resolved(builder, record);
     case OI_CLI_HISTORY_RECORD_CHECKPOINT:
         return apply_checkpoint(builder, record);
+    case OI_CLI_HISTORY_RECORD_SESSION_SETTING:
+        return apply_session_setting(builder, record);
     case OI_CLI_HISTORY_RECORD_NONE:
     case OI_CLI_HISTORY_RECORD_TRANSITION:
         return OI_ERR_PARSE;
@@ -542,6 +560,8 @@ void oi_cli_history_replay_state_free(
     }
     free(state->context);
     oi_cli_string_free(&state->pending_input);
+    oi_cli_string_free(&state->last_model);
+    oi_cli_string_free(&state->last_cwd);
     for (size_t i = 0; i < state->unresolved_tools_len; i++) {
         oi_cli_string_free(&state->unresolved_tools[i].tool_call_id);
     }

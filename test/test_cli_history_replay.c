@@ -398,6 +398,145 @@ TEST(checkpoint_replaces_only_the_context_prefix) {
     oi_cli_history_free(&history);
 }
 
+TEST(session_setting_records_update_last_known_values) {
+    struct oi_cli_history history;
+    struct oi_cli_history_record record;
+    struct oi_cli_history_replay_state state;
+    struct oi_cli_message message;
+    oi_cli_history_init(&history);
+    oi_cli_history_record_init(&record);
+    oi_cli_history_replay_state_init(&state);
+    oi_cli_message_init(&message);
+
+    add_transition(&history, &record, 0);
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 2, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
+                 "gpt-first", 9),
+             OI_OK);
+    append_record(&history, &record);
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 3, OI_CLI_HISTORY_SESSION_SETTING_CWD,
+                 "/home/az/first", 14),
+             OI_OK);
+    append_record(&history, &record);
+    CHECK_EQ(oi_cli_message_set_user(&message, "q1", 2), OI_OK);
+    add_message(&history, &record, &message, 4, 1,
+                OI_CLI_HISTORY_MESSAGE_NORMAL, NULL,
+                OI_CLI_HISTORY_TOOL_OUTCOME_NONE, 0);
+    CHECK_EQ(oi_cli_message_set_assistant(&message, "a1", 2), OI_OK);
+    add_message(&history, &record, &message, 5, 1,
+                OI_CLI_HISTORY_MESSAGE_NORMAL, "model",
+                OI_CLI_HISTORY_TOOL_OUTCOME_NONE, 0);
+    /* A later change to the same field wins (last-write). */
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 6, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
+                 "gpt-second", 10),
+             OI_OK);
+    append_record(&history, &record);
+
+    CHECK_EQ(oi_cli_history_replay(NULL, &history, &state), OI_OK);
+    CHECK_STREQ(state.last_model.data, "gpt-second");
+    CHECK_STREQ(state.last_cwd.data, "/home/az/first");
+
+    oi_cli_message_free(&message);
+    oi_cli_history_replay_state_free(&state);
+    oi_cli_history_record_free(&record);
+    oi_cli_history_free(&history);
+}
+
+TEST(session_setting_rejected_mid_turn) {
+    struct oi_cli_history history;
+    struct oi_cli_history_record record;
+    struct oi_cli_history_replay_state state;
+    struct oi_cli_message message;
+    oi_cli_history_init(&history);
+    oi_cli_history_record_init(&record);
+    oi_cli_history_replay_state_init(&state);
+    oi_cli_message_init(&message);
+
+    add_transition(&history, &record, 0);
+    CHECK_EQ(oi_cli_message_set_user(&message, "q1", 2), OI_OK);
+    add_message(&history, &record, &message, 2, 1,
+                OI_CLI_HISTORY_MESSAGE_NORMAL, NULL,
+                OI_CLI_HISTORY_TOOL_OUTCOME_NONE, 0);
+    /* Mid-turn (assistant reply still pending): rejected. */
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 3, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
+                 "gpt-test", 8),
+             OI_OK);
+    append_record(&history, &record);
+
+    CHECK_EQ(oi_cli_history_replay(NULL, &history, &state), OI_ERR_PARSE);
+
+    oi_cli_message_free(&message);
+    oi_cli_history_replay_state_free(&state);
+    oi_cli_history_record_free(&record);
+    oi_cli_history_free(&history);
+}
+
+TEST(session_setting_rejects_embedded_nul) {
+    struct oi_cli_history history;
+    struct oi_cli_history_record record;
+    struct oi_cli_history_replay_state state;
+    struct oi_cli_message message;
+    static const char with_nul[] = {'g', 'p', 't', '\0', 'x'};
+    oi_cli_history_init(&history);
+    oi_cli_history_record_init(&record);
+    oi_cli_history_replay_state_init(&state);
+    oi_cli_message_init(&message);
+
+    add_transition(&history, &record, 0);
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 2, OI_CLI_HISTORY_SESSION_SETTING_MODEL, with_nul,
+                 sizeof with_nul),
+             OI_OK);
+    append_record(&history, &record);
+
+    CHECK_EQ(oi_cli_history_replay(NULL, &history, &state), OI_ERR_PARSE);
+
+    oi_cli_message_free(&message);
+    oi_cli_history_replay_state_free(&state);
+    oi_cli_history_record_free(&record);
+    oi_cli_history_free(&history);
+}
+
+TEST(session_setting_rejected_while_input_is_queued) {
+    struct oi_cli_history history;
+    struct oi_cli_history_record record;
+    struct oi_cli_history_replay_state state;
+    struct oi_cli_message message;
+    oi_cli_history_init(&history);
+    oi_cli_history_record_init(&record);
+    oi_cli_history_replay_state_init(&state);
+    oi_cli_message_init(&message);
+
+    add_transition(&history, &record, 0);
+    CHECK_EQ(oi_cli_message_set_user(&message, "q1", 2), OI_OK);
+    add_message(&history, &record, &message, 2, 1,
+                OI_CLI_HISTORY_MESSAGE_NORMAL, NULL,
+                OI_CLI_HISTORY_TOOL_OUTCOME_NONE, 0);
+    CHECK_EQ(oi_cli_message_set_assistant(&message, "a1", 2), OI_OK);
+    add_message(&history, &record, &message, 3, 1,
+                OI_CLI_HISTORY_MESSAGE_NORMAL, "model",
+                OI_CLI_HISTORY_TOOL_OUTCOME_NONE, 0);
+    CHECK_EQ(oi_cli_history_record_set_queued_input(&record, 4, 2, "next", 4),
+             OI_OK);
+    append_record(&history, &record);
+    /* A pending queued item still occupies the between-turns slot. */
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, 5, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
+                 "gpt-test", 8),
+             OI_OK);
+    append_record(&history, &record);
+
+    CHECK_EQ(oi_cli_history_replay(NULL, &history, &state), OI_ERR_PARSE);
+
+    oi_cli_message_free(&message);
+    oi_cli_history_replay_state_free(&state);
+    oi_cli_history_record_free(&record);
+    oi_cli_history_free(&history);
+}
+
 int main(void) {
     RUN(empty_and_legacy_histories_replay);
     RUN(typed_history_continues_after_legacy_transition);
@@ -408,5 +547,9 @@ int main(void) {
     RUN(queue_consumption_requires_matching_next_user_message);
     RUN(interrupted_queue_consumption_restores_editable_input);
     RUN(checkpoint_replaces_only_the_context_prefix);
+    RUN(session_setting_records_update_last_known_values);
+    RUN(session_setting_rejected_mid_turn);
+    RUN(session_setting_rejects_embedded_nul);
+    RUN(session_setting_rejected_while_input_is_queued);
     return oi_test_report();
 }
