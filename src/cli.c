@@ -201,8 +201,9 @@ struct persistence_context {
     struct oi_cli_history_store *store;
     struct oi_cli_history_replay_state *state;
     uint64_t turn_id;
-    const char *model;
-    size_t model_len;
+    struct oi_cli_string model; /* owned; may be updated live by /model */
+    const char *metadata_path;  /* borrowed, stable for the process lifetime */
+    const char *session_id;    /* borrowed */
     oi_status last_error;
 };
 
@@ -214,19 +215,24 @@ struct automatic_session_context {
     struct oi_cli_history_store *store;
     struct oi_cli_history_replay_state *state;
     struct persistence_context *persistence;
-    const char *model;
+    struct oi_cli_string *pending_model;
+    const char *default_cwd;
+    FILE *diagnostics;
 };
 
 static oi_status prepare_automatic_session(void *user_data,
                                            oi_arena **out_arena) {
     struct automatic_session_context *context = user_data;
+    struct oi_cli_session_restore restore;
     oi_status status;
 
     if (context == NULL || context->registry == NULL ||
         context->session == NULL || context->location == NULL ||
         context->store == NULL || context->state == NULL ||
-        context->persistence == NULL || context->model == NULL ||
-        out_arena == NULL || *context->session != NULL) {
+        context->persistence == NULL || context->pending_model == NULL ||
+        context->pending_model->data == NULL ||
+        context->default_cwd == NULL || out_arena == NULL ||
+        *context->session != NULL) {
         return OI_ERR_INVAL;
     }
     status = oi_cli_session_location_create(context->root_override,
@@ -257,11 +263,34 @@ static oi_status prepare_automatic_session(void *user_data,
     if (status != OI_OK) {
         return status;
     }
+
+    /* Every automatic session is brand new: bare interactive startup
+     * always begins a fresh timestamped directory (docs/REPL_PLAN.md),
+     * so this always durably records its first-ever effective model/cwd. */
+    oi_cli_session_restore_init(&restore);
+    status = oi_cli_session_restore_settings(
+        context->store, context->state, context->location->metadata_path,
+        context->location->id, /*is_new_session=*/1, /*explicit_model=*/NULL,
+        context->pending_model->data, context->default_cwd,
+        context->diagnostics, &restore);
+    if (status == OI_OK) {
+        status = oi_cli_string_set(context->pending_model, restore.model.data,
+                                   restore.model.len);
+    }
+    if (status == OI_OK) {
+        status = oi_cli_string_set(&context->persistence->model,
+                                   restore.model.data, restore.model.len);
+    }
+    oi_cli_session_restore_free(&restore);
+    if (status != OI_OK) {
+        return status;
+    }
+
     context->persistence->store = context->store;
     context->persistence->state = context->state;
     context->persistence->turn_id = context->state->next_turn_id;
-    context->persistence->model = context->model;
-    context->persistence->model_len = strlen(context->model);
+    context->persistence->metadata_path = context->location->metadata_path;
+    context->persistence->session_id = context->location->id;
     context->persistence->last_error = OI_OK;
     *out_arena = oi_session_arena(*context->session);
     return *out_arena == NULL ? OI_ERR_IO : OI_OK;
@@ -325,7 +354,7 @@ static oi_status persist_conversation_event(
         st = oi_cli_history_record_set_partial_assistant(
             &record, context->state->next_record_id, context->turn_id,
             event->as.bytes.data, event->as.bytes.len,
-            context->model, context->model_len);
+            context->model.data, context->model.len);
         append = st == OI_OK;
     }
     if (append) {
@@ -341,6 +370,37 @@ static oi_status persist_conversation_event(
         context->turn_id = context->state->next_turn_id;
     }
     return st;
+}
+
+/* Durable persistence for a live /model or /cwd change -- cli_repl.c's
+ * controller only requests the change; cli.c owns what persisting it
+ * actually means (a durable history record plus a metadata.json
+ * refresh). NULL `store` means no durable session exists yet (nothing
+ * to persist to yet; the REPL's own live update already applied). */
+static oi_status persist_model_setting(void *user_data, const char *name,
+                                       size_t name_len) {
+    struct persistence_context *persistence = user_data;
+
+    if (persistence->store == NULL) {
+        return OI_OK;
+    }
+    return oi_cli_session_apply_setting(
+        persistence->store, persistence->state, persistence->metadata_path,
+        persistence->session_id, OI_CLI_HISTORY_SESSION_SETTING_MODEL, name,
+        name_len);
+}
+
+static oi_status persist_cwd_setting(void *user_data, const char *path,
+                                     size_t path_len) {
+    struct persistence_context *persistence = user_data;
+
+    if (persistence->store == NULL) {
+        return OI_OK;
+    }
+    return oi_cli_session_apply_setting(
+        persistence->store, persistence->state, persistence->metadata_path,
+        persistence->session_id, OI_CLI_HISTORY_SESSION_SETTING_CWD, path,
+        path_len);
 }
 
 int main(int argc, char **argv) {
@@ -596,6 +656,28 @@ int main(int argc, char **argv) {
     oi_cli_message_list_init(&initial_context);
     struct oi_cli_loop_result loop_result = {0};
     int exit_code = 0;
+    char *default_cwd = getcwd(NULL, 0);
+    struct oi_cli_string pending_model = {0};
+    char *explicit_metadata_path = NULL;
+    int model_flag_explicit = 0;
+
+    for (size_t i = 0; i < n_overrides; i++) {
+        if (strcmp(overrides[i].key, "model") == 0) {
+            model_flag_explicit = 1;
+            break;
+        }
+    }
+    if (default_cwd == NULL) {
+        fprintf(stderr, "oi: failed to resolve current working directory\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+    st = oi_cli_string_set(&pending_model, cfg.model, strlen(cfg.model));
+    if (st != OI_OK) {
+        fprintf(stderr, "oi: out of memory\n");
+        exit_code = 1;
+        goto cleanup;
+    }
 
     reactor = oi_reactor_create();
     sessions = oi_session_registry_create();
@@ -629,6 +711,10 @@ int main(int argc, char **argv) {
             exit_code = 1;
             goto cleanup;
         }
+        /* Captured before this run appends anything (including its own
+         * transition record below), so it reflects whether this ID had
+         * any pre-existing records at all. */
+        int is_new_history = history_store.typed_history.len == 0;
         if (replay_state.needs_transition) {
             struct oi_cli_history_record transition;
             oi_cli_history_record_init(&transition);
@@ -667,11 +753,37 @@ int main(int argc, char **argv) {
             }
         }
         turn_arena = oi_session_arena(session);
+        st = oi_cli_session_metadata_path_for_log(log_path, 0,
+                                                  &explicit_metadata_path);
+        if (st == OI_OK) {
+            struct oi_cli_session_restore restore;
+
+            oi_cli_session_restore_init(&restore);
+            st = oi_cli_session_restore_settings(
+                &history_store, &replay_state, explicit_metadata_path,
+                session_id, is_new_history,
+                model_flag_explicit ? cfg.model : NULL, cfg.model,
+                default_cwd, stderr, &restore);
+            if (st == OI_OK) {
+                st = oi_config_set(&cfg, "model", restore.model.data);
+            }
+            if (st == OI_OK) {
+                st = oi_cli_string_set(&persistence.model, restore.model.data,
+                                       restore.model.len);
+            }
+            oi_cli_session_restore_free(&restore);
+        }
+        if (st != OI_OK) {
+            fprintf(stderr, "oi: failed to restore session settings: %s\n",
+                    status_str(st));
+            exit_code = 1;
+            goto cleanup;
+        }
         persistence.store = &history_store;
         persistence.state = &replay_state;
         persistence.turn_id = replay_state.next_turn_id;
-        persistence.model = cfg.model;
-        persistence.model_len = strlen(cfg.model);
+        persistence.metadata_path = explicit_metadata_path;
+        persistence.session_id = session_id;
         persistence.last_error = OI_OK;
     } else if (!automatic_session) {
         ephemeral_arena = oi_arena_create(0);
@@ -691,7 +803,9 @@ int main(int argc, char **argv) {
         automatic_context.store = &history_store;
         automatic_context.state = &replay_state;
         automatic_context.persistence = &persistence;
-        automatic_context.model = cfg.model;
+        automatic_context.pending_model = &pending_model;
+        automatic_context.default_cwd = default_cwd;
+        automatic_context.diagnostics = stderr;
     }
 
     struct oi_llm_config llm_cfg = {
@@ -746,6 +860,11 @@ int main(int argc, char **argv) {
                 automatic_session ? &automatic_context : NULL,
             .session_id = current_session_id,
             .session_id_user_data = &session,
+            .pending_model = automatic_session ? &pending_model : NULL,
+            .persist_model = persist_model_setting,
+            .persist_model_user_data = &persistence,
+            .persist_cwd = persist_cwd_setting,
+            .persist_cwd_user_data = &persistence,
         };
         st = oi_cli_repl_run(client, reactor, turn_arena, tools,
                              &repl_config);
@@ -774,6 +893,10 @@ cleanup:
     oi_reactor_destroy(reactor);
     oi_json_writer_destroy(w);
     oi_config_free(&cfg);
+    oi_cli_string_free(&persistence.model);
+    oi_cli_string_free(&pending_model);
+    free(explicit_metadata_path);
+    free(default_cwd);
     if (owns_prompt) {
         free((char *)prompt);
     }
