@@ -4,6 +4,7 @@
 #include "oi/tool.h"
 #include "test.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -823,6 +824,34 @@ TEST(tool_execution_preserves_signal_dispositions) {
     oi_tool_registry_destroy(reg);
 }
 
+TEST(auto_reaped_child_reports_status_unavailable) {
+    struct sigaction ignored;
+    memset(&ignored, 0, sizeof ignored);
+    ignored.sa_handler = SIG_IGN;
+    sigemptyset(&ignored.sa_mask);
+    struct sigaction old;
+    CHECK_EQ(sigaction(SIGCHLD, &ignored, &old), 0);
+
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct out_ctx ctx = {0};
+    oi_tool_call *call = NULL;
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "echo", NULL, allow_cb, NULL,
+                                 capture_output, capture_done, &ctx, &call),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.kind, OI_TOOL_EXIT_FAILED);
+    CHECK_EQ(ctx.code, ECHILD);
+
+    CHECK_EQ(sigaction(SIGCHLD, &old, NULL), 0);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
 int main(void) {
     RUN(run_echo_captures_output_and_normal_exit);
     RUN(nonzero_exit_code_reported);
@@ -846,5 +875,6 @@ int main(void) {
     RUN(child_does_not_inherit_other_tool_descriptors);
     RUN(tool_execution_does_not_reap_unrelated_children);
     RUN(tool_execution_preserves_signal_dispositions);
+    RUN(auto_reaped_child_reports_status_unavailable);
     return oi_test_report();
 }

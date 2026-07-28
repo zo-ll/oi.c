@@ -161,6 +161,15 @@ static void on_pidfd_event(oi_reactor *r, int fd, int revents, void *ud) {
     do {
         rc = waitpid(call->pid, &status, WNOHANG);
     } while (rc < 0 && errno == EINTR);
+    if (rc < 0 && errno == ECHILD) {
+        /* The embedder may use SIG_IGN/SA_NOCLDWAIT for SIGCHLD, causing
+         * the kernel to reap children automatically. The pidfd still
+         * becomes readable, but no exit status remains to collect. */
+        status = 0;
+        call->exec_failed = 1;
+        call->exec_errno = ECHILD;
+        rc = call->pid;
+    }
     if (rc != call->pid) {
         return;
     }
