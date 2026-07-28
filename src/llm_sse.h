@@ -26,4 +26,8 @@ void oi_llm_sse_parser_destroy(oi_llm_sse_parser *p);
 oi_status oi_llm_sse_parser_feed(oi_llm_sse_parser *p, const void *bytes,
                                   size_t len);
 
+/* Confirms end-of-input and dispatches a final non-empty line even when
+ * it was not newline-terminated. Safe to call after any number of feeds. */
+oi_status oi_llm_sse_parser_finish(oi_llm_sse_parser *p);
+
 #endif /* OI_LLM_SSE_H */

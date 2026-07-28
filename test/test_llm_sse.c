@@ -106,6 +106,21 @@ TEST(create_null_callback_ok) {
 
 TEST(destroy_null_safe) { oi_llm_sse_parser_destroy(NULL); }
 
+TEST(finish_dispatches_unterminated_final_line) {
+    struct capture c = {0};
+    oi_llm_sse_parser *p = oi_llm_sse_parser_create(on_event, &c);
+    CHECK_EQ(oi_llm_sse_parser_feed(p, "data: final", 11), OI_OK);
+    CHECK_EQ(c.count, 0);
+    CHECK_EQ(oi_llm_sse_parser_finish(p), OI_OK);
+    CHECK_EQ(c.count, 1);
+    CHECK_EQ(c.lens[0], 5u);
+    CHECK(memcmp(c.events[0], "final", 5) == 0);
+    CHECK_EQ(oi_llm_sse_parser_finish(p), OI_OK);
+    CHECK_EQ(c.count, 1);
+    oi_llm_sse_parser_destroy(p);
+    CHECK_EQ(oi_llm_sse_parser_finish(NULL), OI_ERR_INVAL);
+}
+
 int main(void) {
     RUN(single_event);
     RUN(multiple_events);
@@ -116,5 +131,6 @@ int main(void) {
     RUN(split_across_many_small_feeds);
     RUN(create_null_callback_ok);
     RUN(destroy_null_safe);
+    RUN(finish_dispatches_unterminated_final_line);
     return oi_test_report();
 }

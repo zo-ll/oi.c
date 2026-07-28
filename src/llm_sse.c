@@ -119,3 +119,24 @@ OI_DIAG_POP
     p->destroyed_flag = NULL;
     return OI_OK;
 }
+
+oi_status oi_llm_sse_parser_finish(oi_llm_sse_parser *p) {
+    if (p == NULL) {
+        return OI_ERR_INVAL;
+    }
+    if (p->line_len == 0) {
+        return OI_OK;
+    }
+
+    int destroyed = 0;
+OI_DIAG_PUSH_IGNORE_DANGLING
+    p->destroyed_flag = &destroyed;
+OI_DIAG_POP
+    process_line(p);
+    if (destroyed) {
+        return OI_OK;
+    }
+    p->line_len = 0;
+    p->destroyed_flag = NULL;
+    return OI_OK;
+}

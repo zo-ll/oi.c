@@ -50,6 +50,7 @@ struct oi_llm_request {
      * driving completion. */
     int body_cb_failed;
     oi_status body_cb_status;
+    int saw_done;
 
     int finished;
 
@@ -213,7 +214,18 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
         return;
     }
     if (len == 6 && memcmp(data, "[DONE]", 6) == 0) {
+        if (req->saw_done) {
+            req->body_cb_failed = 1;
+            req->body_cb_status = OI_ERR_PARSE;
+            return;
+        }
+        req->saw_done = 1;
         return; /* sentinel, not JSON; body_done drives actual completion */
+    }
+    if (req->saw_done) {
+        req->body_cb_failed = 1;
+        req->body_cb_status = OI_ERR_PARSE;
+        return;
     }
 
     oi_json_parser_reset(req->json);
@@ -350,6 +362,24 @@ OI_DIAG_POP
 
     if (oi_llm_http_parser_body_done(req->http)) {
         if (req->is_success_status) {
+            int finish_destroyed = 0;
+OI_DIAG_PUSH_IGNORE_DANGLING
+            req->destroyed_flag = &finish_destroyed;
+OI_DIAG_POP
+            st = oi_llm_sse_parser_finish(req->sse);
+            if (finish_destroyed) {
+                return;
+            }
+            req->destroyed_flag = NULL;
+            if (st != OI_OK || req->body_cb_failed || !req->saw_done) {
+                finish(req,
+                       st != OI_OK
+                           ? st
+                           : (req->body_cb_failed ? req->body_cb_status
+                                                  : OI_ERR_PARSE),
+                       req->http_status, NULL, 0);
+                return;
+            }
             finish(req, OI_OK, req->http_status, NULL, 0);
         } else {
             finish(req, OI_ERR_IO, req->http_status, req->error_buf,

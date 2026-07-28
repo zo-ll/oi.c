@@ -336,6 +336,71 @@ TEST(malformed_sse_json_is_reported_not_dropped) {
     waitpid(child, NULL, 0);
 }
 
+TEST(success_response_requires_done_sentinel) {
+    const char *sse_body =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+    size_t total;
+    char *response = build_content_length_response(
+        sse_body, strlen(sse_body), "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL, "/v1/chat"};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct malformed_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, mal_on_delta,
+                                   mal_on_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.done_status, OI_ERR_PARSE);
+    CHECK_EQ(ctx.delta_count, 1);
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+TEST(unterminated_done_sentinel_completes_stream) {
+    const char *sse_body =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"
+        "data: [DONE]";
+    size_t total;
+    char *response = build_content_length_response(
+        sse_body, strlen(sse_body), "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL, "/v1/chat"};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct stream_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.done_status, OI_OK);
+    CHECK_EQ(ctx.delta_count, 1);
+    CHECK_EQ(ctx.text_len, 2u);
+    CHECK(memcmp(ctx.text, "ok", 2) == 0);
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
 /* --- cancellation from within on_delta --- */
 
 struct cancel_ctx {
@@ -463,6 +528,8 @@ int main(void) {
     RUN(streaming_success_delivers_deltas);
     RUN(non_2xx_status_reports_error_body);
     RUN(malformed_sse_json_is_reported_not_dropped);
+    RUN(success_response_requires_done_sentinel);
+    RUN(unterminated_done_sentinel_completes_stream);
     RUN(cancel_from_within_on_delta);
     RUN(start_rejects_bad_args);
     RUN(client_rejects_unsafe_http_fields);
