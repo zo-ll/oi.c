@@ -29,6 +29,17 @@ struct oi_cli_md_span_list {
     size_t cap;
 };
 
+/*
+ * Which block construct produced a line handed to the style renderer.
+ * Shared between cli_markdown_block (the producer) and cli_render_style
+ * (the consumer) so neither depends on the other's header.
+ */
+enum oi_cli_md_block_style {
+    OI_CLI_MD_BLOCK_STYLE_NONE = 0,
+    OI_CLI_MD_BLOCK_STYLE_HEADING,
+    OI_CLI_MD_BLOCK_STYLE_LIST
+};
+
 void oi_cli_md_span_list_init(struct oi_cli_md_span_list *spans);
 oi_status oi_cli_md_span_list_append(struct oi_cli_md_span_list *spans,
                                      size_t start, size_t len,
