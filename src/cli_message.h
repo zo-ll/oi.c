@@ -17,6 +17,11 @@ struct oi_cli_string {
     size_t len;
 };
 
+/* `string` must be zero-initialized or previously managed by these helpers. */
+oi_status oi_cli_string_set(struct oi_cli_string *string, const char *data,
+                            size_t len);
+void oi_cli_string_free(struct oi_cli_string *string);
+
 struct oi_cli_tool_call_value {
     struct oi_cli_string id;
     struct oi_cli_string name;

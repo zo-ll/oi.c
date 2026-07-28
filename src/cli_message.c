@@ -8,8 +8,11 @@ static int bytes_are_valid(const char *data, size_t len) {
     return data != NULL || len == 0;
 }
 
-static oi_status string_copy(struct oi_cli_string *destination,
-                             const char *data, size_t len) {
+oi_status oi_cli_string_set(struct oi_cli_string *destination,
+                            const char *data, size_t len) {
+    if (destination == NULL) {
+        return OI_ERR_INVAL;
+    }
     if (!bytes_are_valid(data, len)) {
         return OI_ERR_INVAL;
     }
@@ -25,20 +28,24 @@ static oi_status string_copy(struct oi_cli_string *destination,
         memcpy(copy, data, len);
     }
     copy[len] = '\0';
+    free(destination->data);
     destination->data = copy;
     destination->len = len;
     return OI_OK;
 }
 
-static void string_free(struct oi_cli_string *string) {
+void oi_cli_string_free(struct oi_cli_string *string) {
+    if (string == NULL) {
+        return;
+    }
     free(string->data);
     memset(string, 0, sizeof *string);
 }
 
 static void tool_call_free(struct oi_cli_tool_call_value *call) {
-    string_free(&call->id);
-    string_free(&call->name);
-    string_free(&call->arguments);
+    oi_cli_string_free(&call->id);
+    oi_cli_string_free(&call->name);
+    oi_cli_string_free(&call->arguments);
 }
 
 static oi_status message_set_content(struct oi_cli_message *message,
@@ -53,7 +60,7 @@ static oi_status message_set_content(struct oi_cli_message *message,
     oi_cli_message_init(&replacement);
     replacement.role = role;
     oi_status st =
-        string_copy(&replacement.content, content, content_len);
+        oi_cli_string_set(&replacement.content, content, content_len);
     if (st != OI_OK) {
         return st;
     }
@@ -73,8 +80,8 @@ void oi_cli_message_free(struct oi_cli_message *message) {
     if (message == NULL) {
         return;
     }
-    string_free(&message->content);
-    string_free(&message->tool_call_id);
+    oi_cli_string_free(&message->content);
+    oi_cli_string_free(&message->tool_call_id);
     for (size_t i = 0; i < message->tool_calls_len; i++) {
         tool_call_free(&message->tool_calls[i]);
     }
@@ -109,9 +116,10 @@ oi_status oi_cli_message_set_tool(struct oi_cli_message *message,
     oi_cli_message_init(&replacement);
     replacement.role = OI_CLI_MESSAGE_TOOL;
     oi_status st =
-        string_copy(&replacement.tool_call_id, tool_call_id, tool_call_id_len);
+        oi_cli_string_set(&replacement.tool_call_id, tool_call_id,
+                          tool_call_id_len);
     if (st == OI_OK) {
-        st = string_copy(&replacement.content, content, content_len);
+        st = oi_cli_string_set(&replacement.content, content, content_len);
     }
     if (st != OI_OK) {
         oi_cli_message_free(&replacement);
@@ -140,12 +148,12 @@ oi_status oi_cli_message_add_tool_call(struct oi_cli_message *message,
 
     struct oi_cli_tool_call_value call;
     memset(&call, 0, sizeof call);
-    oi_status st = string_copy(&call.id, id, id_len);
+    oi_status st = oi_cli_string_set(&call.id, id, id_len);
     if (st == OI_OK) {
-        st = string_copy(&call.name, name, name_len);
+        st = oi_cli_string_set(&call.name, name, name_len);
     }
     if (st == OI_OK) {
-        st = string_copy(&call.arguments, arguments, arguments_len);
+        st = oi_cli_string_set(&call.arguments, arguments, arguments_len);
     }
     if (st != OI_OK) {
         tool_call_free(&call);
