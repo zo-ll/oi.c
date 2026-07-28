@@ -9,6 +9,8 @@ INCLUDES = -Iinclude -Isrc
 LDLIBS = -pthread -lssl -lcrypto
 
 BUILD = build
+VERSION = 0.1.0
+ABI_MAJOR = 0
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib
@@ -25,14 +27,16 @@ LIB = $(BUILD)/liboi.a
 PIC_BUILD = $(BUILD)/pic
 PIC_OBJS = $(LIB_SRCS:src/%.c=$(PIC_BUILD)/%.o)
 LIB_SO = $(BUILD)/liboi.so
+LIB_SO_SONAME = $(BUILD)/liboi.so.$(ABI_MAJOR)
+LIB_SO_REAL = $(BUILD)/liboi.so.$(VERSION)
 
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
 CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c
 
-.PHONY: all lib so cli install test check asan ubsan tsan valgrind fuzz \
-	fuzz-run test-integration clean
+.PHONY: all lib so cli install test check abi-check asan ubsan tsan valgrind \
+	fuzz fuzz-run test-integration clean
 
 all: lib cli
 
@@ -46,7 +50,10 @@ install: all
 	install -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(LIBDIR)" \
 		"$(DESTDIR)$(INCLUDEDIR)/oi"
 	install -m 755 $(CLI_BIN) "$(DESTDIR)$(BINDIR)/oi"
-	install -m 644 $(LIB) $(LIB_SO) "$(DESTDIR)$(LIBDIR)/"
+	install -m 644 $(LIB) $(LIB_SO_REAL) "$(DESTDIR)$(LIBDIR)/"
+	ln -sfn "liboi.so.$(VERSION)" \
+		"$(DESTDIR)$(LIBDIR)/liboi.so.$(ABI_MAJOR)"
+	ln -sfn "liboi.so.$(ABI_MAJOR)" "$(DESTDIR)$(LIBDIR)/liboi.so"
 	install -m 644 include/oi/*.h "$(DESTDIR)$(INCLUDEDIR)/oi/"
 
 $(BUILD):
@@ -64,8 +71,15 @@ $(PIC_BUILD)/%.o: src/%.c | $(PIC_BUILD)
 $(LIB): $(LIB_OBJS)
 	ar rcs $@ $^
 
-$(LIB_SO): $(PIC_OBJS)
-	$(CC) -shared -o $@ $^ $(LDLIBS)
+$(LIB_SO_REAL): $(PIC_OBJS) src/liboi.map
+	$(CC) -shared -Wl,-soname,liboi.so.$(ABI_MAJOR) \
+		-Wl,--version-script=src/liboi.map -o $@ $(PIC_OBJS) $(LDLIBS)
+
+$(LIB_SO_SONAME): $(LIB_SO_REAL)
+	ln -sfn "liboi.so.$(VERSION)" $@
+
+$(LIB_SO): $(LIB_SO_SONAME)
+	ln -sfn "liboi.so.$(ABI_MAJOR)" $@
 
 $(CLI_BIN): $(CLI_SRCS) $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(CLI_SRCS) $(LIB) -o $@ $(LDLIBS)
@@ -103,6 +117,11 @@ test-integration: $(INTEGRATION_BINS)
 # tests too -- they are where the reactor, the socket paths, and the
 # tool subprocesses actually run together.
 check: test test-integration
+
+abi-check: $(LIB_SO_REAL)
+	@nm -D --defined-only --format=posix $(LIB_SO_REAL) | \
+		awk '$$1 ~ /^oi_/ { sub(/@.*/, "", $$1); print $$1 }' | \
+		sort -u | diff -u test/abi_exports.txt -
 
 # Sanitizer variants each recurse into a separate BUILD dir with
 # overridden CFLAGS, reusing every rule above unchanged rather than

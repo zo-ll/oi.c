@@ -37,8 +37,17 @@ make DESTDIR=/tmp/package-root PREFIX=/usr install
 ```
 
 This installs the CLI, both libraries, and public headers under
-`$PREFIX/{bin,lib,include/oi}`. The library is pre-release and does not yet
-promise a stable ABI or shared-library soname.
+`$PREFIX/{bin,lib,include/oi}`. The shared library is installed as
+`liboi.so.0.1.0` with `liboi.so.0` (runtime) and `liboi.so` (development)
+symlinks.
+
+The project follows semantic release versions and is currently `0.1.0`.
+Its public C ABI is deliberately exported through an allowlist and carries
+ABI major `0` in the SONAME. The API remains pre-stable: additions are
+expected during `0.x`, but an incompatible ABI change must advance the
+SONAME major. Patch releases preserve the current ABI; obsolete APIs should
+be deprecated for at least one release before removal when practical.
+`make abi-check` verifies the exported symbol set.
 
 ## CLI
 
