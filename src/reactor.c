@@ -6,8 +6,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/timerfd.h>
-#include <unistd.h>
+
+#include "reactor_process.h"
 
 /* The generic layer passes OI_EV_* bits straight through to the backend
  * without translation; keep the two bit-layouts in lockstep. */
@@ -35,14 +35,36 @@ struct oi_reactor {
     size_t capacity;
     size_t registered_count;
     int stop_requested;
+    uint64_t next_native_id;
+    struct oi_reactor_timer *timers;
+    struct oi_reactor_process *processes;
 };
 
 struct oi_reactor_timer {
     oi_reactor *reactor;
-    int fd;
+    uint64_t id;
+    uintptr_t backend_handle;
     oi_reactor_timer_cb cb;
     void *user_data;
+    int active;
+    struct oi_reactor_timer *next;
 };
+
+struct oi_reactor_process {
+    oi_reactor *reactor;
+    uint64_t id;
+    uintptr_t backend_handle;
+    pid_t pid;
+    oi_reactor_process_cb cb;
+    void *user_data;
+    int active;
+    struct oi_reactor_process *next;
+};
+
+#define TOKEN_KIND_SHIFT 62
+#define TOKEN_PAYLOAD_MASK ((UINT64_C(1) << TOKEN_KIND_SHIFT) - 1)
+#define TOKEN_TIMER (UINT64_C(1) << TOKEN_KIND_SHIFT)
+#define TOKEN_PROCESS (UINT64_C(2) << TOKEN_KIND_SHIFT)
 
 oi_reactor *oi_reactor_create(void) {
     oi_reactor *r = malloc(sizeof *r);
@@ -60,6 +82,9 @@ oi_reactor *oi_reactor_create(void) {
     r->capacity = 0;
     r->registered_count = 0;
     r->stop_requested = 0;
+    r->next_native_id = 1;
+    r->timers = NULL;
+    r->processes = NULL;
     return r;
 }
 
@@ -68,6 +93,16 @@ void oi_reactor_destroy(oi_reactor *r) {
         return;
     }
     oi_reactor_backend_destroy(r->backend);
+    while (r->timers != NULL) {
+        oi_reactor_timer *next = r->timers->next;
+        free(r->timers);
+        r->timers = next;
+    }
+    while (r->processes != NULL) {
+        oi_reactor_process *next = r->processes->next;
+        free(r->processes);
+        r->processes = next;
+    }
     free(r->entries);
     free(r);
 }
@@ -106,7 +141,8 @@ static oi_status validate_fd_interest(int fd, int interest) {
 }
 
 static uint64_t registration_token(int fd, uint32_t generation) {
-    return ((uint64_t)generation << 32) | (uint32_t)fd;
+    return (((uint64_t)generation << 32) | (uint32_t)fd) &
+           TOKEN_PAYLOAD_MASK;
 }
 
 oi_status oi_reactor_add(oi_reactor *r, int fd, int interest,
@@ -125,6 +161,7 @@ oi_status oi_reactor_add(oi_reactor *r, int fd, int interest,
     }
 
     uint32_t generation = r->entries[fd].generation + 1;
+    generation &= UINT32_C(0x3fffffff);
     if (generation == 0) {
         generation = 1;
     }
@@ -208,6 +245,46 @@ int oi_reactor_step(oi_reactor *r, int timeout_ms, oi_status *out_status) {
 
     int dispatched = 0;
     for (int i = 0; i < n; i++) {
+        uint64_t kind = tokens[i] >> TOKEN_KIND_SHIFT;
+        if (kind == 1) {
+            uint64_t id = tokens[i] & TOKEN_PAYLOAD_MASK;
+            oi_reactor_timer **link = &r->timers;
+            while (*link != NULL && (*link)->id != id) {
+                link = &(*link)->next;
+            }
+            if (*link != NULL) {
+                oi_reactor_timer *timer = *link;
+                *link = timer->next;
+                oi_reactor_backend_timer_remove(r->backend,
+                                                 timer->backend_handle);
+                timer->active = 0;
+                timer->next = NULL;
+                r->registered_count--;
+                timer->cb(r, timer->user_data);
+                dispatched++;
+            }
+            continue;
+        }
+        if (kind == 2) {
+            uint64_t id = tokens[i] & TOKEN_PAYLOAD_MASK;
+            oi_reactor_process **link = &r->processes;
+            while (*link != NULL && (*link)->id != id) {
+                link = &(*link)->next;
+            }
+            if (*link != NULL) {
+                oi_reactor_process *process = *link;
+                *link = process->next;
+                oi_reactor_backend_process_remove(r->backend,
+                                                   process->backend_handle);
+                process->active = 0;
+                process->next = NULL;
+                r->registered_count--;
+                process->cb(r, process->pid, process->user_data);
+                dispatched++;
+            }
+            continue;
+        }
+
         int fd = (int)(uint32_t)tokens[i];
         uint32_t generation = (uint32_t)(tokens[i] >> 32);
         if ((size_t)fd >= r->capacity || !r->entries[fd].in_use ||
@@ -245,23 +322,6 @@ void oi_reactor_stop(oi_reactor *r) {
     r->stop_requested = 1;
 }
 
-static void on_timer_event(oi_reactor *r, int fd, int revents,
-                            void *user_data) {
-    (void)revents;
-    oi_reactor_timer *timer = user_data;
-    uint64_t expirations;
-    ssize_t n;
-    do {
-        n = read(fd, &expirations, sizeof expirations);
-    } while (n < 0 && errno == EINTR);
-    (void)n;
-
-    oi_reactor_remove(r, fd);
-    close(fd);
-    timer->fd = -1;
-    timer->cb(r, timer->user_data);
-}
-
 oi_status oi_reactor_timer_start(oi_reactor *r, int timeout_ms,
                                   oi_reactor_timer_cb cb, void *user_data,
                                   oi_reactor_timer **out_timer) {
@@ -273,32 +333,25 @@ oi_status oi_reactor_timer_start(oi_reactor *r, int timeout_ms,
     if (timer == NULL) {
         return OI_ERR_NOMEM;
     }
-    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (fd < 0) {
-        free(timer);
-        return OI_ERR_IO;
-    }
-
-    struct itimerspec spec;
-    memset(&spec, 0, sizeof spec);
-    spec.it_value.tv_sec = timeout_ms / 1000;
-    spec.it_value.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
-    if (timerfd_settime(fd, 0, &spec, NULL) != 0) {
-        close(fd);
-        free(timer);
-        return OI_ERR_IO;
-    }
-
     timer->reactor = r;
-    timer->fd = fd;
+    timer->id = r->next_native_id++;
+    if (timer->id == 0 || timer->id > TOKEN_PAYLOAD_MASK) {
+        timer->id = 1;
+        r->next_native_id = 2;
+    }
     timer->cb = cb;
     timer->user_data = user_data;
-    oi_status st = oi_reactor_add(r, fd, OI_EV_READ, on_timer_event, timer);
+    timer->active = 1;
+    timer->next = r->timers;
+    oi_status st = oi_reactor_backend_timer_add(
+        r->backend, timeout_ms, TOKEN_TIMER | timer->id,
+        &timer->backend_handle);
     if (st != OI_OK) {
-        close(fd);
         free(timer);
         return st;
     }
+    r->timers = timer;
+    r->registered_count++;
     *out_timer = timer;
     return OI_OK;
 }
@@ -307,9 +360,70 @@ void oi_reactor_timer_cancel(oi_reactor_timer *timer) {
     if (timer == NULL) {
         return;
     }
-    if (timer->fd >= 0) {
-        oi_reactor_remove(timer->reactor, timer->fd);
-        close(timer->fd);
+    if (timer->active) {
+        oi_reactor_timer **link = &timer->reactor->timers;
+        while (*link != NULL && *link != timer) {
+            link = &(*link)->next;
+        }
+        if (*link == timer) {
+            *link = timer->next;
+        }
+        oi_reactor_backend_timer_remove(timer->reactor->backend,
+                                         timer->backend_handle);
+        timer->reactor->registered_count--;
     }
     free(timer);
+}
+
+oi_status oi_reactor_process_start(oi_reactor *r, pid_t pid,
+                                    oi_reactor_process_cb cb, void *user_data,
+                                    oi_reactor_process **out_process) {
+    if (r == NULL || pid <= 0 || cb == NULL || out_process == NULL) {
+        return OI_ERR_INVAL;
+    }
+    oi_reactor_process *process = calloc(1, sizeof *process);
+    if (process == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    process->reactor = r;
+    process->id = r->next_native_id++;
+    if (process->id == 0 || process->id > TOKEN_PAYLOAD_MASK) {
+        process->id = 1;
+        r->next_native_id = 2;
+    }
+    process->pid = pid;
+    process->cb = cb;
+    process->user_data = user_data;
+    process->active = 1;
+    process->next = r->processes;
+    oi_status st = oi_reactor_backend_process_add(
+        r->backend, pid, TOKEN_PROCESS | process->id,
+        &process->backend_handle);
+    if (st != OI_OK) {
+        free(process);
+        return st;
+    }
+    r->processes = process;
+    r->registered_count++;
+    *out_process = process;
+    return OI_OK;
+}
+
+void oi_reactor_process_cancel(oi_reactor_process *process) {
+    if (process == NULL) {
+        return;
+    }
+    if (process->active) {
+        oi_reactor_process **link = &process->reactor->processes;
+        while (*link != NULL && *link != process) {
+            link = &(*link)->next;
+        }
+        if (*link == process) {
+            *link = process->next;
+        }
+        oi_reactor_backend_process_remove(process->reactor->backend,
+                                           process->backend_handle);
+        process->reactor->registered_count--;
+    }
+    free(process);
 }

@@ -11,11 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "compat.h"
+#include "reactor_process.h"
 
 enum call_state { CALL_PENDING_PERMISSION, CALL_RUNNING };
 
@@ -35,7 +35,7 @@ struct oi_tool_call {
     const oi_json_value *args;
 
     pid_t pid;
-    int pid_fd;     /* pidfd watched by this call's reactor */
+    oi_reactor_process *process;
     oi_reactor_timer *timer;
     int timeout_ms;
     int stdin_fd;  /* -1 once closed */
@@ -72,16 +72,6 @@ static oi_status set_nonblocking(int fd) {
     return OI_OK;
 }
 
-static int open_pidfd(pid_t pid) {
-#ifdef SYS_pidfd_open
-    return (int)syscall(SYS_pidfd_open, pid, 0);
-#else
-    (void)pid;
-    errno = ENOSYS;
-    return -1;
-#endif
-}
-
 static void close_call_io(oi_tool_call *call) {
     if (call->stdin_fd >= 0) {
         oi_reactor_remove(call->reactor, call->stdin_fd);
@@ -105,10 +95,7 @@ static void close_call_io(oi_tool_call *call) {
 
 static void free_call(oi_tool_call *call) {
     oi_reactor_timer_cancel(call->timer);
-    if (call->pid_fd >= 0) {
-        oi_reactor_remove(call->reactor, call->pid_fd);
-        close(call->pid_fd);
-    }
+    oi_reactor_process_cancel(call->process);
     close_call_io(call);
     if (call->destroyed_flag) {
         *call->destroyed_flag = 1;
@@ -143,33 +130,30 @@ static void maybe_finish(oi_tool_call *call) {
     free_call(call);
 }
 
-static void on_pidfd_event(oi_reactor *r, int fd, int revents, void *ud) {
+static void on_process_event(oi_reactor *r, pid_t pid, void *ud) {
     (void)r;
-    (void)fd;
-    (void)revents;
     oi_tool_call *call = ud;
 
     int status;
     pid_t rc;
     do {
-        rc = waitpid(call->pid, &status, WNOHANG);
+        rc = waitpid(pid, &status, 0);
     } while (rc < 0 && errno == EINTR);
     if (rc < 0 && errno == ECHILD) {
         /* The embedder may use SIG_IGN/SA_NOCLDWAIT for SIGCHLD, causing
-         * the kernel to reap children automatically. The pidfd still
-         * becomes readable, but no exit status remains to collect. */
+         * the kernel to reap children automatically. The native process
+         * watcher still fires, but no exit status remains to collect. */
         status = 0;
         call->exec_failed = 1;
         call->exec_errno = ECHILD;
-        rc = call->pid;
+        rc = pid;
     }
-    if (rc != call->pid) {
+    if (rc != pid) {
         return;
     }
 
-    oi_reactor_remove(call->reactor, call->pid_fd);
-    close(call->pid_fd);
-    call->pid_fd = -1;
+    oi_reactor_process_cancel(call->process);
+    call->process = NULL;
     call->child_exited = 1;
     call->exit_status = status;
     maybe_finish(call);
@@ -384,19 +368,9 @@ child_failed:;
     close(stdout_pipe[1]);
     close(err_pipe[1]);
 
-    int pid_fd = open_pidfd(pid);
-    if (pid_fd < 0) {
-        close(stdin_pipe[1]);
-        close(stdout_pipe[0]);
-        close(err_pipe[0]);
-        kill_and_reap(pid);
-        return OI_ERR_IO;
-    }
-
     if (set_nonblocking(stdin_pipe[1]) != OI_OK ||
         set_nonblocking(stdout_pipe[0]) != OI_OK ||
         set_nonblocking(err_pipe[0]) != OI_OK) {
-        close(pid_fd);
         close(stdin_pipe[1]);
         close(stdout_pipe[0]);
         close(err_pipe[0]);
@@ -405,7 +379,6 @@ child_failed:;
     }
 
     call->pid = pid;
-    call->pid_fd = pid_fd;
     call->stdin_fd = stdin_pipe[1];
     call->stdout_fd = stdout_pipe[0];
     call->err_fd = err_pipe[0];
@@ -416,8 +389,6 @@ child_failed:;
         close(call->stdin_fd);
         close(call->stdout_fd);
         close(call->err_fd);
-        close(call->pid_fd);
-        call->pid_fd = -1;
         kill_and_reap(pid);
         return st;
     }
@@ -428,22 +399,18 @@ child_failed:;
         close(call->stdin_fd);
         close(call->stdout_fd);
         close(call->err_fd);
-        close(call->pid_fd);
-        call->pid_fd = -1;
         kill_and_reap(pid);
         return st;
     }
 
-    st = oi_reactor_add(call->reactor, call->pid_fd, OI_EV_READ,
-                         on_pidfd_event, call);
+    st = oi_reactor_process_start(call->reactor, call->pid, on_process_event,
+                                   call, &call->process);
     if (st != OI_OK) {
         oi_reactor_remove(call->reactor, call->stdout_fd);
         oi_reactor_remove(call->reactor, call->err_fd);
         close(call->stdin_fd);
         close(call->stdout_fd);
         close(call->err_fd);
-        close(call->pid_fd);
-        call->pid_fd = -1;
         kill_and_reap(pid);
         return st;
     }
@@ -454,13 +421,12 @@ child_failed:;
         if (st != OI_OK) {
             oi_reactor_remove(call->reactor, call->stdout_fd);
             oi_reactor_remove(call->reactor, call->err_fd);
-            oi_reactor_remove(call->reactor, call->pid_fd);
+            oi_reactor_process_cancel(call->process);
+            call->process = NULL;
             close(call->stdin_fd);
             close(call->stdout_fd);
             close(call->err_fd);
-            close(call->pid_fd);
             call->stdin_fd = call->stdout_fd = call->err_fd = -1;
-            call->pid_fd = -1;
             kill_and_reap(pid);
             return st;
         }
@@ -511,7 +477,6 @@ oi_status oi_tool_call_start(oi_tool_registry *reg, oi_reactor *r,
     call->stdin_fd = -1;
     call->stdout_fd = -1;
     call->err_fd = -1;
-    call->pid_fd = -1;
 
     if (decision == OI_TOOL_ASK) {
         call->state = CALL_PENDING_PERMISSION;

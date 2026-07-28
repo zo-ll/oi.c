@@ -2,6 +2,7 @@
 #define OI_REACTOR_BACKEND_H
 
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "oi/status.h"
 
@@ -36,6 +37,19 @@ oi_status oi_reactor_backend_add(oi_reactor_backend *b, int fd, int interest,
 oi_status oi_reactor_backend_modify(oi_reactor_backend *b, int fd,
                                      int interest, uint64_t token);
 oi_status oi_reactor_backend_remove(oi_reactor_backend *b, int fd);
+
+/* Native one-shot timer and child-exit watches. `out_handle` is an opaque
+ * backend-owned identifier used only to cancel the watch. */
+oi_status oi_reactor_backend_timer_add(oi_reactor_backend *b, int timeout_ms,
+                                        uint64_t token,
+                                        uintptr_t *out_handle);
+oi_status oi_reactor_backend_timer_remove(oi_reactor_backend *b,
+                                           uintptr_t handle);
+oi_status oi_reactor_backend_process_add(oi_reactor_backend *b, pid_t pid,
+                                          uint64_t token,
+                                          uintptr_t *out_handle);
+oi_status oi_reactor_backend_process_remove(oi_reactor_backend *b,
+                                             uintptr_t handle);
 
 /*
  * Waits up to timeout_ms (-1 = indefinite) for ready fds. On success,
