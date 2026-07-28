@@ -4,10 +4,34 @@ static int is_continuation(unsigned char byte) {
     return (byte & 0xc0U) == 0x80U;
 }
 
+oi_status oi_cli_utf8_lead_length(unsigned char first, size_t *out_len) {
+    if (out_len == NULL) {
+        return OI_ERR_INVAL;
+    }
+    if (first <= 0x7fU) {
+        *out_len = 1;
+        return OI_OK;
+    }
+    if (first >= 0xc2U && first <= 0xdfU) {
+        *out_len = 2;
+        return OI_OK;
+    }
+    if (first >= 0xe0U && first <= 0xefU) {
+        *out_len = 3;
+        return OI_OK;
+    }
+    if (first >= 0xf0U && first <= 0xf4U) {
+        *out_len = 4;
+        return OI_OK;
+    }
+    return OI_ERR_PARSE;
+}
+
 oi_status oi_cli_utf8_sequence_length(const unsigned char *data, size_t len,
                                       size_t *out_len) {
     unsigned char first;
     size_t sequence_len;
+    oi_status status;
 
     if (data == NULL || out_len == NULL) {
         return OI_ERR_INVAL;
@@ -17,18 +41,13 @@ oi_status oi_cli_utf8_sequence_length(const unsigned char *data, size_t len,
     }
 
     first = data[0];
-    if (first <= 0x7fU) {
+    status = oi_cli_utf8_lead_length(first, &sequence_len);
+    if (status != OI_OK) {
+        return status;
+    }
+    if (sequence_len == 1) {
         *out_len = 1;
         return OI_OK;
-    }
-    if (first >= 0xc2U && first <= 0xdfU) {
-        sequence_len = 2;
-    } else if (first >= 0xe0U && first <= 0xefU) {
-        sequence_len = 3;
-    } else if (first >= 0xf0U && first <= 0xf4U) {
-        sequence_len = 4;
-    } else {
-        return OI_ERR_PARSE;
     }
 
     if (len < sequence_len) {

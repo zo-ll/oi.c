@@ -92,6 +92,34 @@ TEST(boundary_functions_reject_bad_arguments_and_offsets) {
         OI_ERR_INVAL);
 }
 
+TEST(lead_length_classifies_every_byte_class) {
+    size_t len = 0;
+
+    CHECK_EQ(oi_cli_utf8_lead_length(0x00, &len), OI_OK);
+    CHECK_EQ(len, 1);
+    CHECK_EQ(oi_cli_utf8_lead_length(0x7f, &len), OI_OK);
+    CHECK_EQ(len, 1);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xc2, &len), OI_OK);
+    CHECK_EQ(len, 2);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xdf, &len), OI_OK);
+    CHECK_EQ(len, 2);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xe0, &len), OI_OK);
+    CHECK_EQ(len, 3);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xef, &len), OI_OK);
+    CHECK_EQ(len, 3);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xf0, &len), OI_OK);
+    CHECK_EQ(len, 4);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xf4, &len), OI_OK);
+    CHECK_EQ(len, 4);
+
+    CHECK_EQ(oi_cli_utf8_lead_length(0x80, &len), OI_ERR_PARSE);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xc0, &len), OI_ERR_PARSE);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xc1, &len), OI_ERR_PARSE);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xf5, &len), OI_ERR_PARSE);
+    CHECK_EQ(oi_cli_utf8_lead_length(0xff, &len), OI_ERR_PARSE);
+    CHECK_EQ(oi_cli_utf8_lead_length(0x41, NULL), OI_ERR_INVAL);
+}
+
 TEST(sequence_function_rejects_bad_arguments) {
     static const unsigned char text[] = {'A'};
     size_t len = 0;
@@ -109,6 +137,7 @@ int main(void) {
     RUN(validation_rejects_malformed_sequences);
     RUN(boundaries_move_across_mixed_text);
     RUN(boundary_functions_reject_bad_arguments_and_offsets);
+    RUN(lead_length_classifies_every_byte_class);
     RUN(sequence_function_rejects_bad_arguments);
     return oi_test_report();
 }
