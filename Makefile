@@ -40,7 +40,7 @@ SHARED_FLAGS = -shared -Wl,-soname,liboi.so.$(ABI_MAJOR) \
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
-CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c src/cli_conversation.c src/cli_utf8.c src/cli_editor.c src/cli_input_history.c src/cli_terminal.c src/cli_input.c src/cli_prompt_state.c src/cli_render.c src/cli_prompt.c src/cli_present.c src/cli_repl.c src/cli_sessions.c src/cli_commands.c src/cli_command_dispatch.c src/cli_bytebuf.c src/cli_utf8_stream.c src/cli_render_sanitize.c src/cli_markdown.c src/cli_render_style.c src/cli_markdown_inline.c src/cli_markdown_block.c src/cli_render_stream.c src/cli_session_metadata.c src/cli_session_metadata_codec.c
+CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c src/cli_conversation.c src/cli_utf8.c src/cli_editor.c src/cli_input_history.c src/cli_terminal.c src/cli_input.c src/cli_prompt_state.c src/cli_render.c src/cli_prompt.c src/cli_present.c src/cli_repl.c src/cli_sessions.c src/cli_commands.c src/cli_command_dispatch.c src/cli_bytebuf.c src/cli_utf8_stream.c src/cli_render_sanitize.c src/cli_markdown.c src/cli_render_style.c src/cli_markdown_inline.c src/cli_markdown_block.c src/cli_render_stream.c src/cli_session_metadata.c src/cli_session_metadata_codec.c src/cli_session_metadata_store.c
 
 .PHONY: all lib so cli install test check abi-check asan ubsan tsan valgrind \
 	fuzz fuzz-run test-integration clean
@@ -162,6 +162,9 @@ $(BUILD)/test_cli_session_metadata: test/test_cli_session_metadata.c src/cli_ses
 
 $(BUILD)/test_cli_session_metadata_codec: test/test_cli_session_metadata_codec.c src/cli_session_metadata_codec.c src/cli_session_metadata.c src/cli_message.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_session_metadata_codec.c src/cli_session_metadata.c src/cli_message.c $(LIB) -o $@ $(LDLIBS)
+
+$(BUILD)/test_cli_session_metadata_store: test/test_cli_session_metadata_store.c src/cli_session_metadata_store.c src/cli_session_metadata_codec.c src/cli_session_metadata.c src/cli_message.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_session_metadata_store.c src/cli_session_metadata_codec.c src/cli_session_metadata.c src/cli_message.c $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/test_cli_prompt: test/test_cli_prompt.c src/cli_prompt.c src/cli_prompt_state.c src/cli_render.c src/cli_terminal.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c src/cli_commands.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_prompt.c src/cli_prompt_state.c src/cli_render.c src/cli_terminal.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c src/cli_commands.c $(LIB) -o $@ $(LDLIBS) $(PTY_LIBS)
