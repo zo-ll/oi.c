@@ -38,7 +38,7 @@ static uint32_t decode_u32le(const unsigned char *buf) {
 static oi_status scan_for_valid_end(int fd, off_t file_size,
                                      off_t *out_valid_end) {
     off_t pos = OI_SESSLOG_HEADER_LEN;
-    while (pos + 4 <= file_size) {
+    while (pos <= file_size && file_size - pos >= 4) {
         unsigned char len_buf[4];
         ssize_t n = pread(fd, len_buf, sizeof len_buf, pos);
         if (n < 0) {
@@ -51,10 +51,10 @@ static oi_status scan_for_valid_end(int fd, off_t file_size,
         if (rec_len > OI_SESSLOG_MAX_RECORD) {
             break; /* implausible: treat as corruption, stop before it */
         }
-        off_t record_end = pos + 4 + (off_t)rec_len;
-        if (record_end > file_size) {
+        if ((off_t)rec_len > file_size - pos - 4) {
             break; /* truncated payload */
         }
+        off_t record_end = pos + 4 + (off_t)rec_len;
         pos = record_end;
     }
     *out_valid_end = pos;
@@ -200,14 +200,14 @@ oi_status oi_sesslog_replay(oi_sesslog *log, oi_sesslog_record_cb cb,
     }
 
     off_t pos = OI_SESSLOG_HEADER_LEN;
-    while (pos + 4 <= st.st_size) {
+    while (pos <= st.st_size && st.st_size - pos >= 4) {
         unsigned char len_buf[4];
         ssize_t n = pread(log->fd, len_buf, sizeof len_buf, pos);
         if (n != (ssize_t)sizeof len_buf) {
             return OI_ERR_IO; /* open() already validated/truncated the file */
         }
         uint32_t rec_len = decode_u32le(len_buf);
-        if (pos + 4 + (off_t)rec_len > st.st_size) {
+        if ((off_t)rec_len > st.st_size - pos - 4) {
             return OI_ERR_IO;
         }
 
