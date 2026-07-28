@@ -147,9 +147,6 @@ static oi_status handle_status_line(oi_llm_http_parser *p) {
 }
 
 static oi_status finish_headers(oi_llm_http_parser *p) {
-    if (p->on_headers_done) {
-        p->on_headers_done(p->status_code, p->user_data);
-    }
     if (p->is_chunked) {
         p->state = ST_CHUNK_SIZE_LINE;
     } else if (p->content_length >= 0) {
@@ -164,6 +161,9 @@ static oi_status finish_headers(oi_llm_http_parser *p) {
          * Scoped simplification -- OpenAI-compatible APIs always set
          * one or the other; a general client would read until close. */
         p->state = ST_DONE;
+    }
+    if (p->on_headers_done) {
+        p->on_headers_done(p->status_code, p->user_data);
     }
     return OI_OK;
 }
@@ -282,7 +282,8 @@ static int is_line_state(enum state s) {
            s == ST_FINAL_CRLF;
 }
 
-static oi_status on_line_complete(oi_llm_http_parser *p) {
+static oi_status on_line_complete(oi_llm_http_parser *p,
+                                   const int *destroyed) {
     oi_status st;
     switch (p->state) {
     case ST_STATUS_LINE:
@@ -304,6 +305,9 @@ static oi_status on_line_complete(oi_llm_http_parser *p) {
         p->state = ST_ERROR;
         st = OI_ERR_PARSE;
         break;
+    }
+    if (*destroyed) {
+        return OI_OK;
     }
     p->line_len = 0;
     return st;
@@ -339,7 +343,7 @@ OI_DIAG_POP
                 if (p->line_len > 0 && p->line_buf[p->line_len - 1] == '\r') {
                     p->line_len--;
                 }
-                oi_status st = on_line_complete(p);
+                oi_status st = on_line_complete(p, &destroyed);
                 if (destroyed) {
                     return OI_OK; /* `p` was freed by a reentrant destroy */
                 }

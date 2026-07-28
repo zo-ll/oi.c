@@ -208,6 +208,27 @@ TEST(create_null_callbacks_ok) {
 
 TEST(destroy_null_safe) { oi_llm_http_parser_destroy(NULL); }
 
+struct destroy_headers_ctx {
+    oi_llm_http_parser *parser;
+    int called;
+};
+
+static void destroy_on_headers(int status_code, void *ud) {
+    (void)status_code;
+    struct destroy_headers_ctx *ctx = ud;
+    ctx->called++;
+    oi_llm_http_parser_destroy(ctx->parser);
+}
+
+TEST(destroy_from_headers_callback_is_safe) {
+    struct destroy_headers_ctx ctx = {0};
+    ctx.parser = oi_llm_http_parser_create(destroy_on_headers, NULL, &ctx);
+    const char *doc =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
+    CHECK_EQ(oi_llm_http_parser_feed(ctx.parser, doc, strlen(doc)), OI_OK);
+    CHECK_EQ(ctx.called, 1);
+}
+
 /*
  * Regression tests for three signed-overflow defects found by
  * test/fuzz/fuzz_http.c. Content-Length and chunk-size digits arrive
@@ -298,6 +319,7 @@ int main(void) {
     RUN(every_split_point_of_chunked_doc);
     RUN(create_null_callbacks_ok);
     RUN(destroy_null_safe);
+    RUN(destroy_from_headers_callback_is_safe);
     RUN(overlong_content_length_errors);
     RUN(overlong_chunk_size_errors);
     RUN(empty_content_length_value_errors);
