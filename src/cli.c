@@ -183,12 +183,17 @@ static void on_done(oi_status status, int http_status, const char *error_body,
 
 struct replay_ctx {
     int index;
+    int output_failed;
 };
 
 static void replay_cb(const void *data, size_t len, void *ud) {
     struct replay_ctx *ctx = ud;
     const char *role = (ctx->index % 2 == 0) ? "user" : "assistant";
-    printf("[resumed %s] %.*s\n", role, (int)len, (const char *)data);
+    if (printf("[resumed %s] ", role) < 0 ||
+        (len > 0 && fwrite(data, 1, len, stdout) != len) ||
+        putchar('\n') == EOF) {
+        ctx->output_failed = 1;
+    }
     ctx->index++;
 }
 
@@ -409,8 +414,17 @@ int main(int argc, char **argv) {
     }
 
     char log_path[4096];
-    snprintf(log_path, sizeof log_path, "%s/%s.oilog", session_dir,
-             session_id);
+    int log_path_len = snprintf(log_path, sizeof log_path, "%s/%s.oilog",
+                                session_dir, session_id);
+    if (log_path_len < 0 || (size_t)log_path_len >= sizeof log_path) {
+        fprintf(stderr, "oi: session log path is too long\n");
+        oi_json_writer_destroy(w);
+        oi_config_free(&cfg);
+        if (owns_prompt) {
+            free((char *)prompt);
+        }
+        return 1;
+    }
 
     /* All of oi_reactor_destroy/oi_session_registry_destroy/
      * oi_llm_client_destroy are documented NULL-safe, so a single
@@ -440,7 +454,13 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     struct replay_ctx rctx = {0};
-    oi_sesslog_replay(oi_session_log(session), replay_cb, &rctx);
+    st = oi_sesslog_replay(oi_session_log(session), replay_cb, &rctx);
+    if (st != OI_OK || rctx.output_failed) {
+        fprintf(stderr, "oi: failed to replay session: %s\n",
+                status_str(st != OI_OK ? st : OI_ERR_IO));
+        exit_code = 1;
+        goto cleanup;
+    }
 
     struct oi_llm_config llm_cfg = {
         cfg.host, (unsigned short)cfg.port, cfg.use_tls,
@@ -476,9 +496,18 @@ int main(int argc, char **argv) {
     printf("\n");
 
     if (ctx.exit_code == 0) {
-        oi_sesslog_append(oi_session_log(session), prompt, strlen(prompt));
-        oi_sesslog_append(oi_session_log(session), ctx.response.data,
-                           ctx.response.len);
+        st = oi_sesslog_append(oi_session_log(session), prompt,
+                                strlen(prompt));
+        if (st == OI_OK) {
+            st = oi_sesslog_append(oi_session_log(session), ctx.response.data,
+                                    ctx.response.len);
+        }
+        if (st != OI_OK) {
+            fprintf(stderr, "oi: failed to persist session: %s\n",
+                    status_str(st));
+            oi_session_fail(session);
+            ctx.exit_code = 1;
+        }
     }
     exit_code = ctx.exit_code;
 

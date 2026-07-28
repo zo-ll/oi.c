@@ -278,6 +278,25 @@ TEST(missing_config_file_fails) {
     CHECK_EQ(r.exit_code, 1);
 }
 
+TEST(overlong_session_path_fails_cleanly) {
+    char *long_dir = malloc(5000);
+    CHECK(long_dir != NULL);
+    memset(long_dir, 'x', 4999);
+    long_dir[4999] = '\0';
+    char *argv[] = {(char *)OI_BIN,
+                     (char *)"--api-key",
+                     (char *)"test-key",
+                     (char *)"--session-dir",
+                     long_dir,
+                     (char *)"hello",
+                     NULL};
+    struct run_result r;
+    run_cli(argv, &r);
+    CHECK_EQ(r.exit_code, 1);
+    CHECK(strstr(r.output, "path is too long") != NULL);
+    free(long_dir);
+}
+
 /* --- end-to-end streaming through a mock server --- */
 
 TEST(end_to_end_streaming_reply) {
@@ -420,6 +439,7 @@ int main(void) {
     RUN(config_file_is_applied);
     RUN(cli_flag_overrides_config_file);
     RUN(missing_config_file_fails);
+    RUN(overlong_session_path_fails_cleanly);
     RUN(end_to_end_streaming_reply);
     RUN(resume_replays_prior_exchange);
     return oi_test_report();
