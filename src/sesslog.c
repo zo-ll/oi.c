@@ -30,6 +30,12 @@ static uint32_t decode_u32le(const unsigned char *buf) {
            ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
 }
 
+static void best_effort_truncate(int fd, off_t size) {
+    if (ftruncate(fd, size) != 0) {
+        return;
+    }
+}
+
 /* Walks records from just after the header, bounding every offset
  * against the file's actual size (rather than relying on read() EOF
  * detection), so a length prefix claiming more than what's really
@@ -90,7 +96,7 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log) {
         if (n != (ssize_t)sizeof header) {
             /* Keep a failed first write from leaving a file that looks
              * permanently corrupt to the next open attempt. */
-            (void)ftruncate(fd, 0);
+            best_effort_truncate(fd, 0);
             close(fd);
             return OI_ERR_IO;
         }
@@ -182,7 +188,7 @@ oi_status oi_sesslog_append(oi_sesslog *log, const void *data, size_t len) {
          * partial tail now instead of waiting for a future reopen to
          * discover and recover it. The lifetime flock excludes another
          * appender from racing this rollback. */
-        (void)ftruncate(log->fd, before.st_size);
+        best_effort_truncate(log->fd, before.st_size);
         return OI_ERR_IO;
     }
     return OI_OK;
