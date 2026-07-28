@@ -20,6 +20,9 @@ struct oi_arena {
 };
 
 static struct oi_block *block_alloc(size_t capacity) {
+    if (capacity > (size_t)-1 - sizeof(struct oi_block)) {
+        return NULL;
+    }
     struct oi_block *b = malloc(sizeof *b + capacity);
     if (b == NULL) {
         return NULL;

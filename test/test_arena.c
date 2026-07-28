@@ -12,6 +12,10 @@ TEST(create_destroy) {
     oi_arena_destroy(NULL); /* NULL-safe */
 }
 
+TEST(create_rejects_overflowing_block_size) {
+    CHECK(oi_arena_create(SIZE_MAX) == NULL);
+}
+
 TEST(alloc_rejects_bad_args) {
     oi_arena *a = oi_arena_create(64);
     CHECK(oi_arena_alloc(NULL, 8) == NULL);
@@ -156,6 +160,7 @@ TEST(used_null_safe) { CHECK_EQ(oi_arena_used(NULL), 0u); }
 
 int main(void) {
     RUN(create_destroy);
+    RUN(create_rejects_overflowing_block_size);
     RUN(alloc_rejects_bad_args);
     RUN(alloc_returns_usable_memory);
     RUN(allocations_are_aligned);
