@@ -2,20 +2,28 @@ CC ?= cc
 CSTD = -std=c11 -D_POSIX_C_SOURCE=200809L
 WARN = -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Werror
 CFLAGS ?= -g -O0
-INCLUDES = -Iinclude -Isrc
+OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null)
+OPENSSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
+INCLUDES = -Iinclude -Isrc $(OPENSSL_CFLAGS)
 # openssl (libssl/libcrypto) is the one deliberate exception to "no
 # build-time dependency beyond a C toolchain" -- see PLAN.md and the
 # issue #4 commit that introduces the LLM client's TLS support.
-LDLIBS = -pthread -lssl -lcrypto
+LDLIBS = -pthread $(OPENSSL_LIBS)
 
 BUILD = build
 VERSION = 0.1.0
 ABI_MAJOR = 0
+UNAME_S := $(shell uname -s)
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib
 INCLUDEDIR ?= $(PREFIX)/include
-LIB_SRCS = src/reactor.c src/reactor_epoll.c src/arena.c src/json_value.c src/json_parse.c src/json_write.c src/llm_http.c src/llm_sse.c src/llm_conn.c src/llm.c src/tool_registry.c src/tool_exec.c src/sesslog.c src/session.c src/config.c
+ifeq ($(UNAME_S),Darwin)
+REACTOR_BACKEND = src/reactor_kqueue.c
+else
+REACTOR_BACKEND = src/reactor_epoll.c
+endif
+LIB_SRCS = src/reactor.c $(REACTOR_BACKEND) src/arena.c src/json_value.c src/json_parse.c src/json_write.c src/llm_http.c src/llm_sse.c src/llm_conn.c src/llm.c src/tool_registry.c src/tool_exec.c src/sesslog.c src/session.c src/config.c
 LIB_OBJS = $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
 LIB = $(BUILD)/liboi.a
 
@@ -26,9 +34,23 @@ LIB = $(BUILD)/liboi.a
 # touch the .so).
 PIC_BUILD = $(BUILD)/pic
 PIC_OBJS = $(LIB_SRCS:src/%.c=$(PIC_BUILD)/%.o)
+ifeq ($(UNAME_S),Darwin)
+LIB_SO = $(BUILD)/liboi.dylib
+LIB_SO_SONAME = $(BUILD)/liboi.$(ABI_MAJOR).dylib
+LIB_SO_REAL = $(BUILD)/liboi.$(VERSION).dylib
+SHARED_DEPS = src/liboi.exports.macos
+SHARED_FLAGS = -dynamiclib \
+	-Wl,-install_name,$(LIBDIR)/liboi.$(ABI_MAJOR).dylib \
+	-Wl,-current_version,$(VERSION) -Wl,-compatibility_version,$(VERSION) \
+	-Wl,-exported_symbols_list,src/liboi.exports.macos
+else
 LIB_SO = $(BUILD)/liboi.so
 LIB_SO_SONAME = $(BUILD)/liboi.so.$(ABI_MAJOR)
 LIB_SO_REAL = $(BUILD)/liboi.so.$(VERSION)
+SHARED_DEPS = src/liboi.map
+SHARED_FLAGS = -shared -Wl,-soname,liboi.so.$(ABI_MAJOR) \
+	-Wl,--version-script=src/liboi.map
+endif
 
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
@@ -51,9 +73,10 @@ install: all
 		"$(DESTDIR)$(INCLUDEDIR)/oi"
 	install -m 755 $(CLI_BIN) "$(DESTDIR)$(BINDIR)/oi"
 	install -m 644 $(LIB) $(LIB_SO_REAL) "$(DESTDIR)$(LIBDIR)/"
-	ln -sfn "liboi.so.$(VERSION)" \
-		"$(DESTDIR)$(LIBDIR)/liboi.so.$(ABI_MAJOR)"
-	ln -sfn "liboi.so.$(ABI_MAJOR)" "$(DESTDIR)$(LIBDIR)/liboi.so"
+	ln -sfn "$(notdir $(LIB_SO_REAL))" \
+		"$(DESTDIR)$(LIBDIR)/$(notdir $(LIB_SO_SONAME))"
+	ln -sfn "$(notdir $(LIB_SO_SONAME))" \
+		"$(DESTDIR)$(LIBDIR)/$(notdir $(LIB_SO))"
 	install -m 644 include/oi/*.h "$(DESTDIR)$(INCLUDEDIR)/oi/"
 
 $(BUILD):
@@ -71,15 +94,14 @@ $(PIC_BUILD)/%.o: src/%.c | $(PIC_BUILD)
 $(LIB): $(LIB_OBJS)
 	ar rcs $@ $^
 
-$(LIB_SO_REAL): $(PIC_OBJS) src/liboi.map
-	$(CC) -shared -Wl,-soname,liboi.so.$(ABI_MAJOR) \
-		-Wl,--version-script=src/liboi.map -o $@ $(PIC_OBJS) $(LDLIBS)
+$(LIB_SO_REAL): $(PIC_OBJS) $(SHARED_DEPS)
+	$(CC) $(SHARED_FLAGS) -o $@ $(PIC_OBJS) $(LDLIBS)
 
 $(LIB_SO_SONAME): $(LIB_SO_REAL)
-	ln -sfn "liboi.so.$(VERSION)" $@
+	ln -sfn "$(notdir $(LIB_SO_REAL))" $@
 
 $(LIB_SO): $(LIB_SO_SONAME)
-	ln -sfn "liboi.so.$(ABI_MAJOR)" $@
+	ln -sfn "$(notdir $(LIB_SO_SONAME))" $@
 
 $(CLI_BIN): $(CLI_SRCS) $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(CLI_SRCS) $(LIB) -o $@ $(LDLIBS)
@@ -119,9 +141,14 @@ test-integration: $(INTEGRATION_BINS)
 check: test test-integration
 
 abi-check: $(LIB_SO_REAL)
+ifeq ($(UNAME_S),Darwin)
+	@nm -gUj $(LIB_SO_REAL) | sed 's/^_//' | sort -u | \
+		diff -u test/abi_exports.txt -
+else
 	@nm -D --defined-only --format=posix $(LIB_SO_REAL) | \
 		awk '$$1 ~ /^oi_/ { sub(/@.*/, "", $$1); print $$1 }' | \
 		sort -u | diff -u test/abi_exports.txt -
+endif
 
 # Sanitizer variants each recurse into a separate BUILD dir with
 # overridden CFLAGS, reusing every rule above unchanged rather than

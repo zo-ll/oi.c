@@ -1,8 +1,3 @@
-/* pipe2() is a Linux extension, not POSIX -- _GNU_SOURCE exposes it.
- * Scoped to this file rather than loosening the whole project's
- * feature-test macros. */
-#define _GNU_SOURCE
-
 #include "tool_internal.h"
 
 #include <errno.h>
@@ -70,6 +65,57 @@ static oi_status set_nonblocking(int fd) {
         return OI_ERR_IO;
     }
     return OI_OK;
+}
+
+static oi_status set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
+        return OI_ERR_IO;
+    }
+    return OI_OK;
+}
+
+static int make_pipe(int fds[2]) {
+    if (pipe(fds) != 0) {
+        return -1;
+    }
+    if (set_cloexec(fds[0]) != OI_OK || set_cloexec(fds[1]) != OI_OK) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    return 0;
+}
+
+static int make_socketpair(int fds[2]) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        return -1;
+    }
+    if (set_cloexec(fds[0]) != OI_OK || set_cloexec(fds[1]) != OI_OK) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+#ifdef SO_NOSIGPIPE
+    int enabled = 1;
+    if (setsockopt(fds[0], SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                   sizeof enabled) != 0 ||
+        setsockopt(fds[1], SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                   sizeof enabled) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+static ssize_t send_without_sigpipe(int fd, const void *data, size_t len) {
+#ifdef MSG_NOSIGNAL
+    return send(fd, data, len, MSG_NOSIGNAL);
+#else
+    return send(fd, data, len, 0);
+#endif
 }
 
 static void close_call_io(oi_tool_call *call) {
@@ -271,8 +317,10 @@ static void on_stdin_event(oi_reactor *r, int fd, int revents, void *ud) {
     oi_tool_call *call = ud;
 
     while (call->out_off < call->out_len) {
-        ssize_t n = send(call->stdin_fd, call->out_buf + call->out_off,
-                          call->out_len - call->out_off, MSG_NOSIGNAL);
+        ssize_t n =
+            send_without_sigpipe(call->stdin_fd,
+                                 call->out_buf + call->out_off,
+                                 call->out_len - call->out_off);
         if (n > 0) {
             call->out_off += (size_t)n;
             continue;
@@ -313,15 +361,15 @@ static oi_status spawn(oi_tool_call *call) {
     }
 
     int stdin_pipe[2], stdout_pipe[2], err_pipe[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stdin_pipe) != 0) {
+    if (make_socketpair(stdin_pipe) != 0) {
         return OI_ERR_IO;
     }
-    if (pipe2(stdout_pipe, O_CLOEXEC) != 0) {
+    if (make_pipe(stdout_pipe) != 0) {
         close(stdin_pipe[0]);
         close(stdin_pipe[1]);
         return OI_ERR_IO;
     }
-    if (pipe2(err_pipe, O_CLOEXEC) != 0) {
+    if (make_pipe(err_pipe) != 0) {
         close(stdin_pipe[0]);
         close(stdin_pipe[1]);
         close(stdout_pipe[0]);

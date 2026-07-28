@@ -5,9 +5,10 @@ responses, running approved subprocess tools, and persisting independent
 agent sessions. Its core is a single-threaded reactor: network sockets,
 tool pipes, child exits, and deadlines share one event loop without locks.
 
-The implementation currently targets Linux. It uses epoll, timerfd, and
-pidfd (`pidfd_open` requires Linux 5.3 or newer). OpenSSL is the only
-external library dependency.
+The implementation supports Linux and macOS. Linux uses epoll, timerfd,
+and pidfd (`pidfd_open` requires Linux 5.3 or newer); macOS uses kqueue
+with native timer and process-exit filters. OpenSSL and POSIX threads are
+the only external runtime dependencies.
 
 ## Build and verify
 
@@ -37,9 +38,10 @@ make DESTDIR=/tmp/package-root PREFIX=/usr install
 ```
 
 This installs the CLI, both libraries, and public headers under
-`$PREFIX/{bin,lib,include/oi}`. The shared library is installed as
-`liboi.so.0.1.0` with `liboi.so.0` (runtime) and `liboi.so` (development)
-symlinks.
+`$PREFIX/{bin,lib,include/oi}`. On Linux, the shared library is installed
+as `liboi.so.0.1.0` with `liboi.so.0` (runtime) and `liboi.so`
+(development) symlinks. macOS uses the equivalent `liboi.0.1.0.dylib`,
+`liboi.0.dylib`, and `liboi.dylib` chain.
 
 The project follows semantic release versions and is currently `0.1.0`.
 Its public C ABI is deliberately exported through an allowlist and carries
@@ -58,9 +60,13 @@ export OI_API_KEY='...'
 build/oi "Explain this repository"
 ```
 
-Use `build/oi --help` for endpoint, TLS, model, session, and deadline
-options. `--dry-run` prints the resolved request without making a network
-connection or requiring an API key.
+The CLI advertises a built-in `shell` tool. By default it asks on the
+controlling terminal before each execution; use `--allow-tools` or
+`--deny-tools` for explicit non-interactive policy. It follows tool calls
+with their results until the model returns a final answer or `--max-turns`
+is reached. Use `build/oi --help` for endpoint, TLS, model, session,
+deadline, and tool-policy options. `--dry-run` prints the resolved request
+without making a network connection or requiring an API key.
 
 Configuration is resolved in this order:
 
@@ -87,11 +93,6 @@ are documented beside each API.
 
 ## Current limits
 
-- DNS resolution uses blocking `getaddrinfo`.
-- The bundled CLI sends one turn and does not execute model-requested tools.
-- The LLM API currently forwards assistant text deltas; it does not expose
-  structured `tool_calls` deltas to embedders.
-- macOS/kqueue support is not implemented.
 - No license has been selected, so the repository currently grants no
   redistribution license.
 

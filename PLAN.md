@@ -13,9 +13,10 @@ supports running many independent agent sessions concurrently.
   one-process-per-agent because the workload is I/O-bound (waiting on LLM API responses,
   subprocess pipes); a single-threaded reactor has no locks/races by construction, the
   lowest memory overhead, and the most predictable scheduling.
-- **Platform target**: Linux today (epoll, timerfd, pidfd). macOS/kqueue is
-  deferred until child-process and timer watchers have native kqueue
-  implementations; the project does not claim portable POSIX support.
+- **Platform target**: Linux (epoll, timerfd, pidfd) and macOS (kqueue with
+  native timer and process-exit filters). Platform-specific behavior stays
+  behind the reactor backend; the project does not claim broader portable
+  POSIX support.
 - **Interface**: a C library core (headers + .a/.so) exposing the reactor/session API, plus
   a thin CLI binary that links it for standalone use.
 

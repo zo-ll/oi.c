@@ -85,6 +85,19 @@ static oi_status set_cloexec(int fd) {
     return OI_OK;
 }
 
+static oi_status set_no_sigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int enabled = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                      sizeof enabled) == 0
+               ? OI_OK
+               : OI_ERR_IO;
+#else
+    (void)fd;
+    return OI_OK;
+#endif
+}
+
 static void update_interest(oi_llm_conn *c) {
     int interest = OI_EV_READ;
     if (c->read_needs_write ||
@@ -250,7 +263,11 @@ static long conn_raw_write(oi_llm_conn *c, const void *buf, size_t len,
         return -2;
     }
 
+#ifdef MSG_NOSIGNAL
     ssize_t rc = send(c->fd, buf, len, MSG_NOSIGNAL);
+#else
+    ssize_t rc = send(c->fd, buf, len, 0);
+#endif
     if (rc >= 0) {
         return rc;
     }
@@ -402,12 +419,12 @@ static int begin_tcp_connect(oi_llm_conn *c) {
     while (c->next_address != NULL) {
         struct addrinfo *ai = c->next_address;
         c->next_address = ai->ai_next;
-        fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC,
-                    ai->ai_protocol);
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) {
             continue;
         }
-        if (set_nonblocking(fd) != OI_OK) {
+        if (set_cloexec(fd) != OI_OK || set_nonblocking(fd) != OI_OK ||
+            set_no_sigpipe(fd) != OI_OK) {
             close(fd);
             fd = -1;
             continue;
