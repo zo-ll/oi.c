@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "cli_editor.h"
+#include "cli_commands.h"
 #include "oi/status.h"
 
 /*
@@ -21,6 +22,10 @@ oi_status oi_cli_render_init(struct oi_cli_render *render, int output_fd,
 void oi_cli_render_set_columns(struct oi_cli_render *render, size_t columns);
 oi_status oi_cli_render_draw(struct oi_cli_render *render,
                              const struct oi_cli_editor *editor);
+oi_status oi_cli_render_draw_commands(
+    struct oi_cli_render *render, const struct oi_cli_editor *editor,
+    const size_t *command_indices, size_t command_count,
+    size_t selected_command);
 oi_status oi_cli_render_finish(struct oi_cli_render *render);
 
 #endif

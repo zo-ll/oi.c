@@ -27,6 +27,18 @@ static oi_status apply(struct oi_cli_prompt_state *state,
     return oi_cli_prompt_state_apply(state, &event, action);
 }
 
+static oi_status type_ascii(struct oi_cli_prompt_state *state,
+                            const char *text,
+                            enum oi_cli_prompt_action *action) {
+    oi_status status = OI_OK;
+    size_t i;
+
+    for (i = 0; status == OI_OK && text[i] != '\0'; i++) {
+        status = apply(state, text_event(text + i, 1, 0), action);
+    }
+    return status;
+}
+
 TEST(editing_events_update_the_buffer) {
     static const char cent[] = {(char)0xc2, (char)0xa2};
     struct oi_cli_input_history history;
@@ -146,6 +158,49 @@ TEST(ctrl_c_clears_and_ctrl_d_exits_only_when_empty) {
     oi_cli_input_history_free(&history);
 }
 
+TEST(slash_menu_filters_navigates_and_completes) {
+    struct oi_cli_input_history history;
+    struct oi_cli_prompt_state state;
+    enum oi_cli_prompt_action action;
+
+    oi_cli_input_history_init(&history);
+    CHECK_EQ(oi_cli_prompt_state_init(&state, &history), OI_OK);
+    CHECK_EQ(type_ascii(&state, "/", &action), OI_OK);
+    CHECK_EQ(state.command_match_count, oi_cli_command_count());
+    CHECK_EQ(state.command_selection, 0);
+    CHECK_EQ(apply(&state, simple_event(OI_CLI_INPUT_DOWN), &action), OI_OK);
+    CHECK_EQ(state.command_selection, 1);
+    CHECK_EQ(apply(&state, simple_event(OI_CLI_INPUT_ENTER), &action), OI_OK);
+    CHECK_EQ(action, OI_CLI_PROMPT_ACTION_REDRAW);
+    CHECK_STREQ(oi_cli_editor_data(&state.editor), "/exit ");
+    CHECK_EQ(state.command_match_count, 0);
+
+    oi_cli_editor_clear(&state.editor);
+    CHECK_EQ(type_ascii(&state, "/sta", &action), OI_OK);
+    CHECK_EQ(state.command_match_count, 1);
+    CHECK_EQ(apply(&state, simple_event(OI_CLI_INPUT_TAB), &action), OI_OK);
+    CHECK_STREQ(oi_cli_editor_data(&state.editor), "/status ");
+
+    oi_cli_prompt_state_free(&state);
+    oi_cli_input_history_free(&history);
+}
+
+TEST(exact_slash_command_submits) {
+    struct oi_cli_input_history history;
+    struct oi_cli_prompt_state state;
+    enum oi_cli_prompt_action action;
+
+    oi_cli_input_history_init(&history);
+    CHECK_EQ(oi_cli_prompt_state_init(&state, &history), OI_OK);
+    CHECK_EQ(type_ascii(&state, "/help", &action), OI_OK);
+    CHECK_EQ(state.command_match_count, 1);
+    CHECK_EQ(apply(&state, simple_event(OI_CLI_INPUT_ENTER), &action), OI_OK);
+    CHECK_EQ(action, OI_CLI_PROMPT_ACTION_SUBMIT);
+
+    oi_cli_prompt_state_free(&state);
+    oi_cli_input_history_free(&history);
+}
+
 TEST(bad_arguments_are_rejected) {
     struct oi_cli_input_history history;
     struct oi_cli_prompt_state state;
@@ -176,6 +231,8 @@ int main(void) {
     RUN(history_navigation_restores_the_draft);
     RUN(paste_batches_redraw_and_keeps_control_bytes_as_text);
     RUN(ctrl_c_clears_and_ctrl_d_exits_only_when_empty);
+    RUN(slash_menu_filters_navigates_and_completes);
+    RUN(exact_slash_command_submits);
     RUN(bad_arguments_are_rejected);
     return oi_test_report();
 }

@@ -136,17 +136,17 @@ $(BUILD)/test_cli_terminal: test/test_cli_terminal.c src/cli_terminal.c $(LIB) |
 $(BUILD)/test_cli_input: test/test_cli_input.c src/cli_input.c src/cli_utf8.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_input.c src/cli_utf8.c $(LIB) -o $@ $(LDLIBS)
 
-$(BUILD)/test_cli_prompt_state: test/test_cli_prompt_state.c src/cli_prompt_state.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_prompt_state.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c $(LIB) -o $@ $(LDLIBS)
+$(BUILD)/test_cli_prompt_state: test/test_cli_prompt_state.c src/cli_prompt_state.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c src/cli_commands.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_prompt_state.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c src/cli_commands.c $(LIB) -o $@ $(LDLIBS)
 
-$(BUILD)/test_cli_render: test/test_cli_render.c src/cli_render.c src/cli_editor.c src/cli_utf8.c $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_render.c src/cli_editor.c src/cli_utf8.c $(LIB) -o $@ $(LDLIBS)
+$(BUILD)/test_cli_render: test/test_cli_render.c src/cli_render.c src/cli_editor.c src/cli_utf8.c src/cli_commands.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_render.c src/cli_editor.c src/cli_utf8.c src/cli_commands.c $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/test_cli_sessions: test/test_cli_sessions.c src/cli_sessions.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_sessions.c $(LIB) -o $@ $(LDLIBS)
 
-$(BUILD)/test_cli_prompt: test/test_cli_prompt.c src/cli_prompt.c src/cli_prompt_state.c src/cli_render.c src/cli_terminal.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_prompt.c src/cli_prompt_state.c src/cli_render.c src/cli_terminal.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c $(LIB) -o $@ $(LDLIBS) $(PTY_LIBS)
+$(BUILD)/test_cli_prompt: test/test_cli_prompt.c src/cli_prompt.c src/cli_prompt_state.c src/cli_render.c src/cli_terminal.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c src/cli_commands.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_prompt.c src/cli_prompt_state.c src/cli_render.c src/cli_terminal.c src/cli_editor.c src/cli_input_history.c src/cli_input.c src/cli_utf8.c src/cli_commands.c $(LIB) -o $@ $(LDLIBS) $(PTY_LIBS)
 
 $(BUILD)/test_cli_history: test/test_cli_history.c src/cli_history.c src/cli_message.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_history.c src/cli_message.c $(LIB) -o $@ $(LDLIBS)

@@ -3,6 +3,46 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void refresh_commands(struct oi_cli_prompt_state *state) {
+    state->command_match_count = oi_cli_command_filter(
+        oi_cli_editor_data(&state->editor),
+        oi_cli_editor_length(&state->editor), state->command_matches,
+        sizeof state->command_matches / sizeof state->command_matches[0]);
+    if (state->command_match_count >
+        sizeof state->command_matches / sizeof state->command_matches[0]) {
+        state->command_match_count =
+            sizeof state->command_matches / sizeof state->command_matches[0];
+    }
+    if (state->command_selection >= state->command_match_count) {
+        state->command_selection = 0;
+    }
+}
+
+static oi_status complete_selected_command(
+    struct oi_cli_prompt_state *state) {
+    const struct oi_cli_command_definition *command;
+    size_t name_len;
+    oi_status status;
+
+    if (state->command_match_count == 0) {
+        return OI_ERR_NOTFOUND;
+    }
+    command = oi_cli_command_at(
+        state->command_matches[state->command_selection]);
+    if (command == NULL) {
+        return OI_ERR_INVAL;
+    }
+    name_len = strlen(command->name);
+    status = oi_cli_editor_set(&state->editor, command->name, name_len);
+    if (status == OI_OK) {
+        status = oi_cli_editor_insert(&state->editor, " ", 1);
+    }
+    if (status == OI_OK) {
+        refresh_commands(state);
+    }
+    return status;
+}
+
 static oi_status apply_history(struct oi_cli_prompt_state *state, int previous,
                                enum oi_cli_prompt_action *out_action) {
     const char *text;
@@ -26,6 +66,7 @@ static oi_status apply_history(struct oi_cli_prompt_state *state, int previous,
     }
     status = oi_cli_editor_set(&state->editor, text, text_len);
     if (status == OI_OK) {
+        refresh_commands(state);
         *out_action = OI_CLI_PROMPT_ACTION_REDRAW;
     }
     return status;
@@ -39,6 +80,8 @@ oi_status oi_cli_prompt_state_init(struct oi_cli_prompt_state *state,
     oi_cli_editor_init(&state->editor);
     state->history = history;
     state->pasting = 0;
+    state->command_match_count = 0;
+    state->command_selection = 0;
     return OI_OK;
 }
 
@@ -49,6 +92,8 @@ void oi_cli_prompt_state_free(struct oi_cli_prompt_state *state) {
     oi_cli_editor_free(&state->editor);
     state->history = NULL;
     state->pasting = 0;
+    state->command_match_count = 0;
+    state->command_selection = 0;
 }
 
 oi_status oi_cli_prompt_state_apply(
@@ -72,17 +117,42 @@ oi_status oi_cli_prompt_state_apply(
         status = oi_cli_editor_insert(&state->editor,
                                       (const char *)event->text,
                                       event->text_len);
+        if (status == OI_OK) {
+            refresh_commands(state);
+        }
         if (status == OI_OK && !state->pasting) {
             *out_action = OI_CLI_PROMPT_ACTION_REDRAW;
         }
         return status;
     case OI_CLI_INPUT_ENTER:
+        if (state->command_match_count != 0) {
+            const struct oi_cli_command_definition *command =
+                oi_cli_command_at(state->command_matches[
+                    state->command_selection]);
+            size_t current_len =
+                oi_cli_editor_length(&state->editor);
+            if (command != NULL &&
+                current_len == strlen(command->name) &&
+                memcmp(oi_cli_editor_data(&state->editor),
+                       command->name, current_len) == 0) {
+                *out_action = OI_CLI_PROMPT_ACTION_SUBMIT;
+                return OI_OK;
+            }
+            status = complete_selected_command(state);
+            if (status == OI_OK) {
+                *out_action = OI_CLI_PROMPT_ACTION_REDRAW;
+            }
+            return status;
+        }
         if (oi_cli_editor_length(&state->editor) != 0) {
             *out_action = OI_CLI_PROMPT_ACTION_SUBMIT;
         }
         return OI_OK;
     case OI_CLI_INPUT_NEWLINE:
         status = oi_cli_editor_insert(&state->editor, "\n", 1);
+        if (status == OI_OK) {
+            refresh_commands(state);
+        }
         break;
     case OI_CLI_INPUT_LEFT:
         status = oi_cli_editor_move_left(&state->editor);
@@ -91,8 +161,25 @@ oi_status oi_cli_prompt_state_apply(
         status = oi_cli_editor_move_right(&state->editor);
         break;
     case OI_CLI_INPUT_UP:
+        if (state->command_match_count != 0) {
+            if (state->command_selection == 0) {
+                state->command_selection =
+                    state->command_match_count - 1;
+            } else {
+                state->command_selection--;
+            }
+            *out_action = OI_CLI_PROMPT_ACTION_REDRAW;
+            return OI_OK;
+        }
         return apply_history(state, 1, out_action);
     case OI_CLI_INPUT_DOWN:
+        if (state->command_match_count != 0) {
+            state->command_selection =
+                (state->command_selection + 1) %
+                state->command_match_count;
+            *out_action = OI_CLI_PROMPT_ACTION_REDRAW;
+            return OI_OK;
+        }
         return apply_history(state, 0, out_action);
     case OI_CLI_INPUT_HOME:
         oi_cli_editor_move_line_start(&state->editor);
@@ -102,13 +189,26 @@ oi_status oi_cli_prompt_state_apply(
         break;
     case OI_CLI_INPUT_BACKSPACE:
         status = oi_cli_editor_backspace(&state->editor);
+        if (status == OI_OK) {
+            refresh_commands(state);
+        }
         break;
     case OI_CLI_INPUT_DELETE:
         status = oi_cli_editor_delete(&state->editor);
+        if (status == OI_OK) {
+            refresh_commands(state);
+        }
+        break;
+    case OI_CLI_INPUT_TAB:
+        status = complete_selected_command(state);
+        if (status == OI_ERR_NOTFOUND) {
+            return OI_OK;
+        }
         break;
     case OI_CLI_INPUT_CTRL_C:
         oi_cli_editor_clear(&state->editor);
         state->pasting = 0;
+        refresh_commands(state);
         *out_action = OI_CLI_PROMPT_ACTION_REDRAW;
         return OI_OK;
     case OI_CLI_INPUT_CTRL_D:
@@ -117,6 +217,9 @@ oi_status oi_cli_prompt_state_apply(
             return OI_OK;
         }
         status = oi_cli_editor_delete(&state->editor);
+        if (status == OI_OK) {
+            refresh_commands(state);
+        }
         break;
     case OI_CLI_INPUT_PASTE_BEGIN:
         state->pasting = 1;
@@ -125,7 +228,6 @@ oi_status oi_cli_prompt_state_apply(
         state->pasting = 0;
         *out_action = OI_CLI_PROMPT_ACTION_REDRAW;
         return OI_OK;
-    case OI_CLI_INPUT_TAB:
     case OI_CLI_INPUT_ESCAPE:
     case OI_CLI_INPUT_INVALID:
     case OI_CLI_INPUT_NONE:
@@ -167,6 +269,7 @@ oi_status oi_cli_prompt_state_commit(struct oi_cli_prompt_state *state,
         return status;
     }
     oi_cli_editor_clear(&state->editor);
+    refresh_commands(state);
     *out_text = copy;
     *out_len = len;
     return OI_OK;

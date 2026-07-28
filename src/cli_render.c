@@ -189,15 +189,19 @@ void oi_cli_render_set_columns(struct oi_cli_render *render, size_t columns) {
     }
 }
 
-oi_status oi_cli_render_draw(struct oi_cli_render *render,
-                             const struct oi_cli_editor *editor) {
+static oi_status render_draw(
+    struct oi_cli_render *render, const struct oi_cli_editor *editor,
+    const size_t *command_indices, size_t command_count,
+    size_t selected_command) {
     struct render_buffer buffer = {0};
     struct cursor_position cursor = {0};
     struct cursor_position end = {0};
     oi_status status;
 
     if (render == NULL || editor == NULL || render->output_fd < 0 ||
-        render->columns < sizeof prompt) {
+        render->columns < sizeof prompt ||
+        (command_indices == NULL && command_count != 0) ||
+        (command_count != 0 && selected_command >= command_count)) {
         return OI_ERR_INVAL;
     }
 
@@ -211,6 +215,39 @@ oi_status oi_cli_render_draw(struct oi_cli_render *render,
     }
     if (status == OI_OK) {
         status = build_frame(editor, render->columns, &buffer, &cursor, &end);
+    }
+    if (status == OI_OK) {
+        size_t i;
+        for (i = 0; i < command_count; i++) {
+            const struct oi_cli_command_definition *command =
+                oi_cli_command_at(command_indices[i]);
+            const char *marker = i == selected_command ? "> " : "  ";
+
+            if (command == NULL) {
+                status = OI_ERR_INVAL;
+                break;
+            }
+            status = buffer_append(&buffer, "\r\n", 2);
+            if (status == OI_OK) {
+                status = buffer_append(&buffer, marker, 2);
+            }
+            if (status == OI_OK) {
+                status = buffer_append(&buffer, command->name,
+                                       strlen(command->name));
+            }
+            if (status == OI_OK) {
+                status = buffer_append(&buffer, "  ", 2);
+            }
+            if (status == OI_OK) {
+                status = buffer_append(&buffer, command->description,
+                                       strlen(command->description));
+            }
+            if (status != OI_OK) {
+                break;
+            }
+            end.row++;
+            end.column = 0;
+        }
     }
     if (status == OI_OK && end.row > cursor.row) {
         status = buffer_append(&buffer, "\r", 1);
@@ -232,6 +269,19 @@ oi_status oi_cli_render_draw(struct oi_cli_render *render,
     }
     free(buffer.data);
     return status;
+}
+
+oi_status oi_cli_render_draw(struct oi_cli_render *render,
+                             const struct oi_cli_editor *editor) {
+    return render_draw(render, editor, NULL, 0, 0);
+}
+
+oi_status oi_cli_render_draw_commands(
+    struct oi_cli_render *render, const struct oi_cli_editor *editor,
+    const size_t *command_indices, size_t command_count,
+    size_t selected_command) {
+    return render_draw(render, editor, command_indices, command_count,
+                       selected_command);
 }
 
 oi_status oi_cli_render_finish(struct oi_cli_render *render) {

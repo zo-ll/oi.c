@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "cli_editor.h"
+#include "cli_commands.h"
 #include "cli_input.h"
 #include "cli_input_history.h"
 #include "oi/status.h"
@@ -23,6 +24,9 @@ struct oi_cli_prompt_state {
     struct oi_cli_editor editor;
     struct oi_cli_input_history *history;
     int pasting;
+    size_t command_matches[8];
+    size_t command_match_count;
+    size_t command_selection;
 };
 
 oi_status oi_cli_prompt_state_init(struct oi_cli_prompt_state *state,

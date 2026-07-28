@@ -48,7 +48,9 @@ static oi_status apply_event(struct oi_cli_prompt_state *state,
     case OI_CLI_PROMPT_ACTION_NONE:
         return OI_OK;
     case OI_CLI_PROMPT_ACTION_REDRAW:
-        return oi_cli_render_draw(render, &state->editor);
+        return oi_cli_render_draw_commands(
+            render, &state->editor, state->command_matches,
+            state->command_match_count, state->command_selection);
     case OI_CLI_PROMPT_ACTION_SUBMIT:
         status = oi_cli_prompt_state_commit(state, out_text, out_len);
         if (status == OI_OK) {
