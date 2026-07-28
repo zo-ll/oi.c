@@ -35,7 +35,7 @@
 
 /* --- mock SSE server, same shape as test_llm.c's --- */
 
-static void drain_request(int cfd) {
+static void drain_request(int cfd, int capture_fd) {
     char buf[8192];
     for (;;) {
         fd_set rfds;
@@ -49,6 +49,10 @@ static void drain_request(int cfd) {
         ssize_t n = read(cfd, buf, sizeof buf);
         if (n <= 0) {
             break;
+        }
+        if (capture_fd >= 0) {
+            ssize_t unused = write(capture_fd, buf, (size_t)n);
+            (void)unused;
         }
     }
 }
@@ -81,10 +85,10 @@ static char *build_chunked_response(const char *body, size_t body_len,
     return buf;
 }
 
-static pid_t start_mock_server_turns(const char *const *responses,
-                                     const size_t *response_lens,
-                                     size_t response_count,
-                                     unsigned short *out_port) {
+static pid_t start_mock_server_turns_capture(
+    const char *const *responses, const size_t *response_lens,
+    size_t response_count, unsigned short *out_port,
+    const char *capture_path) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(listen_fd >= 0);
     int opt = 1;
@@ -101,6 +105,12 @@ static pid_t start_mock_server_turns(const char *const *responses,
     socklen_t alen = sizeof addr;
     CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
     *out_port = ntohs(addr.sin_port);
+    int capture_fd = -1;
+    if (capture_path != NULL) {
+        capture_fd =
+            open(capture_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        CHECK(capture_fd >= 0);
+    }
 
     pid_t pid = fork();
     CHECK(pid >= 0);
@@ -119,7 +129,7 @@ static pid_t start_mock_server_turns(const char *const *responses,
             if (cfd < 0) {
                 break;
             }
-            drain_request(cfd);
+            drain_request(cfd, capture_fd);
             size_t off = 0;
             while (off < response_lens[turn]) {
                 ssize_t w =
@@ -132,11 +142,25 @@ static pid_t start_mock_server_turns(const char *const *responses,
             }
             close(cfd);
         }
+        if (capture_fd >= 0) {
+            close(capture_fd);
+        }
         close(listen_fd);
         _exit(0);
     }
+    if (capture_fd >= 0) {
+        close(capture_fd);
+    }
     close(listen_fd);
     return pid;
+}
+
+static pid_t start_mock_server_turns(const char *const *responses,
+                                     const size_t *response_lens,
+                                     size_t response_count,
+                                     unsigned short *out_port) {
+    return start_mock_server_turns_capture(
+        responses, response_lens, response_count, out_port, NULL);
 }
 
 static pid_t start_mock_server(const char *response, size_t response_len,
@@ -302,6 +326,8 @@ TEST(overlong_session_path_fails_cleanly) {
                      (char *)"test-key",
                      (char *)"--session-dir",
                      long_dir,
+                     (char *)"--session",
+                     (char *)"test",
                      (char *)"hello",
                      NULL};
     struct run_result r;
@@ -329,13 +355,10 @@ TEST(end_to_end_streaming_reply) {
 
     char port_str[16];
     snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
-    char session_dir[] = "/tmp";
-    char session_name[64];
-    snprintf(session_name, sizeof session_name, "oi-cli-e2e-%d",
-             (int)getpid());
+    char session_dir[] = "/tmp/oi-cli-ephemeral-XXXXXX";
+    CHECK(mkdtemp(session_dir) != NULL);
     char log_path[128];
-    snprintf(log_path, sizeof log_path, "%s/%s.oilog", session_dir,
-             session_name);
+    snprintf(log_path, sizeof log_path, "%s/default.oilog", session_dir);
     unlink(log_path);
 
     char *argv[] = {(char *)OI_BIN,
@@ -348,8 +371,6 @@ TEST(end_to_end_streaming_reply) {
                      (char *)"test-key",
                      (char *)"--session-dir",
                      session_dir,
-                     (char *)"--session",
-                     session_name,
                      (char *)"say hi",
                      NULL};
     struct run_result r;
@@ -357,9 +378,10 @@ TEST(end_to_end_streaming_reply) {
 
     CHECK_EQ(r.exit_code, 0);
     CHECK(strstr(r.output, "Hello, CLI") != NULL);
+    CHECK(access(log_path, F_OK) != 0);
 
     waitpid(child, NULL, 0);
-    unlink(log_path);
+    rmdir(session_dir);
 }
 
 static void run_tool_cli(const char *first_sse, const char *second_sse,
@@ -532,7 +554,14 @@ TEST(resume_replays_prior_exchange) {
     char *response2 =
         build_chunked_response(sse2, strlen(sse2), "HTTP/1.1 200 OK", &total2);
     unsigned short port2;
-    pid_t child2 = start_mock_server(response2, total2, &port2);
+    char capture_path[160];
+    snprintf(capture_path, sizeof capture_path,
+             "/tmp/oi-cli-resume-request-%d", (int)getpid());
+    unlink(capture_path);
+    const char *responses2[] = {response2};
+    size_t response_lengths2[] = {total2};
+    pid_t child2 = start_mock_server_turns_capture(
+        responses2, response_lengths2, 1, &port2, capture_path);
     free(response2);
 
     char port2_str[16];
@@ -554,11 +583,23 @@ TEST(resume_replays_prior_exchange) {
     struct run_result r2;
     run_cli(argv2, &r2);
     CHECK_EQ(r2.exit_code, 0);
-    CHECK(strstr(r2.output, "[resumed user] first prompt") != NULL);
-    CHECK(strstr(r2.output, "[resumed assistant] first-reply") != NULL);
+    CHECK(strstr(r2.output, "[resumed") == NULL);
     CHECK(strstr(r2.output, "second-reply") != NULL);
 
     waitpid(child2, NULL, 0);
+    FILE *capture = fopen(capture_path, "r");
+    CHECK(capture != NULL);
+    char request[8192];
+    size_t request_len =
+        capture == NULL ? 0 : fread(request, 1, sizeof request - 1, capture);
+    if (capture != NULL) {
+        fclose(capture);
+    }
+    request[request_len] = '\0';
+    CHECK(strstr(request, "first prompt") != NULL);
+    CHECK(strstr(request, "first-reply") != NULL);
+    CHECK(strstr(request, "second prompt") != NULL);
+    unlink(capture_path);
     unlink(log_path);
 }
 

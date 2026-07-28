@@ -18,6 +18,8 @@ struct wrapper_state {
     struct output_buffer assistant;
     int done;
     oi_status status;
+    oi_cli_conversation_event_cb external_event;
+    void *external_user_data;
 };
 
 static oi_status output_buffer_append(struct output_buffer *buffer,
@@ -83,6 +85,13 @@ static oi_status write_model_error(
 static oi_status on_conversation_event(
     const struct oi_cli_conversation_event *event, void *user_data) {
     struct wrapper_state *state = user_data;
+    if (state->external_event != NULL) {
+        oi_status st =
+            state->external_event(event, state->external_user_data);
+        if (st != OI_OK) {
+            return st;
+        }
+    }
     switch (event->type) {
     case OI_CLI_CONVERSATION_EVENT_ASSISTANT_DELTA:
         if ((event->as.bytes.len > 0 &&
@@ -127,6 +136,8 @@ oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
     struct wrapper_state state = {
         .out = config->out,
         .err = config->err,
+        .external_event = config->on_event,
+        .external_user_data = config->event_user_data,
     };
     struct oi_cli_conversation_config conversation_config = {
         .model = config->model,
@@ -139,7 +150,8 @@ oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
     };
     oi_cli_conversation *conversation = NULL;
     oi_status st = oi_cli_conversation_create(
-        client, reactor, arena, tools, &conversation_config, NULL,
+        client, reactor, arena, tools, &conversation_config,
+        config->initial_context,
         &conversation);
     if (st == OI_OK) {
         st = oi_cli_conversation_start(conversation, prompt, strlen(prompt));

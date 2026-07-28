@@ -3,6 +3,8 @@
 #include <string.h>
 
 #include "cli_loop.h"
+#include "cli_history_repair.h"
+#include "cli_history_store.h"
 #include "cli_tools.h"
 #include "oi/config.h"
 #include "oi/json.h"
@@ -56,7 +58,7 @@ static void print_usage(void) {
         "\n"
         "flags:\n"
         "  --config PATH        config file to load\n"
-        "  --session ID         session id (default: \"default\")\n"
+        "  --session ID         durable named session (omitted: ephemeral)\n"
         "  --session-dir DIR    directory for session logs (default: \".\")\n"
         "  --host HOST          API host (default: api.openai.com)\n"
         "  --port PORT          API port (default: 443)\n"
@@ -151,22 +153,6 @@ static char *read_stdin_all(oi_status *out_status) {
     return b.data;
 }
 
-struct replay_ctx {
-    int index;
-    int output_failed;
-};
-
-static void replay_cb(const void *data, size_t len, void *ud) {
-    struct replay_ctx *ctx = ud;
-    const char *role = (ctx->index % 2 == 0) ? "user" : "assistant";
-    if (printf("[resumed %s] ", role) < 0 ||
-        (len > 0 && fwrite(data, 1, len, stdout) != len) ||
-        putchar('\n') == EOF) {
-        ctx->output_failed = 1;
-    }
-    ctx->index++;
-}
-
 static oi_status build_request_body(const char *model, const char *prompt,
                                      oi_json_writer **out_writer) {
     oi_json_writer *w = oi_json_writer_create();
@@ -208,9 +194,85 @@ fail:
     return st;
 }
 
+struct persistence_context {
+    struct oi_cli_history_store *store;
+    struct oi_cli_history_replay_state *state;
+    uint64_t turn_id;
+    const char *model;
+    size_t model_len;
+    oi_status last_error;
+};
+
+static enum oi_cli_history_tool_outcome history_tool_outcome(
+    enum oi_cli_conversation_tool_outcome outcome) {
+    switch (outcome) {
+    case OI_CLI_CONVERSATION_TOOL_COMPLETED:
+        return OI_CLI_HISTORY_TOOL_COMPLETED;
+    case OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN:
+        return OI_CLI_HISTORY_TOOL_OUTCOME_UNKNOWN;
+    case OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED:
+        return OI_CLI_HISTORY_TOOL_NOT_EXECUTED;
+    case OI_CLI_CONVERSATION_TOOL_NONE:
+        return OI_CLI_HISTORY_TOOL_OUTCOME_NONE;
+    }
+    return OI_CLI_HISTORY_TOOL_OUTCOME_NONE;
+}
+
+static oi_status persist_conversation_event(
+    const struct oi_cli_conversation_event *event, void *user_data) {
+    struct persistence_context *context = user_data;
+    struct oi_cli_history_record record;
+    oi_cli_history_record_init(&record);
+    oi_status st = OI_OK;
+    int append = 0;
+
+    if (event->type == OI_CLI_CONVERSATION_EVENT_MESSAGE) {
+        const struct oi_cli_message *message = event->as.message.value;
+        const char *model =
+            message->role == OI_CLI_MESSAGE_ASSISTANT
+                ? event->as.message.model
+                : NULL;
+        size_t model_len =
+            message->role == OI_CLI_MESSAGE_ASSISTANT
+                ? event->as.message.model_len
+                : 0;
+        st = oi_cli_history_record_set_message(
+            &record, context->state->next_record_id, context->turn_id,
+            message, OI_CLI_HISTORY_MESSAGE_NORMAL, model, model_len,
+            history_tool_outcome(event->as.message.tool_outcome),
+            event->as.message.raw_tool_output,
+            event->as.message.raw_tool_output_len,
+            event->as.message.has_raw_tool_output);
+        append = st == OI_OK;
+    } else if (event->type ==
+               OI_CLI_CONVERSATION_EVENT_TOOL_STARTING) {
+        st = oi_cli_history_record_set_tool_started(
+            &record, context->state->next_record_id, context->turn_id,
+            event->as.tool_starting.id->data,
+            event->as.tool_starting.id->len);
+        append = st == OI_OK;
+    } else if (event->type ==
+               OI_CLI_CONVERSATION_EVENT_PARTIAL_ASSISTANT) {
+        st = oi_cli_history_record_set_partial_assistant(
+            &record, context->state->next_record_id, context->turn_id,
+            event->as.bytes.data, event->as.bytes.len,
+            context->model, context->model_len);
+        append = st == OI_OK;
+    }
+    if (append) {
+        st = oi_cli_history_store_append(context->store, &record,
+                                         context->state);
+    }
+    oi_cli_history_record_free(&record);
+    if (st != OI_OK) {
+        context->last_error = st;
+    }
+    return st;
+}
+
 int main(int argc, char **argv) {
     const char *config_path = NULL;
-    const char *session_id = "default";
+    const char *session_id = NULL;
     const char *session_dir = ".";
     const char *prompt = NULL;
     int cli_use_tls = -1; /* -1 = not specified on the command line */
@@ -409,17 +471,20 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    char log_path[4096];
-    int log_path_len = snprintf(log_path, sizeof log_path, "%s/%s.oilog",
-                                session_dir, session_id);
-    if (log_path_len < 0 || (size_t)log_path_len >= sizeof log_path) {
-        fprintf(stderr, "oi: session log path is too long\n");
-        oi_json_writer_destroy(w);
-        oi_config_free(&cfg);
-        if (owns_prompt) {
-            free((char *)prompt);
+    char log_path[4096] = {0};
+    if (session_id != NULL) {
+        int log_path_len = snprintf(log_path, sizeof log_path, "%s/%s.oilog",
+                                    session_dir, session_id);
+        if (log_path_len < 0 ||
+            (size_t)log_path_len >= sizeof log_path) {
+            fprintf(stderr, "oi: session log path is too long\n");
+            oi_json_writer_destroy(w);
+            oi_config_free(&cfg);
+            if (owns_prompt) {
+                free((char *)prompt);
+            }
+            return 1;
         }
-        return 1;
     }
 
     /* All of oi_reactor_destroy/oi_session_registry_destroy/
@@ -431,6 +496,16 @@ int main(int argc, char **argv) {
     oi_session_registry *sessions = NULL;
     oi_llm_client *client = NULL;
     oi_tool_registry *tools = NULL;
+    oi_arena *ephemeral_arena = NULL;
+    oi_arena *turn_arena = NULL;
+    oi_session *session = NULL;
+    struct oi_cli_history_store history_store;
+    struct oi_cli_history_replay_state replay_state;
+    struct oi_cli_message_list initial_context;
+    struct persistence_context persistence = {0};
+    oi_cli_history_store_init(&history_store);
+    oi_cli_history_replay_state_init(&replay_state);
+    oi_cli_message_list_init(&initial_context);
     struct oi_cli_loop_result loop_result = {0};
     int exit_code = 0;
 
@@ -450,21 +525,74 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    oi_session *session;
-    st = oi_session_create(sessions, session_id, log_path, 0, &session);
-    if (st != OI_OK) {
-        fprintf(stderr, "oi: failed to open session '%s' at '%s': %s\n",
-                session_id, log_path, status_str(st));
-        exit_code = 1;
-        goto cleanup;
-    }
-    struct replay_ctx rctx = {0};
-    st = oi_sesslog_replay(oi_session_log(session), replay_cb, &rctx);
-    if (st != OI_OK || rctx.output_failed) {
-        fprintf(stderr, "oi: failed to replay session: %s\n",
-                status_str(st != OI_OK ? st : OI_ERR_IO));
-        exit_code = 1;
-        goto cleanup;
+    if (session_id != NULL) {
+        st = oi_session_create(sessions, session_id, log_path, 0, &session);
+        if (st != OI_OK) {
+            fprintf(stderr, "oi: failed to open session '%s' at '%s': %s\n",
+                    session_id, log_path, status_str(st));
+            exit_code = 1;
+            goto cleanup;
+        }
+        st = oi_cli_history_store_load(oi_session_log(session),
+                                       &history_store, &replay_state);
+        if (st != OI_OK) {
+            fprintf(stderr, "oi: failed to replay session: %s\n",
+                    status_str(st));
+            exit_code = 1;
+            goto cleanup;
+        }
+        if (replay_state.needs_transition) {
+            struct oi_cli_history_record transition;
+            oi_cli_history_record_init(&transition);
+            st = oi_cli_history_record_set_transition(
+                &transition, replay_state.next_record_id,
+                history_store.legacy_messages.len);
+            if (st == OI_OK) {
+                st = oi_cli_history_store_append(
+                    &history_store, &transition, &replay_state);
+            }
+            oi_cli_history_record_free(&transition);
+        }
+        if (st == OI_OK && replay_state.needs_repair) {
+            struct oi_cli_history repairs;
+            oi_cli_history_init(&repairs);
+            st = oi_cli_history_build_repairs(&replay_state, &repairs);
+            for (size_t i = 0; st == OI_OK && i < repairs.len; i++) {
+                st = oi_cli_history_store_append(
+                    &history_store, &repairs.records[i], &replay_state);
+            }
+            oi_cli_history_free(&repairs);
+        }
+        if (st != OI_OK) {
+            fprintf(stderr, "oi: failed to prepare session history: %s\n",
+                    status_str(st));
+            exit_code = 1;
+            goto cleanup;
+        }
+        for (size_t i = 0; i < replay_state.context_len; i++) {
+            st = oi_cli_message_list_append_clone(
+                &initial_context, &replay_state.context[i].message);
+            if (st != OI_OK) {
+                fprintf(stderr, "oi: out of memory restoring context\n");
+                exit_code = 1;
+                goto cleanup;
+            }
+        }
+        turn_arena = oi_session_arena(session);
+        persistence.store = &history_store;
+        persistence.state = &replay_state;
+        persistence.turn_id = replay_state.next_turn_id;
+        persistence.model = cfg.model;
+        persistence.model_len = strlen(cfg.model);
+        persistence.last_error = OI_OK;
+    } else {
+        ephemeral_arena = oi_arena_create(0);
+        if (ephemeral_arena == NULL) {
+            fprintf(stderr, "oi: out of memory\n");
+            exit_code = 1;
+            goto cleanup;
+        }
+        turn_arena = ephemeral_arena;
     }
 
     struct oi_llm_config llm_cfg = {
@@ -481,31 +609,35 @@ int main(int argc, char **argv) {
 
     struct oi_cli_permission permission = {tool_policy};
     struct oi_cli_loop_config loop_config = {
-        cfg.model, max_turns, cfg.timeout_ms, &permission, stdout, stderr,
+        .model = cfg.model,
+        .max_turns = max_turns,
+        .tool_timeout_ms = cfg.timeout_ms,
+        .permission = &permission,
+        .out = stdout,
+        .err = stderr,
+        .initial_context =
+            session_id != NULL ? &initial_context : NULL,
+        .on_event =
+            session_id != NULL ? persist_conversation_event : NULL,
+        .event_user_data =
+            session_id != NULL ? &persistence : NULL,
     };
-    st = oi_cli_loop_run(client, reactor, oi_session_arena(session), tools,
-                          &loop_config, prompt, &loop_result);
-    if (st == OI_OK) {
-        st = oi_sesslog_append(oi_session_log(session), prompt,
-                                strlen(prompt));
-        if (st == OI_OK) {
-            st = oi_sesslog_append(oi_session_log(session),
-                                    loop_result.assistant_text,
-                                    loop_result.assistant_text_len);
-        }
-        if (st != OI_OK) {
-            fprintf(stderr, "oi: failed to persist session: %s\n",
-                    status_str(st));
-            oi_session_fail(session);
-            exit_code = 1;
-        }
-    } else {
+    st = oi_cli_loop_run(client, reactor, turn_arena, tools, &loop_config,
+                         prompt, &loop_result);
+    if (st != OI_OK) {
         fprintf(stderr, "oi: agent loop failed: %s\n", status_str(st));
+        if (persistence.last_error != OI_OK && session != NULL) {
+            oi_session_fail(session);
+        }
         exit_code = 1;
     }
 
 cleanup:
     free(loop_result.assistant_text);
+    oi_cli_message_list_free(&initial_context);
+    oi_cli_history_replay_state_free(&replay_state);
+    oi_cli_history_store_free(&history_store);
+    oi_arena_destroy(ephemeral_arena);
     oi_tool_registry_destroy(tools);
     oi_llm_client_destroy(client);
     oi_session_registry_destroy(sessions);

@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#include "cli_conversation.h"
+#include "cli_message.h"
 #include "cli_tools.h"
 #include "oi/arena.h"
 #include "oi/llm.h"
@@ -18,6 +20,9 @@ struct oi_cli_loop_config {
     struct oi_cli_permission *permission;
     FILE *out;
     FILE *err;
+    const struct oi_cli_message_list *initial_context;
+    oi_cli_conversation_event_cb on_event;
+    void *event_user_data;
 };
 
 struct oi_cli_loop_result {
