@@ -7,8 +7,9 @@
 
 /*
  * Durable append-only log for session state: one write() syscall per
- * record, so a record is never observably half-written except by a
- * genuine mid-write crash -- which recovery handles by discarding it.
+ * record. A short/error write is rolled back before returning; a genuine
+ * mid-write process crash is recovered by discarding the partial tail on
+ * the next open.
  * No fsync by default: crash-safe against the *process* dying, not
  * against a power loss losing the page cache.
  *
@@ -40,7 +41,8 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log);
 void oi_sesslog_close(oi_sesslog *log);
 
 /* Appends one record in a single write() call. OI_ERR_INVAL if `len`
- * exceeds OI_SESSLOG_MAX_RECORD. */
+ * exceeds OI_SESSLOG_MAX_RECORD. OI_ERR_IO leaves the prior valid log
+ * contents intact whenever the filesystem permits rollback. */
 oi_status oi_sesslog_append(oi_sesslog *log, const void *data, size_t len);
 
 /* Replays every record currently in the log, in write order, via `cb`.

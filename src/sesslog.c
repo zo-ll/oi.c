@@ -88,6 +88,9 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log) {
         encode_u32le(header + OI_SESSLOG_MAGIC_LEN, OI_SESSLOG_VERSION);
         ssize_t n = write(fd, header, sizeof header);
         if (n != (ssize_t)sizeof header) {
+            /* Keep a failed first write from leaving a file that looks
+             * permanently corrupt to the next open attempt. */
+            (void)ftruncate(fd, 0);
             close(fd);
             return OI_ERR_IO;
         }
@@ -153,6 +156,11 @@ oi_status oi_sesslog_append(oi_sesslog *log, const void *data, size_t len) {
         return OI_ERR_INVAL;
     }
 
+    struct stat before;
+    if (fstat(log->fd, &before) != 0) {
+        return OI_ERR_IO;
+    }
+
     size_t total = 4 + len;
     unsigned char *buf = malloc(total);
     if (buf == NULL) {
@@ -170,7 +178,12 @@ oi_status oi_sesslog_append(oi_sesslog *log, const void *data, size_t len) {
     free(buf);
 
     if (n < 0 || (size_t)n != total) {
-        return OI_ERR_IO; /* including a short write: not a whole record */
+        /* The handle stays usable after a short/error write: remove any
+         * partial tail now instead of waiting for a future reopen to
+         * discover and recover it. The lifetime flock excludes another
+         * appender from racing this rollback. */
+        (void)ftruncate(log->fd, before.st_size);
+        return OI_ERR_IO;
     }
     return OI_OK;
 }
