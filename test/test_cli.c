@@ -1393,6 +1393,94 @@ TEST(recoverable_turn_error_returns_to_the_prompt) {
     }
 }
 
+TEST(sigterm_during_a_turn_terminates_cleanly) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[1];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    /* A generous delay: the turn only needs to still be in flight by the
+     * time SIGTERM is sent below, not for the full delay to elapse -- the
+     * mock server is killed once the test is done with it regardless. */
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].delay_seconds = 3;
+    server = start_slow_mock_server(turns, 1, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-sigterm-turn-%d", (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    /* Wait for the bracket-paste disable before signalling, matching the
+     * SIGINT tests above: it proves oi_cli_prompt_read has already
+     * returned and cli_repl.c's own turn setup (including registering
+     * signal_fd on the reactor) has already run, so the signal is
+     * guaranteed to be handled by the turn-time reactor callback rather
+     * than raced against the idle-prompt's own signal draining. */
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004l", 1));
+    CHECK_EQ(kill(cli, SIGTERM), 0);
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    free(reply);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+        unlink(metadata_path);
+        {
+            char history_path[640];
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(history_path);
+        }
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
 TEST(interactive_cwd_command_changes_the_process_directory) {
     char target_dir[160];
     unsigned short port;
@@ -1746,6 +1834,7 @@ int main(void) {
     RUN(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt);
     RUN(sigint_cancels_a_running_tool_and_returns_to_the_prompt);
     RUN(recoverable_turn_error_returns_to_the_prompt);
+    RUN(sigterm_during_a_turn_terminates_cleanly);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);

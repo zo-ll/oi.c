@@ -361,7 +361,13 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
             }
             if (turn_signal_context.terminate_signal != 0) {
                 /* SIGTERM/SIGHUP: the conversation was already cancelled
-                 * above; clean up and exit regardless of anything else. */
+                 * above; clean up and exit regardless of anything else.
+                 * Report a clean exit (OI_OK), matching the idle-prompt
+                 * SIGTERM/SIGHUP path (oi_cli_prompt_read's own
+                 * terminate_signal out-param leaves its return status
+                 * OI_OK) rather than leaking the cancellation's own
+                 * OI_ERR_CLOSED as if the turn itself had failed. */
+                status = OI_OK;
                 break;
             }
             if (oi_cli_conversation_was_cancelled(conversation)) {
