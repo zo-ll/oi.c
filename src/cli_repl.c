@@ -106,8 +106,12 @@ static oi_status dispatch_set_cwd(void *user_data, const char *path,
             strlen(resolved));
         if (status != OI_OK) {
             /* Nothing was durably written yet: roll the live chdir back
-             * rather than leaving live and durable state disagreeing. */
-            chdir(previous);
+             * rather than leaving live and durable state disagreeing. A
+             * failed rollback has no further fallback -- `status` (the
+             * persist failure) is still the right thing to report. */
+            if (chdir(previous) != 0) {
+                /* best effort: nothing more to do */
+            }
             free(previous);
             return status;
         }
