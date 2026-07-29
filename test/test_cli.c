@@ -122,18 +122,12 @@ static pid_t start_mock_server_turns_capture(
         /* Bounded, not accept() outright: if the CLI process we expect
          * to connect never does (e.g. it failed to even start), this
          * must not hang forever -- see the OI_CLI_BIN comment above for
-         * exactly the incident that motivated this. 90s: on GitHub's
-         * standard-tier runners, asan/tsan-instrumented binaries have
-         * been observed to stall for tens of seconds at a time (not
-         * reproducible locally, including under matching sanitizers --
-         * apparently genuine resource contention on that infrastructure
-         * tier) well past what a local machine ever needs for the same
-         * connect. This must outlast that, not just the connect itself. */
+         * exactly the incident that motivated this. */
         for (size_t turn = 0; turn < response_count; turn++) {
             fd_set rfds;
             FD_ZERO(&rfds);
             FD_SET(listen_fd, &rfds);
-            struct timeval tv = {90, 0};
+            struct timeval tv = {20, 0};
             int rc = select(listen_fd + 1, &rfds, NULL, NULL, &tv);
             int cfd = rc > 0 ? accept(listen_fd, NULL, NULL) : -1;
             if (cfd < 0) {
@@ -216,12 +210,11 @@ static int interactive_wait_for(int master_fd,
                                 const char *text, size_t minimum_count) {
     while (result->output_len < sizeof result->output - 1) {
         fd_set reads;
-        /* Generous on purpose: under asan/tsan instrumentation on a
-         * loaded CI runner, a single mock-server round trip has been
-         * observed to take noticeably longer than on a quiet local
-         * machine. Each individual read-to-read gap gets its own fresh
-         * window, so this only matters when data genuinely stalls. */
-        struct timeval timeout = {90, 0};
+        /* Bounded, not a real deadline: a slower CI runner under
+         * asan/tsan can legitimately take longer than a quiet local
+         * machine for one round trip. Each read-to-read gap gets its own
+         * fresh window, so this only matters when data genuinely stalls. */
+        struct timeval timeout = {20, 0};
         ssize_t len;
 
         if (count_text(result->output, text) >= minimum_count) {
@@ -871,6 +864,16 @@ TEST(interactive_model_command_changes_the_live_model) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "/model changed-model\r", 21));
     CHECK(interactive_wait_for(master_fd, &result, "Model: changed-model", 1));
+    /* oi_cli_terminal_enable puts the fd back in raw mode via
+     * tcsetattr(..., TCSAFLUSH, ...), which discards any input received
+     * but not yet read at that moment. "Model: changed-model" is printed
+     * by command dispatch *before* the next oi_cli_prompt_read call (and
+     * therefore before that tcsetattr), so writing the next line right
+     * after seeing it races: if it lands in the queue before that
+     * tcsetattr call, it is silently discarded and never seen. Waiting
+     * for the re-enable sequence first (occurrence 2: the first was
+     * startup) proves the child is already back in raw mode. */
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
     CHECK(write_interactive(master_fd, "a prompt\r", 9));
     CHECK(interactive_wait_for(master_fd, &result, "changed-reply", 1));
     /* Bracketed paste is toggled off/on around every oi_cli_prompt_read
@@ -988,6 +991,16 @@ TEST(interactive_cwd_command_changes_the_process_directory) {
     snprintf(cwd_command, sizeof cwd_command, "/cwd %s\r", target_dir);
     CHECK(write_interactive(master_fd, cwd_command, strlen(cwd_command)));
     CHECK(interactive_wait_for(master_fd, &result, "CWD:", 1));
+    /* oi_cli_terminal_enable puts the fd back in raw mode via
+     * tcsetattr(..., TCSAFLUSH, ...), which discards any input received
+     * but not yet read at that moment. The "CWD:" confirmation above is
+     * printed by command dispatch *before* the next oi_cli_prompt_read
+     * call (and therefore before that tcsetattr), so writing the next
+     * line right after seeing it races: if it lands in the queue before
+     * that tcsetattr call, it is silently discarded and never seen.
+     * Waiting for the re-enable sequence first (occurrence 2: the first
+     * was startup) proves the child is already back in raw mode. */
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
     CHECK(write_interactive(master_fd, "/status\r", 8));
     {
         char expected[192];
