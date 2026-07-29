@@ -9,8 +9,15 @@
 /*
  * Reads one interactive submission. The returned text is caller-owned.
  * `out_exit` is set when Ctrl+D was pressed at an empty prompt.
+ *
+ * `resize_fd` is an optional signalfd already registered for SIGWINCH
+ * (SFD_NONBLOCK), owned and blocked/created by the caller; pass -1 to
+ * disable resize handling entirely (the terminal width is still read once
+ * at the start of the call either way). When >= 0, a pending resize
+ * re-reads the terminal width and redraws the current frame in place,
+ * preserving the edit buffer, cursor, and command-menu selection.
  */
-oi_status oi_cli_prompt_read(int input_fd, int output_fd,
+oi_status oi_cli_prompt_read(int input_fd, int output_fd, int resize_fd,
                              struct oi_cli_input_history *history,
                              char **out_text, size_t *out_len, int *out_exit);
 

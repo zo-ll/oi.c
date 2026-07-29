@@ -1,12 +1,19 @@
+/* signalfd(2) is a GNU/Linux extension, needed by the resize test below to
+ * create its own SIGWINCH signalfd (mirroring what cli_repl.c owns in
+ * production). */
+#define _GNU_SOURCE
+
 #include "cli_prompt.h"
 #include "test.h"
 
 #include <poll.h>
 #include <pty.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/signalfd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -100,7 +107,7 @@ static struct prompt_result run_prompt(const char *input, size_t input_len,
             _exit(1);
         }
         oi_cli_input_history_init(&history);
-        status = oi_cli_prompt_read(slave_fd, slave_fd, &history, &text,
+        status = oi_cli_prompt_read(slave_fd, slave_fd, -1, &history, &text,
                                     &text_len, &exit_requested);
         result.status = status;
         result.exit_requested = exit_requested;
@@ -181,9 +188,140 @@ TEST(ctrl_c_clears_and_ctrl_d_exits) {
     check_restored(&original, &restored);
 }
 
+struct captured_output {
+    char data[2048];
+    size_t len;
+};
+
+static int wait_for_text(int fd, struct captured_output *out,
+                         const char *needle, int timeout_ms) {
+    while (out->len < sizeof out->data - 1) {
+        struct pollfd descriptor = {
+            .fd = fd,
+            .events = POLLIN,
+        };
+        ssize_t n;
+
+        if (strstr(out->data, needle) != NULL) {
+            return 1;
+        }
+        if (poll(&descriptor, 1, timeout_ms) <= 0) {
+            return 0;
+        }
+        n = read(fd, out->data + out->len, sizeof out->data - 1 - out->len);
+        if (n <= 0) {
+            return 0;
+        }
+        out->len += (size_t)n;
+        out->data[out->len] = '\0';
+    }
+    return 0;
+}
+
+TEST(resize_redraws_at_the_new_width_and_preserves_submitted_text) {
+    struct prompt_result result;
+    struct captured_output output;
+    struct winsize initial = {0};
+    struct winsize resized = {0};
+    int result_pipe[2] = {-1, -1};
+    int master_fd = -1;
+    int slave_fd = -1;
+    pid_t child;
+
+    memset(&result, 0, sizeof result);
+    memset(&output, 0, sizeof output);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    CHECK_EQ(pipe(result_pipe), 0);
+
+    initial.ws_row = 24;
+    initial.ws_col = 20;
+    CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &initial), 0);
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct oi_cli_input_history history;
+        sigset_t winch;
+        char *text = NULL;
+        size_t text_len = 0;
+        int exit_requested = 0;
+        int resize_fd;
+        oi_status status;
+
+        close(master_fd);
+        close(result_pipe[0]);
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
+            result.status = OI_ERR_IO;
+            (void)write_all(result_pipe[1], &result, sizeof result);
+            close(result_pipe[1]);
+            close(slave_fd);
+            _exit(1);
+        }
+        sigemptyset(&winch);
+        sigaddset(&winch, SIGWINCH);
+        if (sigprocmask(SIG_BLOCK, &winch, NULL) != 0) {
+            result.status = OI_ERR_IO;
+            (void)write_all(result_pipe[1], &result, sizeof result);
+            close(result_pipe[1]);
+            close(slave_fd);
+            _exit(1);
+        }
+        resize_fd = signalfd(-1, &winch, SFD_NONBLOCK | SFD_CLOEXEC);
+        oi_cli_input_history_init(&history);
+        status = oi_cli_prompt_read(slave_fd, slave_fd, resize_fd, &history,
+                                    &text, &text_len, &exit_requested);
+        result.status = status;
+        result.exit_requested = exit_requested;
+        result.text_len = text_len;
+        if (text_len != 0 && text_len <= sizeof result.text) {
+            memcpy(result.text, text, text_len);
+        }
+        (void)write_all(result_pipe[1], &result, sizeof result);
+        free(text);
+        oi_cli_input_history_free(&history);
+        if (resize_fd >= 0) {
+            close(resize_fd);
+        }
+        close(result_pipe[1]);
+        close(slave_fd);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    wait_for_prompt_output(master_fd);
+    CHECK(write_all(master_fd, "abcdefghij", 10));
+    CHECK(wait_for_text(master_fd, &output, "abcdefghij", 2000));
+
+    /* Reset the capture and resize: a fresh "\x1b[J" appearing without any
+     * further keystroke proves the redraw was driven by the resize signal
+     * itself, not by continued typing. */
+    memset(&output, 0, sizeof output);
+    resized.ws_row = 24;
+    resized.ws_col = 8;
+    CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &resized), 0);
+    CHECK(wait_for_text(master_fd, &output, "\x1b[J", 2000));
+
+    CHECK(write_all(master_fd, "\r", 1));
+    CHECK(read_all(result_pipe[0], &result, sizeof result));
+    CHECK_EQ(result.status, OI_OK);
+    CHECK(!result.exit_requested);
+    CHECK_EQ(result.text_len, 10);
+    CHECK(memcmp(result.text, "abcdefghij", 10) == 0);
+
+    {
+        int child_status = 0;
+        CHECK_EQ(waitpid(child, &child_status, 0), child);
+        CHECK(WIFEXITED(child_status));
+    }
+    close(result_pipe[0]);
+    close(slave_fd);
+    close(master_fd);
+}
+
 int main(void) {
     RUN(cursor_editing_submits_expected_text_and_restores_terminal);
     RUN(bracketed_multiline_paste_is_one_submission);
     RUN(ctrl_c_clears_and_ctrl_d_exits);
+    RUN(resize_redraws_at_the_new_width_and_preserves_submitted_text);
     return oi_test_report();
 }

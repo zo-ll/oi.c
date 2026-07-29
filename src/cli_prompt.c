@@ -1,3 +1,9 @@
+/* struct signalfd_siginfo is a GNU/Linux extension; needs _GNU_SOURCE
+ * defined before any header pulls in its own feature-test macros,
+ * matching the precedent in reactor_epoll.c for other GNU fd primitives
+ * (timerfd, pidfd). */
+#define _GNU_SOURCE
+
 #include "cli_prompt.h"
 
 #include "cli_input.h"
@@ -10,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/signalfd.h>
 #include <unistd.h>
 
 #define OI_CLI_PROMPT_INPUT_CAP 4096U
@@ -31,6 +38,26 @@ static void consume_input(unsigned char *input, size_t *input_len,
         memmove(input, input + consumed, *input_len - consumed);
     }
     *input_len -= consumed;
+}
+
+/* Drains every currently-readable signalfd record. SIGWINCH is a standard
+ * (non-realtime) signal, so at most one is ever actually pending -- this
+ * loop is defensive, not load-bearing. */
+static void drain_resize_signal(int resize_fd) {
+    struct signalfd_siginfo info;
+
+    while (read(resize_fd, &info, sizeof info) == (ssize_t)sizeof info) {
+    }
+}
+
+static oi_status handle_resize(int resize_fd, int output_fd,
+                               struct oi_cli_render *render,
+                               const struct oi_cli_prompt_state *state) {
+    drain_resize_signal(resize_fd);
+    oi_cli_render_set_columns(render, terminal_columns(output_fd));
+    return oi_cli_render_draw_commands(
+        render, &state->editor, state->command_matches,
+        state->command_match_count, state->command_selection);
 }
 
 static oi_status apply_event(struct oi_cli_prompt_state *state,
@@ -65,7 +92,7 @@ static oi_status apply_event(struct oi_cli_prompt_state *state,
     return OI_ERR_INVAL;
 }
 
-oi_status oi_cli_prompt_read(int input_fd, int output_fd,
+oi_status oi_cli_prompt_read(int input_fd, int output_fd, int resize_fd,
                              struct oi_cli_input_history *history,
                              char **out_text, size_t *out_len, int *out_exit) {
     struct oi_cli_terminal terminal;
@@ -108,6 +135,12 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd,
     if (status != OI_OK) {
         goto cleanup;
     }
+    if (resize_fd >= 0) {
+        /* The draw above already used a freshly-read width; discard any
+         * resize notification queued before this call started so it
+         * doesn't trigger an immediate, redundant second redraw. */
+        drain_resize_signal(resize_fd);
+    }
 
     while (!done) {
         while (input_len != 0) {
@@ -134,18 +167,26 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd,
         }
 
         {
-            struct pollfd descriptor = {
-                .fd = input_fd,
-                .events = POLLIN,
-            };
+            struct pollfd descriptors[2];
+            nfds_t ndescriptors = 1;
             int timeout =
                 input_len != 0 && input[0] == '\x1b' && !decoder.pasting
                     ? OI_CLI_ESCAPE_TIMEOUT_MS
                     : -1;
             int ready;
 
+            descriptors[0].fd = input_fd;
+            descriptors[0].events = POLLIN;
+            descriptors[0].revents = 0;
+            if (resize_fd >= 0) {
+                descriptors[1].fd = resize_fd;
+                descriptors[1].events = POLLIN;
+                descriptors[1].revents = 0;
+                ndescriptors = 2;
+            }
+
             do {
-                ready = poll(&descriptor, 1, timeout);
+                ready = poll(descriptors, ndescriptors, timeout);
             } while (ready < 0 && errno == EINTR);
             if (ready < 0) {
                 status = OI_ERR_IO;
@@ -164,11 +205,19 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd,
                                      out_text, out_len, out_exit);
                 continue;
             }
-            if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0) {
+            if (ndescriptors == 2 &&
+                (descriptors[1].revents & POLLIN) != 0) {
+                status = handle_resize(resize_fd, output_fd, &render, &state);
+                if (status != OI_OK) {
+                    break;
+                }
+                continue;
+            }
+            if ((descriptors[0].revents & (POLLERR | POLLNVAL)) != 0) {
                 status = OI_ERR_IO;
                 break;
             }
-            if ((descriptor.revents & (POLLIN | POLLHUP)) != 0) {
+            if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0) {
                 ssize_t read_len;
 
                 if (input_len == sizeof input) {

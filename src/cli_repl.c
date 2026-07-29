@@ -186,7 +186,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         struct oi_cli_command_parse parsed;
 
         status = oi_cli_prompt_read(
-            config->input_fd, config->output_fd, &input_history, &prompt,
+            config->input_fd, config->output_fd, -1, &input_history, &prompt,
             &prompt_len, &exit_requested);
         if (status != OI_OK || exit_requested) {
             free(prompt);
