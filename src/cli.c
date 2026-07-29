@@ -450,6 +450,48 @@ static oi_status persist_queue_resolved(void *user_data,
 }
 
 /*
+ * `prefix_message_count` is a count into cli_repl.c's own live message
+ * list, never a record id -- the source range recorded here is read
+ * directly off replay_state->context[0..prefix_message_count-1]'s own
+ * record_id fields (real, stored ids), never computed arithmetically from
+ * the count itself, since a live index and a durable record id diverge
+ * once any earlier checkpoint has already collapsed part of the history.
+ */
+static oi_status persist_checkpoint(void *user_data,
+                                    size_t prefix_message_count,
+                                    const char *summary, size_t summary_len,
+                                    const char *model, size_t model_len) {
+    struct persistence_context *persistence = user_data;
+    struct oi_cli_history_record record;
+    oi_status st;
+
+    if (persistence->store == NULL) {
+        return OI_OK;
+    }
+    if (prefix_message_count == 0 ||
+        prefix_message_count > persistence->state->context_len) {
+        return OI_ERR_INVAL;
+    }
+    uint64_t first = persistence->state->context[0].record_id;
+    uint64_t last =
+        persistence->state->context[prefix_message_count - 1].record_id;
+
+    oi_cli_history_record_init(&record);
+    st = oi_cli_history_record_set_checkpoint(
+        &record, persistence->state->next_record_id, summary, summary_len,
+        model, model_len, first, last);
+    if (st == OI_OK) {
+        st = oi_cli_history_store_append(persistence->store, &record,
+                                         persistence->state);
+    }
+    oi_cli_history_record_free(&record);
+    if (st != OI_OK) {
+        persistence->last_error = st;
+    }
+    return st;
+}
+
+/*
  * Closes out a crash-recovery window found by replay (a QUEUED_INPUT record
  * with no matching QUEUE_RESOLVED, replay_state->has_pending_input):
  * persists QUEUE_RESOLVED(DISCARDED) for it immediately, before anything
@@ -977,6 +1019,8 @@ int main(int argc, char **argv) {
             .persist_queued_input_user_data = &persistence,
             .persist_queue_resolved = persist_queue_resolved,
             .persist_queue_resolved_user_data = &persistence,
+            .persist_checkpoint = persist_checkpoint,
+            .persist_checkpoint_user_data = &persistence,
             .initial_draft = initial_draft.data,
             .initial_draft_len = initial_draft.len,
         };

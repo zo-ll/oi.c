@@ -62,6 +62,24 @@ typedef oi_status (*oi_cli_repl_persist_queued_input_cb)(
 typedef oi_status (*oi_cli_repl_persist_queue_resolved_cb)(
     void *user_data, uint64_t queued_record_id, int consumed);
 
+/*
+ * Durable persistence for /compact, implemented by the caller (cli.c owns
+ * the replay state's context array, the only place a live message index
+ * can be translated into real record ids). `prefix_message_count` is a
+ * count into the REPL's own live message list (oi_cli_conversation_messages),
+ * never a record id itself -- cli.c must read the checkpoint's source
+ * range directly off replay_state->context[0..prefix_message_count-1]'s
+ * own record_id fields, never infer it arithmetically, since a live
+ * message index and a durable record id are not the same number once any
+ * prior checkpoint has already collapsed part of the history. Nullable,
+ * matching persist_queued_input/persist_queue_resolved's existing
+ * ephemeral-session skip -- an ephemeral session has nothing to persist
+ * this into, but /compact's live-side effect still applies regardless.
+ */
+typedef oi_status (*oi_cli_repl_persist_checkpoint_cb)(
+    void *user_data, size_t prefix_message_count, const char *summary,
+    size_t summary_len, const char *model, size_t model_len);
+
 struct oi_cli_repl_config {
     const char *model;
     int max_turns;
@@ -94,6 +112,8 @@ struct oi_cli_repl_config {
     void *persist_queued_input_user_data;
     oi_cli_repl_persist_queue_resolved_cb persist_queue_resolved;
     void *persist_queue_resolved_user_data;
+    oi_cli_repl_persist_checkpoint_cb persist_checkpoint;
+    void *persist_checkpoint_user_data;
     /* Crash-recovery text found by the caller's own replay (an interrupted
      * queue consumption) to seed as the composer's initial draft -- never
      * auto-run, just handed back as an editable line. NULL/0 (the default)
