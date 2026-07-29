@@ -1892,6 +1892,365 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
     }
 }
 
+/*
+ * Loads oi_sesslog's length-prefixed records (see the file-format comment
+ * in busy_submit_is_queued_and_a_second_one_is_refused above) as an array
+ * of NUL-terminated JSON strings, one per record -- for tests that need to
+ * check more than one record's presence, or the relative order/turn_ids
+ * between several of them.
+ */
+struct oilog_records {
+    char **items;
+    size_t count;
+};
+
+static void oilog_records_load(const char *path, struct oilog_records *out) {
+    FILE *history = fopen(path, "r");
+    long size;
+    unsigned char *contents;
+    size_t len;
+    size_t offset;
+    size_t cap = 16;
+
+    CHECK(history != NULL);
+    CHECK_EQ(fseek(history, 0, SEEK_END), 0);
+    size = ftell(history);
+    CHECK(size > 12);
+    rewind(history);
+    contents = malloc((size_t)size);
+    CHECK(contents != NULL);
+    len = fread(contents, 1, (size_t)size, history);
+    fclose(history);
+    CHECK_EQ(len, (size_t)size);
+
+    out->items = malloc(cap * sizeof(char *));
+    CHECK(out->items != NULL);
+    out->count = 0;
+    offset = 12;
+    while (offset + 4 <= len) {
+        uint32_t record_len = (uint32_t)contents[offset] |
+            ((uint32_t)contents[offset + 1] << 8) |
+            ((uint32_t)contents[offset + 2] << 16) |
+            ((uint32_t)contents[offset + 3] << 24);
+        char *record;
+
+        offset += 4;
+        CHECK(offset + record_len <= len);
+        record = malloc(record_len + 1);
+        CHECK(record != NULL);
+        memcpy(record, contents + offset, record_len);
+        record[record_len] = '\0';
+        offset += record_len;
+
+        if (out->count == cap) {
+            cap *= 2;
+            out->items = realloc(out->items, cap * sizeof(char *));
+            CHECK(out->items != NULL);
+        }
+        out->items[out->count++] = record;
+    }
+    free(contents);
+}
+
+static void oilog_records_free(struct oilog_records *records) {
+    size_t i;
+
+    for (i = 0; i < records->count; i++) {
+        free(records->items[i]);
+    }
+    free(records->items);
+}
+
+/* Finds the first record at or after start_index containing every needle;
+ * returns its index, or SIZE_MAX if none match. */
+static size_t oilog_find(const struct oilog_records *records,
+                         size_t start_index, const char *const *needles,
+                         size_t needle_count) {
+    size_t i;
+
+    for (i = start_index; i < records->count; i++) {
+        size_t j;
+
+        for (j = 0; j < needle_count; j++) {
+            if (strstr(records->items[i], needles[j]) == NULL) {
+                break;
+            }
+        }
+        if (j == needle_count) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+/* Every history record's turn_id is written as a JSON string, e.g.
+ * "turn_id":"2" -- extracts its numeric value. */
+static uint64_t oilog_record_turn_id(const char *record) {
+    const char *marker = strstr(record, "\"turn_id\":\"");
+
+    CHECK(marker != NULL);
+    return (uint64_t)strtoull(marker + strlen("\"turn_id\":\""), NULL, 10);
+}
+
+TEST(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids) {
+    const char *first_reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *second_reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"secondreply\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t first_len;
+    size_t second_len;
+    char *first_reply = build_chunked_response(
+        first_reply_sse, strlen(first_reply_sse), "HTTP/1.1 200 OK",
+        &first_len);
+    char *second_reply = build_chunked_response(
+        second_reply_sse, strlen(second_reply_sse), "HTTP/1.1 200 OK",
+        &second_len);
+    struct slow_mock_turn turns[2];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    /* The first turn's 2s delay keeps it reliably busy long enough to
+     * submit "world" while it's still in flight; the second turn (no
+     * delay) is the queued message's own resumed turn, run automatically
+     * once the first reaches its safe boundary. */
+    turns[0].response = first_reply;
+    turns[0].response_len = first_len;
+    turns[0].delay_seconds = 2;
+    turns[1].response = second_reply;
+    turns[1].response_len = second_len;
+    turns[1].delay_seconds = 0;
+    server = start_slow_mock_server(turns, 2, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-queue-resume-%d",
+             (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+
+    CHECK(write_interactive(master_fd, "world\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+
+    CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    /* The queued message runs immediately once the first turn finishes,
+     * with no further input from us. */
+    CHECK(interactive_wait_for(master_fd, &result, "secondreply", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+    free(first_reply);
+    free(second_reply);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        char history_path[640] = {0};
+        size_t sessions_found = 0;
+        struct oilog_records records;
+        size_t hello_index;
+        size_t queued_index;
+        size_t resolved_index;
+        size_t resumed_index;
+        uint64_t hello_turn_id;
+        uint64_t queued_turn_id;
+        const char *hello_needles[] = {"\"type\":\"message\"",
+                                       "\"role\":\"user\"",
+                                       "\"content\":\"hello\""};
+        const char *queued_needles[] = {"\"type\":\"queued_input\"",
+                                        "\"content\":\"world\""};
+        const char *resolved_needles[] = {"\"type\":\"queue_resolved\"",
+                                          "\"resolution\":\"consumed\""};
+        const char *resumed_needles[] = {"\"type\":\"message\"",
+                                         "\"role\":\"user\"",
+                                         "\"content\":\"world\""};
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+
+        oilog_records_load(history_path, &records);
+
+        hello_index = oilog_find(&records, 0, hello_needles, 3);
+        CHECK(hello_index != SIZE_MAX);
+        queued_index =
+            oilog_find(&records, hello_index + 1, queued_needles, 2);
+        CHECK(queued_index != SIZE_MAX);
+        resolved_index =
+            oilog_find(&records, queued_index + 1, resolved_needles, 2);
+        CHECK(resolved_index != SIZE_MAX);
+        resumed_index =
+            oilog_find(&records, resolved_index + 1, resumed_needles, 3);
+        CHECK(resumed_index != SIZE_MAX);
+
+        /* The core correctness property: the queued item, the record that
+         * resolves it, and the turn it becomes must all share one turn_id,
+         * distinct from (and later than) the first turn's. */
+        hello_turn_id = oilog_record_turn_id(records.items[hello_index]);
+        queued_turn_id = oilog_record_turn_id(records.items[queued_index]);
+        CHECK(queued_turn_id > hello_turn_id);
+        CHECK_EQ(oilog_record_turn_id(records.items[resolved_index]),
+                 queued_turn_id);
+        CHECK_EQ(oilog_record_turn_id(records.items[resumed_index]),
+                 queued_turn_id);
+
+        oilog_records_free(&records);
+
+        unlink(metadata_path);
+        unlink(history_path);
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
+TEST(queued_command_while_busy_resolves_discarded_and_dispatches_live) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[1];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].delay_seconds = 2;
+    server = start_slow_mock_server(turns, 1, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-queue-cmd-%d",
+             (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+
+    /* /model is not read-only (unlike /help and /status): it queues like
+     * any plain message while busy, per the schema-forced rule that a
+     * queued command can only ever resolve DISCARDED, then dispatch live. */
+    CHECK(write_interactive(master_fd, "/model gpt-test\r", 17));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+
+    CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    /* Once the turn reaches its safe boundary, the queued command
+     * dispatches live -- its own confirmation text proves this ran through
+     * dispatch_model, not as a new conversation turn. */
+    CHECK(interactive_wait_for(master_fd, &result, "Model: gpt-test", 1));
+
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "Model: gpt-test", 2));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+    free(reply);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        char history_path[640] = {0};
+        size_t sessions_found = 0;
+        struct oilog_records records;
+        size_t queued_index;
+        size_t resolved_index;
+        const char *queued_needles[] = {"\"type\":\"queued_input\"",
+                                        "\"content\":\"/model gpt-test\""};
+        const char *resolved_needles[] = {"\"type\":\"queue_resolved\"",
+                                          "\"resolution\":\"discarded\""};
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+
+        oilog_records_load(history_path, &records);
+
+        queued_index = oilog_find(&records, 0, queued_needles, 2);
+        CHECK(queued_index != SIZE_MAX);
+        resolved_index =
+            oilog_find(&records, queued_index + 1, resolved_needles, 2);
+        CHECK(resolved_index != SIZE_MAX);
+        CHECK_EQ(oilog_record_turn_id(records.items[queued_index]),
+                 oilog_record_turn_id(records.items[resolved_index]));
+
+        oilog_records_free(&records);
+
+        unlink(metadata_path);
+        unlink(history_path);
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
 TEST(sigterm_during_a_turn_terminates_cleanly) {
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -2332,6 +2691,8 @@ int main(void) {
     RUN(typing_during_a_turn_does_not_corrupt_the_display);
     RUN(typed_ctrl_c_during_a_turn_cancels_it);
     RUN(busy_submit_is_queued_and_a_second_one_is_refused);
+    RUN(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids);
+    RUN(queued_command_while_busy_resolves_discarded_and_dispatches_live);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);

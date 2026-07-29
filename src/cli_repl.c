@@ -334,6 +334,11 @@ static void handle_busy_submit(struct repl_turn_input_context *context) {
         context->pending->kind = kind;
         context->pending->text = text;
         context->pending->text_len = text_len;
+        /* Now that something is queued, no new tool call (or follow-up
+         * model round) should start ahead of it -- whatever's already in
+         * flight (the model request, or a running tool) still finishes
+         * naturally. */
+        oi_cli_conversation_steer(context->conversation);
         report_busy_io_error(
             context, fputs(busy_queued_text, context->config->err) != EOF &&
                           fflush(context->config->err) == 0);
@@ -550,6 +555,62 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         int terminate_signal = 0;
         struct oi_cli_command_parse parsed;
 
+        if (pending.kind != OI_CLI_REPL_PENDING_NONE) {
+            /* The safe boundary the previous turn's steering was waiting
+             * for has been reached (present.done, back at the top of this
+             * loop): resolve the queue durably before running it, per the
+             * issue's own requirement, and run it immediately, before
+             * returning to an idle read. A queued command always resolves
+             * DISCARDED (the durable schema has no "consumed by running a
+             * command" shape -- see cli_history_replay.c's queue_consumed
+             * gate); only a queued plain message can ever resolve
+             * CONSUMED. */
+            int consumed = pending.kind == OI_CLI_REPL_PENDING_MESSAGE;
+
+            if (config->persist_queue_resolved != NULL) {
+                status = config->persist_queue_resolved(
+                    config->persist_queue_resolved_user_data,
+                    pending.record_id, consumed);
+                if (status != OI_OK) {
+                    repl_pending_free(&pending);
+                    if (config->is_durably_failed != NULL &&
+                        config->is_durably_failed(
+                            config->is_durably_failed_user_data)) {
+                        break;
+                    }
+                    if (fprintf(config->err, "oi: turn failed: %s\n",
+                               oi_status_str(status)) < 0 ||
+                        fflush(config->err) != 0) {
+                        status = OI_ERR_IO;
+                        break;
+                    }
+                    status = OI_OK;
+                    continue;
+                }
+            }
+            prompt = pending.text;
+            prompt_len = pending.text_len;
+            pending.text = NULL;
+            pending.text_len = 0;
+            pending.kind = OI_CLI_REPL_PENDING_NONE;
+            pending.record_id = 0;
+            if (consumed) {
+                /* Already known to be a plain message as of queueing time
+                 * (any leading "//" already stripped then, too) --
+                 * skip straight past command parsing/dispatch instead of
+                 * re-parsing it, which would wrongly re-trigger command
+                 * handling for message content that happens to start with
+                 * a bare "/". */
+                goto have_message;
+            }
+            status = oi_cli_command_parse_text(prompt, prompt_len, &parsed);
+            if (status != OI_OK) {
+                free(prompt);
+                break;
+            }
+            goto have_parsed_command;
+        }
+
         status = oi_cli_composer_wait_submit(
             &composer, signal_fd, &prompt, &prompt_len, &exit_requested,
             &terminate_signal);
@@ -566,6 +627,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
             free(prompt);
             break;
         }
+have_parsed_command:
         if (parsed.kind == OI_CLI_COMMAND_PARSE_UNKNOWN) {
             if (fprintf(config->err, "oi: unknown command: %.*s\n",
                         (int)prompt_len, prompt) < 0) {
@@ -607,6 +669,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
             memmove(prompt, prompt + 1, prompt_len);
             prompt_len--;
         }
+have_message:
         if (conversation == NULL) {
             oi_arena *conversation_arena = arena;
 
