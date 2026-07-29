@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -87,6 +88,17 @@ static struct prompt_result run_prompt(const char *input, size_t input_len,
 
         close(master_fd);
         close(result_pipe[0]);
+        /* A plain fork() inherits the test harness's own session/process
+         * group, not one attached to this pty -- a resize test's
+         * TIOCSWINSZ-triggered SIGWINCH has nowhere to go without a real
+         * controlling terminal established here first. */
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
+            result.status = OI_ERR_IO;
+            (void)write_all(result_pipe[1], &result, sizeof result);
+            close(result_pipe[1]);
+            close(slave_fd);
+            _exit(1);
+        }
         oi_cli_input_history_init(&history);
         status = oi_cli_prompt_read(slave_fd, slave_fd, &history, &text,
                                     &text_len, &exit_requested);

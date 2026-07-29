@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -271,6 +272,13 @@ static pid_t start_interactive_cli(unsigned short port, int slave_fd,
         char port_text[16];
         char *argv[13];
 
+        /* A plain fork() inherits the test harness's own session/process
+         * group, not one attached to this pty -- a resize test's
+         * TIOCSWINSZ-triggered SIGWINCH has nowhere to go without a real
+         * controlling terminal established here first. */
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
+            _exit(126);
+        }
         snprintf(port_text, sizeof port_text, "%u", (unsigned)port);
         if (dup2(slave_fd, STDIN_FILENO) < 0 ||
             dup2(slave_fd, STDOUT_FILENO) < 0 ||
