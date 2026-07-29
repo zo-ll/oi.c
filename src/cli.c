@@ -377,6 +377,75 @@ static oi_status persist_cwd_setting(void *user_data, const char *path,
         path_len);
 }
 
+/*
+ * Durable persistence for the one-slot queued-input mechanism. Unlike
+ * persist_model_setting/persist_cwd_setting, these append a plain history
+ * record directly (oi_cli_history_store_append), the same way
+ * persist_conversation_event does -- there is no metadata.json refresh
+ * involved. context->state->next_record_id/next_turn_id are exactly right
+ * for a QUEUED_INPUT record (cli_history_replay.c requires its turn_id to
+ * be the *next* turn, the one that hasn't started yet, not the currently
+ * active one tracked by context->turn_id); a successful append then has
+ * oi_cli_history_store_append itself replay context->state fresh, which is
+ * what populates pending_input_turn_id below for the matching
+ * QUEUE_RESOLVED record -- cli_repl.c never needs to track or pass a
+ * turn_id itself, only the opaque record id persist_queued_input hands
+ * back.
+ */
+static oi_status persist_queued_input(void *user_data, const char *content,
+                                      size_t content_len,
+                                      uint64_t *out_record_id) {
+    struct persistence_context *persistence = user_data;
+    struct oi_cli_history_record record;
+    oi_status st;
+
+    *out_record_id = 0;
+    if (persistence->store == NULL) {
+        return OI_OK;
+    }
+    oi_cli_history_record_init(&record);
+    st = oi_cli_history_record_set_queued_input(
+        &record, persistence->state->next_record_id,
+        persistence->state->next_turn_id, content, content_len);
+    if (st == OI_OK) {
+        *out_record_id = persistence->state->next_record_id;
+        st = oi_cli_history_store_append(persistence->store, &record,
+                                         persistence->state);
+    }
+    oi_cli_history_record_free(&record);
+    if (st != OI_OK) {
+        persistence->last_error = st;
+    }
+    return st;
+}
+
+static oi_status persist_queue_resolved(void *user_data,
+                                        uint64_t queued_record_id,
+                                        int consumed) {
+    struct persistence_context *persistence = user_data;
+    struct oi_cli_history_record record;
+    oi_status st;
+
+    if (persistence->store == NULL) {
+        return OI_OK;
+    }
+    oi_cli_history_record_init(&record);
+    st = oi_cli_history_record_set_queue_resolved(
+        &record, persistence->state->next_record_id,
+        persistence->state->pending_input_turn_id, queued_record_id,
+        consumed ? OI_CLI_HISTORY_QUEUE_CONSUMED
+                : OI_CLI_HISTORY_QUEUE_DISCARDED);
+    if (st == OI_OK) {
+        st = oi_cli_history_store_append(persistence->store, &record,
+                                         persistence->state);
+    }
+    oi_cli_history_record_free(&record);
+    if (st != OI_OK) {
+        persistence->last_error = st;
+    }
+    return st;
+}
+
 /* Wired unconditionally into oi_cli_repl_config, even for an ephemeral
  * session with no durable persistence at all: persist_conversation_event
  * (the only writer of persistence->last_error) is then never registered as
@@ -850,6 +919,10 @@ int main(int argc, char **argv) {
             .persist_cwd_user_data = &persistence,
             .is_durably_failed = persistence_has_failed,
             .is_durably_failed_user_data = &persistence,
+            .persist_queued_input = persist_queued_input,
+            .persist_queued_input_user_data = &persistence,
+            .persist_queue_resolved = persist_queue_resolved,
+            .persist_queue_resolved_user_data = &persistence,
         };
         st = oi_cli_repl_run(client, reactor, turn_arena, tools,
                              &repl_config);

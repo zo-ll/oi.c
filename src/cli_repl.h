@@ -1,6 +1,7 @@
 #ifndef OI_CLI_REPL_H
 #define OI_CLI_REPL_H
 
+#include <stdint.h>
 #include <stdio.h>
 
 #include "cli_conversation.h"
@@ -41,6 +42,26 @@ typedef oi_status (*oi_cli_repl_persist_cwd_cb)(void *user_data,
  */
 typedef int (*oi_cli_repl_is_durably_failed_cb)(void *user_data);
 
+/*
+ * Durable persistence for the one-slot queued-input mechanism, implemented
+ * by the caller (cli.c owns the record/turn_id bookkeeping; the REPL
+ * controller only ever holds the opaque record id handed back to it).
+ * Both nullable, matching persist_model/persist_cwd's existing ephemeral-
+ * session skip. persist_queued_input must be called (and must succeed)
+ * before the REPL treats a message as durably queued, per the issue's own
+ * "persist before acknowledging" requirement; *out_record_id is the id to
+ * later pass back to persist_queue_resolved. `consumed` is true if the
+ * queued message is becoming the next turn's real user message, false if
+ * it's being discarded (refused, cancelled, or a queued command, which the
+ * durable schema can only ever resolve as discarded -- see
+ * cli_history_replay.c's queue_consumed gate).
+ */
+typedef oi_status (*oi_cli_repl_persist_queued_input_cb)(
+    void *user_data, const char *content, size_t content_len,
+    uint64_t *out_record_id);
+typedef oi_status (*oi_cli_repl_persist_queue_resolved_cb)(
+    void *user_data, uint64_t queued_record_id, int consumed);
+
 struct oi_cli_repl_config {
     const char *model;
     int max_turns;
@@ -69,6 +90,10 @@ struct oi_cli_repl_config {
     void *persist_cwd_user_data;
     oi_cli_repl_is_durably_failed_cb is_durably_failed;
     void *is_durably_failed_user_data;
+    oi_cli_repl_persist_queued_input_cb persist_queued_input;
+    void *persist_queued_input_user_data;
+    oi_cli_repl_persist_queue_resolved_cb persist_queue_resolved;
+    void *persist_queue_resolved_user_data;
 };
 
 oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
