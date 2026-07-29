@@ -15,6 +15,13 @@ typedef struct oi_cli_conversation oi_cli_conversation;
 enum oi_cli_conversation_tool_outcome {
     OI_CLI_CONVERSATION_TOOL_NONE = 0,
     OI_CLI_CONVERSATION_TOOL_COMPLETED,
+    /* The tool ran, but exited nonzero or abnormally. Durable history
+     * still records this as a completed execution; this distinction is
+     * for accurate live presentation. */
+    OI_CLI_CONVERSATION_TOOL_FAILED,
+    /* The staged call was explicitly denied. Durable history records this
+     * as not executed; live presentation must not call it cancelled. */
+    OI_CLI_CONVERSATION_TOOL_DENIED,
     OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN,
     OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED
 };

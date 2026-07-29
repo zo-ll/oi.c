@@ -10,7 +10,8 @@ TEST(start_and_feed_produce_a_header_and_content_lines) {
     size_t count;
 
     oi_cli_tool_panel_init(&panel);
-    oi_cli_tool_panel_start(&panel, "shell", 5);
+    CHECK_EQ(oi_cli_tool_panel_start(&panel, "call-1", 6, "shell", 5),
+             OI_OK);
     CHECK_EQ(oi_cli_tool_panel_feed(&panel, "hello\nworld", 11), OI_OK);
 
     count = oi_cli_tool_panel_lines(&panel, lines, 4);
@@ -30,7 +31,8 @@ TEST(finish_updates_the_header_status) {
     struct oi_cli_render_line lines[2];
 
     oi_cli_tool_panel_init(&panel);
-    oi_cli_tool_panel_start(&panel, "shell", 5);
+    CHECK_EQ(oi_cli_tool_panel_start(&panel, "call-1", 6, "shell", 5),
+             OI_OK);
     oi_cli_tool_panel_finish(&panel, OI_CLI_TOOL_PANEL_COMPLETED);
 
     CHECK_EQ(oi_cli_tool_panel_lines(&panel, lines, 2), 1);
@@ -52,7 +54,8 @@ TEST(malicious_escape_sequences_are_stripped_from_displayed_output) {
     size_t count;
 
     oi_cli_tool_panel_init(&panel);
-    oi_cli_tool_panel_start(&panel, "shell", 5);
+    CHECK_EQ(oi_cli_tool_panel_start(&panel, "call-1", 6, "shell", 5),
+             OI_OK);
     CHECK_EQ(oi_cli_tool_panel_feed(&panel, raw, sizeof raw - 1), OI_OK);
 
     count = oi_cli_tool_panel_lines(&panel, lines, 3);
@@ -73,7 +76,8 @@ TEST(output_is_bounded_and_trims_whole_lines_from_the_front) {
     int i;
 
     oi_cli_tool_panel_init(&panel);
-    oi_cli_tool_panel_start(&panel, "shell", 5);
+    CHECK_EQ(oi_cli_tool_panel_start(&panel, "call-1", 6, "shell", 5),
+             OI_OK);
     /* Each fed line is ~11 bytes; feed enough of them to comfortably
      * exceed OI_CLI_TOOL_PANEL_MAX_BYTES (4096). */
     for (i = 0; i < 600; i++) {
@@ -99,7 +103,8 @@ TEST(lines_keeps_only_the_most_recent_within_max_lines) {
     struct oi_cli_render_line lines[3] = {0};
 
     oi_cli_tool_panel_init(&panel);
-    oi_cli_tool_panel_start(&panel, "shell", 5);
+    CHECK_EQ(oi_cli_tool_panel_start(&panel, "call-1", 6, "shell", 5),
+             OI_OK);
     CHECK_EQ(oi_cli_tool_panel_feed(&panel, "one\ntwo\nthree\n", 14), OI_OK);
 
     /* max_lines=3 -> header + last 2 content lines ("two", "three"), not
@@ -117,14 +122,31 @@ TEST(clear_resets_to_inactive) {
     struct oi_cli_tool_panel panel;
 
     oi_cli_tool_panel_init(&panel);
-    oi_cli_tool_panel_start(&panel, "shell", 5);
+    CHECK_EQ(oi_cli_tool_panel_start(&panel, "call-1", 6, "shell", 5),
+             OI_OK);
     CHECK(panel.active);
     oi_cli_tool_panel_finish(&panel, OI_CLI_TOOL_PANEL_COMPLETED);
     oi_cli_tool_panel_clear(&panel);
     CHECK(!panel.active);
+    CHECK_EQ(panel.tool_call_id.len, (size_t)0);
     CHECK_EQ(panel.name_len, (size_t)0);
     CHECK_EQ(panel.tail.len, (size_t)0);
 
+    oi_cli_tool_panel_free(&panel);
+}
+
+TEST(result_identity_matches_only_the_active_tool_call) {
+    struct oi_cli_tool_panel panel;
+
+    oi_cli_tool_panel_init(&panel);
+    CHECK_EQ(oi_cli_tool_panel_start(&panel, "call-1", 6, "shell", 5),
+             OI_OK);
+    CHECK(oi_cli_tool_panel_matches(&panel, "call-1", 6));
+    CHECK(!oi_cli_tool_panel_matches(&panel, "call-2", 6));
+    CHECK(!oi_cli_tool_panel_matches(&panel, "call-1-extra", 12));
+
+    oi_cli_tool_panel_clear(&panel);
+    CHECK(!oi_cli_tool_panel_matches(&panel, "call-1", 6));
     oi_cli_tool_panel_free(&panel);
 }
 
@@ -135,5 +157,6 @@ int main(void) {
     RUN(output_is_bounded_and_trims_whole_lines_from_the_front);
     RUN(lines_keeps_only_the_most_recent_within_max_lines);
     RUN(clear_resets_to_inactive);
+    RUN(result_identity_matches_only_the_active_tool_call);
     return oi_test_report();
 }

@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "cli_bytebuf.h"
+#include "cli_message.h"
 #include "cli_render.h"
 #include "cli_render_sanitize.h"
 #include "cli_utf8_stream.h"
@@ -40,6 +41,10 @@ enum oi_cli_tool_panel_status {
  * bytes in tool output" defense the render layer relies on.
  */
 struct oi_cli_tool_panel {
+    /* Exact, non-display identity of the call currently represented.
+     * Tool-result events are matched against it so a skipped sibling call
+     * cannot overwrite the status of the panel for the call that ran. */
+    struct oi_cli_string tool_call_id;
     char name[OI_CLI_TOOL_PANEL_NAME_MAX];
     size_t name_len;
     enum oi_cli_tool_panel_status status;
@@ -61,8 +66,13 @@ void oi_cli_tool_panel_free(struct oi_cli_tool_panel *panel);
 /* Starts fresh presentation state for one call, sanitizing `name`
  * immediately (bounded to OI_CLI_TOOL_PANEL_NAME_MAX) since it's
  * untrusted, model-supplied text. */
-void oi_cli_tool_panel_start(struct oi_cli_tool_panel *panel,
-                             const char *name, size_t name_len);
+oi_status oi_cli_tool_panel_start(struct oi_cli_tool_panel *panel,
+                                  const char *tool_call_id,
+                                  size_t tool_call_id_len, const char *name,
+                                  size_t name_len);
+int oi_cli_tool_panel_matches(const struct oi_cli_tool_panel *panel,
+                              const char *tool_call_id,
+                              size_t tool_call_id_len);
 oi_status oi_cli_tool_panel_feed(struct oi_cli_tool_panel *panel,
                                  const void *data, size_t len);
 void oi_cli_tool_panel_finish(struct oi_cli_tool_panel *panel,

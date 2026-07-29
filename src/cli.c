@@ -276,7 +276,10 @@ static enum oi_cli_history_tool_outcome history_tool_outcome(
     enum oi_cli_conversation_tool_outcome outcome) {
     switch (outcome) {
     case OI_CLI_CONVERSATION_TOOL_COMPLETED:
+    case OI_CLI_CONVERSATION_TOOL_FAILED:
         return OI_CLI_HISTORY_TOOL_COMPLETED;
+    case OI_CLI_CONVERSATION_TOOL_DENIED:
+        return OI_CLI_HISTORY_TOOL_NOT_EXECUTED;
     case OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN:
         return OI_CLI_HISTORY_TOOL_OUTCOME_UNKNOWN;
     case OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED:

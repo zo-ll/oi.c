@@ -664,9 +664,13 @@ static void on_tool_done(oi_tool_exit_kind kind, int code, void *user_data) {
     const struct oi_cli_tool_call_value *call =
         &assistant->tool_calls[conversation->tool_index];
     if (st == OI_OK) {
+        enum oi_cli_conversation_tool_outcome outcome =
+            kind == OI_TOOL_EXIT_NORMAL && code == 0
+                ? OI_CLI_CONVERSATION_TOOL_COMPLETED
+                : OI_CLI_CONVERSATION_TOOL_FAILED;
+
         st = commit_tool_text(
-            conversation, call, text.data, text.len,
-            OI_CLI_CONVERSATION_TOOL_COMPLETED,
+            conversation, call, text.data, text.len, outcome,
             (const unsigned char *)conversation->tool_output.data,
             conversation->tool_output.len, 1, /*is_repair=*/0);
     }
@@ -711,7 +715,7 @@ static void resolve_permission_body(oi_cli_conversation *conversation,
          * correct for them. */
         st = commit_tool_text(conversation, call, denied_tool_not_executed_text,
                               sizeof denied_tool_not_executed_text - 1,
-                              OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED, NULL, 0,
+                              OI_CLI_CONVERSATION_TOOL_DENIED, NULL, 0,
                               0, /*is_repair=*/0);
         conversation->tool_index++;
         finish_turn_with_repair(conversation,

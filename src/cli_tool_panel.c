@@ -51,23 +51,42 @@ void oi_cli_tool_panel_init(struct oi_cli_tool_panel *panel) {
 }
 
 void oi_cli_tool_panel_free(struct oi_cli_tool_panel *panel) {
+    oi_cli_string_free(&panel->tool_call_id);
     oi_cli_bytebuf_free(&panel->tail);
 }
 
-void oi_cli_tool_panel_start(struct oi_cli_tool_panel *panel,
-                             const char *name, size_t name_len) {
+oi_status oi_cli_tool_panel_start(struct oi_cli_tool_panel *panel,
+                                  const char *tool_call_id,
+                                  size_t tool_call_id_len, const char *name,
+                                  size_t name_len) {
     struct oi_cli_sanitize_state name_sanitize;
     struct oi_cli_bytebuf sanitized_name = {0};
+    oi_status status;
     size_t copy_len;
 
+    if (panel == NULL || (tool_call_id == NULL && tool_call_id_len != 0) ||
+        (name == NULL && name_len != 0)) {
+        return OI_ERR_INVAL;
+    }
+    status = oi_cli_string_set(&panel->tool_call_id, tool_call_id,
+                               tool_call_id_len);
+    if (status != OI_OK) {
+        return status;
+    }
     oi_cli_utf8_stream_init(&panel->utf8);
     oi_cli_sanitize_init(&panel->sanitize);
     oi_cli_bytebuf_reset(&panel->tail);
 
     oi_cli_sanitize_init(&name_sanitize);
-    if (oi_cli_sanitize_feed(&name_sanitize, (const unsigned char *)name,
-                             name_len, &sanitized_name) == OI_OK) {
-        (void)oi_cli_sanitize_finish(&name_sanitize);
+    status = oi_cli_sanitize_feed(&name_sanitize,
+                                  (const unsigned char *)name, name_len,
+                                  &sanitized_name);
+    if (status == OI_OK) {
+        status = oi_cli_sanitize_finish(&name_sanitize);
+    }
+    if (status != OI_OK) {
+        oi_cli_bytebuf_free(&sanitized_name);
+        return status;
     }
     copy_len = sanitized_name.len > sizeof panel->name - 1
                    ? sizeof panel->name - 1
@@ -81,6 +100,18 @@ void oi_cli_tool_panel_start(struct oi_cli_tool_panel *panel,
 
     panel->status = OI_CLI_TOOL_PANEL_RUNNING;
     panel->active = 1;
+    return OI_OK;
+}
+
+int oi_cli_tool_panel_matches(const struct oi_cli_tool_panel *panel,
+                              const char *tool_call_id,
+                              size_t tool_call_id_len) {
+    return panel != NULL && panel->active &&
+           panel->tool_call_id.len == tool_call_id_len &&
+           (tool_call_id_len == 0 ||
+            (tool_call_id != NULL &&
+             memcmp(panel->tool_call_id.data, tool_call_id,
+                    tool_call_id_len) == 0));
 }
 
 oi_status oi_cli_tool_panel_feed(struct oi_cli_tool_panel *panel,
@@ -113,6 +144,7 @@ void oi_cli_tool_panel_clear(struct oi_cli_tool_panel *panel) {
     panel->active = 0;
     panel->status = OI_CLI_TOOL_PANEL_RUNNING;
     panel->name_len = 0;
+    oi_cli_string_free(&panel->tool_call_id);
     oi_cli_bytebuf_reset(&panel->tail);
 }
 

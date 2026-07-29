@@ -2801,6 +2801,7 @@ TEST(permission_ask_deny_ends_the_turn) {
     /* Digit shortcut: '3' jumps directly to and confirms the third option
      * (Deny) without needing arrow keys. */
     CHECK(write_interactive(master_fd, "3", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "shell: denied", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
                                1));
 
@@ -3176,12 +3177,12 @@ TEST(permissions_allow_when_already_allowed_skips_confirmation) {
     close(master_fd);
 }
 
-TEST(tool_panel_shows_live_output_and_final_status) {
+TEST(tool_panel_shows_live_output_and_failed_status) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_panel\",\"type\":\"function\",\"function\":{"
         "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf "
-        "part1; sleep 1; printf part2\\\"}\"}}]}}]}\n\n"
+        "part1; sleep 1; printf part2; exit 7\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -3218,7 +3219,7 @@ TEST(tool_panel_shows_live_output_and_final_status) {
     CHECK(interactive_wait_for(master_fd, &result, "shell: running", 1));
     CHECK(interactive_wait_for(master_fd, &result, "part1", 1));
     CHECK(interactive_wait_for(master_fd, &result, "part2", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "shell: completed", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "shell: failed", 1));
     CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
 
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -3819,7 +3820,7 @@ int main(void) {
     RUN(permissions_allow_requires_confirmation_and_can_be_cancelled);
     RUN(permissions_allow_confirmed_elevates_policy);
     RUN(permissions_allow_when_already_allowed_skips_confirmation);
-    RUN(tool_panel_shows_live_output_and_final_status);
+    RUN(tool_panel_shows_live_output_and_failed_status);
     RUN(tool_panel_survives_malicious_escape_bytes_in_output);
     RUN(tool_panel_coexists_with_resize_and_queued_input);
     RUN(interactive_cwd_command_changes_the_process_directory);

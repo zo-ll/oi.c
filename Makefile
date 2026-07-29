@@ -141,7 +141,7 @@ $(BUILD)/test_cli_tools: test/test_cli_tools.c src/cli_tools.c $(LIB) | $(BUILD)
 
 TOOL_PANEL_DEPS = src/cli_tool_panel.c src/cli_utf8_stream.c src/cli_utf8.c \
 	src/cli_render_sanitize.c src/cli_bytebuf.c src/cli_render.c \
-	src/cli_editor.c src/cli_commands.c
+	src/cli_editor.c src/cli_commands.c src/cli_message.c
 
 $(BUILD)/test_cli_tool_panel: test/test_cli_tool_panel.c $(TOOL_PANEL_DEPS) $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(TOOL_PANEL_DEPS) $(LIB) -o $@ $(LDLIBS)

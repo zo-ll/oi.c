@@ -245,7 +245,7 @@ TEST(tool_start_boundary_precedes_process_output) {
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
         "\"function\":{\"name\":\"shell\",\"arguments\":"
-        "\"{\\\"command\\\":\\\"printf tool-output\\\"}\"}}]}}]}\n\n"
+        "\"{\\\"command\\\":\\\"printf tool-output; exit 7\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
         "data: [DONE]\n\n";
@@ -309,6 +309,8 @@ TEST(tool_start_boundary_precedes_process_output) {
     CHECK(sink.tool_output_position > sink.tool_start_position);
     CHECK(sink.tool_message_position > sink.tool_output_position);
     CHECK(sink.tool_message_has_raw);
+    CHECK_EQ(sink.tool_outcome_count, 1);
+    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_FAILED);
     CHECK_STREQ(sink.text, "finished");
 
     oi_cli_conversation_destroy(conversation);
@@ -484,7 +486,7 @@ TEST(ask_defers_and_resolve_permission_deny_produces_a_protocol_valid_result) {
     CHECK_EQ(sink.tool_output_position, -1);
     CHECK(sink.tool_message_position > sink.awaiting_permission_position);
     CHECK_EQ(sink.tool_outcome_count, 1);
-    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED);
+    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_DENIED);
     CHECK(!sink.tool_outcome_has_raw[0]);
 
     oi_cli_conversation_destroy(conversation);

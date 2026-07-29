@@ -261,19 +261,21 @@ struct repl_event_context {
     struct repl_turn_input_context *turn_input;
 };
 
-/* Maps a settled tool-result outcome to the closest live-panel status --
- * OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED covers several different reasons
- * (denied by user, cancelled before it started, skipped by steering) that
- * the event itself doesn't distinguish; CANCELLED is the closest single
- * label for all of them. OUTCOME_UNKNOWN (cancelled while it may have
- * already been running) has no better fit than FAILED. */
+/* Maps the conversation's durable-plus-presentation outcome to the live
+ * panel's final label. FAILED and DENIED deliberately remain distinct here
+ * even though persistence collapses them into the existing completed and
+ * not-executed history outcomes respectively. */
 static enum oi_cli_tool_panel_status tool_panel_status_for_outcome(
     enum oi_cli_conversation_tool_outcome outcome) {
     switch (outcome) {
     case OI_CLI_CONVERSATION_TOOL_COMPLETED:
         return OI_CLI_TOOL_PANEL_COMPLETED;
-    case OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN:
+    case OI_CLI_CONVERSATION_TOOL_FAILED:
         return OI_CLI_TOOL_PANEL_FAILED;
+    case OI_CLI_CONVERSATION_TOOL_DENIED:
+        return OI_CLI_TOOL_PANEL_DENIED;
+    case OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN:
+        return OI_CLI_TOOL_PANEL_CANCELLED;
     case OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED:
         return OI_CLI_TOOL_PANEL_CANCELLED;
     case OI_CLI_CONVERSATION_TOOL_NONE:
@@ -297,17 +299,31 @@ static oi_status repl_conversation_event(
         if (status != OI_OK) {
             return status;
         }
+        status = oi_cli_tool_panel_start(
+            &turn_input->panel, event->as.awaiting_permission.id->data,
+            event->as.awaiting_permission.id->len,
+            event->as.awaiting_permission.name->data,
+            event->as.awaiting_permission.name->len);
+        if (status != OI_OK) {
+            return status;
+        }
         turn_input->awaiting_permission = 1;
         turn_input->permission_selected = 0;
         turn_input->dirty = 1;
         break;
     }
-    case OI_CLI_CONVERSATION_EVENT_TOOL_STARTING:
-        oi_cli_tool_panel_start(&turn_input->panel,
-                                event->as.tool_starting.name->data,
-                                event->as.tool_starting.name->len);
+    case OI_CLI_CONVERSATION_EVENT_TOOL_STARTING: {
+        oi_status status = oi_cli_tool_panel_start(
+            &turn_input->panel, event->as.tool_starting.id->data,
+            event->as.tool_starting.id->len,
+            event->as.tool_starting.name->data,
+            event->as.tool_starting.name->len);
+        if (status != OI_OK) {
+            return status;
+        }
         turn_input->dirty = 1;
         break;
+    }
     case OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT: {
         oi_status status = oi_cli_tool_panel_feed(
             &turn_input->panel, event->as.bytes.data, event->as.bytes.len);
@@ -318,7 +334,11 @@ static oi_status repl_conversation_event(
         break;
     }
     case OI_CLI_CONVERSATION_EVENT_MESSAGE:
-        if (event->as.message.value->role == OI_CLI_MESSAGE_TOOL) {
+        if (event->as.message.value->role == OI_CLI_MESSAGE_TOOL &&
+            oi_cli_tool_panel_matches(
+                &turn_input->panel,
+                event->as.message.value->tool_call_id.data,
+                event->as.message.value->tool_call_id.len)) {
             oi_cli_tool_panel_finish(
                 &turn_input->panel,
                 tool_panel_status_for_outcome(event->as.message.tool_outcome));
@@ -372,10 +392,26 @@ static int permission_selector_key(const struct oi_cli_input_event *event,
         context->dirty = 1;
         return 0;
     case OI_CLI_SELECTOR_ACTION_CONFIRM:
+        status = oi_cli_conversation_resolve_permission(
+            context->conversation, context->permission_selected != 2);
+        if (status != OI_OK) {
+            /* A signal callback earlier in the same reactor batch may
+             * already have cancelled the pending call. Stale selector
+             * input must not elevate process policy, but it also must not
+             * turn that successful cancellation into a new error. */
+            if (oi_cli_conversation_is_busy(context->conversation) &&
+                context->status == OI_OK) {
+                context->status = status;
+            }
+            context->awaiting_permission = 0;
+            context->dirty = 1;
+            return 1;
+        }
         if (context->permission_selected == 1) {
             /* "Allow for process" is itself the explicit confirming act --
              * distinctly labeled from "allow once" in the selector, so no
-             * further confirmation is layered on top here. */
+             * further confirmation is layered on top here. Apply the
+             * elevation only after the staged decision was accepted. */
             context->config->permission->policy = OI_CLI_TOOLS_ALLOW;
             report_busy_io_error(
                 context,
@@ -383,8 +419,6 @@ static int permission_selector_key(const struct oi_cli_input_event *event,
                      context->config->err) != EOF &&
                     fflush(context->config->err) == 0);
         }
-        (void)oi_cli_conversation_resolve_permission(
-            context->conversation, context->permission_selected != 2);
         context->awaiting_permission = 0;
         context->dirty = 1;
         return 1;
@@ -392,8 +426,13 @@ static int permission_selector_key(const struct oi_cli_input_event *event,
         /* Dismissing the prompt (Escape or Ctrl+C while the selector is
          * up) must never leave the tool call hanging -- resolve as deny,
          * exactly like explicitly selecting "Deny" would. */
-        (void)oi_cli_conversation_resolve_permission(context->conversation,
-                                                      0);
+        status =
+            oi_cli_conversation_resolve_permission(context->conversation, 0);
+        if (status != OI_OK &&
+            oi_cli_conversation_is_busy(context->conversation) &&
+            context->status == OI_OK) {
+            context->status = status;
+        }
         context->awaiting_permission = 0;
         context->dirty = 1;
         return 1;
@@ -1120,9 +1159,10 @@ have_message:
                 if (turn_input_context.status != OI_OK && status == OI_OK) {
                     status = turn_input_context.status;
                 }
-                if (status == OI_OK && !present.done &&
+                if (status == OI_OK &&
                     (turn_input_context.dirty ||
-                     turn_signal_context.resize_pending)) {
+                     turn_signal_context.resize_pending) &&
+                    (!present.done || turn_input_context.panel.active)) {
                     oi_status redraw_status;
 
                     if (turn_input_context.awaiting_permission) {
