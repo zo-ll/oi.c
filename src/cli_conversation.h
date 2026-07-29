@@ -174,6 +174,18 @@ const struct oi_cli_message_list *oi_cli_conversation_messages(
     const oi_cli_conversation *conversation);
 
 /*
+ * The arena this conversation was created with -- borrowed, valid for as
+ * long as the conversation itself is. Lets an embedder (e.g. /compact's
+ * one-off summarization request) reuse the exact same arena the
+ * conversation's own model requests use, without having to separately
+ * track it itself: the arena a lazily-created (automatic-session)
+ * conversation actually uses is only known at creation time and is not
+ * otherwise retained anywhere outside this object. NULL if `conversation`
+ * is NULL.
+ */
+oi_arena *oi_cli_conversation_arena(const oi_cli_conversation *conversation);
+
+/*
  * Replaces the leading `prefix_count` messages of the live conversation
  * with one synthesized assistant-role message built from `summary` --
  * a direct structural mirror of apply_checkpoint's splice in

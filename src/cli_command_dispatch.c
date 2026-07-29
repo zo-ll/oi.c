@@ -237,7 +237,14 @@ oi_status oi_cli_command_dispatch(
     case OI_CLI_COMMAND_CWD:
         return dispatch_cwd(command, context);
     case OI_CLI_COMMAND_SESSION:
+        return print_deferred(command->command, context->err);
     case OI_CLI_COMMAND_COMPACT:
+        /* Never actually reached from the interactive REPL: cli_repl.c
+         * intercepts /compact at have_parsed_command: before dispatch is
+         * ever called, since this command needs the conversation, the
+         * durable history store, and the LLM client, none of which
+         * oi_cli_command_context has access to by design. Only reachable
+         * here via oi_cli_command_dispatch's own unit tests. */
         return print_deferred(command->command, context->err);
     }
     return OI_ERR_INVAL;

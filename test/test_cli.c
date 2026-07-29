@@ -3675,6 +3675,603 @@ TEST(model_override_persists_across_a_restart) {
     }
 }
 
+/* Every history record's record_id (and the checkpoint-specific
+ * source_first_record_id/source_last_record_id) are written as JSON
+ * strings, e.g. "record_id":"3" -- extracts one's numeric value. */
+static uint64_t oilog_record_u64_field(const char *record, const char *key) {
+    char needle[64];
+    const char *marker;
+
+    snprintf(needle, sizeof needle, "\"%s\":\"", key);
+    marker = strstr(record, needle);
+    CHECK(marker != NULL);
+    return (uint64_t)strtoull(marker + strlen(needle), NULL, 10);
+}
+
+/* Isolates the last captured HTTP request in a multi-turn capture file
+ * (start_mock_server_turns_capture appends every turn's raw request bytes
+ * back-to-back with no delimiter) by finding the last occurrence of the
+ * request line every chat-completion request starts with. `buffer` must
+ * outlive the returned pointer, which points into it. */
+static const char *last_request_text(const char *capture_path, char *buffer,
+                                     size_t buffer_len) {
+    static const char needle[] = "POST /v1/chat/completions";
+    FILE *capture = fopen(capture_path, "r");
+    size_t n;
+    const char *last = NULL;
+    const char *scan;
+
+    CHECK(capture != NULL);
+    n = capture == NULL ? 0 : fread(buffer, 1, buffer_len - 1, capture);
+    if (capture != NULL) {
+        fclose(capture);
+    }
+    buffer[n] = '\0';
+
+    scan = buffer;
+    for (;;) {
+        const char *marker = strstr(scan, needle);
+        if (marker == NULL) {
+            break;
+        }
+        last = marker;
+        scan = marker + (sizeof needle - 1);
+    }
+    CHECK(last != NULL);
+    return last != NULL ? last : buffer;
+}
+
+static const char compact_first_sse[] =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+    "\"first reply\"}}]}\n\n"
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+    "\"finish_reason\":\"stop\"}]}\n\n"
+    "data: [DONE]\n\n";
+static const char compact_second_sse[] =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+    "\"second reply\"}}]}\n\n"
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+    "\"finish_reason\":\"stop\"}]}\n\n"
+    "data: [DONE]\n\n";
+static const char compact_summary_sse[] =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+    "\"COMPACT_SUMMARY_MARKER\"}}]}\n\n"
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+    "\"finish_reason\":\"stop\"}]}\n\n"
+    "data: [DONE]\n\n";
+static const char compact_third_sse[] =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+    "\"third reply\"}}]}\n\n"
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+    "\"finish_reason\":\"stop\"}]}\n\n"
+    "data: [DONE]\n\n";
+
+TEST(compact_replaces_older_turns_with_a_checkpoint) {
+    size_t first_len;
+    size_t second_len;
+    size_t summary_len;
+    size_t third_len;
+    char *first = build_chunked_response(
+        compact_first_sse, strlen(compact_first_sse), "HTTP/1.1 200 OK",
+        &first_len);
+    char *second = build_chunked_response(
+        compact_second_sse, strlen(compact_second_sse), "HTTP/1.1 200 OK",
+        &second_len);
+    char *summary = build_chunked_response(
+        compact_summary_sse, strlen(compact_summary_sse), "HTTP/1.1 200 OK",
+        &summary_len);
+    char *third = build_chunked_response(
+        compact_third_sse, strlen(compact_third_sse), "HTTP/1.1 200 OK",
+        &third_len);
+    const char *responses[] = {first, second, summary, third};
+    size_t lengths[] = {first_len, second_len, summary_len, third_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_dir[] = "/tmp";
+    char session_name[64];
+    char log_path[160];
+    char capture_path[160];
+
+    snprintf(session_name, sizeof session_name, "oi-cli-compact-%d",
+             (int)getpid());
+    snprintf(log_path, sizeof log_path, "%s/%s.oilog", session_dir,
+             session_name);
+    unlink(log_path);
+    snprintf(capture_path, sizeof capture_path,
+             "/tmp/oi-cli-compact-capture-%d", (int)getpid());
+    unlink(capture_path);
+
+    server = start_mock_server_turns_capture(responses, lengths, 4, &port,
+                                             capture_path);
+    free(first);
+    free(second);
+    free(summary);
+    free(third);
+
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_with_session(port, slave_fd, session_dir,
+                                             session_name);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "first message\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "first reply", 1));
+    CHECK(write_interactive(master_fd, "second message\r", 15));
+    CHECK(interactive_wait_for(master_fd, &result, "second reply", 1));
+
+    CHECK(write_interactive(master_fd, "/compact 1\r", 11));
+    CHECK(interactive_wait_for(
+        master_fd, &result, "oi: compacted 1 turn into a checkpoint", 1));
+
+    CHECK(write_interactive(master_fd, "third message\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "third reply", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        char buffer[16384];
+        const char *last =
+            last_request_text(capture_path, buffer, sizeof buffer);
+
+        CHECK(strstr(last, "COMPACT_SUMMARY_MARKER") != NULL);
+        CHECK(strstr(last, "second reply") != NULL);
+        CHECK(strstr(last, "third message") != NULL);
+        CHECK(strstr(last, "first reply") == NULL);
+        CHECK(strstr(last, "first message") == NULL);
+    }
+
+    {
+        struct oilog_records records;
+        size_t checkpoint_index;
+        size_t user1_index;
+        size_t assistant1_index;
+        const char *checkpoint_needles[] = {"\"type\":\"checkpoint\"",
+                                            "COMPACT_SUMMARY_MARKER"};
+        const char *user1_needle[] = {"\"content\":\"first message\""};
+        const char *assistant1_needle[] = {"\"content\":\"first reply\""};
+
+        oilog_records_load(log_path, &records);
+        checkpoint_index =
+            oilog_find(&records, 0, checkpoint_needles, 2);
+        CHECK(checkpoint_index != SIZE_MAX);
+        user1_index = oilog_find(&records, 0, user1_needle, 1);
+        assistant1_index = oilog_find(&records, 0, assistant1_needle, 1);
+        CHECK(user1_index != SIZE_MAX);
+        CHECK(assistant1_index != SIZE_MAX);
+        CHECK_EQ(oilog_record_u64_field(records.items[checkpoint_index],
+                                        "source_first_record_id"),
+                 oilog_record_u64_field(records.items[user1_index],
+                                        "record_id"));
+        CHECK_EQ(oilog_record_u64_field(records.items[checkpoint_index],
+                                        "source_last_record_id"),
+                 oilog_record_u64_field(records.items[assistant1_index],
+                                        "record_id"));
+        oilog_records_free(&records);
+    }
+
+    unlink(log_path);
+    unlink(capture_path);
+}
+
+TEST(compact_reports_usage_error_and_nothing_to_compact) {
+    const char *sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"ok\"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t total;
+    char *response =
+        build_chunked_response(sse, strlen(sse), "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t server = start_mock_server(response, total, &port);
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    free(response);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-compact-usage-%d", (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+
+    /* No conversation exists yet. */
+    CHECK(write_interactive(master_fd, "/compact\r", 9));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "oi: nothing to compact yet", 1));
+
+    /* Malformed argument, still before any real turn. */
+    CHECK(write_interactive(master_fd, "/compact abc\r", 13));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "oi: usage: /compact [turns]", 1));
+
+    /* One real turn; the default keep_turns=8 leaves nothing to compact. */
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "ok", 1));
+    CHECK(write_interactive(master_fd, "/compact\r", 9));
+    CHECK(interactive_wait_for(
+        master_fd, &result, "oi: nothing to compact (1 turn, keeping 8)",
+        1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") != 0 &&
+                strcmp(entry->d_name, "..") != 0) {
+                snprintf(session_path, sizeof session_path, "%s/%s",
+                        session_root, entry->d_name);
+            }
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        if (session_path[0] != '\0') {
+            char metadata_path[640];
+            char history_path[640];
+
+            snprintf(metadata_path, sizeof metadata_path,
+                     "%s/metadata.json", session_path);
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(metadata_path);
+            unlink(history_path);
+            rmdir(session_path);
+        }
+    }
+    rmdir(session_root);
+}
+
+TEST(compact_typed_while_a_turn_is_active_queues_and_runs_next) {
+    size_t first_len;
+    size_t summary_len;
+    char *first = build_chunked_response(
+        compact_first_sse, strlen(compact_first_sse), "HTTP/1.1 200 OK",
+        &first_len);
+    char *summary = build_chunked_response(
+        compact_summary_sse, strlen(compact_summary_sse), "HTTP/1.1 200 OK",
+        &summary_len);
+    struct slow_mock_turn turns[2];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    /* The only real turn is the slow one, so this races the queue against
+     * the very first submission in the whole test -- avoiding any
+     * ambiguity from an earlier "\r\n" already sitting in the buffer (see
+     * queued_command_while_busy_resolves_discarded_and_dispatches_live's
+     * identical "hello\r" / wait-for-"\r\n" / queue-behind-it shape,
+     * which relies on the same "first ever submission" property). */
+    turns[0].response = first;
+    turns[0].response_len = first_len;
+    turns[0].delay_seconds = 3;
+    turns[1].response = summary;
+    turns[1].response_len = summary_len;
+    turns[1].delay_seconds = 0;
+    server = start_slow_mock_server(turns, 2, &port);
+
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-compact-queue-%d",
+             (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "first message\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+
+    /* Queues /compact while the only turn so far is still in flight --
+     * once it completes there's exactly 1 turn, so /compact 0 (compact
+     * everything) is what actually has something to do. */
+    CHECK(write_interactive(master_fd, "/compact 0\r", 11));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+
+    CHECK(interactive_wait_for(master_fd, &result, "first reply", 1));
+    CHECK(interactive_wait_for(
+        master_fd, &result, "oi: compacted 1 turn into a checkpoint", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+    free(first);
+    free(summary);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") != 0 &&
+                strcmp(entry->d_name, "..") != 0) {
+                snprintf(session_path, sizeof session_path, "%s/%s",
+                        session_root, entry->d_name);
+            }
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        if (session_path[0] != '\0') {
+            char metadata_path[640];
+            char history_path[640];
+
+            snprintf(metadata_path, sizeof metadata_path,
+                     "%s/metadata.json", session_path);
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(metadata_path);
+            unlink(history_path);
+            rmdir(session_path);
+        }
+    }
+    rmdir(session_root);
+}
+
+TEST(compact_failure_leaves_durable_and_live_state_untouched) {
+    size_t first_len;
+    size_t second_len;
+    size_t error_len;
+    size_t third_len;
+    char *first = build_chunked_response(
+        compact_first_sse, strlen(compact_first_sse), "HTTP/1.1 200 OK",
+        &first_len);
+    char *second = build_chunked_response(
+        compact_second_sse, strlen(compact_second_sse), "HTTP/1.1 200 OK",
+        &second_len);
+    char *error = build_chunked_response(
+        "internal error", 14, "HTTP/1.1 500 Internal Server Error",
+        &error_len);
+    char *third = build_chunked_response(
+        compact_third_sse, strlen(compact_third_sse), "HTTP/1.1 200 OK",
+        &third_len);
+    const char *responses[] = {first, second, error, third};
+    size_t lengths[] = {first_len, second_len, error_len, third_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_dir[] = "/tmp";
+    char session_name[64];
+    char log_path[160];
+    char capture_path[160];
+
+    snprintf(session_name, sizeof session_name, "oi-cli-compact-fail-%d",
+             (int)getpid());
+    snprintf(log_path, sizeof log_path, "%s/%s.oilog", session_dir,
+             session_name);
+    unlink(log_path);
+    snprintf(capture_path, sizeof capture_path,
+             "/tmp/oi-cli-compact-fail-capture-%d", (int)getpid());
+    unlink(capture_path);
+
+    server = start_mock_server_turns_capture(responses, lengths, 4, &port,
+                                             capture_path);
+    free(first);
+    free(second);
+    free(error);
+    free(third);
+
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_with_session(port, slave_fd, session_dir,
+                                             session_name);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "first message\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "first reply", 1));
+    CHECK(write_interactive(master_fd, "second message\r", 15));
+    CHECK(interactive_wait_for(master_fd, &result, "second reply", 1));
+
+    CHECK(write_interactive(master_fd, "/compact 1\r", 11));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "oi: compaction failed", 1));
+
+    CHECK(write_interactive(master_fd, "third message\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "third reply", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        char buffer[16384];
+        const char *last =
+            last_request_text(capture_path, buffer, sizeof buffer);
+
+        /* Nothing was compacted: the third turn's own request still
+         * carries the original first turn's content in full. */
+        CHECK(strstr(last, "first message") != NULL);
+        CHECK(strstr(last, "first reply") != NULL);
+        CHECK(strstr(last, "second reply") != NULL);
+    }
+
+    {
+        struct oilog_records records;
+        const char *checkpoint_needles[] = {"\"type\":\"checkpoint\""};
+
+        oilog_records_load(log_path, &records);
+        CHECK_EQ(oilog_count(&records, checkpoint_needles, 1), (size_t)0);
+        oilog_records_free(&records);
+    }
+
+    unlink(log_path);
+    unlink(capture_path);
+}
+
+TEST(compact_survives_restart_and_replay_shows_the_checkpoint) {
+    size_t first_len;
+    size_t second_len;
+    size_t summary_len;
+    char *first = build_chunked_response(
+        compact_first_sse, strlen(compact_first_sse), "HTTP/1.1 200 OK",
+        &first_len);
+    char *second = build_chunked_response(
+        compact_second_sse, strlen(compact_second_sse), "HTTP/1.1 200 OK",
+        &second_len);
+    char *summary = build_chunked_response(
+        compact_summary_sse, strlen(compact_summary_sse), "HTTP/1.1 200 OK",
+        &summary_len);
+    const char *first_life_responses[] = {first, second, summary};
+    size_t first_life_lengths[] = {first_len, second_len, summary_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_dir[] = "/tmp";
+    char session_name[64];
+    char log_path[160];
+
+    snprintf(session_name, sizeof session_name, "oi-cli-compact-restart-%d",
+             (int)getpid());
+    snprintf(log_path, sizeof log_path, "%s/%s.oilog", session_dir,
+             session_name);
+    unlink(log_path);
+
+    /* First "life": two turns, then compact the first one. */
+    server = start_mock_server_turns(first_life_responses,
+                                     first_life_lengths, 3, &port);
+    free(first);
+    free(second);
+    free(summary);
+
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_with_session(port, slave_fd, session_dir,
+                                             session_name);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "first message\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "first reply", 1));
+    CHECK(write_interactive(master_fd, "second message\r", 15));
+    CHECK(interactive_wait_for(master_fd, &result, "second reply", 1));
+    CHECK(write_interactive(master_fd, "/compact 1\r", 11));
+    CHECK(interactive_wait_for(
+        master_fd, &result, "oi: compacted 1 turn into a checkpoint", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    /* Second "life": restart against the same session, then send one more
+     * message -- its outgoing request is the proof replay reconstructed
+     * the checkpoint correctly, not just that the live process remembered
+     * it. */
+    {
+        size_t restart_len;
+        char *restart_reply = build_chunked_response(
+            compact_third_sse, strlen(compact_third_sse), "HTTP/1.1 200 OK",
+            &restart_len);
+        const char *restart_responses[] = {restart_reply};
+        size_t restart_lengths[] = {restart_len};
+        unsigned short restart_port;
+        pid_t restart_server;
+        char capture_path[160];
+        char buffer[16384];
+        const char *last;
+
+        snprintf(capture_path, sizeof capture_path,
+                 "/tmp/oi-cli-compact-restart-capture-%d", (int)getpid());
+        unlink(capture_path);
+        restart_server = start_mock_server_turns_capture(
+            restart_responses, restart_lengths, 1, &restart_port,
+            capture_path);
+        free(restart_reply);
+
+        CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+        memset(&result, 0, sizeof result);
+        cli = start_interactive_cli_with_session(
+            restart_port, slave_fd, session_dir, session_name);
+        close(slave_fd);
+
+        CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+        CHECK(write_interactive(master_fd, "fourth message\r", 15));
+        CHECK(interactive_wait_for(master_fd, &result, "third reply", 1));
+
+        CHECK(write_interactive(master_fd, "\x04", 1));
+        {
+            int status = 0;
+            CHECK_EQ(waitpid(cli, &status, 0), cli);
+            result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        CHECK_EQ(result.exit_code, 0);
+        close(master_fd);
+        waitpid(restart_server, NULL, 0);
+
+        last = last_request_text(capture_path, buffer, sizeof buffer);
+        CHECK(strstr(last, "COMPACT_SUMMARY_MARKER") != NULL);
+        CHECK(strstr(last, "second reply") != NULL);
+        CHECK(strstr(last, "fourth message") != NULL);
+        CHECK(strstr(last, "first reply") == NULL);
+        CHECK(strstr(last, "first message") == NULL);
+
+        unlink(capture_path);
+    }
+
+    unlink(log_path);
+}
+
 TEST(resize_redraws_the_live_prompt_at_the_new_width) {
     int master_fd = -1;
     int slave_fd = -1;
@@ -3828,5 +4425,10 @@ int main(void) {
     RUN(resize_redraws_the_live_prompt_at_the_new_width);
     RUN(interactive_exit_before_submission_creates_no_session);
     RUN(interactive_help_and_exit_are_dispatched_without_a_session);
+    RUN(compact_replaces_older_turns_with_a_checkpoint);
+    RUN(compact_reports_usage_error_and_nothing_to_compact);
+    RUN(compact_typed_while_a_turn_is_active_queues_and_runs_next);
+    RUN(compact_failure_leaves_durable_and_live_state_untouched);
+    RUN(compact_survives_restart_and_replay_shows_the_checkpoint);
     return oi_test_report();
 }

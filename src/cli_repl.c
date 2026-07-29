@@ -10,6 +10,7 @@
 #include "cli_bytebuf.h"
 #include "cli_command_dispatch.h"
 #include "cli_commands.h"
+#include "cli_compact.h"
 #include "cli_composer.h"
 #include "cli_input_history.h"
 #include "cli_present.h"
@@ -982,6 +983,187 @@ have_parsed_command:
             continue;
         }
         if (parsed.kind == OI_CLI_COMMAND_PARSE_COMMAND) {
+            /*
+             * /compact never reaches cli_command_dispatch.c: dispatch has
+             * no access to the conversation, durable history store, or LLM
+             * client by design, and this command genuinely needs all
+             * three. Handled entirely here, at the same idle/safe-boundary
+             * label a freshly-typed and a dequeued pending command both
+             * funnel through -- matching the /permissions allow gate right
+             * below.
+             */
+            if (parsed.command->id == OI_CLI_COMMAND_COMPACT) {
+                size_t keep_turns = 8;
+                size_t turns_value = 0;
+                int has_value = 0;
+
+                status = oi_cli_compact_parse_turns(
+                    parsed.arguments, parsed.arguments_len, &turns_value,
+                    &has_value);
+                if (status != OI_OK) {
+                    status = OI_OK;
+                    if (fputs("oi: usage: /compact [turns]\n",
+                             config->err) == EOF ||
+                        fflush(config->err) != 0) {
+                        status = OI_ERR_IO;
+                        free(prompt);
+                        break;
+                    }
+                    free(prompt);
+                    continue;
+                }
+                if (has_value) {
+                    keep_turns = turns_value;
+                }
+                if (conversation == NULL) {
+                    if (fputs("oi: nothing to compact yet\n",
+                             config->err) == EOF ||
+                        fflush(config->err) != 0) {
+                        status = OI_ERR_IO;
+                        free(prompt);
+                        break;
+                    }
+                    free(prompt);
+                    continue;
+                }
+
+                const struct oi_cli_message_list *compact_messages =
+                    oi_cli_conversation_messages(conversation);
+                size_t prefix_count = 0;
+                size_t total_turns = 0;
+
+                status = oi_cli_compact_select_prefix(
+                    compact_messages, keep_turns, &prefix_count,
+                    &total_turns);
+                if (status == OI_OK && prefix_count == 0) {
+                    if (fprintf(config->err,
+                               "oi: nothing to compact (%zu turn%s, "
+                               "keeping %zu)\n",
+                               total_turns, total_turns == 1 ? "" : "s",
+                               keep_turns) < 0 ||
+                        fflush(config->err) != 0) {
+                        status = OI_ERR_IO;
+                        free(prompt);
+                        break;
+                    }
+                    free(prompt);
+                    continue;
+                }
+                if (status != OI_OK) {
+                    free(prompt);
+                    break;
+                }
+
+                oi_json_writer *compact_writer = NULL;
+                status = oi_cli_compact_build_request(
+                    compact_messages, prefix_count, current_model->data,
+                    current_model->len, &compact_writer);
+                if (status != OI_OK) {
+                    free(prompt);
+                    break;
+                }
+                size_t compact_body_len = 0;
+                const char *compact_body =
+                    oi_json_writer_data(compact_writer, &compact_body_len);
+                struct oi_cli_compact_result compact_result;
+                status = oi_cli_compact_run(
+                    client, reactor, oi_cli_conversation_arena(conversation),
+                    signal_fd, compact_body, compact_body_len,
+                    &compact_result);
+                oi_json_writer_destroy(compact_writer);
+                if (status != OI_OK) {
+                    free(prompt);
+                    break;
+                }
+
+                if (compact_result.outcome == OI_CLI_COMPACT_CANCELLED) {
+                    int terminate = compact_result.terminate_signal != 0;
+                    oi_cli_compact_result_free(&compact_result);
+                    if (terminate) {
+                        free(prompt);
+                        break;
+                    }
+                    if (fputs("oi: compaction cancelled\n", config->err) ==
+                            EOF ||
+                        fflush(config->err) != 0) {
+                        status = OI_ERR_IO;
+                        free(prompt);
+                        break;
+                    }
+                    free(prompt);
+                    continue;
+                }
+                if (compact_result.outcome == OI_CLI_COMPACT_FAILED) {
+                    oi_status failed_status = compact_result.status;
+                    oi_cli_compact_result_free(&compact_result);
+                    if (fprintf(config->err, "oi: compaction failed: %s\n",
+                               oi_status_str(failed_status)) < 0 ||
+                        fflush(config->err) != 0) {
+                        status = OI_ERR_IO;
+                        free(prompt);
+                        break;
+                    }
+                    free(prompt);
+                    continue;
+                }
+
+                /* OI_CLI_COMPACT_OK: durable append must fully succeed
+                 * before anything live changes, so a failure here leaves
+                 * both the durable log and the live conversation
+                 * completely untouched -- see cli.c's persist_checkpoint. */
+                status = OI_OK;
+                if (config->persist_checkpoint != NULL) {
+                    status = config->persist_checkpoint(
+                        config->persist_checkpoint_user_data, prefix_count,
+                        compact_result.summary, compact_result.summary_len,
+                        current_model->data, current_model->len);
+                }
+                if (status != OI_OK) {
+                    oi_cli_compact_result_free(&compact_result);
+                    if (config->is_durably_failed != NULL &&
+                        config->is_durably_failed(
+                            config->is_durably_failed_user_data)) {
+                        break;
+                    }
+                    if (fprintf(config->err, "oi: turn failed: %s\n",
+                               oi_status_str(status)) < 0 ||
+                        fflush(config->err) != 0) {
+                        status = OI_ERR_IO;
+                        free(prompt);
+                        break;
+                    }
+                    status = OI_OK;
+                    free(prompt);
+                    continue;
+                }
+                /* Cannot fail for reasons outside programmer error (no
+                 * I/O, prefix_count already validated against this exact
+                 * messages list) -- once the durable append above has
+                 * succeeded, breaking here rather than pretending to
+                 * recover is deliberate: silently continuing with durable
+                 * and live state out of lock-step would be worse. */
+                status = oi_cli_conversation_apply_checkpoint(
+                    conversation, prefix_count, compact_result.summary,
+                    compact_result.summary_len);
+                size_t compacted_turns = total_turns - keep_turns;
+                oi_cli_compact_result_free(&compact_result);
+                if (status != OI_OK) {
+                    free(prompt);
+                    break;
+                }
+                if (fprintf(config->out,
+                           "oi: compacted %zu turn%s into a checkpoint "
+                           "(kept last %zu)\n",
+                           compacted_turns, compacted_turns == 1 ? "" : "s",
+                           keep_turns) < 0 ||
+                    fflush(config->out) != 0) {
+                    status = OI_ERR_IO;
+                    free(prompt);
+                    break;
+                }
+                free(prompt);
+                continue;
+            }
             /*
              * /permissions allow must not silently elevate the process-
              * wide tool policy: gated here (not in cli_command_dispatch.c,

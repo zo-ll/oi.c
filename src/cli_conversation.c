@@ -1303,6 +1303,10 @@ const struct oi_cli_message_list *oi_cli_conversation_messages(
     return conversation == NULL ? NULL : &conversation->messages;
 }
 
+oi_arena *oi_cli_conversation_arena(const oi_cli_conversation *conversation) {
+    return conversation == NULL ? NULL : conversation->arena;
+}
+
 oi_status oi_cli_conversation_apply_checkpoint(
     oi_cli_conversation *conversation, size_t prefix_count,
     const char *summary, size_t summary_len) {
