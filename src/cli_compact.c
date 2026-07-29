@@ -1,8 +1,16 @@
+/* struct signalfd_siginfo / signalfd(2) are GNU/Linux extensions --
+ * matches the same _GNU_SOURCE precedent in cli_repl.c. */
+#define _GNU_SOURCE
+
 #include "cli_compact.h"
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/signalfd.h>
+#include <unistd.h>
 
 #include "cli_bytebuf.h"
 
@@ -270,4 +278,168 @@ fail:
     oi_cli_bytebuf_free(&transcript);
     oi_json_writer_destroy(writer);
     return st;
+}
+
+struct compact_run_state {
+    int done;
+    int cancelled;
+    oi_status status;
+    int http_status;
+    int terminate_signal;
+    struct oi_cli_bytebuf text;
+    oi_llm_request *request;
+};
+
+static void compact_on_delta(const char *text, size_t len, void *user_data) {
+    struct compact_run_state *state = user_data;
+    if (oi_cli_bytebuf_append(&state->text, text, len) != OI_OK) {
+        state->status = OI_ERR_NOMEM;
+    }
+}
+
+static void compact_on_done(oi_status status, int http_status,
+                           const char *error_body, size_t error_body_len,
+                           void *user_data) {
+    struct compact_run_state *state = user_data;
+    (void)error_body;
+    (void)error_body_len;
+    state->request = NULL;
+    if (state->status == OI_OK) {
+        state->status = status;
+    }
+    state->http_status = http_status;
+    state->done = 1;
+}
+
+static void compact_on_signal(oi_reactor *r, int fd, int revents,
+                              void *user_data) {
+    struct compact_run_state *state = user_data;
+    struct signalfd_siginfo info;
+
+    (void)r;
+    (void)revents;
+    /* Each of SIGINT/SIGTERM/SIGHUP is a standard (non-realtime) signal,
+     * so at most one of each is ever actually pending -- looping is
+     * defensive, matching cli_repl.c's handle_turn_signal. */
+    while (read(fd, &info, sizeof info) == (ssize_t)sizeof info) {
+        if (state->done) {
+            /* on_done already fired for this request in the same reactor
+             * step (both fds became ready together) -- drain only, don't
+             * relabel an already-finished request as cancelled. */
+            continue;
+        }
+        switch (info.ssi_signo) {
+        case SIGINT:
+            break;
+        case SIGTERM:
+        case SIGHUP:
+            state->terminate_signal = (int)info.ssi_signo;
+            break;
+        default:
+            continue;
+        }
+        state->cancelled = 1;
+        state->done = 1;
+        if (state->request != NULL) {
+            oi_llm_request_cancel(state->request);
+            state->request = NULL;
+        }
+    }
+}
+
+static void set_failed(struct oi_cli_compact_result *out_result,
+                       oi_status status, int http_status) {
+    out_result->outcome = OI_CLI_COMPACT_FAILED;
+    out_result->status = status;
+    out_result->http_status = http_status;
+    out_result->terminate_signal = 0;
+    out_result->summary = NULL;
+    out_result->summary_len = 0;
+}
+
+oi_status oi_cli_compact_run(oi_llm_client *client, oi_reactor *reactor,
+                             oi_arena *arena, int signal_fd, const char *body,
+                             size_t body_len,
+                             struct oi_cli_compact_result *out_result) {
+    if (client == NULL || reactor == NULL || arena == NULL || body == NULL ||
+        body_len == 0 || out_result == NULL) {
+        return OI_ERR_INVAL;
+    }
+
+    struct compact_run_state state;
+    memset(&state, 0, sizeof state);
+    oi_cli_bytebuf_init(&state.text);
+
+    oi_status st = oi_llm_request_start(client, reactor, arena, body,
+                                        body_len, compact_on_delta,
+                                        compact_on_done, &state,
+                                        &state.request);
+    if (st != OI_OK) {
+        oi_cli_bytebuf_free(&state.text);
+        set_failed(out_result, st, 0);
+        return OI_OK;
+    }
+
+    int signal_registered =
+        signal_fd >= 0 && oi_reactor_add(reactor, signal_fd, OI_EV_READ,
+                                         compact_on_signal, &state) == OI_OK;
+
+    while (!state.done) {
+        oi_status step_status;
+        if (oi_reactor_step(reactor, -1, &step_status) < 0) {
+            state.status = step_status;
+            state.done = 1;
+        }
+    }
+
+    if (signal_registered) {
+        oi_reactor_remove(reactor, signal_fd);
+    }
+
+    if (state.cancelled) {
+        out_result->outcome = OI_CLI_COMPACT_CANCELLED;
+        out_result->status = OI_OK;
+        out_result->http_status = 0;
+        out_result->terminate_signal = state.terminate_signal;
+        out_result->summary = NULL;
+        out_result->summary_len = 0;
+        oi_cli_bytebuf_free(&state.text);
+        return OI_OK;
+    }
+
+    if (state.status != OI_OK || state.text.len == 0) {
+        set_failed(out_result,
+                  state.status == OI_OK ? OI_ERR_PARSE : state.status,
+                  state.http_status);
+        oi_cli_bytebuf_free(&state.text);
+        return OI_OK;
+    }
+
+    size_t summary_len = state.text.len;
+    char *summary = malloc(summary_len + 1);
+    if (summary == NULL) {
+        oi_cli_bytebuf_free(&state.text);
+        set_failed(out_result, OI_ERR_NOMEM, state.http_status);
+        return OI_OK;
+    }
+    memcpy(summary, state.text.data, summary_len);
+    summary[summary_len] = '\0';
+    oi_cli_bytebuf_free(&state.text);
+
+    out_result->outcome = OI_CLI_COMPACT_OK;
+    out_result->status = OI_OK;
+    out_result->http_status = state.http_status;
+    out_result->terminate_signal = 0;
+    out_result->summary = summary;
+    out_result->summary_len = summary_len;
+    return OI_OK;
+}
+
+void oi_cli_compact_result_free(struct oi_cli_compact_result *result) {
+    if (result == NULL) {
+        return;
+    }
+    free(result->summary);
+    result->summary = NULL;
+    result->summary_len = 0;
 }

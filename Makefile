@@ -226,6 +226,9 @@ $(INTEGRATION_BUILD)/%: test/integration/%.c $(LIB) | $(INTEGRATION_BUILD)
 $(INTEGRATION_BUILD)/test_cli_conversation: test/integration/test_cli_conversation.c src/cli_conversation.c src/cli_message.c src/cli_tools.c $(LIB) | $(INTEGRATION_BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_conversation.c src/cli_message.c src/cli_tools.c $(LIB) -o $@ $(LDLIBS)
 
+$(INTEGRATION_BUILD)/test_cli_compact: test/integration/test_cli_compact.c src/cli_compact.c src/cli_bytebuf.c $(LIB) | $(INTEGRATION_BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_compact.c src/cli_bytebuf.c $(LIB) -o $@ $(LDLIBS)
+
 test-integration: $(INTEGRATION_BINS)
 	@if [ -z "$(INTEGRATION_BINS)" ]; then \
 		echo "no integration tests yet (test/integration/test_*.c)"; \
