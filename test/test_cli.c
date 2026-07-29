@@ -121,12 +121,18 @@ static pid_t start_mock_server_turns_capture(
         /* Bounded, not accept() outright: if the CLI process we expect
          * to connect never does (e.g. it failed to even start), this
          * must not hang forever -- see the OI_CLI_BIN comment above for
-         * exactly the incident that motivated this. */
+         * exactly the incident that motivated this. 30s (not 10s):
+         * automatic-session creation now does real durable I/O (the
+         * initial model/cwd records plus a metadata.json write) before
+         * the first connect attempt, and that has been observed to run
+         * noticeably slower under asan/tsan instrumentation on a loaded
+         * CI runner than locally -- this must outlast that, not just the
+         * connect itself. */
         for (size_t turn = 0; turn < response_count; turn++) {
             fd_set rfds;
             FD_ZERO(&rfds);
             FD_SET(listen_fd, &rfds);
-            struct timeval tv = {10, 0};
+            struct timeval tv = {30, 0};
             int rc = select(listen_fd + 1, &rfds, NULL, NULL, &tv);
             int cfd = rc > 0 ? accept(listen_fd, NULL, NULL) : -1;
             if (cfd < 0) {
