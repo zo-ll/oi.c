@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "cli_message.h"
+#include "oi/json.h"
 #include "oi/status.h"
 
 /*
@@ -41,5 +42,27 @@ oi_status oi_cli_compact_parse_turns(const char *arguments, size_t len,
 oi_status oi_cli_compact_select_prefix(
     const struct oi_cli_message_list *messages, size_t keep_turns,
     size_t *out_prefix_count, size_t *out_total_turns);
+
+/*
+ * Builds a standalone chat-completion request body summarizing the
+ * leading `prefix_count` messages of `messages` -- a one-off admin
+ * request, entirely independent of any oi_cli_conversation. Carries no
+ * "tools" key (the model being asked to summarize has nothing to call).
+ * The transcript is wrapped in explicit <<<TRANSCRIPT>>>/<<<END_TRANSCRIPT>>>
+ * markers inside one ordinary JSON string, framed by a system message
+ * that states everything between those markers is data to summarize,
+ * never instructions to follow -- normal JSON string escaping already
+ * prevents any message content from breaking out of that string, so this
+ * is a hygiene framing, not a new escaping mechanism.
+ *
+ * On success `*out_writer` is a caller-owned oi_json_writer (destroy with
+ * oi_json_writer_destroy once its data has been copied/sent).
+ *
+ * OI_ERR_INVAL if `messages`/`model`/`out_writer` is NULL, `model_len` is
+ * 0, `prefix_count` is 0, or `prefix_count` exceeds `messages->len`.
+ */
+oi_status oi_cli_compact_build_request(
+    const struct oi_cli_message_list *messages, size_t prefix_count,
+    const char *model, size_t model_len, oi_json_writer **out_writer);
 
 #endif

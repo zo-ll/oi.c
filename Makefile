@@ -167,8 +167,8 @@ $(BUILD)/test_cli_render: test/test_cli_render.c src/cli_render.c src/cli_editor
 $(BUILD)/test_cli_selector: test/test_cli_selector.c src/cli_selector.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_selector.c $(LIB) -o $@ $(LDLIBS)
 
-$(BUILD)/test_cli_compact: test/test_cli_compact.c src/cli_compact.c src/cli_message.c $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_compact.c src/cli_message.c $(LIB) -o $@ $(LDLIBS)
+$(BUILD)/test_cli_compact: test/test_cli_compact.c src/cli_compact.c src/cli_message.c src/cli_bytebuf.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_compact.c src/cli_message.c src/cli_bytebuf.c $(LIB) -o $@ $(LDLIBS)
 
 CLI_SESSIONS_TEST_DEPS = src/cli_sessions.c src/cli_session_metadata.c \
 	src/cli_session_metadata_codec.c src/cli_session_metadata_store.c \
