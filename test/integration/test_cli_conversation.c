@@ -1259,6 +1259,234 @@ TEST(steer_before_any_tool_starts_skips_them_all) {
     mock_api_stop(&api);
 }
 
+static void build_conversation_with_two_turns(
+    oi_llm_client *client, oi_reactor *reactor, oi_arena *arena,
+    oi_tool_registry *tools, oi_cli_conversation **out_conversation) {
+    struct oi_cli_message_list initial;
+    struct oi_cli_message m;
+
+    oi_cli_message_list_init(&initial);
+
+    oi_cli_message_init(&m);
+    CHECK_EQ(oi_cli_message_set_user(&m, "question one", 12), OI_OK);
+    CHECK_EQ(oi_cli_message_list_append_take(&initial, &m), OI_OK);
+
+    oi_cli_message_init(&m);
+    CHECK_EQ(oi_cli_message_set_assistant(&m, "answer one", 10), OI_OK);
+    CHECK_EQ(oi_cli_message_list_append_take(&initial, &m), OI_OK);
+
+    oi_cli_message_init(&m);
+    CHECK_EQ(oi_cli_message_set_user(&m, "question two", 12), OI_OK);
+    CHECK_EQ(oi_cli_message_list_append_take(&initial, &m), OI_OK);
+
+    oi_cli_message_init(&m);
+    CHECK_EQ(oi_cli_message_set_assistant(&m, "answer two", 10), OI_OK);
+    CHECK_EQ(oi_cli_message_list_append_take(&initial, &m), OI_OK);
+
+    struct oi_cli_conversation_config config = {
+        .model = "model-one",
+        .max_model_steps = 2,
+        .tool_timeout_ms = 1000,
+    };
+    CHECK_EQ(oi_cli_conversation_create(client, reactor, arena, tools,
+                                        &config, &initial, out_conversation),
+             OI_OK);
+    oi_cli_message_list_free(&initial);
+}
+
+TEST(checkpoint_splices_a_prefix_into_one_assistant_message) {
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = 9,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    oi_cli_conversation *conversation = NULL;
+    build_conversation_with_two_turns(client, reactor, arena, tools,
+                                      &conversation);
+
+    CHECK_EQ(oi_cli_conversation_apply_checkpoint(
+                 conversation, 2, "summary of turn one", 20),
+             OI_OK);
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    CHECK_EQ(messages->len, (size_t)3);
+    CHECK_EQ(messages->items[0].role, OI_CLI_MESSAGE_ASSISTANT);
+    CHECK_STREQ(messages->items[0].content.data, "summary of turn one");
+    CHECK_EQ(messages->items[1].role, OI_CLI_MESSAGE_USER);
+    CHECK_STREQ(messages->items[1].content.data, "question two");
+    CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_ASSISTANT);
+    CHECK_STREQ(messages->items[2].content.data, "answer two");
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+}
+
+TEST(checkpoint_can_consume_the_entire_message_list) {
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = 9,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    oi_cli_conversation *conversation = NULL;
+    build_conversation_with_two_turns(client, reactor, arena, tools,
+                                      &conversation);
+
+    CHECK_EQ(oi_cli_conversation_apply_checkpoint(
+                 conversation, 4, "summary of everything", 22),
+             OI_OK);
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    CHECK_EQ(messages->len, (size_t)1);
+    CHECK_EQ(messages->items[0].role, OI_CLI_MESSAGE_ASSISTANT);
+    CHECK_STREQ(messages->items[0].content.data, "summary of everything");
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+}
+
+TEST(checkpoint_rejects_invalid_prefix_counts) {
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = 9,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    oi_cli_conversation *conversation = NULL;
+    build_conversation_with_two_turns(client, reactor, arena, tools,
+                                      &conversation);
+
+    CHECK_EQ(oi_cli_conversation_apply_checkpoint(conversation, 0, "x", 1),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_conversation_apply_checkpoint(conversation, 5, "x", 1),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_conversation_apply_checkpoint(NULL, 1, "x", 1),
+             OI_ERR_INVAL);
+
+    /* Rejected calls must leave the message list completely untouched. */
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    CHECK_EQ(messages->len, (size_t)4);
+    CHECK_EQ(messages->items[0].role, OI_CLI_MESSAGE_USER);
+    CHECK_STREQ(messages->items[0].content.data, "question one");
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+}
+
+TEST(checkpoint_is_rejected_while_busy) {
+    const char *slow_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"answer\"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[1] = {
+        {NULL, slow_response, 0},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 1));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    struct event_sink sink = {.arena = arena};
+    struct oi_cli_conversation_config config = {
+        .model = "model-one",
+        .max_model_steps = 2,
+        .tool_timeout_ms = 1000,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(client, reactor, arena, tools,
+                                        &config, NULL, &conversation),
+             OI_OK);
+
+    /* oi_cli_conversation_start sets busy synchronously before returning,
+     * so this is checked before the reactor is ever stepped. */
+    CHECK_EQ(oi_cli_conversation_start(conversation, "question", 8), OI_OK);
+    CHECK(oi_cli_conversation_is_busy(conversation));
+    CHECK_EQ(oi_cli_conversation_apply_checkpoint(conversation, 1, "x", 1),
+             OI_ERR_INVAL);
+
+    for (int i = 0; i < 100 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
 int main(void) {
     RUN(start_is_event_driven_and_preserves_context);
     RUN(tool_start_boundary_precedes_process_output);
@@ -1272,5 +1500,9 @@ int main(void) {
     RUN(steer_after_a_tool_completes_skips_the_next_one);
     RUN(steer_after_the_only_tool_prevents_a_second_model_round);
     RUN(steer_before_any_tool_starts_skips_them_all);
+    RUN(checkpoint_splices_a_prefix_into_one_assistant_message);
+    RUN(checkpoint_can_consume_the_entire_message_list);
+    RUN(checkpoint_rejects_invalid_prefix_counts);
+    RUN(checkpoint_is_rejected_while_busy);
     return oi_test_report();
 }

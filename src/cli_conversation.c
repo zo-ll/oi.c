@@ -1302,3 +1302,33 @@ const struct oi_cli_message_list *oi_cli_conversation_messages(
     const oi_cli_conversation *conversation) {
     return conversation == NULL ? NULL : &conversation->messages;
 }
+
+oi_status oi_cli_conversation_apply_checkpoint(
+    oi_cli_conversation *conversation, size_t prefix_count,
+    const char *summary, size_t summary_len) {
+    struct oi_cli_message checkpoint;
+    struct oi_cli_message *items;
+    size_t remaining;
+    oi_status st;
+
+    if (conversation == NULL || conversation->busy || prefix_count == 0 ||
+        prefix_count > conversation->messages.len) {
+        return OI_ERR_INVAL;
+    }
+
+    oi_cli_message_init(&checkpoint);
+    st = oi_cli_message_set_assistant(&checkpoint, summary, summary_len);
+    if (st != OI_OK) {
+        return st;
+    }
+
+    items = conversation->messages.items;
+    for (size_t i = 0; i < prefix_count; i++) {
+        oi_cli_message_free(&items[i]);
+    }
+    remaining = conversation->messages.len - prefix_count;
+    memmove(&items[1], &items[prefix_count], remaining * sizeof *items);
+    items[0] = checkpoint;
+    conversation->messages.len = remaining + 1;
+    return OI_OK;
+}

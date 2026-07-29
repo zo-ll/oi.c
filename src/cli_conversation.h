@@ -173,4 +173,19 @@ oi_status oi_cli_conversation_last_status(
 const struct oi_cli_message_list *oi_cli_conversation_messages(
     const oi_cli_conversation *conversation);
 
+/*
+ * Replaces the leading `prefix_count` messages of the live conversation
+ * with one synthesized assistant-role message built from `summary` --
+ * a direct structural mirror of apply_checkpoint's splice in
+ * cli_history_replay.c, kept in lock-step with it so the live message list
+ * and a freshly replayed one can never structurally diverge.
+ *
+ * OI_ERR_INVAL if the conversation is busy, `prefix_count` is zero, or
+ * `prefix_count` exceeds the current message count. On any failure the
+ * conversation's message list is left completely unchanged.
+ */
+oi_status oi_cli_conversation_apply_checkpoint(
+    oi_cli_conversation *conversation, size_t prefix_count,
+    const char *summary, size_t summary_len);
+
 #endif
