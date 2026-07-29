@@ -57,12 +57,28 @@ occupy the single pending slot and wait until idle.
 
 ## Private module boundaries
 
-- `cli_repl`: owns interactive lifecycle, state transitions, signals, command
-  dispatch, and the single pending item.
+- `cli_repl`: owns interactive lifecycle, state transitions, signals (blocks
+  `SIGWINCH` and owns the resulting `signalfd`'s lifecycle, threaded into
+  `oi_cli_prompt_read`; degrades gracefully to no live-resize support if
+  setup fails, never a hard REPL-start failure), command dispatch, and the
+  single pending item.
 - `cli_editor`: owns terminal modes, input buffers, cursor movement, multiline
   layout, input-history navigation, bracketed paste, and command selection.
 - `cli_render`: owns control-byte sanitization, incremental Markdown state,
-  terminal styling, and clear/redraw coordination.
+  terminal styling, and clear/redraw coordination, including resizing: a
+  pending `SIGWINCH` re-reads `TIOCGWINSZ` and redraws the current editor/menu
+  frame in place, preserving the edit buffer, cursor, and command-menu
+  selection (nothing else needs to be touched, since editor-frame rendering
+  and assistant/tool-output streaming are strictly sequential today — the
+  editor's raw ANSI frame is never on screen while a turn's output streams
+  through the separate buffered-`FILE*` path in `cli_present`/
+  `cli_render_stream`, so there is nothing for a resize to interleave with).
+  When the still-unimplemented "single pending item / concurrent
+  composition" milestone below lands, resize handling will need to move
+  from `cli_prompt`'s private `poll()` loop into the shared reactor,
+  mirroring the existing `timerfd`/`pidfd` `native_watch` pattern in
+  `reactor_epoll.c`, since the editor could then need to redraw while a
+  turn's reactor loop runs concurrently.
 - `cli_conversation`: owns active messages, model/tool step sequencing,
   safe-boundary steering, cancellation, and recoverable turn failures.
 - `cli_history`: owns JSON record envelopes, stable record IDs, legacy replay,
@@ -114,6 +130,15 @@ Records receive stable monotonic IDs. Checkpoints record their exact source
 range so a future vector index can be rebuilt without changing session files.
 Semantic retrieval, encryption, automatic compaction, full grapheme editing,
 and non-ANSI terminal fallback are outside this milestone.
+
+Cursor/column math uses a documented, testable subset of the Unicode
+combining-mark and East Asian Width ranges (`oi_cli_utf8_codepoint_width`):
+combining marks and C0 controls are zero-width, a pared-down set of common
+CJK/Hangul/fullwidth ranges is width 2, everything else is width 1. This is
+not a full UAX#11 implementation and is not grapheme-cluster aware (ZWJ
+sequences, emoji modifiers) — consistent with "full grapheme editing" being
+out of scope above. A wide code point is treated as atomic for wrapping: it
+is never split across a row boundary, wrapping whole to a fresh row instead.
 
 ## Delivery sequence
 
