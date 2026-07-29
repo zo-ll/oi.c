@@ -107,6 +107,27 @@ static void advance_columns(struct cursor_position *position, size_t columns,
     }
 }
 
+/*
+ * Advances by one code point's display width, treating it as atomic: a
+ * wide (width 2) glyph is never split across a row boundary -- if it
+ * doesn't fully fit in the columns remaining, wrap to a fresh row first,
+ * then place it there. Unlike advance_columns (used for the "> " prompt's
+ * byte-run, where splitting plain ASCII across a boundary is harmless),
+ * this must never leave half a glyph's cells on one row and half on the
+ * next.
+ */
+static void advance_codepoint(struct cursor_position *position,
+                              size_t columns, size_t width) {
+    if (width == 0) {
+        return;
+    }
+    if (columns - position->column < width) {
+        position->row++;
+        position->column = 0;
+    }
+    position->column += width;
+}
+
 static oi_status append_prompt(struct render_buffer *buffer,
                                struct cursor_position *position,
                                size_t columns) {
@@ -155,9 +176,16 @@ static oi_status build_frame(const struct oi_cli_editor *editor,
             position.column = 0;
             status = append_prompt(buffer, &position, columns);
         } else {
-            status = buffer_append(buffer, data + offset, sequence_len);
+            uint32_t codepoint = 0;
+
+            status = oi_cli_utf8_decode(data + offset, sequence_len,
+                                        &codepoint);
             if (status == OI_OK) {
-                advance_columns(&position, columns, 1);
+                status = buffer_append(buffer, data + offset, sequence_len);
+            }
+            if (status == OI_OK) {
+                advance_codepoint(&position, columns,
+                                  oi_cli_utf8_codepoint_width(codepoint));
             }
         }
         if (status != OI_OK) {

@@ -65,6 +65,87 @@ TEST(multiline_redraw_clears_the_previous_frame) {
     oi_cli_editor_free(&editor);
 }
 
+TEST(ascii_wraps_at_the_exact_column_boundary) {
+    /* columns=4: "> " occupies col 0-1, leaving 2 columns of content per
+     * row. "abc" fills "a","b" on row 0 (cols 2,3) and wraps "c" to row 1
+     * (col 0) purely via the terminal's own line-wrap -- no explicit
+     * escape is emitted for a natural wrap, only the internal cursor
+     * bookkeeping changes. */
+    static const char expected[] = "\r\x1b[J> abc";
+    struct oi_cli_editor editor;
+    struct oi_cli_render render;
+    char output[128];
+    int pipe_fds[2];
+    size_t len;
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    oi_cli_editor_init(&editor);
+    CHECK_EQ(oi_cli_editor_set(&editor, "abc", 3), OI_OK);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 4), OI_OK);
+    CHECK_EQ(oi_cli_render_draw(&render, &editor), OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK_EQ(len, sizeof expected - 1);
+    CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
+    CHECK_EQ(render.previous_rows, 2);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    oi_cli_editor_free(&editor);
+}
+
+TEST(a_wide_code_point_wraps_whole_rather_than_splitting) {
+    /* columns=5: "> " leaves 3 content columns on row 0. "a","b" use 2 of
+     * them; the wide (2-column) CJK glyph U+4E2D only has 1 column left,
+     * so it must wrap to row 1 whole rather than splitting its cells
+     * across the boundary. */
+    static const char expected[] = "\r\x1b[J> ab\xe4\xb8\xad";
+    struct oi_cli_editor editor;
+    struct oi_cli_render render;
+    char output[128];
+    int pipe_fds[2];
+    size_t len;
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    oi_cli_editor_init(&editor);
+    CHECK_EQ(oi_cli_editor_set(&editor, "ab\xe4\xb8\xad", 5), OI_OK);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 5), OI_OK);
+    CHECK_EQ(oi_cli_render_draw(&render, &editor), OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK_EQ(len, sizeof expected - 1);
+    CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
+    /* Cursor ends on row 1 (after the wide glyph wrapped there whole). */
+    CHECK_EQ(render.previous_rows, 2);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    oi_cli_editor_free(&editor);
+}
+
+TEST(a_combining_mark_does_not_advance_the_column) {
+    /* U+0301 COMBINING ACUTE ACCENT stacks onto the preceding "a" and must
+     * not itself occupy a column. */
+    static const char expected[] = "\r\x1b[J> a\xcc\x81";
+    struct oi_cli_editor editor;
+    struct oi_cli_render render;
+    char output[128];
+    int pipe_fds[2];
+    size_t len;
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    oi_cli_editor_init(&editor);
+    CHECK_EQ(oi_cli_editor_set(&editor, "a\xcc\x81", 3), OI_OK);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 80), OI_OK);
+    CHECK_EQ(oi_cli_render_draw(&render, &editor), OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK_EQ(len, sizeof expected - 1);
+    CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
+    CHECK_EQ(render.previous_rows, 1);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    oi_cli_editor_free(&editor);
+}
+
 TEST(finish_moves_to_a_fresh_line) {
     struct oi_cli_render render;
     char output[8];
@@ -176,6 +257,9 @@ TEST(bad_arguments_are_rejected) {
 int main(void) {
     RUN(draws_and_repositions_a_single_line);
     RUN(multiline_redraw_clears_the_previous_frame);
+    RUN(ascii_wraps_at_the_exact_column_boundary);
+    RUN(a_wide_code_point_wraps_whole_rather_than_splitting);
+    RUN(a_combining_mark_does_not_advance_the_column);
     RUN(finish_moves_to_a_fresh_line);
     RUN(command_menu_is_rendered_below_the_prompt);
     RUN(second_draw_after_menu_does_not_overshoot_the_clear);
