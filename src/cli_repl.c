@@ -52,6 +52,45 @@ struct repl_setting_context {
     oi_cli_conversation **conversation;
 };
 
+struct repl_turn_signal_context {
+    oi_cli_conversation *conversation;
+    /* 0, or the signal (SIGTERM/SIGHUP) that requested the whole REPL
+     * terminate once this turn finishes unwinding. */
+    int terminate_signal;
+};
+
+static void handle_turn_signal(oi_reactor *reactor, int fd, int revents,
+                               void *user_data) {
+    struct repl_turn_signal_context *context = user_data;
+    struct signalfd_siginfo info;
+
+    (void)reactor;
+    (void)revents;
+    /* Each of SIGWINCH/SIGINT/SIGTERM/SIGHUP is a standard (non-realtime)
+     * signal, so at most one of each is ever actually pending -- looping
+     * is defensive, not load-bearing. */
+    while (read(fd, &info, sizeof info) == (ssize_t)sizeof info) {
+        switch (info.ssi_signo) {
+        case SIGWINCH:
+            /* No editor frame is on screen during a turn; the width is
+             * re-read fresh at the start of the next oi_cli_prompt_read
+             * regardless (matches issue #23's own reasoning), so there is
+             * nothing to do here. */
+            break;
+        case SIGINT:
+            oi_cli_conversation_cancel(context->conversation);
+            break;
+        case SIGTERM:
+        case SIGHUP:
+            oi_cli_conversation_cancel(context->conversation);
+            context->terminate_signal = (int)info.ssi_signo;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 static oi_status dispatch_set_model(void *user_data, const char *name,
                                     size_t name_len) {
     struct repl_setting_context *context = user_data;
@@ -298,20 +337,49 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         status =
             oi_cli_conversation_start(conversation, prompt, prompt_len);
         free(prompt);
-        while (status == OI_OK && !present.done) {
-            oi_status step_status;
-            if (oi_reactor_step(reactor, -1, &step_status) < 0) {
-                status = step_status;
+        {
+            struct repl_turn_signal_context turn_signal_context = {
+                .conversation = conversation,
+            };
+            int signal_registered =
+                signal_fd >= 0 &&
+                oi_reactor_add(reactor, signal_fd, OI_EV_READ,
+                               handle_turn_signal,
+                               &turn_signal_context) == OI_OK;
+
+            while (status == OI_OK && !present.done) {
+                oi_status step_status;
+                if (oi_reactor_step(reactor, -1, &step_status) < 0) {
+                    status = step_status;
+                }
             }
-        }
-        if (status == OI_OK) {
-            status = present.status;
-        }
-        if (status != OI_OK) {
-            if (oi_cli_conversation_is_busy(conversation)) {
-                oi_cli_conversation_cancel(conversation);
+            if (signal_registered) {
+                oi_reactor_remove(reactor, signal_fd);
             }
-            break;
+            if (status == OI_OK) {
+                status = present.status;
+            }
+            if (turn_signal_context.terminate_signal != 0) {
+                /* SIGTERM/SIGHUP: the conversation was already cancelled
+                 * above; clean up and exit regardless of anything else. */
+                break;
+            }
+            if (oi_cli_conversation_was_cancelled(conversation)) {
+                /* Ctrl+C during this turn: always recoverable, regardless
+                 * of whatever oi_status got attached to it. */
+                if (fputs("oi: cancelled\n", config->err) == EOF ||
+                    fflush(config->err) != 0) {
+                    status = OI_ERR_IO;
+                    break;
+                }
+                continue;
+            }
+            if (status != OI_OK) {
+                if (oi_cli_conversation_is_busy(conversation)) {
+                    oi_cli_conversation_cancel(conversation);
+                }
+                break;
+            }
         }
     }
 

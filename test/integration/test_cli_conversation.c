@@ -336,7 +336,10 @@ TEST(cancel_while_streaming_needs_no_repair) {
     /* Cancel immediately after start, before stepping the reactor at all:
      * nothing async has had a chance to run yet, so this deterministically
      * cancels while conversation->request != NULL and no assistant message
-     * has been committed -- no repair is needed or possible. */
+     * has been committed -- no *tool* repair is needed or possible, but the
+     * turn still needs an interrupted-turn placeholder assistant message to
+     * keep durable replay's user/assistant alternation intact for the next
+     * turn's user message. */
     CHECK_EQ(oi_cli_conversation_start(conversation, "question one", 12),
              OI_OK);
     CHECK(oi_cli_conversation_is_busy(conversation));
@@ -349,8 +352,10 @@ TEST(cancel_while_streaming_needs_no_repair) {
 
     const struct oi_cli_message_list *messages =
         oi_cli_conversation_messages(conversation);
-    CHECK_EQ(messages->len, 1);
+    CHECK_EQ(messages->len, 2);
     CHECK_STREQ(messages->items[0].content.data, "question one");
+    CHECK_EQ(messages->items[1].role, OI_CLI_MESSAGE_ASSISTANT);
+    CHECK(strstr(messages->items[1].content.data, "interrupted") != NULL);
 
     /* The conversation is still fully usable for a next turn. */
     memset(&sink, 0, sizeof sink);
@@ -462,7 +467,7 @@ TEST(cancel_while_tool_running_repairs_messages) {
 
     const struct oi_cli_message_list *messages =
         oi_cli_conversation_messages(conversation);
-    CHECK_EQ(messages->len, 4);
+    CHECK_EQ(messages->len, 5);
     CHECK_EQ(messages->items[1].role, OI_CLI_MESSAGE_ASSISTANT);
     CHECK_EQ(messages->items[1].tool_calls_len, 2);
     CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_TOOL);
@@ -471,6 +476,8 @@ TEST(cancel_while_tool_running_repairs_messages) {
     CHECK_EQ(messages->items[3].role, OI_CLI_MESSAGE_TOOL);
     CHECK_STREQ(messages->items[3].tool_call_id.data, "call-2");
     CHECK(strstr(messages->items[3].content.data, "not executed") != NULL);
+    CHECK_EQ(messages->items[4].role, OI_CLI_MESSAGE_ASSISTANT);
+    CHECK(strstr(messages->items[4].content.data, "interrupted") != NULL);
 
     /* No process is left running past the cancel: give the killed one a
      * moment, then confirm no further tool output ever arrives. */
@@ -558,9 +565,11 @@ TEST(cancel_from_within_tool_starting_event) {
 
     const struct oi_cli_message_list *messages =
         oi_cli_conversation_messages(conversation);
-    CHECK_EQ(messages->len, 3);
+    CHECK_EQ(messages->len, 4);
     CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_TOOL);
     CHECK(strstr(messages->items[2].content.data, "not executed") != NULL);
+    CHECK_EQ(messages->items[3].role, OI_CLI_MESSAGE_ASSISTANT);
+    CHECK(strstr(messages->items[3].content.data, "interrupted") != NULL);
 
     /* Give the reactor a few more steps: if a process had actually been
      * spawned despite the cancel, it would show up here. */

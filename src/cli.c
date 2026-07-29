@@ -336,7 +336,10 @@ static oi_status persist_conversation_event(
                 : 0;
         st = oi_cli_history_record_set_message(
             &record, context->state->next_record_id, context->turn_id,
-            message, OI_CLI_HISTORY_MESSAGE_NORMAL, model, model_len,
+            message,
+            event->as.message.is_repair ? OI_CLI_HISTORY_MESSAGE_REPAIR
+                                        : OI_CLI_HISTORY_MESSAGE_NORMAL,
+            model, model_len,
             history_tool_outcome(event->as.message.tool_outcome),
             event->as.message.raw_tool_output,
             event->as.message.raw_tool_output_len,

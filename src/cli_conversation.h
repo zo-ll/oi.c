@@ -45,6 +45,15 @@ struct oi_cli_conversation_event {
             const unsigned char *raw_tool_output;
             size_t raw_tool_output_len;
             int has_raw_tool_output;
+            /*
+             * True for a placeholder committed by a live cancel repair
+             * (cancelled_tool_unknown_text/cancelled_tool_not_executed_text/
+             * interrupted_turn_text), not a real model or tool result --
+             * mirrors OI_CLI_HISTORY_MESSAGE_REPAIR, which durable replay
+             * requires on the assistant message that closes out a turn
+             * after a PARTIAL_ASSISTANT record was already written for it.
+             */
+            int is_repair;
         } message;
         struct {
             const struct oi_cli_string *id;

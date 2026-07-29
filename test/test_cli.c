@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The Makefile defines OI_CLI_BIN to match whatever $(BUILD) directory
@@ -180,6 +181,81 @@ static pid_t start_mock_server(const char *response, size_t response_len,
     return start_mock_server_turns(responses, lengths, 1, out_port);
 }
 
+struct slow_mock_turn {
+    const char *response;
+    size_t response_len;
+    int delay_seconds;
+};
+
+/*
+ * A standalone mock server (not the shared start_mock_server_turns_capture
+ * used everywhere else) that sleeps for each turn's delay_seconds after
+ * accepting its connection and reading its request, before writing that
+ * turn's response -- needed to make a Ctrl+C-during-a-turn test reliably
+ * reach the CLI while a request is genuinely still in flight, rather than
+ * racing a same-host loopback round trip that would otherwise complete
+ * before the test could ever send the signal. Later turns typically use
+ * delay_seconds=0 to verify the REPL is still usable after a cancel.
+ */
+static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
+                                    size_t turn_count,
+                                    unsigned short *out_port) {
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listen_fd >= 0);
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, (int)turn_count), 0);
+
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    *out_port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        signal(SIGPIPE, SIG_IGN);
+        for (size_t i = 0; i < turn_count; i++) {
+            fd_set rfds;
+            struct timeval tv = {20, 0};
+            int cfd;
+
+            FD_ZERO(&rfds);
+            FD_SET(listen_fd, &rfds);
+            cfd = select(listen_fd + 1, &rfds, NULL, NULL, &tv) > 0
+                      ? accept(listen_fd, NULL, NULL)
+                      : -1;
+            if (cfd < 0) {
+                break;
+            }
+            drain_request(cfd, -1);
+            if (turns[i].delay_seconds > 0) {
+                sleep((unsigned)turns[i].delay_seconds);
+            }
+            size_t off = 0;
+            while (off < turns[i].response_len) {
+                ssize_t w = write(cfd, turns[i].response + off,
+                                  turns[i].response_len - off);
+                if (w <= 0) {
+                    break;
+                }
+                off += (size_t)w;
+            }
+            close(cfd);
+        }
+        close(listen_fd);
+        _exit(0);
+    }
+    close(listen_fd);
+    return pid;
+}
+
 /* --- run the built oi binary, capturing stdout+stderr --- */
 
 struct run_result {
@@ -297,6 +373,49 @@ static pid_t start_interactive_cli(unsigned short port, int slave_fd,
         argv[6] = (char *)"--api-key";
         argv[7] = (char *)"test-key";
         argv[8] = (char *)"--deny-tools";
+        argv[9] = (char *)"--session-dir";
+        argv[10] = (char *)session_root;
+        argv[11] = NULL;
+        execv(OI_BIN, argv);
+        _exit(127);
+    }
+    return pid;
+}
+
+/* Same as start_interactive_cli, but allows tools to run without prompting
+ * -- needed for tests that cancel a genuinely-running tool subprocess,
+ * where --deny-tools would never let one start at all. */
+static pid_t start_interactive_cli_allowing_tools(unsigned short port,
+                                                  int slave_fd,
+                                                  const char *session_root) {
+    pid_t pid = fork();
+
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        char port_text[16];
+        char *argv[13];
+
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
+            _exit(126);
+        }
+        snprintf(port_text, sizeof port_text, "%u", (unsigned)port);
+        if (dup2(slave_fd, STDIN_FILENO) < 0 ||
+            dup2(slave_fd, STDOUT_FILENO) < 0 ||
+            dup2(slave_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        if (slave_fd > STDERR_FILENO) {
+            close(slave_fd);
+        }
+        argv[0] = (char *)OI_BIN;
+        argv[1] = (char *)"--host";
+        argv[2] = (char *)"127.0.0.1";
+        argv[3] = (char *)"--port";
+        argv[4] = port_text;
+        argv[5] = (char *)"--no-tls";
+        argv[6] = (char *)"--api-key";
+        argv[7] = (char *)"test-key";
+        argv[8] = (char *)"--allow-tools";
         argv[9] = (char *)"--session-dir";
         argv[10] = (char *)session_root;
         argv[11] = NULL;
@@ -971,6 +1090,214 @@ TEST(interactive_model_command_changes_the_live_model) {
     }
 }
 
+TEST(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[2];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].delay_seconds = 3;
+    turns[1].response = reply;
+    turns[1].response_len = reply_len;
+    turns[1].delay_seconds = 0;
+    server = start_slow_mock_server(turns, 2, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-sigint-req-%d",
+             (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    /* Wait for the bracket-paste disable that oi_cli_prompt_read's cleanup
+     * unconditionally emits before returning: without this, a SIGINT sent
+     * immediately after write_interactive can race the idle-prompt's own
+     * poll() loop, which still has signal_fd registered until the read
+     * actually returns -- if both input_fd and signal_fd become readable
+     * in the same poll() call, the signal branch is checked first and the
+     * submission is never even read. Once this disable is observed,
+     * oi_cli_prompt_read has already returned and cli_repl.c's remaining
+     * turn-setup (including registering signal_fd on the reactor) runs
+     * synchronously with no further blocking until oi_reactor_step, so
+     * there is no further race once this is seen -- the mock server's 3s
+     * delay only needs to outlast that setup, not this wait. */
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004l", 1));
+    CHECK_EQ(kill(cli, SIGINT), 0);
+    CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
+    /* Wait for the fresh prompt's re-enable (occurrence 2) before writing
+     * more input -- oi_cli_terminal_enable's tcsetattr(TCSAFLUSH) discards
+     * anything queued before it runs, and "oi: cancelled" is printed
+     * before that call, not after. */
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
+    CHECK(write_interactive(master_fd, "world\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    free(reply);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+        unlink(metadata_path);
+        {
+            char history_path[640];
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(history_path);
+        }
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
+TEST(sigint_cancels_a_running_tool_and_returns_to_the_prompt) {
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_sigint\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\\\"printf started; sleep 3\\\"}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    size_t answer_len;
+    char *tool_resp =
+        build_chunked_response(tool_sse, strlen(tool_sse), "HTTP/1.1 200 OK",
+                              &tool_len);
+    char *answer_resp = build_chunked_response(
+        answer_sse, strlen(answer_sse), "HTTP/1.1 200 OK", &answer_len);
+    const char *responses[] = {tool_resp, answer_resp};
+    size_t lengths[] = {tool_len, answer_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server_turns(responses, lengths, 2, &port);
+    free(tool_resp);
+    free(answer_resp);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-sigint-tool-%d",
+             (int)getpid());
+    cli = start_interactive_cli_allowing_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    /* The interactive present layer only ever prints a "running tool"
+     * status line, never the tool's own raw stdout -- there is no
+     * terminal-visible marker for "the shell command has actually
+     * produced output" to wait for. Wait for the status line, then give
+     * the forked child a short, generous fixed window to actually start
+     * running (fork+exec completing in a few milliseconds, in practice)
+     * well before its own 3-second sleep would complete on its own. */
+    CHECK(interactive_wait_for(master_fd, &result, "running tool shell", 1));
+    {
+        struct timespec delay = {0, 300000000L};
+        nanosleep(&delay, NULL);
+    }
+    CHECK_EQ(kill(cli, SIGINT), 0);
+    CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
+    CHECK(write_interactive(master_fd, "world\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+        unlink(metadata_path);
+        {
+            char history_path[640];
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(history_path);
+        }
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
 TEST(interactive_cwd_command_changes_the_process_directory) {
     char target_dir[160];
     unsigned short port;
@@ -1321,6 +1648,8 @@ int main(void) {
     RUN(resume_replays_prior_exchange);
     RUN(interactive_repl_preserves_context_across_prompts);
     RUN(interactive_model_command_changes_the_live_model);
+    RUN(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt);
+    RUN(sigint_cancels_a_running_tool_and_returns_to_the_prompt);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);
