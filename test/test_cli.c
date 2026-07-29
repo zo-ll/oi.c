@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -805,6 +806,346 @@ TEST(interactive_repl_preserves_context_across_prompts) {
     }
 }
 
+TEST(interactive_model_command_changes_the_live_model) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"changed-reply\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    const char *responses[] = {reply};
+    size_t lengths[] = {reply_len};
+    char capture_path[160];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    snprintf(capture_path, sizeof capture_path,
+             "/tmp/oi-cli-model-request-%d", (int)getpid());
+    unlink(capture_path);
+    server = start_mock_server_turns_capture(responses, lengths, 1, &port,
+                                             capture_path);
+    free(reply);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-model-sessions-%d", (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "/model changed-model\r", 21));
+    CHECK(interactive_wait_for(master_fd, &result, "Model: changed-model", 1));
+    CHECK(write_interactive(master_fd, "a prompt\r", 9));
+    CHECK(interactive_wait_for(master_fd, &result, "changed-reply", 1));
+    /* Bracketed paste is toggled off/on around every oi_cli_prompt_read
+     * call, including the one for /model's own confirmation -- so
+     * occurrence 2 already exists in the buffer before "a prompt" is even
+     * sent. Occurrence 3 is the re-enable that starts the *next* prompt
+     * read after this turn completes; waiting for only 2 here would
+     * short-circuit without draining the turn's actual completion output,
+     * leaving it unread when \x04 is sent next (the same PTY-drain
+     * deadlock class documented on the OI_CLI_BIN fallback above). */
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        FILE *capture = fopen(capture_path, "r");
+        char requests[8192];
+        size_t request_len =
+            capture == NULL ? 0
+                            : fread(requests, 1, sizeof requests - 1, capture);
+        CHECK(capture != NULL);
+        if (capture != NULL) {
+            fclose(capture);
+        }
+        requests[request_len] = '\0';
+        CHECK(strstr(requests, "\"model\":\"changed-model\"") != NULL);
+        CHECK(strstr(requests, "gpt-4o-mini") == NULL);
+    }
+    unlink(capture_path);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s", session_root,
+                     entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+        {
+            FILE *metadata_file = fopen(metadata_path, "r");
+            char metadata[4096];
+            size_t metadata_len =
+                metadata_file == NULL
+                    ? 0
+                    : fread(metadata, 1, sizeof metadata - 1, metadata_file);
+            CHECK(metadata_file != NULL);
+            if (metadata_file != NULL) {
+                fclose(metadata_file);
+            }
+            metadata[metadata_len] = '\0';
+            CHECK(strstr(metadata, "\"model\":\"changed-model\"") != NULL);
+            CHECK(strstr(metadata, "test-key") == NULL);
+            CHECK(strstr(metadata, "api_key") == NULL);
+        }
+        unlink(metadata_path);
+        {
+            char history_path[640];
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(history_path);
+        }
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
+TEST(interactive_cwd_command_changes_the_process_directory) {
+    char target_dir[160];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+    char cwd_command[256];
+
+    snprintf(target_dir, sizeof target_dir, "/tmp/oi-cli-cwd-target-%d",
+             (int)getpid());
+    CHECK_EQ(mkdir(target_dir, 0700), 0);
+    /* /cwd and /status never submit a model message, so this server is
+     * never actually queried -- a harmless placeholder response. */
+    server = start_mock_server("data: [DONE]\n\n", 14, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-cwd-sessions-%d",
+             (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    snprintf(cwd_command, sizeof cwd_command, "/cwd %s\r", target_dir);
+    CHECK(write_interactive(master_fd, cwd_command, strlen(cwd_command)));
+    CHECK(interactive_wait_for(master_fd, &result, "CWD:", 1));
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    {
+        char expected[192];
+        snprintf(expected, sizeof expected, "CWD: %s", target_dir);
+        /* The /cwd confirmation above already printed this exact text once;
+         * /status's own CWD line is the second occurrence. Waiting for
+         * count 1 here would be satisfied instantly without draining the
+         * PTY, leaving /status's real response unread and deadlocking the
+         * child once its output fills the PTY buffer. */
+        CHECK(interactive_wait_for(master_fd, &result, expected, 2));
+    }
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+
+    /* No session was ever created: /cwd alone doesn't submit a model
+     * message, matching interactive_exit_before_submission_creates_no_session. */
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        size_t sessions_found = 0;
+
+        if (directory != NULL) {
+            while ((entry = readdir(directory)) != NULL) {
+                if (strcmp(entry->d_name, ".") != 0 &&
+                    strcmp(entry->d_name, "..") != 0) {
+                    sessions_found++;
+                }
+            }
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 0);
+    }
+    rmdir(session_root);
+    rmdir(target_dir);
+}
+
+TEST(model_override_persists_across_a_restart) {
+    char session_dir[] = "/tmp";
+    char session_name[64];
+    char log_path[128];
+    const char *sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"a-reply\"}}]}\n\ndata: [DONE]\n\n";
+
+    snprintf(session_name, sizeof session_name, "oi-cli-model-restart-%d",
+             (int)getpid());
+    snprintf(log_path, sizeof log_path, "%s/%s.oilog", session_dir,
+             session_name);
+    unlink(log_path);
+
+    /* Run 1: create the session with the default model. */
+    {
+        size_t total;
+        char *response =
+            build_chunked_response(sse, strlen(sse), "HTTP/1.1 200 OK",
+                                   &total);
+        unsigned short port;
+        pid_t child = start_mock_server(response, total, &port);
+        char port_str[16];
+        struct run_result r;
+        free(response);
+        snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
+        char *argv[] = {(char *)OI_BIN,
+                        (char *)"--host",
+                        (char *)"127.0.0.1",
+                        (char *)"--port",
+                        port_str,
+                        (char *)"--no-tls",
+                        (char *)"--api-key",
+                        (char *)"test-key",
+                        (char *)"--session-dir",
+                        session_dir,
+                        (char *)"--session",
+                        session_name,
+                        (char *)"first prompt",
+                        NULL};
+        run_cli(argv, &r);
+        CHECK_EQ(r.exit_code, 0);
+        waitpid(child, NULL, 0);
+    }
+
+    /* Run 2: pass --model explicitly; the override must win and persist. */
+    {
+        size_t total;
+        char *response =
+            build_chunked_response(sse, strlen(sse), "HTTP/1.1 200 OK",
+                                   &total);
+        unsigned short port;
+        pid_t child = start_mock_server(response, total, &port);
+        char port_str[16];
+        struct run_result r;
+        free(response);
+        snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
+        char *argv[] = {(char *)OI_BIN,
+                        (char *)"--host",
+                        (char *)"127.0.0.1",
+                        (char *)"--port",
+                        port_str,
+                        (char *)"--no-tls",
+                        (char *)"--api-key",
+                        (char *)"test-key",
+                        (char *)"--session-dir",
+                        session_dir,
+                        (char *)"--session",
+                        session_name,
+                        (char *)"--model",
+                        (char *)"overridden-model",
+                        (char *)"second prompt",
+                        NULL};
+        run_cli(argv, &r);
+        CHECK_EQ(r.exit_code, 0);
+        waitpid(child, NULL, 0);
+    }
+
+    /* Run 3: no --model given; the overridden value must still apply. */
+    {
+        size_t total;
+        char *response =
+            build_chunked_response(sse, strlen(sse), "HTTP/1.1 200 OK",
+                                   &total);
+        unsigned short port;
+        char capture_path[160];
+        const char *responses[] = {response};
+        size_t lengths[] = {total};
+        pid_t child;
+        char port_str[16];
+        struct run_result r;
+
+        snprintf(capture_path, sizeof capture_path,
+                 "/tmp/oi-cli-model-restart-request-%d", (int)getpid());
+        unlink(capture_path);
+        child = start_mock_server_turns_capture(responses, lengths, 1, &port,
+                                                capture_path);
+        free(response);
+        snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
+        char *argv[] = {(char *)OI_BIN,
+                        (char *)"--host",
+                        (char *)"127.0.0.1",
+                        (char *)"--port",
+                        port_str,
+                        (char *)"--no-tls",
+                        (char *)"--api-key",
+                        (char *)"test-key",
+                        (char *)"--session-dir",
+                        session_dir,
+                        (char *)"--session",
+                        session_name,
+                        (char *)"third prompt",
+                        NULL};
+        run_cli(argv, &r);
+        CHECK_EQ(r.exit_code, 0);
+        waitpid(child, NULL, 0);
+
+        {
+            FILE *capture = fopen(capture_path, "r");
+            char request[8192];
+            size_t request_len =
+                capture == NULL
+                    ? 0
+                    : fread(request, 1, sizeof request - 1, capture);
+            CHECK(capture != NULL);
+            if (capture != NULL) {
+                fclose(capture);
+            }
+            request[request_len] = '\0';
+            CHECK(strstr(request, "\"model\":\"overridden-model\"") != NULL);
+        }
+        unlink(capture_path);
+    }
+
+    unlink(log_path);
+    {
+        char metadata_path[160];
+        snprintf(metadata_path, sizeof metadata_path, "%s/%s.metadata.json",
+                session_dir, session_name);
+        unlink(metadata_path);
+    }
+}
+
 TEST(interactive_exit_before_submission_creates_no_session) {
     int master_fd = -1;
     int slave_fd = -1;
@@ -878,6 +1219,9 @@ int main(void) {
     RUN(tool_turn_limit_is_enforced);
     RUN(resume_replays_prior_exchange);
     RUN(interactive_repl_preserves_context_across_prompts);
+    RUN(interactive_model_command_changes_the_live_model);
+    RUN(interactive_cwd_command_changes_the_process_directory);
+    RUN(model_override_persists_across_a_restart);
     RUN(interactive_exit_before_submission_creates_no_session);
     RUN(interactive_help_and_exit_are_dispatched_without_a_session);
     return oi_test_report();
