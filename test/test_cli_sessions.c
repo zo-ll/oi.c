@@ -207,10 +207,10 @@ TEST(fresh_session_records_initial_model_and_cwd) {
     oi_cli_session_metadata_free(&metadata);
 
     oi_cli_session_restore_free(&restore);
+    unlink(fresh.metadata_path);
     fresh_store_close(&fresh);
     restore_cwd(original_cwd);
     unlink(fresh_log_path("fresh"));
-    unlink(fresh.metadata_path);
     rmdir(target_dir);
     free(target_dir);
 }
@@ -243,10 +243,10 @@ TEST(unchanged_resume_writes_no_new_records_but_refreshes_metadata) {
     CHECK_STREQ(restore.cwd.data, target_dir);
 
     oi_cli_session_restore_free(&restore);
+    unlink(fresh.metadata_path);
     fresh_store_close(&fresh);
     restore_cwd(original_cwd);
     unlink(fresh_log_path("unchanged"));
-    unlink(fresh.metadata_path);
     rmdir(target_dir);
     free(target_dir);
 }
@@ -281,10 +281,10 @@ TEST(apply_setting_writes_a_record_and_persists_through_restore) {
     CHECK_STREQ(restore.model.data, "gpt-changed");
 
     oi_cli_session_restore_free(&restore);
+    unlink(fresh.metadata_path);
     fresh_store_close(&fresh);
     restore_cwd(original_cwd);
     unlink(fresh_log_path("apply"));
-    unlink(fresh.metadata_path);
     rmdir(target_dir);
     free(target_dir);
 }
@@ -326,10 +326,10 @@ TEST(missing_metadata_rebuilds_from_history_with_a_diagnostic) {
 
     fclose(diagnostics);
     oi_cli_session_restore_free(&restore);
+    unlink(fresh.metadata_path);
     fresh_store_close(&fresh);
     restore_cwd(original_cwd);
     unlink(fresh_log_path("missing-meta"));
-    unlink(fresh.metadata_path);
     rmdir(target_dir);
     free(target_dir);
 }
@@ -370,10 +370,10 @@ TEST(mismatched_session_id_in_metadata_is_treated_as_corrupt) {
     CHECK_STREQ(restore.model.data, "gpt-default");
 
     oi_cli_session_restore_free(&restore);
+    unlink(fresh.metadata_path);
     fresh_store_close(&fresh);
     restore_cwd(original_cwd);
     unlink(fresh_log_path("mismatch"));
-    unlink(fresh.metadata_path);
     rmdir(target_dir);
     free(target_dir);
 }
@@ -418,10 +418,10 @@ TEST(missing_prior_cwd_falls_back_with_a_diagnostic) {
 
     fclose(diagnostics);
     oi_cli_session_restore_free(&restore);
+    unlink(fresh.metadata_path);
     fresh_store_close(&fresh);
     restore_cwd(original_cwd);
     unlink(fresh_log_path("cwd-missing"));
-    unlink(fresh.metadata_path);
     rmdir(target_dir);
     free(target_dir);
     free(deleted_dir);
@@ -460,10 +460,10 @@ TEST(explicit_model_override_wins_and_persists) {
     }
 
     oi_cli_session_restore_free(&restore);
+    unlink(fresh.metadata_path);
     fresh_store_close(&fresh);
     restore_cwd(original_cwd);
     unlink(fresh_log_path("override"));
-    unlink(fresh.metadata_path);
     rmdir(target_dir);
     free(target_dir);
 }
