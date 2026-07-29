@@ -7,11 +7,13 @@
 
 #include "cli_repl.h"
 
+#include "cli_bytebuf.h"
 #include "cli_command_dispatch.h"
 #include "cli_commands.h"
 #include "cli_composer.h"
 #include "cli_input_history.h"
 #include "cli_present.h"
+#include "cli_render_sanitize.h"
 
 #include <limits.h>
 #include <signal.h>
@@ -131,6 +133,10 @@ static oi_status dispatch_set_model(void *user_data, const char *name,
 static oi_status dispatch_set_cwd(void *user_data, const char *path,
                                   size_t path_len);
 
+struct repl_turn_input_context;
+static void report_busy_io_error(struct repl_turn_input_context *context,
+                                 int wrote_ok);
+
 struct repl_turn_input_context {
     struct oi_cli_composer *composer;
     oi_cli_conversation *conversation;
@@ -160,27 +166,200 @@ struct repl_turn_input_context {
      * happened this step avoids that entirely.
      */
     int dirty;
+    /*
+     * True from the moment an AWAITING_PERMISSION event arrives until the
+     * decision is resolved one way or another -- while set,
+     * handle_turn_input/handle_turn_escape_timeout route decoded input
+     * through the permission selector instead of the composer's normal
+     * editor-applying path, and the turn loop's redraw draws the selector
+     * instead of the ordinary prompt frame.
+     */
+    int awaiting_permission;
+    /* 0 = allow once, 1 = allow for process, 2 = deny -- reset to 0 each
+     * time a new AWAITING_PERMISSION event arrives. */
+    size_t permission_selected;
+    /* Sanitized/bounded "Tool: <name>"/"Args: <summary>" header lines,
+     * rebuilt fresh by build_permission_header for each AWAITING_PERMISSION
+     * event -- copied immediately rather than keeping the event's own
+     * borrowed pointers, which aren't guaranteed to outlive the call. */
+    struct oi_cli_bytebuf permission_tool_line;
+    struct oi_cli_bytebuf permission_args_line;
 };
+
+/*
+ * Bounds the raw argument JSON before sanitizing it, so a pathologically
+ * large tool call can't blow up the header display or the sanitize pass'
+ * own bounded memory use -- the full arguments are still whatever the
+ * model actually sent; only this pre-approval summary is truncated.
+ */
+#define OI_CLI_REPL_PERMISSION_ARGS_SUMMARY_MAX 200u
+
+/*
+ * Builds the "Tool: <name>" / "Args: <summary>" header lines shown above
+ * the permission selector, sanitizing both through the same
+ * control-byte/escape-sequence stripper write_tool_start already uses for
+ * "oi: running tool <name>" -- untrusted model output must never be able
+ * to inject terminal escapes into this display. Copied into
+ * caller-owned buffers immediately: `name`/`arguments` are event-scoped
+ * borrowed pointers, not guaranteed to outlive this call.
+ */
+static oi_status build_permission_header(struct oi_cli_bytebuf *tool_line,
+                                         struct oi_cli_bytebuf *args_line,
+                                         const struct oi_cli_string *name,
+                                         const struct oi_cli_string *arguments) {
+    struct oi_cli_sanitize_state sanitize;
+    size_t bounded_args_len = arguments->len > OI_CLI_REPL_PERMISSION_ARGS_SUMMARY_MAX
+                                  ? OI_CLI_REPL_PERMISSION_ARGS_SUMMARY_MAX
+                                  : arguments->len;
+    oi_status status;
+
+    oi_cli_bytebuf_reset(tool_line);
+    oi_cli_bytebuf_reset(args_line);
+    status = oi_cli_bytebuf_append(tool_line, "Tool: ", 6);
+    if (status == OI_OK) {
+        oi_cli_sanitize_init(&sanitize);
+        status = oi_cli_sanitize_feed(
+            &sanitize, (const unsigned char *)name->data, name->len,
+            tool_line);
+        if (status == OI_OK) {
+            status = oi_cli_sanitize_finish(&sanitize);
+        }
+    }
+    if (status == OI_OK) {
+        status = oi_cli_bytebuf_append(args_line, "Args: ", 6);
+    }
+    if (status == OI_OK) {
+        oi_cli_sanitize_init(&sanitize);
+        status = oi_cli_sanitize_feed(
+            &sanitize, (const unsigned char *)arguments->data,
+            bounded_args_len, args_line);
+        if (status == OI_OK) {
+            status = oi_cli_sanitize_finish(&sanitize);
+        }
+    }
+    if (status == OI_OK && arguments->len > bounded_args_len) {
+        status = oi_cli_bytebuf_append(args_line, "...", 3);
+    }
+    return status;
+}
+
+struct repl_event_context {
+    struct oi_cli_present *present;
+    /* Set to the current turn's context at the start of each turn, and
+     * only ever dereferenced while a turn is genuinely active (conversation
+     * events can't fire otherwise) -- see oi_cli_repl_run. */
+    struct repl_turn_input_context *turn_input;
+};
+
+static oi_status repl_conversation_event(
+    const struct oi_cli_conversation_event *event, void *user_data) {
+    struct repl_event_context *context = user_data;
+
+    if (event->type == OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION) {
+        struct repl_turn_input_context *turn_input = context->turn_input;
+        oi_status status = build_permission_header(
+            &turn_input->permission_tool_line,
+            &turn_input->permission_args_line,
+            event->as.awaiting_permission.name,
+            event->as.awaiting_permission.arguments);
+        if (status != OI_OK) {
+            return status;
+        }
+        turn_input->awaiting_permission = 1;
+        turn_input->permission_selected = 0;
+        turn_input->dirty = 1;
+    }
+    return oi_cli_present_event(event, context->present);
+}
+
+static const char permission_option_allow_once[] = "Allow once";
+static const char permission_option_allow_process[] =
+    "Allow for process (skip future prompts)";
+static const char permission_option_deny[] = "Deny";
+static const char permission_allowed_for_process_text[] =
+    "oi: tool policy set to allow for the rest of this process\n";
+
+/*
+ * Applies one decoded event to the permission selector (via
+ * oi_cli_selector_apply) instead of the editor -- called through
+ * oi_cli_composer_feed_raw/_resolve_escape_raw, which never touch
+ * composer->state, so the in-progress draft can't be corrupted by keys
+ * being intercepted here. Returns nonzero once the decision is settled
+ * (confirmed or cancelled), matching feed_raw's "stop at the first
+ * decisive action" contract.
+ */
+static int permission_selector_key(const struct oi_cli_input_event *event,
+                                   void *user_data) {
+    struct repl_turn_input_context *context = user_data;
+    enum oi_cli_selector_action action;
+    oi_status status =
+        oi_cli_selector_apply(event, 3, &context->permission_selected,
+                              &action);
+
+    if (status != OI_OK) {
+        if (context->status == OI_OK) {
+            context->status = status;
+        }
+        return 1;
+    }
+    switch (action) {
+    case OI_CLI_SELECTOR_ACTION_NONE:
+        return 0;
+    case OI_CLI_SELECTOR_ACTION_REDRAW:
+        context->dirty = 1;
+        return 0;
+    case OI_CLI_SELECTOR_ACTION_CONFIRM:
+        if (context->permission_selected == 1) {
+            /* "Allow for process" is itself the explicit confirming act --
+             * distinctly labeled from "allow once" in the selector, so no
+             * further confirmation is layered on top here. */
+            context->config->permission->policy = OI_CLI_TOOLS_ALLOW;
+            report_busy_io_error(
+                context,
+                fputs(permission_allowed_for_process_text,
+                     context->config->err) != EOF &&
+                    fflush(context->config->err) == 0);
+        }
+        (void)oi_cli_conversation_resolve_permission(
+            context->conversation, context->permission_selected != 2);
+        context->awaiting_permission = 0;
+        context->dirty = 1;
+        return 1;
+    case OI_CLI_SELECTOR_ACTION_CANCEL:
+        /* Dismissing the prompt (Escape or Ctrl+C while the selector is
+         * up) must never leave the tool call hanging -- resolve as deny,
+         * exactly like explicitly selecting "Deny" would. */
+        (void)oi_cli_conversation_resolve_permission(context->conversation,
+                                                      0);
+        context->awaiting_permission = 0;
+        context->dirty = 1;
+        return 1;
+    }
+    return 1;
+}
 
 static void handle_turn_escape_timeout(oi_reactor *reactor, void *user_data) {
     struct repl_turn_input_context *context = user_data;
     oi_reactor_timer *timer = context->escape_timer;
-    enum oi_cli_composer_action action;
     oi_status status;
 
     (void)reactor;
     context->escape_timer = NULL;
     context->dirty = 1;
     oi_reactor_timer_cancel(timer);
-    status = oi_cli_composer_resolve_escape(context->composer, &action);
-    if (status != OI_OK) {
-        if (context->status == OI_OK) {
-            context->status = status;
+    if (context->awaiting_permission) {
+        status = oi_cli_composer_resolve_escape_raw(
+            context->composer, permission_selector_key, context);
+    } else {
+        enum oi_cli_composer_action action;
+
+        status = oi_cli_composer_resolve_escape(context->composer, &action);
+        if (status == OI_OK && action == OI_CLI_COMPOSER_ACTION_CTRL_C) {
+            oi_cli_conversation_cancel(context->conversation);
         }
-        return;
     }
-    if (action == OI_CLI_COMPOSER_ACTION_CTRL_C) {
-        oi_cli_conversation_cancel(context->conversation);
+    if (status != OI_OK && context->status == OI_OK) {
+        context->status = status;
     }
 }
 
@@ -388,7 +567,6 @@ static void discard_pending_on_cancel(struct repl_turn_input_context *context) {
 static void handle_turn_input(oi_reactor *reactor, int fd, int revents,
                               void *user_data) {
     struct repl_turn_input_context *context = user_data;
-    enum oi_cli_composer_action action;
     oi_status status;
 
     (void)fd;
@@ -398,24 +576,36 @@ static void handle_turn_input(oi_reactor *reactor, int fd, int revents,
         oi_reactor_timer_cancel(context->escape_timer);
         context->escape_timer = NULL;
     }
-    status = oi_cli_composer_feed(context->composer, &action);
+    if (context->awaiting_permission) {
+        /* Keys are intercepted by the selector entirely -- never reach
+         * the editor -- for as long as a decision is outstanding. */
+        status = oi_cli_composer_feed_raw(context->composer,
+                                          permission_selector_key, context);
+    } else {
+        enum oi_cli_composer_action action;
+
+        status = oi_cli_composer_feed(context->composer, &action);
+        if (status == OI_OK) {
+            if (action == OI_CLI_COMPOSER_ACTION_CTRL_C) {
+                oi_cli_conversation_cancel(context->conversation);
+                discard_pending_on_cancel(context);
+            } else if (action == OI_CLI_COMPOSER_ACTION_SUBMIT) {
+                handle_busy_submit(context);
+            }
+            /* EXIT (Ctrl+D at an empty draft) while busy is still a
+             * documented no-op: not explicitly required by the issue, and
+             * there is no pressing need to synthesize an "/exit" queue
+             * entry for it ahead of an explicitly typed /exit, which
+             * already goes through the one-slot rule above like any other
+             * command. */
+        }
+    }
     if (status != OI_OK) {
         if (context->status == OI_OK) {
             context->status = status;
         }
         return;
     }
-    if (action == OI_CLI_COMPOSER_ACTION_CTRL_C) {
-        oi_cli_conversation_cancel(context->conversation);
-        discard_pending_on_cancel(context);
-    } else if (action == OI_CLI_COMPOSER_ACTION_SUBMIT) {
-        handle_busy_submit(context);
-    }
-    /* EXIT (Ctrl+D at an empty draft) while busy is still a documented
-     * no-op: not explicitly required by the issue, and there is no
-     * pressing need to synthesize an "/exit" queue entry for it ahead of
-     * an explicitly typed /exit, which already goes through the one-slot
-     * rule above like any other command. */
     if (oi_cli_composer_escape_pending(context->composer)) {
         (void)oi_reactor_timer_start(reactor,
                                      OI_CLI_COMPOSER_ESCAPE_TIMEOUT_MS,
@@ -508,6 +698,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     struct oi_cli_string current_model_storage = {0};
     struct oi_cli_string *current_model;
     struct repl_setting_context setting_context;
+    struct repl_event_context repl_event_context;
     struct oi_cli_repl_pending pending = {0};
     int signal_fd = -1;
     oi_status status;
@@ -593,8 +784,10 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     conversation_config.tool_timeout_ms = config->tool_timeout_ms;
     conversation_config.permission = oi_cli_tool_permission;
     conversation_config.permission_user_data = config->permission;
-    conversation_config.on_event = oi_cli_present_event;
-    conversation_config.event_user_data = &present;
+    repl_event_context.present = &present;
+    repl_event_context.turn_input = NULL;
+    conversation_config.on_event = repl_conversation_event;
+    conversation_config.event_user_data = &repl_event_context;
 
     for (;;) {
         char *prompt = NULL;
@@ -760,12 +953,16 @@ have_message:
                 .setting_context = &setting_context,
                 .pending = &pending,
             };
-            int signal_registered =
+            int signal_registered;
+            int input_registered;
+
+            repl_event_context.turn_input = &turn_input_context;
+            signal_registered =
                 signal_fd >= 0 &&
                 oi_reactor_add(reactor, signal_fd, OI_EV_READ,
                                handle_turn_signal,
                                &turn_signal_context) == OI_OK;
-            int input_registered =
+            input_registered =
                 oi_reactor_add(reactor, config->input_fd, OI_EV_READ,
                                handle_turn_input,
                                &turn_input_context) == OI_OK;
@@ -804,8 +1001,40 @@ have_message:
                 if (status == OI_OK && !present.done &&
                     (turn_input_context.dirty ||
                      turn_signal_context.resize_pending)) {
-                    oi_status redraw_status =
-                        oi_cli_composer_redraw(&composer);
+                    oi_status redraw_status;
+
+                    if (turn_input_context.awaiting_permission) {
+                        struct oi_cli_render_line header[2];
+                        struct oi_cli_render_line options[3] = {
+                            {permission_option_allow_once,
+                             sizeof permission_option_allow_once - 1},
+                            {permission_option_allow_process,
+                             sizeof permission_option_allow_process - 1},
+                            {permission_option_deny,
+                             sizeof permission_option_deny - 1},
+                        };
+                        size_t header_count = 0;
+
+                        if (turn_input_context.permission_tool_line.len > 0) {
+                            header[header_count].text =
+                                turn_input_context.permission_tool_line.data;
+                            header[header_count].len =
+                                turn_input_context.permission_tool_line.len;
+                            header_count++;
+                        }
+                        if (turn_input_context.permission_args_line.len > 0) {
+                            header[header_count].text =
+                                turn_input_context.permission_args_line.data;
+                            header[header_count].len =
+                                turn_input_context.permission_args_line.len;
+                            header_count++;
+                        }
+                        redraw_status = oi_cli_composer_draw_selector(
+                            &composer, header, header_count, options, 3,
+                            turn_input_context.permission_selected);
+                    } else {
+                        redraw_status = oi_cli_composer_redraw(&composer);
+                    }
                     if (redraw_status != OI_OK) {
                         status = redraw_status;
                     }
@@ -813,6 +1042,9 @@ have_message:
                     turn_signal_context.resize_pending = 0;
                 }
             }
+            oi_cli_bytebuf_free(&turn_input_context.permission_tool_line);
+            oi_cli_bytebuf_free(&turn_input_context.permission_args_line);
+            repl_event_context.turn_input = NULL;
             if (signal_registered) {
                 oi_reactor_remove(reactor, signal_fd);
             }

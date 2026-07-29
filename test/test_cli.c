@@ -511,6 +511,49 @@ static pid_t start_interactive_cli_allowing_tools(unsigned short port,
     return pid;
 }
 
+/* Same as start_interactive_cli, but with neither --allow-tools nor
+ * --deny-tools: the default `ask` policy, which now (issue #26) routes
+ * through the REPL's own permission selector instead of blocking on
+ * /dev/tty -- needed for tests exercising that selector directly. */
+static pid_t start_interactive_cli_asking_tools(unsigned short port,
+                                                int slave_fd,
+                                                const char *session_root) {
+    pid_t pid = fork();
+
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        char port_text[16];
+        char *argv[12];
+
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
+            _exit(126);
+        }
+        snprintf(port_text, sizeof port_text, "%u", (unsigned)port);
+        if (dup2(slave_fd, STDIN_FILENO) < 0 ||
+            dup2(slave_fd, STDOUT_FILENO) < 0 ||
+            dup2(slave_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        if (slave_fd > STDERR_FILENO) {
+            close(slave_fd);
+        }
+        argv[0] = (char *)OI_BIN;
+        argv[1] = (char *)"--host";
+        argv[2] = (char *)"127.0.0.1";
+        argv[3] = (char *)"--port";
+        argv[4] = port_text;
+        argv[5] = (char *)"--no-tls";
+        argv[6] = (char *)"--api-key";
+        argv[7] = (char *)"test-key";
+        argv[8] = (char *)"--session-dir";
+        argv[9] = (char *)session_root;
+        argv[10] = NULL;
+        execv(OI_BIN, argv);
+        _exit(127);
+    }
+    return pid;
+}
+
 /* Same as start_interactive_cli, but against an explicit --session ID
  * rather than a fresh automatic session directory -- needed to actually
  * resume the same durable log across two separate process lifetimes (an
@@ -2638,6 +2681,374 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
     unlink(log_path);
 }
 
+static const char permission_tool_sse[] =
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+    "\"index\":0,\"id\":\"call_ask\",\"type\":\"function\",\"function\":{"
+    "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf "
+    "tool-ok\\\"}\"}}]}}]}\n\n"
+    "data: [DONE]\n\n";
+
+TEST(permission_ask_allow_once_lets_the_tool_run) {
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"finished\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    size_t answer_len;
+    char *tool_response = build_chunked_response(
+        permission_tool_sse, strlen(permission_tool_sse), "HTTP/1.1 200 OK",
+        &tool_len);
+    char *answer_response = build_chunked_response(
+        answer_sse, strlen(answer_sse), "HTTP/1.1 200 OK", &answer_len);
+    const char *responses[] = {tool_response, answer_response};
+    size_t lengths[] = {tool_len, answer_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server_turns(responses, lengths, 2, &port);
+    free(tool_response);
+    free(answer_response);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-ask-allow-once-%d",
+             (int)getpid());
+    cli = start_interactive_cli_asking_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Allow once", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Deny", 1));
+
+    /* Confirms at the default selection (index 0, "Allow once"). */
+    CHECK(write_interactive(master_fd, "\r", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") != 0 &&
+                strcmp(entry->d_name, "..") != 0) {
+                snprintf(session_path, sizeof session_path, "%s/%s",
+                         session_root, entry->d_name);
+            }
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        if (session_path[0] != '\0') {
+            char metadata_path[640];
+            char history_path[640];
+
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(metadata_path);
+            unlink(history_path);
+            rmdir(session_path);
+        }
+    }
+    rmdir(session_root);
+}
+
+TEST(permission_ask_deny_ends_the_turn) {
+    size_t tool_len;
+    char *tool_response = build_chunked_response(
+        permission_tool_sse, strlen(permission_tool_sse), "HTTP/1.1 200 OK",
+        &tool_len);
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server(tool_response, tool_len, &port);
+    free(tool_response);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-ask-deny-%d",
+             (int)getpid());
+    cli = start_interactive_cli_asking_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+
+    /* Digit shortcut: '3' jumps directly to and confirms the third option
+     * (Deny) without needing arrow keys. */
+    CHECK(write_interactive(master_fd, "3", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
+                               1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+}
+
+TEST(permission_ask_allow_for_process_elevates_policy) {
+    const char *first_answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"first done\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *second_answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"second done\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    size_t first_answer_len;
+    size_t second_answer_len;
+    char *tool_response = build_chunked_response(
+        permission_tool_sse, strlen(permission_tool_sse), "HTTP/1.1 200 OK",
+        &tool_len);
+    char *first_answer = build_chunked_response(
+        first_answer_sse, strlen(first_answer_sse), "HTTP/1.1 200 OK",
+        &first_answer_len);
+    char *second_answer = build_chunked_response(
+        second_answer_sse, strlen(second_answer_sse), "HTTP/1.1 200 OK",
+        &second_answer_len);
+    const char *responses[] = {tool_response, first_answer, tool_response,
+                              second_answer};
+    size_t lengths[] = {tool_len, first_answer_len, tool_len,
+                       second_answer_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server_turns(responses, lengths, 4, &port);
+    free(tool_response);
+    free(first_answer);
+    free(second_answer);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-ask-allow-process-%d", (int)getpid());
+    cli = start_interactive_cli_asking_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+
+    /* Digit shortcut '2' -> "Allow for process". */
+    CHECK(write_interactive(master_fd, "2", 1));
+    CHECK(interactive_wait_for(
+        master_fd, &result,
+        "oi: tool policy set to allow for the rest of this process", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "first done", 1));
+
+    /* A second tool call in a later turn must not prompt again -- the
+     * process-wide policy is now allow. */
+    CHECK(write_interactive(master_fd, "run it again\r", 13));
+    CHECK(interactive_wait_for(master_fd, &result, "second done", 1));
+    CHECK_EQ(count_text(result.output, "Tool: shell"), 1);
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+}
+
+TEST(permission_ask_ctrl_c_while_awaiting_denies_without_hanging) {
+    size_t tool_len;
+    char *tool_response = build_chunked_response(
+        permission_tool_sse, strlen(permission_tool_sse), "HTTP/1.1 200 OK",
+        &tool_len);
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server(tool_response, tool_len, &port);
+    free(tool_response);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-ask-ctrlc-%d",
+             (int)getpid());
+    cli = start_interactive_cli_asking_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+
+    /* Dismissing the selector via Ctrl+C must resolve as a deny, not hang
+     * waiting for a decision that will never come. */
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
+                               1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+}
+
+TEST(permission_ask_resize_redraws_the_selector) {
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"finished\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    size_t answer_len;
+    char *tool_response = build_chunked_response(
+        permission_tool_sse, strlen(permission_tool_sse), "HTTP/1.1 200 OK",
+        &tool_len);
+    char *answer_response = build_chunked_response(
+        answer_sse, strlen(answer_sse), "HTTP/1.1 200 OK", &answer_len);
+    const char *responses[] = {tool_response, answer_response};
+    size_t lengths[] = {tool_len, answer_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    struct winsize resized = {0};
+    char session_root[128];
+
+    server = start_mock_server_turns(responses, lengths, 2, &port);
+    free(tool_response);
+    free(answer_response);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-ask-resize-%d",
+             (int)getpid());
+    cli = start_interactive_cli_asking_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+
+    /* A fresh "\x1b[J" appearing with no further keystroke proves the
+     * redraw was driven by the resize signal, not by typing -- same
+     * technique as the composer-level resize test. */
+    result.output_len = 0;
+    resized.ws_row = 24;
+    resized.ws_col = 100;
+    CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &resized), 0);
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[J", 1));
+
+    CHECK(write_interactive(master_fd, "\r", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+}
+
+TEST(permission_ask_typing_does_not_leak_into_the_draft) {
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"finished\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    size_t answer_len;
+    char *tool_response = build_chunked_response(
+        permission_tool_sse, strlen(permission_tool_sse), "HTTP/1.1 200 OK",
+        &tool_len);
+    char *answer_response = build_chunked_response(
+        answer_sse, strlen(answer_sse), "HTTP/1.1 200 OK", &answer_len);
+    const char *responses[] = {tool_response, answer_response};
+    size_t lengths[] = {tool_len, answer_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server_turns(responses, lengths, 2, &port);
+    free(tool_response);
+    free(answer_response);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-ask-notype-%d",
+             (int)getpid());
+    cli = start_interactive_cli_asking_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+
+    /* Plain letters are not digit shortcuts -- they must have no visible
+     * effect on the selector and must never reach the editor. */
+    CHECK(write_interactive(master_fd, "xyz", 3));
+    /* Confirms at the default selection (index 0, "Allow once"): if any
+     * of "xyz" had leaked into the editor instead, this "\r" would submit
+     * garbage as a new message rather than confirming the selector. */
+    CHECK(write_interactive(master_fd, "\r", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
+
+    /* Back at an idle prompt: if "xyz" had leaked into the draft, Ctrl+D
+     * would delete forward instead of exiting (same technique used
+     * elsewhere in this file to prove a draft is empty). */
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+}
+
 TEST(sigterm_during_a_turn_terminates_cleanly) {
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -3083,6 +3494,12 @@ int main(void) {
     RUN(queued_command_while_busy_resolves_discarded_and_dispatches_live);
     RUN(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft);
     RUN(crash_with_a_pending_item_restores_it_as_a_startup_draft);
+    RUN(permission_ask_allow_once_lets_the_tool_run);
+    RUN(permission_ask_deny_ends_the_turn);
+    RUN(permission_ask_allow_for_process_elevates_policy);
+    RUN(permission_ask_ctrl_c_while_awaiting_denies_without_hanging);
+    RUN(permission_ask_resize_redraws_the_selector);
+    RUN(permission_ask_typing_does_not_leak_into_the_draft);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);
