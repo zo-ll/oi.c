@@ -136,6 +136,9 @@ $(BUILD)/test_cli_editor: test/test_cli_editor.c src/cli_editor.c src/cli_utf8.c
 $(BUILD)/test_cli_commands: test/test_cli_commands.c src/cli_commands.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_commands.c $(LIB) -o $@ $(LDLIBS)
 
+$(BUILD)/test_cli_tools: test/test_cli_tools.c src/cli_tools.c $(LIB) | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_tools.c $(LIB) -o $@ $(LDLIBS)
+
 $(BUILD)/test_cli_command_dispatch: test/test_cli_command_dispatch.c src/cli_command_dispatch.c src/cli_commands.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_command_dispatch.c src/cli_commands.c $(LIB) -o $@ $(LDLIBS)
 

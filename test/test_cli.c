@@ -851,6 +851,59 @@ TEST(tool_denial_stops_loop) {
     CHECK(strstr(result.output, "denied") != NULL);
 }
 
+TEST(default_ask_policy_denies_safely_without_a_controlling_terminal) {
+    /* The one-shot loop is only ever reached when stdin/stdout aren't
+     * both a tty (cli.c's own `interactive` gate) -- exactly the case
+     * this test exercises via run_cli's plain pipe/fork setup, with no
+     * --allow-tools/--deny-tools flag at all, so the default policy is
+     * `ask`. It must deny promptly rather than hang forever waiting for
+     * a decision nothing can ever supply. */
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_ask\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\""
+        "}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    char *tool_response = build_chunked_response(
+        tool_sse, strlen(tool_sse), "HTTP/1.1 200 OK", &tool_len);
+    unsigned short port;
+    pid_t server = start_mock_server(tool_response, tool_len, &port);
+    free(tool_response);
+
+    char port_str[16];
+    snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
+    char session_name[96];
+    snprintf(session_name, sizeof session_name, "oi-cli-tool-ask-noninteractive-%d",
+             (int)getpid());
+    char log_path[160];
+    snprintf(log_path, sizeof log_path, "/tmp/%s.oilog", session_name);
+    unlink(log_path);
+    char *argv[] = {(char *)OI_BIN,
+                    (char *)"--host",
+                    (char *)"127.0.0.1",
+                    (char *)"--port",
+                    port_str,
+                    (char *)"--no-tls",
+                    (char *)"--api-key",
+                    (char *)"test-key",
+                    (char *)"--session-dir",
+                    (char *)"/tmp",
+                    (char *)"--session",
+                    session_name,
+                    (char *)"--max-turns",
+                    (char *)"4",
+                    (char *)"use a tool",
+                    NULL};
+    struct run_result result;
+    run_cli(argv, &result);
+    waitpid(server, NULL, 0);
+    unlink(log_path);
+
+    CHECK_EQ(result.exit_code, 1);
+    CHECK(strstr(result.output, "denied") != NULL);
+}
+
 TEST(tool_failure_is_returned_to_model) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -3012,6 +3065,7 @@ int main(void) {
     RUN(end_to_end_streaming_reply);
     RUN(tool_loop_executes_and_returns_result);
     RUN(tool_denial_stops_loop);
+    RUN(default_ask_policy_denies_safely_without_a_controlling_terminal);
     RUN(tool_failure_is_returned_to_model);
     RUN(tool_turn_limit_is_enforced);
     RUN(resume_replays_prior_exchange);
