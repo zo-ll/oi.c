@@ -316,6 +316,19 @@ $(FUZZ_BUILD)/fuzz_cli_render_stream: test/fuzz/fuzz_cli_render_stream.c $(CLI_R
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
 		$(INCLUDES) $< $(CLI_RENDER_STREAM_SRCS) -o $@ $(LDLIBS)
 
+# Also CLI-private, plus the JSON parser/writer $(LIB_SRCS) itself needs
+# for record encode/decode (oi_cli_history_record_encode is compiled in
+# even though this harness never calls it, so the writer side is a real
+# link dependency too, not just the parser).
+CLI_HISTORY_REPLAY_FUZZ_SRCS = src/cli_history.c src/cli_history_codec.c \
+	src/cli_history_replay.c src/cli_message.c src/arena.c \
+	src/json_value.c src/json_parse.c src/json_write.c
+
+$(FUZZ_BUILD)/fuzz_cli_history_replay: test/fuzz/fuzz_cli_history_replay.c $(CLI_HISTORY_REPLAY_FUZZ_SRCS) | $(FUZZ_BUILD)
+	$(FUZZ_CC) $(CSTD) $(WARN) -g -O1 \
+		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
+		$(INCLUDES) $< $(CLI_HISTORY_REPLAY_FUZZ_SRCS) -o $@ $(LDLIBS)
+
 fuzz: $(FUZZ_BINS)
 	@if [ -z "$(FUZZ_BINS)" ]; then \
 		echo "no fuzz harnesses yet (test/fuzz/fuzz_*.c)"; \

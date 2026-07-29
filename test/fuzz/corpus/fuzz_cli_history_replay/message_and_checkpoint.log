@@ -1,0 +1,3 @@
+{"version":1,"record_id":"1","turn_id":"1","type":"message","role":"user","content":"hello","source":"normal"}
+{"version":1,"record_id":"2","turn_id":"1","type":"message","role":"assistant","content":"hi there","source":"normal","model":"gpt-test"}
+{"version":1,"record_id":"3","turn_id":"0","type":"checkpoint","summary":"a summary","model":"gpt-test","source_first_record_id":"1","source_last_record_id":"2"}
