@@ -15,8 +15,6 @@
 #include <sys/signalfd.h>
 #include <unistd.h>
 
-#define OI_CLI_ESCAPE_TIMEOUT_MS 40
-
 static size_t terminal_columns(int fd) {
     struct winsize size;
 
@@ -226,7 +224,7 @@ oi_status oi_cli_composer_wait_submit(struct oi_cli_composer *composer,
             int timeout = composer->input_len != 0 &&
                                   composer->input[0] == '\x1b' &&
                                   !composer->decoder.pasting
-                              ? OI_CLI_ESCAPE_TIMEOUT_MS
+                              ? OI_CLI_COMPOSER_ESCAPE_TIMEOUT_MS
                               : -1;
             int ready;
 
@@ -320,4 +318,124 @@ cleanup:
         *out_exit = 0;
     }
     return status;
+}
+
+/*
+ * Applies one already-decoded event to the editor (mutating state exactly
+ * like the idle path does), but never draws and never acts on
+ * SUBMIT/EXIT/CTRL_C itself -- just classifies which of those (if any)
+ * this event produced, for a busy-mode caller to decide what to do with.
+ * oi_cli_prompt_state_apply's own SUBMIT/EXIT handling never mutates the
+ * editor by itself (SUBMIT is only actually committed by a later, separate
+ * oi_cli_prompt_state_commit call; EXIT only fires when the editor was
+ * already empty), so it's safe to let it run unconditionally here and
+ * classify the result afterward -- CTRL_C is the one exception (it clears
+ * the draft immediately as part of applying it), which is fine: a
+ * busy-mode Ctrl+C clearing the in-progress draft alongside cancelling the
+ * turn matches the idle Ctrl+C behavior of clearing on its own.
+ */
+static oi_status classify_event(struct oi_cli_composer *composer,
+                                const struct oi_cli_input_event *event,
+                                enum oi_cli_composer_action *out_action) {
+    enum oi_cli_prompt_action prompt_action;
+    oi_status status =
+        oi_cli_prompt_state_apply(&composer->state, event, &prompt_action);
+
+    if (status != OI_OK) {
+        return status;
+    }
+    if (event->type == OI_CLI_INPUT_CTRL_C) {
+        *out_action = OI_CLI_COMPOSER_ACTION_CTRL_C;
+    } else if (event->type == OI_CLI_INPUT_ENTER &&
+              prompt_action == OI_CLI_PROMPT_ACTION_SUBMIT) {
+        *out_action = OI_CLI_COMPOSER_ACTION_SUBMIT;
+    } else if (event->type == OI_CLI_INPUT_CTRL_D &&
+              prompt_action == OI_CLI_PROMPT_ACTION_EXIT) {
+        *out_action = OI_CLI_COMPOSER_ACTION_EXIT;
+    } else {
+        *out_action = OI_CLI_COMPOSER_ACTION_NONE;
+    }
+    return OI_OK;
+}
+
+oi_status oi_cli_composer_feed(struct oi_cli_composer *composer,
+                               enum oi_cli_composer_action *out_action) {
+    ssize_t read_len;
+
+    if (composer == NULL || out_action == NULL) {
+        return OI_ERR_INVAL;
+    }
+    *out_action = OI_CLI_COMPOSER_ACTION_NONE;
+
+    if (composer->input_len == sizeof composer->input) {
+        return OI_ERR_PARSE;
+    }
+    do {
+        read_len = read(composer->input_fd,
+                        composer->input + composer->input_len,
+                        sizeof composer->input - composer->input_len);
+    } while (read_len < 0 && errno == EINTR);
+    if (read_len == 0) {
+        return OI_ERR_CLOSED;
+    }
+    if (read_len < 0) {
+        return errno == EAGAIN || errno == EWOULDBLOCK ? OI_OK : OI_ERR_IO;
+    }
+    composer->input_len += (size_t)read_len;
+
+    while (composer->input_len != 0) {
+        struct oi_cli_input_event event;
+        size_t consumed;
+        oi_status status = oi_cli_input_decode(
+            &composer->decoder, composer->input, composer->input_len,
+            &consumed, &event);
+
+        if (status == OI_ERR_AGAIN) {
+            break;
+        }
+        if (status != OI_OK) {
+            return status;
+        }
+        consume_input(composer->input, &composer->input_len, consumed);
+        status = classify_event(composer, &event, out_action);
+        if (status != OI_OK) {
+            return status;
+        }
+        if (*out_action != OI_CLI_COMPOSER_ACTION_NONE) {
+            break;
+        }
+    }
+    return OI_OK;
+}
+
+int oi_cli_composer_escape_pending(const struct oi_cli_composer *composer) {
+    return composer != NULL && composer->input_len != 0 &&
+           composer->input[0] == '\x1b' && !composer->decoder.pasting;
+}
+
+oi_status oi_cli_composer_resolve_escape(
+    struct oi_cli_composer *composer,
+    enum oi_cli_composer_action *out_action) {
+    struct oi_cli_input_event event;
+    size_t consumed;
+    oi_status status;
+
+    if (composer == NULL || out_action == NULL) {
+        return OI_ERR_INVAL;
+    }
+    *out_action = OI_CLI_COMPOSER_ACTION_NONE;
+
+    status = oi_cli_input_decode_escape(&consumed, &event);
+    if (status != OI_OK) {
+        return status;
+    }
+    consume_input(composer->input, &composer->input_len, consumed);
+    return classify_event(composer, &event, out_action);
+}
+
+oi_status oi_cli_composer_redraw(struct oi_cli_composer *composer) {
+    if (composer == NULL) {
+        return OI_ERR_INVAL;
+    }
+    return handle_resize(composer);
 }

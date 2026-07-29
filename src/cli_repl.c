@@ -57,6 +57,11 @@ struct repl_turn_signal_context {
     /* 0, or the signal (SIGTERM/SIGHUP) that requested the whole REPL
      * terminate once this turn finishes unwinding. */
     int terminate_signal;
+    /* Set on SIGWINCH; the turn loop checks this after each step to decide
+     * whether the composer's frame needs redrawing -- see
+     * repl_turn_input_context.dirty for why this can't just redraw
+     * unconditionally on every step. */
+    int resize_pending;
 };
 
 static void handle_turn_signal(oi_reactor *reactor, int fd, int revents,
@@ -72,10 +77,7 @@ static void handle_turn_signal(oi_reactor *reactor, int fd, int revents,
     while (read(fd, &info, sizeof info) == (ssize_t)sizeof info) {
         switch (info.ssi_signo) {
         case SIGWINCH:
-            /* No editor frame is on screen during a turn; the width is
-             * re-read fresh at the start of the next
-             * oi_cli_composer_wait_submit regardless (matches issue #23's
-             * own reasoning), so there is nothing to do here. */
+            context->resize_pending = 1;
             break;
         case SIGINT:
             oi_cli_conversation_cancel(context->conversation);
@@ -88,6 +90,89 @@ static void handle_turn_signal(oi_reactor *reactor, int fd, int revents,
         default:
             break;
         }
+    }
+}
+
+struct repl_turn_input_context {
+    struct oi_cli_composer *composer;
+    oi_cli_conversation *conversation;
+    /* Owned by this context: cancelled unconditionally when the turn ends
+     * (whichever way), since a still-pending timer firing after this
+     * stack-local context goes out of scope would be a use-after-free. */
+    oi_reactor_timer *escape_timer;
+    /* First composer error seen (e.g. OI_ERR_CLOSED if input_fd hit EOF);
+     * checked by the turn loop after each step alongside the reactor's own
+     * step_status, since this callback has no return value of its own. */
+    oi_status status;
+    /*
+     * Set whenever input was actually decoded this step; the turn loop
+     * checks this (and resize_pending above) after each step to decide
+     * whether to redraw the composer's frame at all. Redrawing
+     * unconditionally on every step -- regardless of whether *this*
+     * step's ready fds had anything to do with the composer -- would
+     * interleave its escape sequences into the turn's own streamed
+     * output (config->out and config->output_fd are the same fd)
+     * whenever a multi-chunk reply and typing land in different steps,
+     * corrupting normal token-by-token streaming, not just risking
+     * flicker. Only redrawing when something composer-relevant actually
+     * happened this step avoids that entirely.
+     */
+    int dirty;
+};
+
+static void handle_turn_escape_timeout(oi_reactor *reactor, void *user_data) {
+    struct repl_turn_input_context *context = user_data;
+    oi_reactor_timer *timer = context->escape_timer;
+    enum oi_cli_composer_action action;
+    oi_status status;
+
+    (void)reactor;
+    context->escape_timer = NULL;
+    context->dirty = 1;
+    oi_reactor_timer_cancel(timer);
+    status = oi_cli_composer_resolve_escape(context->composer, &action);
+    if (status != OI_OK) {
+        if (context->status == OI_OK) {
+            context->status = status;
+        }
+        return;
+    }
+    if (action == OI_CLI_COMPOSER_ACTION_CTRL_C) {
+        oi_cli_conversation_cancel(context->conversation);
+    }
+}
+
+static void handle_turn_input(oi_reactor *reactor, int fd, int revents,
+                              void *user_data) {
+    struct repl_turn_input_context *context = user_data;
+    enum oi_cli_composer_action action;
+    oi_status status;
+
+    (void)fd;
+    (void)revents;
+    context->dirty = 1;
+    if (context->escape_timer != NULL) {
+        oi_reactor_timer_cancel(context->escape_timer);
+        context->escape_timer = NULL;
+    }
+    status = oi_cli_composer_feed(context->composer, &action);
+    if (status != OI_OK) {
+        if (context->status == OI_OK) {
+            context->status = status;
+        }
+        return;
+    }
+    if (action == OI_CLI_COMPOSER_ACTION_CTRL_C) {
+        oi_cli_conversation_cancel(context->conversation);
+    }
+    /* SUBMIT/EXIT while busy: an explicit, documented no-op for now -- no
+     * one-slot queue exists yet to accept them into (a later commit adds
+     * it). The draft is left exactly as typed either way. */
+    if (oi_cli_composer_escape_pending(context->composer)) {
+        (void)oi_reactor_timer_start(reactor,
+                                     OI_CLI_COMPOSER_ESCAPE_TIMEOUT_MS,
+                                     handle_turn_escape_timeout, context,
+                                     &context->escape_timer);
     }
 }
 
@@ -353,21 +438,70 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
             struct repl_turn_signal_context turn_signal_context = {
                 .conversation = conversation,
             };
+            struct repl_turn_input_context turn_input_context = {
+                .composer = &composer,
+                .conversation = conversation,
+            };
             int signal_registered =
                 signal_fd >= 0 &&
                 oi_reactor_add(reactor, signal_fd, OI_EV_READ,
                                handle_turn_signal,
                                &turn_signal_context) == OI_OK;
+            int input_registered =
+                oi_reactor_add(reactor, config->input_fd, OI_EV_READ,
+                               handle_turn_input,
+                               &turn_input_context) == OI_OK;
 
             while (status == OI_OK && !present.done) {
                 oi_status step_status;
+
+                /* Clear the composer's frame (if drawn) before the step,
+                 * then redraw fresh once it settles: the turn's own
+                 * streamed output and any decoded keystrokes both land on
+                 * the same fd, and interleaving them without this erase/
+                 * redraw bracket would corrupt both writers' row-count
+                 * assumptions (see oi_cli_render_erase's own doc comment).
+                 * The redraw itself only happens when this step actually
+                 * touched the composer (input decoded, or a resize) --
+                 * redrawing unconditionally on every step, including ones
+                 * that were purely model/tool activity, would inject the
+                 * composer's escape sequences into the *middle* of a
+                 * multi-chunk streamed reply whenever that reply and some
+                 * unrelated composer-relevant step happen to land in
+                 * separate oi_reactor_step calls, corrupting normal
+                 * token-by-token streaming outright, not just risking
+                 * flicker. The erase, in contrast, is always safe to run
+                 * unconditionally: it's a no-op whenever nothing is
+                 * currently drawn. */
+                oi_cli_render_erase(&composer.render);
                 if (oi_reactor_step(reactor, -1, &step_status) < 0) {
                     status = step_status;
+                }
+                if (fflush(config->out) != 0 && status == OI_OK) {
+                    status = OI_ERR_IO;
+                }
+                if (turn_input_context.status != OI_OK && status == OI_OK) {
+                    status = turn_input_context.status;
+                }
+                if (status == OI_OK && !present.done &&
+                    (turn_input_context.dirty ||
+                     turn_signal_context.resize_pending)) {
+                    oi_status redraw_status =
+                        oi_cli_composer_redraw(&composer);
+                    if (redraw_status != OI_OK) {
+                        status = redraw_status;
+                    }
+                    turn_input_context.dirty = 0;
+                    turn_signal_context.resize_pending = 0;
                 }
             }
             if (signal_registered) {
                 oi_reactor_remove(reactor, signal_fd);
             }
+            if (input_registered) {
+                oi_reactor_remove(reactor, config->input_fd);
+            }
+            oi_reactor_timer_cancel(turn_input_context.escape_timer);
             if (status == OI_OK) {
                 status = present.status;
             }

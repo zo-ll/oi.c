@@ -256,6 +256,91 @@ static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
     return pid;
 }
 
+/*
+ * A single-turn mock server that writes `response` in two pieces (the
+ * first `split_at` bytes, a pause, then the rest) over the same
+ * connection -- unlike start_slow_mock_server's one-sleep-then-write-it-
+ * all shape, this puts a real mid-stream gap *inside* the SSE body itself,
+ * so a client is genuinely still assembling a partial assistant delta (not
+ * just waiting for the first byte) when the pause happens. Used to
+ * exercise typing concurrently with an in-flight, partially-delivered
+ * response.
+ */
+static pid_t start_split_response_mock_server(const char *response,
+                                              size_t response_len,
+                                              size_t split_at,
+                                              int pause_ms,
+                                              unsigned short *out_port) {
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listen_fd >= 0);
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, 1), 0);
+
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    *out_port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        fd_set rfds;
+        struct timeval tv = {20, 0};
+        int cfd;
+
+        signal(SIGPIPE, SIG_IGN);
+        FD_ZERO(&rfds);
+        FD_SET(listen_fd, &rfds);
+        cfd = select(listen_fd + 1, &rfds, NULL, NULL, &tv) > 0
+                  ? accept(listen_fd, NULL, NULL)
+                  : -1;
+        if (cfd >= 0) {
+            drain_request(cfd, -1);
+            {
+                size_t off = 0;
+                size_t first_len = split_at < response_len ? split_at
+                                                            : response_len;
+                while (off < first_len) {
+                    ssize_t w = write(cfd, response + off, first_len - off);
+                    if (w <= 0) {
+                        break;
+                    }
+                    off += (size_t)w;
+                }
+            }
+            {
+                struct timespec delay = {pause_ms / 1000,
+                                         (pause_ms % 1000) * 1000000L};
+                nanosleep(&delay, NULL);
+            }
+            {
+                size_t off = split_at < response_len ? split_at
+                                                     : response_len;
+                while (off < response_len) {
+                    ssize_t w =
+                        write(cfd, response + off, response_len - off);
+                    if (w <= 0) {
+                        break;
+                    }
+                    off += (size_t)w;
+                }
+            }
+            close(cfd);
+        }
+        close(listen_fd);
+        _exit(0);
+    }
+    close(listen_fd);
+    return pid;
+}
+
 /* --- run the built oi binary, capturing stdout+stderr --- */
 
 struct run_result {
@@ -1366,15 +1451,14 @@ TEST(recoverable_turn_error_returns_to_the_prompt) {
 }
 
 TEST(ctrl_d_during_a_turn_has_no_effect) {
-    /* Empirically determined (not assumed): the terminal stays in cooked
-     * mode for the whole turn and nothing reads input_fd until the next
-     * oi_cli_prompt_read call, so Ctrl+D mid-turn just becomes a pending
-     * VEOF marker the tty driver holds -- oi_cli_terminal_enable's
-     * tcsetattr(..., TCSAFLUSH, ...) at the start of that next read
-     * discards it before anything ever consumes it (the same discard
-     * behavior documented elsewhere for ordinary queued bytes). The turn
-     * completes normally and the REPL is left exactly as if Ctrl+D had
-     * never been sent. */
+    /* Raw mode now spans the whole session, and input_fd is read live
+     * during a turn (see handle_turn_input in cli_repl.c), so Ctrl+D is
+     * actually decoded here, not just sitting unread -- but with the
+     * editor empty, it classifies as an EXIT action, and EXIT (like
+     * SUBMIT) is a deliberate no-op while busy: there is no queue or
+     * "exit at the next safe boundary" logic wired up yet to act on it.
+     * The turn completes normally and the REPL is left exactly as if
+     * Ctrl+D had never been sent. */
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
         "\"recovered\"}}]}\n\n"
@@ -1409,6 +1493,199 @@ TEST(ctrl_d_during_a_turn_has_no_effect) {
      * mid-turn, matching the same reasoning used for SIGINT above. */
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    free(reply);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+        unlink(metadata_path);
+        {
+            char history_path[640];
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(history_path);
+        }
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
+TEST(typing_during_a_turn_does_not_corrupt_the_display) {
+    /* The response is written in two pieces with a real pause between
+     * them (not just a delay before the first byte), so the client is
+     * still assembling a partial assistant delta -- with its own composer
+     * frame erased/redrawn around every reactor step in between (see
+     * cli_repl.c) -- when the second piece and further keystrokes both
+     * land in the same window. */
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recov\"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"ered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    /* Split partway through the SSE body (well past the HTTP header and
+     * first delta), so the first write already reached the client as a
+     * real in-flight, partially-received response. */
+    server = start_split_response_mock_server(reply, reply_len, reply_len / 2,
+                                              300, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-typing-turn-%d",
+             (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+    /* Type while the turn is genuinely in flight (mid-response, per the
+     * server-side pause above). Enter is deliberately not sent -- SUBMIT
+     * while busy is still a documented no-op as of this commit (the
+     * one-slot queue lands in a later commit), so this only exercises
+     * that the keystrokes are decoded and redrawn without corrupting the
+     * turn's own streamed output. */
+    CHECK(write_interactive(master_fd, "world", 5));
+    CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    /* The typed text is echoed as an uninterrupted run: if the composer's
+     * erase/redraw around each reactor step failed to coordinate with the
+     * turn's own streamed writes, the two would interleave and this exact
+     * substring would not appear intact. */
+    CHECK(strstr(result.output, "world") != NULL);
+    /* Nothing submitted it (no Enter), so it carries over as the next
+     * prompt's draft exactly as typed -- clear it with Ctrl+C before
+     * exiting cleanly. */
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+    free(reply);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+        unlink(metadata_path);
+        {
+            char history_path[640];
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(history_path);
+        }
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
+TEST(typed_ctrl_c_during_a_turn_cancels_it) {
+    /* Unlike the existing sigint_cancels_* tests (an external kill(SIGINT)
+     * on the process), this sends the raw Ctrl+C byte (0x03) through the
+     * pty as a real keystroke, exercising the composer's own decoded-
+     * CTRL_C path in handle_turn_input rather than the signalfd path. */
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[2];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].delay_seconds = 3;
+    turns[1].response = reply;
+    turns[1].response_len = reply_len;
+    turns[1].delay_seconds = 0;
+    server = start_slow_mock_server(turns, 2, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-typed-ctrl-c-%d",
+             (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
+    CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
@@ -1895,6 +2172,8 @@ int main(void) {
     RUN(recoverable_turn_error_returns_to_the_prompt);
     RUN(sigterm_during_a_turn_terminates_cleanly);
     RUN(ctrl_d_during_a_turn_has_no_effect);
+    RUN(typing_during_a_turn_does_not_corrupt_the_display);
+    RUN(typed_ctrl_c_during_a_turn_cancels_it);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);
