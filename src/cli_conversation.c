@@ -64,6 +64,15 @@ struct oi_cli_conversation {
      * naturally.
      */
     int steering;
+    /*
+     * Set only between request_tool_call staging a call whose policy
+     * decision is OI_TOOL_ASK and oi_cli_conversation_resolve_permission
+     * supplying the eventual decision -- mutually exclusive with `tool`
+     * (only ever set once a process has actually spawned) and `request`
+     * (only ever set while awaiting a model reply): exactly one of the
+     * three, or none, is non-NULL at any moment while busy.
+     */
+    oi_tool_call *pending_permission_tool;
 };
 
 static oi_status buffer_append(struct buffer *buffer, const void *data,
@@ -530,6 +539,8 @@ static oi_status repair_dangling_tool_calls(oi_cli_conversation *conversation,
 
 static const char steered_tool_not_executed_text[] =
     "[tool not executed: skipped because a new message was queued]";
+static const char denied_tool_not_executed_text[] =
+    "[tool not executed: denied by user]";
 
 /*
  * Steering's analog of repair_dangling_tool_calls, deliberately not a
@@ -634,6 +645,144 @@ static void on_tool_done(oi_tool_exit_kind kind, int code, void *user_data) {
     start_next_tool(conversation);
 }
 
+/*
+ * Today's synchronous ALLOW tail (TOOL_STARTING emit, the reentrant-cancel-
+ * during-emit guard, conversation->tool = staged, oi_tool_call_resolve,
+ * set_timeout/close_stdin) and today's synchronous DENY handling, unified
+ * behind one `allow` bool -- called either immediately (a synchronous
+ * OI_TOOL_ALLOW/OI_TOOL_DENY decision) or arbitrarily later, from
+ * oi_cli_conversation_resolve_permission, once an OI_TOOL_ASK decision's
+ * answer finally arrives. `call` must be freshly derived from
+ * conversation->tool_index/assistant_message_index by the caller, never a
+ * pointer held across the (potentially indefinite) async gap: committing
+ * other messages in between can reallocate conversation->messages.items.
+ */
+static void resolve_permission_body(oi_cli_conversation *conversation,
+                                    const struct oi_cli_tool_call_value *call,
+                                    oi_tool_call *staged, int allow) {
+    oi_status st;
+
+    if (!allow) {
+        (void)oi_tool_call_resolve(staged, 0);
+        /* Committed directly (not via repair_dangling_tool_calls) so this
+         * specific call gets its own distinct wording -- a denial is not
+         * the same thing as a genuine cancel-before-start, which is what
+         * repair_dangling_tool_calls' shared text otherwise means. Any
+         * later tool_calls in the same round that never got this far are
+         * still exactly a "cancelled before it started" case, so bumping
+         * tool_index past just this one and letting the ordinary repair
+         * path handle the rest (via finish_turn_with_repair below) is
+         * correct for them. */
+        st = commit_tool_text(conversation, call, denied_tool_not_executed_text,
+                              sizeof denied_tool_not_executed_text - 1,
+                              OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED, NULL, 0,
+                              0, /*is_repair=*/0);
+        conversation->tool_index++;
+        finish_turn_with_repair(conversation,
+                                st != OI_OK ? st : OI_ERR_DENIED,
+                                /*first_call_may_have_started=*/0);
+        return;
+    }
+
+    struct oi_cli_conversation_event event = {
+        .type = OI_CLI_CONVERSATION_EVENT_TOOL_STARTING,
+        .as.tool_starting = {&call->id, &call->name, &call->arguments},
+    };
+    st = emit(conversation, &event);
+    if (st != OI_OK) {
+        oi_tool_call_cancel(staged);
+        finish_turn_with_repair(conversation, st,
+                                /*first_call_may_have_started=*/0);
+        return;
+    }
+    if (!conversation->busy) {
+        /* The embedder's on_event callback cancelled the conversation
+         * reentrantly from within the TOOL_STARTING emit above (a
+         * supported pattern one layer down, mirroring
+         * oi_tool_call_cancel's own documented reentrancy from within
+         * its own on_output). oi_cli_conversation_cancel's repair now
+         * runs unconditionally (no longer gated on conversation->tool
+         * != NULL), so that reentrant call already closed the turn out
+         * fully -- nothing left to do here but tear down the
+         * staged-but-never-started call. */
+        oi_tool_call_cancel(staged);
+        return;
+    }
+    conversation->tool = staged;
+    st = oi_tool_call_resolve(staged, 1);
+    if (st != OI_OK) {
+        conversation->tool = NULL;
+        finish_turn_with_repair(conversation, st,
+                                /*first_call_may_have_started=*/1);
+        return;
+    }
+    if (conversation->config.tool_timeout_ms > 0) {
+        st = oi_tool_call_set_timeout(conversation->tool,
+                                      conversation->config.tool_timeout_ms);
+    }
+    if (st == OI_OK) {
+        st = oi_tool_call_close_stdin(conversation->tool);
+    }
+    if (st != OI_OK) {
+        oi_tool_call *tool = conversation->tool;
+        conversation->tool = NULL;
+        oi_tool_call_cancel(tool);
+        finish_turn_with_repair(conversation, st,
+                                /*first_call_may_have_started=*/1);
+    }
+}
+
+/*
+ * Stages a tool call (already done by the caller) and asks the embedder's
+ * policy what to do with it. OI_TOOL_ASK defers the actual decision:
+ * conversation->pending_permission_tool holds the staged call, an
+ * AWAITING_PERMISSION event is emitted, and this returns without resolving
+ * anything -- the turn stays busy until oi_cli_conversation_resolve_permission
+ * is called, arbitrarily later, from anywhere. ALLOW/DENY resolve
+ * immediately via resolve_permission_body, exactly as before this split.
+ */
+static void request_tool_call(oi_cli_conversation *conversation,
+                              const struct oi_cli_tool_call_value *call,
+                              const oi_json_value *arguments,
+                              oi_tool_call *staged) {
+    oi_tool_decision decision =
+        conversation->config.permission == NULL
+            ? OI_TOOL_ALLOW
+            : conversation->config.permission(
+                  call->name.data, arguments,
+                  conversation->config.permission_user_data);
+
+    if (decision == OI_TOOL_ASK) {
+        struct oi_cli_conversation_event event = {
+            .type = OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION,
+            .as.awaiting_permission = {&call->id, &call->name,
+                                      &call->arguments},
+        };
+        oi_status st;
+
+        conversation->pending_permission_tool = staged;
+        st = emit(conversation, &event);
+        if (st != OI_OK) {
+            conversation->pending_permission_tool = NULL;
+            oi_tool_call_cancel(staged);
+            finish_turn_with_repair(conversation, st,
+                                    /*first_call_may_have_started=*/0);
+            return;
+        }
+        if (!conversation->busy) {
+            /* Reentrant cancel from within the AWAITING_PERMISSION emit
+             * above, mirroring the same TOOL_STARTING reentrancy pattern
+             * documented in resolve_permission_body --
+             * oi_cli_conversation_cancel's own pending_permission_tool
+             * branch already cleared it and cancelled staged. */
+            return;
+        }
+        return;
+    }
+    resolve_permission_body(conversation, call, staged,
+                            decision == OI_TOOL_ALLOW);
+}
+
 static void start_next_tool(oi_cli_conversation *conversation) {
     while (conversation->busy) {
         const struct oi_cli_message *assistant =
@@ -682,66 +831,7 @@ static void start_next_tool(oi_cli_conversation *conversation) {
                                     /*first_call_may_have_started=*/0);
             return;
         }
-        oi_tool_decision decision =
-            conversation->config.permission == NULL
-                ? OI_TOOL_ALLOW
-                : conversation->config.permission(
-                      call->name.data, arguments,
-                      conversation->config.permission_user_data);
-        if (decision != OI_TOOL_ALLOW) {
-            (void)oi_tool_call_resolve(staged, 0);
-            finish_turn_with_repair(conversation, OI_ERR_DENIED,
-                                    /*first_call_may_have_started=*/0);
-            return;
-        }
-
-        struct oi_cli_conversation_event event = {
-            .type = OI_CLI_CONVERSATION_EVENT_TOOL_STARTING,
-            .as.tool_starting = {&call->id, &call->name, &call->arguments},
-        };
-        st = emit(conversation, &event);
-        if (st != OI_OK) {
-            oi_tool_call_cancel(staged);
-            finish_turn_with_repair(conversation, st,
-                                    /*first_call_may_have_started=*/0);
-            return;
-        }
-        if (!conversation->busy) {
-            /* The embedder's on_event callback cancelled the conversation
-             * reentrantly from within the TOOL_STARTING emit above (a
-             * supported pattern one layer down, mirroring
-             * oi_tool_call_cancel's own documented reentrancy from within
-             * its own on_output). oi_cli_conversation_cancel's repair now
-             * runs unconditionally (no longer gated on conversation->tool
-             * != NULL), so that reentrant call already closed the turn out
-             * fully -- nothing left to do here but tear down the
-             * staged-but-never-started call. */
-            oi_tool_call_cancel(staged);
-            return;
-        }
-        conversation->tool = staged;
-        st = oi_tool_call_resolve(staged, 1);
-        if (st != OI_OK) {
-            conversation->tool = NULL;
-            finish_turn_with_repair(conversation, st,
-                                    /*first_call_may_have_started=*/1);
-            return;
-        }
-        if (conversation->config.tool_timeout_ms > 0) {
-            st = oi_tool_call_set_timeout(
-                conversation->tool,
-                conversation->config.tool_timeout_ms);
-        }
-        if (st == OI_OK) {
-            st = oi_tool_call_close_stdin(conversation->tool);
-        }
-        if (st != OI_OK) {
-            oi_tool_call *tool = conversation->tool;
-            conversation->tool = NULL;
-            oi_tool_call_cancel(tool);
-            finish_turn_with_repair(conversation, st,
-                                    /*first_call_may_have_started=*/1);
-        }
+        request_tool_call(conversation, call, arguments, staged);
         return;
     }
 }
@@ -944,6 +1034,9 @@ void oi_cli_conversation_destroy(oi_cli_conversation *conversation) {
     if (conversation->tool != NULL) {
         oi_tool_call_cancel(conversation->tool);
     }
+    if (conversation->pending_permission_tool != NULL) {
+        oi_tool_call_cancel(conversation->pending_permission_tool);
+    }
     clear_streamed_response(conversation);
     buffer_free(&conversation->tool_output);
     oi_cli_message_list_free(&conversation->messages);
@@ -1086,6 +1179,13 @@ void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
         }
         oi_llm_request_cancel(request);
     }
+    if (conversation->pending_permission_tool != NULL) {
+        oi_tool_call *staged = conversation->pending_permission_tool;
+        conversation->pending_permission_tool = NULL;
+        oi_tool_call_cancel(staged);
+        /* first_call_may_have_started stays 0: nothing was ever spawned
+         * for a call still awaiting a permission decision. */
+    }
     if (conversation->tool != NULL) {
         oi_tool_call *tool = conversation->tool;
         conversation->tool = NULL;
@@ -1121,6 +1221,29 @@ void oi_cli_conversation_steer(oi_cli_conversation *conversation) {
 int oi_cli_conversation_is_steering(
     const oi_cli_conversation *conversation) {
     return conversation != NULL && conversation->steering;
+}
+
+oi_status oi_cli_conversation_resolve_permission(
+    oi_cli_conversation *conversation, int allow) {
+    oi_tool_call *staged;
+    const struct oi_cli_message *assistant;
+    const struct oi_cli_tool_call_value *call;
+
+    if (conversation == NULL || conversation->pending_permission_tool == NULL) {
+        return OI_ERR_INVAL;
+    }
+    staged = conversation->pending_permission_tool;
+    conversation->pending_permission_tool = NULL;
+    /* Freshly derived, not a pointer carried across the async gap since
+     * this was staged: committing other messages in between (e.g. a
+     * steered sibling call's placeholder) can reallocate
+     * conversation->messages.items, but tool_index/assistant_message_index
+     * themselves stay valid the whole time nothing has resolved yet. */
+    assistant =
+        &conversation->messages.items[conversation->assistant_message_index];
+    call = &assistant->tool_calls[conversation->tool_index];
+    resolve_permission_body(conversation, call, staged, allow != 0);
+    return OI_OK;
 }
 
 oi_status oi_cli_conversation_last_status(

@@ -22,6 +22,7 @@ enum oi_cli_conversation_tool_outcome {
 enum oi_cli_conversation_event_type {
     OI_CLI_CONVERSATION_EVENT_ASSISTANT_DELTA,
     OI_CLI_CONVERSATION_EVENT_MESSAGE,
+    OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION,
     OI_CLI_CONVERSATION_EVENT_TOOL_STARTING,
     OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT,
     OI_CLI_CONVERSATION_EVENT_PARTIAL_ASSISTANT,
@@ -60,6 +61,17 @@ struct oi_cli_conversation_event {
             const struct oi_cli_string *name;
             const struct oi_cli_string *arguments;
         } tool_starting;
+        /* Same borrowed-string shape as tool_starting -- emitted instead of
+         * (not in addition to) it when the tool's policy decision is
+         * OI_TOOL_ASK, before anything is spawned. The call stays staged
+         * and the turn stays busy until oi_cli_conversation_resolve_permission
+         * is called; TOOL_STARTING (if the decision is to allow) fires
+         * only once that happens. */
+        struct {
+            const struct oi_cli_string *id;
+            const struct oi_cli_string *name;
+            const struct oi_cli_string *arguments;
+        } awaiting_permission;
         struct {
             int http_status;
             const char *body;
@@ -122,6 +134,22 @@ void oi_cli_conversation_cancel(oi_cli_conversation *conversation);
  */
 void oi_cli_conversation_steer(oi_cli_conversation *conversation);
 int oi_cli_conversation_is_steering(const oi_cli_conversation *conversation);
+
+/*
+ * Resolves a tool call left staged and awaiting a decision (the most
+ * recently emitted event on this conversation was AWAITING_PERMISSION and
+ * the turn is still busy). `allow` nonzero proceeds exactly as a
+ * synchronous OI_TOOL_ALLOW decision would have (TOOL_STARTING fires next,
+ * then the process spawns); zero denies it exactly as a synchronous
+ * OI_TOOL_DENY decision would have (a protocol-valid tool-result message is
+ * committed and the turn ends with OI_ERR_DENIED) -- this does not change
+ * what a denial means, only how the decision arrives.
+ *
+ * OI_ERR_INVAL if the conversation is not currently awaiting a permission
+ * decision (never staged one, already resolved, or already cancelled).
+ */
+oi_status oi_cli_conversation_resolve_permission(
+    oi_cli_conversation *conversation, int allow);
 
 int oi_cli_conversation_is_busy(const oi_cli_conversation *conversation);
 /*

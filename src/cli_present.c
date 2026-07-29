@@ -191,6 +191,7 @@ oi_status oi_cli_present_event(
         return finish_status;
     }
     case OI_CLI_CONVERSATION_EVENT_MESSAGE:
+    case OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION:
     case OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT:
     case OI_CLI_CONVERSATION_EVENT_PARTIAL_ASSISTANT:
         return OI_OK;

@@ -39,6 +39,13 @@ struct event_sink {
     oi_cli_conversation **steer_on_response_done;
     oi_cli_conversation **steer_on_tool_message;
     int tool_starting_count;
+    int awaiting_permission_count;
+    int awaiting_permission_position;
+    /* Reentrantly cancels from within the AWAITING_PERMISSION event itself
+     * -- mirrors cancel_on_tool_starting's existing reentrancy pattern, for
+     * a test exercising a cancel that arrives while a call is staged but
+     * not yet resolved, rather than while it's already running. */
+    oi_cli_conversation **cancel_on_awaiting_permission;
 };
 
 static oi_status collect_event(
@@ -104,6 +111,13 @@ static oi_status collect_event(
             sink->tool_output_position = position;
         }
         break;
+    case OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION:
+        sink->awaiting_permission_count++;
+        sink->awaiting_permission_position = position;
+        if (sink->cancel_on_awaiting_permission != NULL) {
+            oi_cli_conversation_cancel(*sink->cancel_on_awaiting_permission);
+        }
+        break;
     case OI_CLI_CONVERSATION_EVENT_PARTIAL_ASSISTANT:
     case OI_CLI_CONVERSATION_EVENT_MODEL_ERROR:
         break;
@@ -118,6 +132,14 @@ static oi_tool_decision allow_tool(const char *tool_name,
     (void)args;
     (void)user_data;
     return OI_TOOL_ALLOW;
+}
+
+static oi_tool_decision ask_tool(const char *tool_name,
+                                 const oi_json_value *args, void *user_data) {
+    (void)tool_name;
+    (void)args;
+    (void)user_data;
+    return OI_TOOL_ASK;
 }
 
 TEST(start_is_event_driven_and_preserves_context) {
@@ -288,6 +310,257 @@ TEST(tool_start_boundary_precedes_process_output) {
     CHECK(sink.tool_message_position > sink.tool_output_position);
     CHECK(sink.tool_message_has_raw);
     CHECK_STREQ(sink.text, "finished");
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
+TEST(ask_defers_and_resolve_permission_allow_lets_the_tool_run) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf tool-output\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *second_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"finished\"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[2] = {
+        {NULL, first_response, 11},
+        {NULL, second_response, 0},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 2));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 1000,
+        .permission = ask_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && sink.awaiting_permission_count == 0; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK_EQ(sink.awaiting_permission_count, 1);
+    /* Nothing has spawned yet: the decision hasn't arrived. */
+    CHECK_EQ(sink.tool_start_position, -1);
+    CHECK(!sink.turn_done);
+
+    /* Resolved genuinely later, from outside the event callback entirely
+     * -- not reentrantly -- proving the turn really stayed suspended
+     * across an arbitrary gap rather than the decision being available
+     * synchronously all along. */
+    CHECK_EQ(oi_cli_conversation_resolve_permission(conversation, 1), OI_OK);
+
+    for (int i = 0; i < 200 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_OK);
+    CHECK(sink.tool_start_position > sink.awaiting_permission_position);
+    CHECK(sink.tool_output_position > sink.tool_start_position);
+    CHECK(sink.tool_message_position > sink.tool_output_position);
+    CHECK_STREQ(sink.text, "finished");
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
+TEST(ask_defers_and_resolve_permission_deny_produces_a_protocol_valid_result) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf tool-output\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turn = {NULL, first_response, 11};
+    struct mock_api api;
+    CHECK(mock_api_start(&api, &turn, 1));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 1000,
+        .permission = ask_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && sink.awaiting_permission_count == 0; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK_EQ(sink.awaiting_permission_count, 1);
+
+    CHECK_EQ(oi_cli_conversation_resolve_permission(conversation, 0), OI_OK);
+    /* A resolved, non-pending decision can't be resolved twice. */
+    CHECK_EQ(oi_cli_conversation_resolve_permission(conversation, 1),
+             OI_ERR_INVAL);
+
+    for (int i = 0; i < 200 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_ERR_DENIED);
+    /* Denied outright: the process never spawned or produced output. */
+    CHECK_EQ(sink.tool_starting_count, 0);
+    CHECK_EQ(sink.tool_output_position, -1);
+    CHECK(sink.tool_message_position > sink.awaiting_permission_position);
+    CHECK_EQ(sink.tool_outcome_count, 1);
+    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED);
+    CHECK(!sink.tool_outcome_has_raw[0]);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
+TEST(cancel_while_awaiting_permission_repairs_as_not_executed) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf tool-output\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turn = {NULL, first_response, 11};
+    struct mock_api api;
+    CHECK(mock_api_start(&api, &turn, 1));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 1000,
+        .permission = ask_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    sink.cancel_on_awaiting_permission = &conversation;
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.awaiting_permission_count, 1);
+    CHECK(oi_cli_conversation_was_cancelled(conversation));
+    CHECK_EQ(sink.tool_starting_count, 0);
+    CHECK_EQ(sink.tool_outcome_count, 1);
+    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED);
+    /* A genuine cancel-before-start, not a denial -- resolving it again
+     * afterward must be rejected, the same as any other already-settled
+     * permission request. */
+    CHECK_EQ(oi_cli_conversation_resolve_permission(conversation, 1),
+             OI_ERR_INVAL);
 
     oi_cli_conversation_destroy(conversation);
     oi_llm_client_destroy(client);
@@ -976,6 +1249,9 @@ TEST(steer_before_any_tool_starts_skips_them_all) {
 int main(void) {
     RUN(start_is_event_driven_and_preserves_context);
     RUN(tool_start_boundary_precedes_process_output);
+    RUN(ask_defers_and_resolve_permission_allow_lets_the_tool_run);
+    RUN(ask_defers_and_resolve_permission_deny_produces_a_protocol_valid_result);
+    RUN(cancel_while_awaiting_permission_repairs_as_not_executed);
     RUN(cancel_while_streaming_needs_no_repair);
     RUN(cancel_while_tool_running_repairs_messages);
     RUN(cancel_from_within_tool_starting_event);
