@@ -52,8 +52,14 @@ without learning terminal UI or conversation-record semantics.
   policy; elevation to `allow` requires confirmation.
 - `/status`: show session ID, model, endpoint, permission policy, timeout,
   working directory, queue state, and checkpoint state without secrets.
-- `/compact [N]`: summarize older active context while retaining eight recent
-  completed turns by default.
+- `/compact [N]`: summarize the completed turns older than the most recent `N`
+  (default 8) into one durable checkpoint. Only runs at an idle safe boundary
+  (the same one queued commands drain into); the summarization request is a
+  dedicated, bounded request that treats the prior turns as data to
+  summarize, never as instructions, so a prior adversarial tool result or
+  model response can't hijack it. The durable checkpoint append must fully
+  succeed before the live conversation is spliced to match it, so a failed or
+  `Ctrl+C`/`SIGINT`-cancelled request leaves both completely untouched.
 - `/cwd`: change and persist the session working directory.
 
 `//text` sends a literal model message beginning with `/`. While a turn is
