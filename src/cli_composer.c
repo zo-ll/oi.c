@@ -439,3 +439,11 @@ oi_status oi_cli_composer_redraw(struct oi_cli_composer *composer) {
     }
     return handle_resize(composer);
 }
+
+oi_status oi_cli_composer_commit_draft(struct oi_cli_composer *composer,
+                                       char **out_text, size_t *out_len) {
+    if (composer == NULL) {
+        return OI_ERR_INVAL;
+    }
+    return oi_cli_prompt_state_commit(&composer->state, out_text, out_len);
+}

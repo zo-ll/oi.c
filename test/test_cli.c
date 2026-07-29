@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <pty.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1735,6 +1736,162 @@ TEST(typed_ctrl_c_during_a_turn_cancels_it) {
     }
 }
 
+TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[1];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].delay_seconds = 2;
+    server = start_slow_mock_server(turns, 1, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-queue-slot-%d",
+             (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+
+    /* First submission while busy: accepted into the one pending slot. */
+    CHECK(write_interactive(master_fd, "world\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+
+    /* /help and /status are read-only: they dispatch immediately
+     * regardless of the occupied slot, and don't themselves get queued.
+     * Checked before the refused submission below, since a refusal
+     * deliberately leaves its draft uncommitted -- typing more after it
+     * would land in the same still-open draft rather than starting fresh. */
+    CHECK(write_interactive(master_fd, "/help\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "Commands:", 1));
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "Model:", 1));
+
+    /* Second submission while the slot is still occupied: refused, not
+     * silently dropped and not overwriting the first. */
+    CHECK(write_interactive(master_fd, "another\r", 8));
+    CHECK(interactive_wait_for(
+        master_fd, &result, "oi: a message is already queued", 1));
+
+    CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    /* "another" is still sitting in the draft (the refusal above left it
+     * uncommitted, and busy/idle share the same editor state) -- clear it
+     * before Ctrl+D, which otherwise deletes forward instead of exiting
+     * when the draft isn't empty. The turn has already finished by this
+     * point (recovered arrived), so Ctrl+C here only clears the draft,
+     * it has no turn left to cancel. */
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+    free(reply);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        char history_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+
+        /* The accepted message ("world") was durably persisted as a
+         * QUEUED_INPUT record; the refused one ("another") never reached
+         * persist_queued_input at all. */
+        {
+            FILE *history = fopen(history_path, "r");
+            unsigned char contents[8192];
+            size_t len = 0;
+            size_t offset;
+            int found_queued_input_world = 0;
+            int found_another = 0;
+
+            CHECK(history != NULL);
+            len = fread(contents, 1, sizeof contents, history);
+            fclose(history);
+            /* oi_sesslog's own file format is a 12-byte binary header
+             * ("OISESLOG" + a little-endian u32 version) followed by a
+             * sequence of [4-byte little-endian length][JSON bytes]
+             * records -- both the header and each record's own length
+             * prefix contain embedded NUL/non-ASCII bytes, so treating the
+             * whole file as one C string (strstr from the start) stops
+             * almost immediately. Walk the length-prefixed records
+             * individually instead, each of which *is* a plain, NUL-free
+             * JSON string safe to strstr on its own. */
+            CHECK(len > 12);
+            offset = 12;
+            while (offset + 4 <= len) {
+                uint32_t record_len = (uint32_t)(unsigned char)contents[offset] |
+                    ((uint32_t)(unsigned char)contents[offset + 1] << 8) |
+                    ((uint32_t)(unsigned char)contents[offset + 2] << 16) |
+                    ((uint32_t)(unsigned char)contents[offset + 3] << 24);
+                char record[1024];
+
+                offset += 4;
+                CHECK(offset + record_len <= len);
+                CHECK(record_len < sizeof record);
+                memcpy(record, contents + offset, record_len);
+                record[record_len] = '\0';
+                if (strstr(record, "\"type\":\"queued_input\"") != NULL &&
+                    strstr(record, "\"content\":\"world\"") != NULL) {
+                    found_queued_input_world = 1;
+                }
+                if (strstr(record, "\"content\":\"another\"") != NULL) {
+                    found_another = 1;
+                }
+                offset += record_len;
+            }
+            CHECK(found_queued_input_world);
+            CHECK(!found_another);
+        }
+
+        unlink(metadata_path);
+        unlink(history_path);
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
 TEST(sigterm_during_a_turn_terminates_cleanly) {
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -2174,6 +2331,7 @@ int main(void) {
     RUN(ctrl_d_during_a_turn_has_no_effect);
     RUN(typing_during_a_turn_does_not_corrupt_the_display);
     RUN(typed_ctrl_c_during_a_turn_cancels_it);
+    RUN(busy_submit_is_queued_and_a_second_one_is_refused);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);

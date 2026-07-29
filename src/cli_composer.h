@@ -126,4 +126,14 @@ oi_status oi_cli_composer_resolve_escape(
  * necessarily what's on screen anymore." */
 oi_status oi_cli_composer_redraw(struct oi_cli_composer *composer);
 
+/*
+ * Extracts and clears the current draft exactly like a real idle
+ * submission would (oi_cli_prompt_state_commit under the hood, including
+ * appending it to input history) -- for a caller that decided, based on
+ * its own busy/idle policy, that a reported SUBMIT action should actually
+ * be accepted rather than left as a no-op.
+ */
+oi_status oi_cli_composer_commit_draft(struct oi_cli_composer *composer,
+                                       char **out_text, size_t *out_len);
+
 #endif

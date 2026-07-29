@@ -52,6 +52,39 @@ struct repl_setting_context {
     oi_cli_conversation **conversation;
 };
 
+/*
+ * The one-slot pending item, owned entirely by cli_repl.c per this
+ * issue's own module-boundary rule (cli_conversation only ever gets a
+ * bare "steer" signal, no content; cli_history only encodes/replays the
+ * durable record shape, it never decides what's queued). Reset to NONE at
+ * the top of oi_cli_repl_run's turn loop each time it's actually consumed
+ * or discarded (added in a later commit) -- this commit only ever
+ * populates it, nothing yet drains it.
+ */
+enum oi_cli_repl_pending_kind {
+    OI_CLI_REPL_PENDING_NONE = 0,
+    OI_CLI_REPL_PENDING_MESSAGE,
+    OI_CLI_REPL_PENDING_COMMAND
+};
+
+struct oi_cli_repl_pending {
+    enum oi_cli_repl_pending_kind kind;
+    char *text;
+    size_t text_len;
+    /* Opaque durable record id from persist_queued_input, passed back
+     * verbatim to persist_queue_resolved; 0 if persistence is disabled
+     * (ephemeral session) or failed benignly under a store==NULL config. */
+    uint64_t record_id;
+};
+
+static void repl_pending_free(struct oi_cli_repl_pending *pending) {
+    free(pending->text);
+    pending->text = NULL;
+    pending->text_len = 0;
+    pending->kind = OI_CLI_REPL_PENDING_NONE;
+    pending->record_id = 0;
+}
+
 struct repl_turn_signal_context {
     oi_cli_conversation *conversation;
     /* 0, or the signal (SIGTERM/SIGHUP) that requested the whole REPL
@@ -93,9 +126,18 @@ static void handle_turn_signal(oi_reactor *reactor, int fd, int revents,
     }
 }
 
+static oi_status dispatch_set_model(void *user_data, const char *name,
+                                    size_t name_len);
+static oi_status dispatch_set_cwd(void *user_data, const char *path,
+                                  size_t path_len);
+
 struct repl_turn_input_context {
     struct oi_cli_composer *composer;
     oi_cli_conversation *conversation;
+    const struct oi_cli_repl_config *config;
+    struct oi_cli_string *current_model;
+    struct repl_setting_context *setting_context;
+    struct oi_cli_repl_pending *pending;
     /* Owned by this context: cancelled unconditionally when the turn ends
      * (whichever way), since a still-pending timer firing after this
      * stack-local context goes out of scope would be a use-after-free. */
@@ -142,6 +184,162 @@ static void handle_turn_escape_timeout(oi_reactor *reactor, void *user_data) {
     }
 }
 
+static const char busy_refused_text[] =
+    "oi: a message is already queued; it will run once the current turn "
+    "reaches a safe point\n";
+static const char busy_queued_text[] =
+    "oi: queued -- will run once the current turn reaches a safe point\n";
+
+static void report_busy_io_error(struct repl_turn_input_context *context,
+                                 int wrote_ok) {
+    if (!wrote_ok && context->status == OI_OK) {
+        context->status = OI_ERR_IO;
+    }
+}
+
+/*
+ * Handles Enter pressed while a turn is active. /help and /status (the
+ * only OI_CLI_COMMAND_READ_ONLY commands) dispatch immediately regardless
+ * of the pending slot, matching the issue's own carve-out; everything
+ * else -- a plain message, or any other command (including /exit) --
+ * goes through the one-slot rule: refused non-destructively if the slot
+ * is already occupied (the draft is only ever committed/cleared once the
+ * submission is actually accepted, one way or the other), else committed,
+ * durably persisted as QUEUED_INPUT, and held here until a later commit
+ * wires up steering/consumption to actually run it at the next safe
+ * boundary.
+ */
+static void handle_busy_submit(struct repl_turn_input_context *context) {
+    struct oi_cli_command_parse peek;
+    oi_status status;
+
+    status = oi_cli_command_parse_text(
+        oi_cli_editor_data(&context->composer->state.editor),
+        oi_cli_editor_length(&context->composer->state.editor), &peek);
+    if (status != OI_OK) {
+        if (context->status == OI_OK) {
+            context->status = status;
+        }
+        return;
+    }
+
+    if (peek.kind == OI_CLI_COMMAND_PARSE_UNKNOWN) {
+        char *text = NULL;
+        size_t text_len = 0;
+
+        status = oi_cli_composer_commit_draft(context->composer, &text,
+                                              &text_len);
+        if (status != OI_OK) {
+            if (context->status == OI_OK) {
+                context->status = status;
+            }
+            return;
+        }
+        report_busy_io_error(
+            context, fprintf(context->config->err,
+                             "oi: unknown command: %.*s\n", (int)text_len,
+                             text) >= 0 &&
+                          fflush(context->config->err) == 0);
+        free(text);
+        return;
+    }
+
+    if (peek.kind == OI_CLI_COMMAND_PARSE_COMMAND &&
+        peek.command->scope == OI_CLI_COMMAND_READ_ONLY) {
+        char *text = NULL;
+        size_t text_len = 0;
+        struct oi_cli_command_parse committed;
+
+        status = oi_cli_composer_commit_draft(context->composer, &text,
+                                              &text_len);
+        if (status != OI_OK) {
+            if (context->status == OI_OK) {
+                context->status = status;
+            }
+            return;
+        }
+        status = oi_cli_command_parse_text(text, text_len, &committed);
+        if (status == OI_OK) {
+            struct oi_cli_command_context command_context = {
+                .out = context->config->out,
+                .err = context->config->err,
+                .model = context->current_model->data,
+                .permission = context->config->permission,
+                .session_id =
+                    context->config->session_id == NULL
+                        ? NULL
+                        : context->config->session_id(
+                              context->config->session_id_user_data),
+                .set_model = dispatch_set_model,
+                .set_model_user_data = context->setting_context,
+                .set_cwd = dispatch_set_cwd,
+                .set_cwd_user_data = context->setting_context,
+            };
+            enum oi_cli_command_result command_result;
+
+            /* Read-only by construction (checked above): /help and
+             * /status never return EXIT_REPL or mutate model/cwd, so
+             * command_result needs no further handling here. */
+            status = oi_cli_command_dispatch(&committed, &command_context,
+                                             &command_result);
+        }
+        if (status != OI_OK && context->status == OI_OK) {
+            context->status = status;
+        }
+        free(text);
+        return;
+    }
+
+    if (context->pending->kind != OI_CLI_REPL_PENDING_NONE) {
+        report_busy_io_error(
+            context, fputs(busy_refused_text, context->config->err) != EOF &&
+                          fflush(context->config->err) == 0);
+        return;
+    }
+
+    {
+        char *text = NULL;
+        size_t text_len = 0;
+        enum oi_cli_repl_pending_kind kind =
+            peek.kind == OI_CLI_COMMAND_PARSE_COMMAND
+                ? OI_CLI_REPL_PENDING_COMMAND
+                : OI_CLI_REPL_PENDING_MESSAGE;
+
+        status = oi_cli_composer_commit_draft(context->composer, &text,
+                                              &text_len);
+        if (status != OI_OK) {
+            if (context->status == OI_OK) {
+                context->status = status;
+            }
+            return;
+        }
+        if (peek.kind == OI_CLI_COMMAND_PARSE_LITERAL_SLASH) {
+            memmove(text, text + 1, text_len - 1);
+            text_len--;
+        }
+        if (context->config->persist_queued_input != NULL) {
+            status = context->config->persist_queued_input(
+                context->config->persist_queued_input_user_data, text,
+                text_len, &context->pending->record_id);
+            if (status != OI_OK) {
+                if (context->status == OI_OK) {
+                    context->status = status;
+                }
+                free(text);
+                return;
+            }
+        } else {
+            context->pending->record_id = 0;
+        }
+        context->pending->kind = kind;
+        context->pending->text = text;
+        context->pending->text_len = text_len;
+        report_busy_io_error(
+            context, fputs(busy_queued_text, context->config->err) != EOF &&
+                          fflush(context->config->err) == 0);
+    }
+}
+
 static void handle_turn_input(oi_reactor *reactor, int fd, int revents,
                               void *user_data) {
     struct repl_turn_input_context *context = user_data;
@@ -164,10 +362,14 @@ static void handle_turn_input(oi_reactor *reactor, int fd, int revents,
     }
     if (action == OI_CLI_COMPOSER_ACTION_CTRL_C) {
         oi_cli_conversation_cancel(context->conversation);
+    } else if (action == OI_CLI_COMPOSER_ACTION_SUBMIT) {
+        handle_busy_submit(context);
     }
-    /* SUBMIT/EXIT while busy: an explicit, documented no-op for now -- no
-     * one-slot queue exists yet to accept them into (a later commit adds
-     * it). The draft is left exactly as typed either way. */
+    /* EXIT (Ctrl+D at an empty draft) while busy is still a documented
+     * no-op: not explicitly required by the issue, and there is no
+     * pressing need to synthesize an "/exit" queue entry for it ahead of
+     * an explicitly typed /exit, which already goes through the one-slot
+     * rule above like any other command. */
     if (oi_cli_composer_escape_pending(context->composer)) {
         (void)oi_reactor_timer_start(reactor,
                                      OI_CLI_COMPOSER_ESCAPE_TIMEOUT_MS,
@@ -260,6 +462,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     struct oi_cli_string current_model_storage = {0};
     struct oi_cli_string *current_model;
     struct repl_setting_context setting_context;
+    struct oi_cli_repl_pending pending = {0};
     int signal_fd = -1;
     oi_status status;
 
@@ -441,6 +644,10 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
             struct repl_turn_input_context turn_input_context = {
                 .composer = &composer,
                 .conversation = conversation,
+                .config = config,
+                .current_model = current_model,
+                .setting_context = &setting_context,
+                .pending = &pending,
             };
             int signal_registered =
                 signal_fd >= 0 &&
@@ -554,6 +761,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     if (composer_initialized) {
         oi_cli_composer_free(&composer);
     }
+    repl_pending_free(&pending);
 cleanup_present:
     oi_cli_present_free(&present);
 cleanup_history:
