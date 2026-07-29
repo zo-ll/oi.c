@@ -1197,6 +1197,56 @@ TEST(model_override_persists_across_a_restart) {
     }
 }
 
+TEST(resize_redraws_the_live_prompt_at_the_new_width) {
+    int master_fd = -1;
+    int slave_fd = -1;
+    pid_t cli;
+    struct interactive_result result;
+    char session_root[128];
+    struct winsize ws;
+    size_t clears_before_resize;
+
+    memset(&ws, 0, sizeof ws);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-resize-%d",
+             (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    ws.ws_row = 24;
+    ws.ws_col = 30;
+    CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &ws), 0);
+    memset(&result, 0, sizeof result);
+    /* Never submits a prompt, so the mock-server port is never actually
+     * connected to -- matching interactive_exit_before_submission_creates_
+     * no_session's use of an arbitrary unused port below. */
+    cli = start_interactive_cli(9, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello", 5));
+    CHECK(interactive_wait_for(master_fd, &result, "hello", 1));
+
+    /* Resize mid-edit, without any further keystroke: a fresh "\x1b[J"
+     * clear sequence appearing proves the redraw was driven by the
+     * SIGWINCH/signalfd path added in cli_repl.c, not by continued
+     * typing. */
+    clears_before_resize = count_text(result.output, "\x1b[J");
+    ws.ws_col = 10;
+    CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &ws), 0);
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[J",
+                               clears_before_resize + 1));
+
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    CHECK(access(session_root, F_OK) != 0);
+    close(master_fd);
+}
+
 TEST(interactive_exit_before_submission_creates_no_session) {
     int master_fd = -1;
     int slave_fd = -1;
@@ -1273,6 +1323,7 @@ int main(void) {
     RUN(interactive_model_command_changes_the_live_model);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
+    RUN(resize_redraws_the_live_prompt_at_the_new_width);
     RUN(interactive_exit_before_submission_creates_no_session);
     RUN(interactive_help_and_exit_are_dispatched_without_a_session);
     return oi_test_report();
