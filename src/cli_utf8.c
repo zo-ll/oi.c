@@ -149,3 +149,70 @@ oi_status oi_cli_utf8_previous_boundary(const char *data, size_t len,
     *out_offset = start;
     return OI_OK;
 }
+
+oi_status oi_cli_utf8_decode(const char *data, size_t len,
+                             uint32_t *out_codepoint) {
+    const unsigned char *bytes = (const unsigned char *)data;
+
+    if (data == NULL || out_codepoint == NULL || len < 1 || len > 4) {
+        return OI_ERR_INVAL;
+    }
+    switch (len) {
+    case 1:
+        *out_codepoint = bytes[0];
+        break;
+    case 2:
+        *out_codepoint = ((uint32_t)(bytes[0] & 0x1fU) << 6) |
+                         (uint32_t)(bytes[1] & 0x3fU);
+        break;
+    case 3:
+        *out_codepoint = ((uint32_t)(bytes[0] & 0x0fU) << 12) |
+                         ((uint32_t)(bytes[1] & 0x3fU) << 6) |
+                         (uint32_t)(bytes[2] & 0x3fU);
+        break;
+    default:
+        *out_codepoint = ((uint32_t)(bytes[0] & 0x07U) << 18) |
+                         ((uint32_t)(bytes[1] & 0x3fU) << 12) |
+                         ((uint32_t)(bytes[2] & 0x3fU) << 6) |
+                         (uint32_t)(bytes[3] & 0x3fU);
+        break;
+    }
+    return OI_OK;
+}
+
+static int in_range(uint32_t codepoint, uint32_t low, uint32_t high) {
+    return codepoint >= low && codepoint <= high;
+}
+
+size_t oi_cli_utf8_codepoint_width(uint32_t codepoint) {
+    /* C0 controls and DEL: defensive -- rendering these literally would
+     * corrupt the display, and they should never advance the column. */
+    if (codepoint <= 0x1fU || codepoint == 0x7fU) {
+        return 0;
+    }
+    /* Combining marks and other zero-width formatting code points. */
+    if (in_range(codepoint, 0x0300, 0x036f) ||
+        in_range(codepoint, 0x200b, 0x200f) ||
+        in_range(codepoint, 0xfe00, 0xfe0f) ||
+        in_range(codepoint, 0xfe20, 0xfe2f) ||
+        in_range(codepoint, 0x20d0, 0x20ff)) {
+        return 0;
+    }
+    /* East Asian Wide/Fullwidth: a pared-down, documented subset covering
+     * common CJK/Hangul ranges -- not a full Unicode UAX#11 table. */
+    if (in_range(codepoint, 0x1100, 0x115f) ||
+        in_range(codepoint, 0x2e80, 0x303e) ||
+        in_range(codepoint, 0x3041, 0x33ff) ||
+        in_range(codepoint, 0x3400, 0x4dbf) ||
+        in_range(codepoint, 0x4e00, 0x9fff) ||
+        in_range(codepoint, 0xa000, 0xa4cf) ||
+        in_range(codepoint, 0xac00, 0xd7a3) ||
+        in_range(codepoint, 0xf900, 0xfaff) ||
+        in_range(codepoint, 0xff00, 0xff60) ||
+        in_range(codepoint, 0xffe0, 0xffe6) ||
+        in_range(codepoint, 0x20000, 0x2fffd) ||
+        in_range(codepoint, 0x30000, 0x3fffd)) {
+        return 2;
+    }
+    return 1;
+}

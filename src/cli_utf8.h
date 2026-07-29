@@ -2,6 +2,7 @@
 #define OI_CLI_UTF8_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "oi/status.h"
 
@@ -30,5 +31,25 @@ oi_status oi_cli_utf8_next_boundary(const char *data, size_t len,
                                     size_t offset, size_t *out_offset);
 oi_status oi_cli_utf8_previous_boundary(const char *data, size_t len,
                                         size_t offset, size_t *out_offset);
+
+/*
+ * Decodes the UTF-8 sequence at `data` to its code point. Precondition:
+ * `len` is exactly the sequence length already validated by
+ * oi_cli_utf8_sequence_length -- like oi_cli_utf8_next_boundary's boundary
+ * precondition, this is not re-validated here.
+ */
+oi_status oi_cli_utf8_decode(const char *data, size_t len,
+                             uint32_t *out_codepoint);
+
+/*
+ * Display-width policy for cursor/column math: 0 (combining marks and C0
+ * control code points, which must not advance the column), 1 (the
+ * default), or 2 (wide code points -- CJK/Hangul/fullwidth ranges). A
+ * documented, testable subset of Unicode combining-mark and East Asian
+ * Width ranges, not a full UAX#11 implementation; multi-code-point
+ * grapheme clusters (ZWJ sequences, emoji modifiers) are out of scope, per
+ * REPL_PLAN.md's "full grapheme editing" exclusion.
+ */
+size_t oi_cli_utf8_codepoint_width(uint32_t codepoint);
 
 #endif
