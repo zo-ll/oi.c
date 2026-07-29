@@ -217,8 +217,24 @@ void oi_cli_render_set_columns(struct oi_cli_render *render, size_t columns) {
     }
 }
 
+static oi_status append_header_lines(struct render_buffer *buffer,
+                                     const struct oi_cli_render_line *lines,
+                                     size_t line_count) {
+    size_t i;
+    oi_status status = OI_OK;
+
+    for (i = 0; i < line_count && status == OI_OK; i++) {
+        status = buffer_append(buffer, lines[i].text, lines[i].len);
+        if (status == OI_OK) {
+            status = buffer_append(buffer, "\r\n", 2);
+        }
+    }
+    return status;
+}
+
 static oi_status render_draw(
     struct oi_cli_render *render, const struct oi_cli_editor *editor,
+    const struct oi_cli_render_line *header_lines, size_t header_count,
     const size_t *command_indices, size_t command_count,
     size_t selected_command) {
     struct render_buffer buffer = {0};
@@ -228,6 +244,7 @@ static oi_status render_draw(
 
     if (render == NULL || editor == NULL || render->output_fd < 0 ||
         render->columns < sizeof prompt ||
+        (header_lines == NULL && header_count != 0) ||
         (command_indices == NULL && command_count != 0) ||
         (command_count != 0 && selected_command >= command_count)) {
         return OI_ERR_INVAL;
@@ -240,6 +257,9 @@ static oi_status render_draw(
     }
     if (status == OI_OK) {
         status = buffer_append(&buffer, "\x1b[J", 3);
+    }
+    if (status == OI_OK) {
+        status = append_header_lines(&buffer, header_lines, header_count);
     }
     if (status == OI_OK) {
         status = build_frame(editor, render->columns, &buffer, &cursor, &end);
@@ -299,8 +319,10 @@ static oi_status render_draw(
          * wrapped trailing content) -- previous_rows must track where the
          * cursor actually ends up, or the next draw's clear step
          * overshoots past this frame's top row and erases real prior
-         * terminal content. */
-        render->previous_rows = cursor.row + 1;
+         * terminal content. header_count is a uniform offset added to
+         * every row position build_frame computed relative to the first
+         * editor row, so it's added in only here, once. */
+        render->previous_rows = header_count + cursor.row + 1;
     }
     free(buffer.data);
     return status;
@@ -308,15 +330,80 @@ static oi_status render_draw(
 
 oi_status oi_cli_render_draw(struct oi_cli_render *render,
                              const struct oi_cli_editor *editor) {
-    return render_draw(render, editor, NULL, 0, 0);
+    return render_draw(render, editor, NULL, 0, NULL, 0, 0);
 }
 
 oi_status oi_cli_render_draw_commands(
     struct oi_cli_render *render, const struct oi_cli_editor *editor,
     const size_t *command_indices, size_t command_count,
     size_t selected_command) {
-    return render_draw(render, editor, command_indices, command_count,
-                       selected_command);
+    return render_draw(render, editor, NULL, 0, command_indices,
+                       command_count, selected_command);
+}
+
+oi_status oi_cli_render_draw_panel(
+    struct oi_cli_render *render, const struct oi_cli_editor *editor,
+    const struct oi_cli_render_line *header_lines, size_t header_count,
+    const size_t *command_indices, size_t command_count,
+    size_t selected_command) {
+    return render_draw(render, editor, header_lines, header_count,
+                       command_indices, command_count, selected_command);
+}
+
+oi_status oi_cli_render_draw_selector(
+    struct oi_cli_render *render,
+    const struct oi_cli_render_line *header_lines, size_t header_count,
+    const struct oi_cli_render_line *option_lines, size_t option_count,
+    size_t selected_option) {
+    struct render_buffer buffer = {0};
+    oi_status status;
+    size_t row_count;
+    size_t i;
+
+    if (render == NULL || render->output_fd < 0 ||
+        (header_lines == NULL && header_count != 0) ||
+        (option_lines == NULL && option_count != 0) || option_count == 0 ||
+        selected_option >= option_count) {
+        return OI_ERR_INVAL;
+    }
+
+    status = buffer_append(&buffer, "\r", 1);
+    if (status == OI_OK && render->previous_rows > 1) {
+        status =
+            buffer_control_number(&buffer, render->previous_rows - 1, 'A');
+    }
+    if (status == OI_OK) {
+        status = buffer_append(&buffer, "\x1b[J", 3);
+    }
+    if (status == OI_OK) {
+        status = append_header_lines(&buffer, header_lines, header_count);
+    }
+    row_count = header_count;
+    for (i = 0; status == OI_OK && i < option_count; i++) {
+        const char *marker = i == selected_option ? "> " : "  ";
+
+        status = buffer_append(&buffer, marker, 2);
+        if (status == OI_OK) {
+            status = buffer_append(&buffer, option_lines[i].text,
+                                   option_lines[i].len);
+        }
+        /* No trailing "\r\n" after the last option: the physical cursor
+         * must end up on the frame's last row (row_count - 1 once this
+         * loop finishes), matching what previous_rows below claims, so
+         * the next erase's cursor-up count is correct. */
+        if (status == OI_OK && i + 1 < option_count) {
+            status = buffer_append(&buffer, "\r\n", 2);
+        }
+        row_count++;
+    }
+    if (status == OI_OK) {
+        status = write_all(render->output_fd, buffer.data, buffer.len);
+    }
+    if (status == OI_OK) {
+        render->previous_rows = row_count;
+    }
+    free(buffer.data);
+    return status;
 }
 
 oi_status oi_cli_render_erase(struct oi_cli_render *render) {

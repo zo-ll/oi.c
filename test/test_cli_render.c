@@ -306,6 +306,166 @@ TEST(erase_clears_a_multiline_frame_and_resets_previous_rows) {
     oi_cli_editor_free(&editor);
 }
 
+TEST(panel_header_lines_are_drawn_above_the_prompt_and_counted) {
+    static const char expected[] = "\r\x1b[JHDR\r\n> abc\r\x1b[4C";
+    struct oi_cli_render_line header[] = {{"HDR", 3}};
+    struct oi_cli_editor editor;
+    struct oi_cli_render render;
+    char output[128];
+    int pipe_fds[2];
+    size_t len;
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    oi_cli_editor_init(&editor);
+    CHECK_EQ(oi_cli_editor_set(&editor, "abc", 3), OI_OK);
+    CHECK_EQ(oi_cli_editor_move_left(&editor), OI_OK);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 80), OI_OK);
+    CHECK_EQ(oi_cli_render_draw_panel(&render, &editor, header, 1, NULL, 0, 0),
+             OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK_EQ(len, sizeof expected - 1);
+    CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
+    /* One header row plus one prompt row. */
+    CHECK_EQ(render.previous_rows, 2);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    oi_cli_editor_free(&editor);
+}
+
+TEST(panel_erase_clears_the_header_plus_prompt_row_count) {
+    static const char expected[] = "\r\x1b[1A\x1b[J";
+    struct oi_cli_render_line header[] = {{"HDR", 3}};
+    struct oi_cli_editor editor;
+    struct oi_cli_render render;
+    char output[128];
+    int pipe_fds[2];
+    size_t len;
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    oi_cli_editor_init(&editor);
+    CHECK_EQ(oi_cli_editor_set(&editor, "abc", 3), OI_OK);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 80), OI_OK);
+    CHECK_EQ(oi_cli_render_draw_panel(&render, &editor, header, 1, NULL, 0, 0),
+             OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK(len > 0);
+    CHECK_EQ(render.previous_rows, 2);
+
+    CHECK_EQ(oi_cli_render_erase(&render), OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK_EQ(len, sizeof expected - 1);
+    CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
+    CHECK_EQ(render.previous_rows, 0);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    oi_cli_editor_free(&editor);
+}
+
+TEST(selector_draws_options_with_markers_and_no_editor_content) {
+    static const char expected[] = "\r\x1b[J> Allow once\r\n  Deny";
+    struct oi_cli_render_line options[] = {{"Allow once", 10}, {"Deny", 4}};
+    struct oi_cli_render render;
+    char output[128];
+    int pipe_fds[2];
+    size_t len;
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 80), OI_OK);
+    CHECK_EQ(
+        oi_cli_render_draw_selector(&render, NULL, 0, options, 2, 0), OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK_EQ(len, sizeof expected - 1);
+    CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
+    CHECK_EQ(render.previous_rows, 2);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+}
+
+TEST(selector_with_header_marks_the_selected_option) {
+    static const char expected[] =
+        "\r\x1b[JTool: shell\r\n  Allow once\r\n> Deny";
+    struct oi_cli_render_line header[] = {{"Tool: shell", 11}};
+    struct oi_cli_render_line options[] = {{"Allow once", 10}, {"Deny", 4}};
+    struct oi_cli_render render;
+    char output[128];
+    int pipe_fds[2];
+    size_t len;
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 80), OI_OK);
+    CHECK_EQ(oi_cli_render_draw_selector(&render, header, 1, options, 2, 1),
+             OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK_EQ(len, sizeof expected - 1);
+    CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
+    /* One header row plus two option rows. */
+    CHECK_EQ(render.previous_rows, 3);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+}
+
+TEST(selector_second_draw_does_not_overshoot_the_clear) {
+    static const char second_prefix[] = "\r\x1b[1A\x1b[J";
+    struct oi_cli_render_line options[] = {{"Allow once", 10}, {"Deny", 4}};
+    struct oi_cli_render_line fewer_options[] = {{"Deny", 4}};
+    struct oi_cli_render render;
+    char output[128];
+    int pipe_fds[2];
+    size_t len;
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 80), OI_OK);
+    CHECK_EQ(
+        oi_cli_render_draw_selector(&render, NULL, 0, options, 2, 0), OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK(len > 0);
+    CHECK_EQ(render.previous_rows, 2);
+
+    CHECK_EQ(oi_cli_render_draw_selector(&render, NULL, 0, fewer_options, 1, 0),
+             OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK(len >= sizeof second_prefix - 1);
+    CHECK(memcmp(output, second_prefix, sizeof second_prefix - 1) == 0);
+    CHECK_EQ(render.previous_rows, 1);
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+}
+
+TEST(panel_and_selector_bad_arguments_are_rejected) {
+    struct oi_cli_render_line header[] = {{"HDR", 3}};
+    struct oi_cli_render_line options[] = {{"Deny", 4}};
+    struct oi_cli_editor editor;
+    struct oi_cli_render render;
+
+    oi_cli_editor_init(&editor);
+    CHECK_EQ(oi_cli_render_init(&render, 1, 80), OI_OK);
+    CHECK_EQ(
+        oi_cli_render_draw_panel(NULL, &editor, header, 1, NULL, 0, 0),
+        OI_ERR_INVAL);
+    CHECK_EQ(
+        oi_cli_render_draw_panel(&render, NULL, header, 1, NULL, 0, 0),
+        OI_ERR_INVAL);
+    CHECK_EQ(
+        oi_cli_render_draw_panel(&render, &editor, NULL, 1, NULL, 0, 0),
+        OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_render_draw_selector(NULL, NULL, 0, options, 1, 0),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_render_draw_selector(&render, NULL, 1, options, 1, 0),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_render_draw_selector(&render, NULL, 0, NULL, 1, 0),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_render_draw_selector(&render, NULL, 0, options, 0, 0),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_render_draw_selector(&render, NULL, 0, options, 1, 1),
+             OI_ERR_INVAL);
+    oi_cli_editor_free(&editor);
+}
+
 int main(void) {
     RUN(draws_and_repositions_a_single_line);
     RUN(multiline_redraw_clears_the_previous_frame);
@@ -318,5 +478,11 @@ int main(void) {
     RUN(bad_arguments_are_rejected);
     RUN(erase_is_a_no_op_before_anything_is_drawn);
     RUN(erase_clears_a_multiline_frame_and_resets_previous_rows);
+    RUN(panel_header_lines_are_drawn_above_the_prompt_and_counted);
+    RUN(panel_erase_clears_the_header_plus_prompt_row_count);
+    RUN(selector_draws_options_with_markers_and_no_editor_content);
+    RUN(selector_with_header_marks_the_selected_option);
+    RUN(selector_second_draw_does_not_overshoot_the_clear);
+    RUN(panel_and_selector_bad_arguments_are_rejected);
     return oi_test_report();
 }
