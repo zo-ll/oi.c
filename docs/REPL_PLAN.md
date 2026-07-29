@@ -32,7 +32,12 @@ without learning terminal UI or conversation-record semantics.
   currently running tool reach a safe boundary; newly requested tools do not
   start ahead of queued input.
 - `Ctrl+C` cancels an active turn or clears edited input. `Ctrl+D` exits from an
-  empty prompt, and `/exit` waits for a safe boundary.
+  empty prompt, and `/exit` waits for a safe boundary; `Ctrl+D` sent while a
+  turn is active has no effect (the terminal stays in cooked mode for the
+  whole turn and nothing reads input until the next prompt, whose
+  raw-mode `tcsetattr` discards it before it is ever read, same as any other
+  byte typed mid-turn). `SIGTERM`/`SIGHUP` cancel an active turn (or, if none
+  is active, the idle prompt) and terminate the process cleanly.
 - Recoverable request, protocol, timeout, and tool errors return to the prompt.
   Durable-storage or structural failures mark the session failed.
 
@@ -58,10 +63,15 @@ occupy the single pending slot and wait until idle.
 ## Private module boundaries
 
 - `cli_repl`: owns interactive lifecycle, state transitions, signals (blocks
-  `SIGWINCH` and owns the resulting `signalfd`'s lifecycle, threaded into
-  `oi_cli_prompt_read`; degrades gracefully to no live-resize support if
-  setup fails, never a hard REPL-start failure), command dispatch, and the
-  single pending item.
+  `SIGWINCH`/`SIGINT`/`SIGTERM`/`SIGHUP` and owns the resulting `signalfd`'s
+  lifecycle -- threaded into `oi_cli_prompt_read` while idle-prompting, and
+  registered directly on the reactor for the duration of an active turn, so
+  either polling context sees the same pending signal with no delivery gap
+  at the handoff between them; degrades gracefully to no live-resize/signal
+  support if setup fails, never a hard REPL-start failure). `SIGINT` during a
+  turn cancels it and returns to a fresh prompt; `SIGTERM`/`SIGHUP` (idle or
+  mid-turn) cancel any active turn and terminate the process cleanly.
+  Command dispatch and the single pending item are owned here too.
 - `cli_editor`: owns terminal modes, input buffers, cursor movement, multiline
   layout, input-history navigation, bracketed paste, and command selection.
 - `cli_render`: owns control-byte sanitization, incremental Markdown state,
@@ -80,7 +90,15 @@ occupy the single pending slot and wait until idle.
   `reactor_epoll.c`, since the editor could then need to redraw while a
   turn's reactor loop runs concurrently.
 - `cli_conversation`: owns active messages, model/tool step sequencing,
-  safe-boundary steering, cancellation, and recoverable turn failures.
+  safe-boundary steering, cancellation, and recoverable turn failures. Any
+  turn that ends before a normal, fully-resolved completion (cancellation,
+  tool denial, a mid-loop failure) is repaired in place before the next
+  turn starts: an `[assistant turn interrupted before completion]`
+  placeholder closes out the missing assistant reply, and dangling tool
+  calls each get an `OUTCOME_UNKNOWN` (may have already run) or
+  `NOT_EXECUTED` (never started) placeholder result -- the same shape
+  `cli_history`'s own crash-time replay repair produces, just applied live
+  instead of at the next process start.
 - `cli_history`: owns JSON record envelopes, stable record IDs, legacy replay,
   repair records, active-context reconstruction, partial responses, and
   checkpoints.

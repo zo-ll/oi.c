@@ -1393,6 +1393,97 @@ TEST(recoverable_turn_error_returns_to_the_prompt) {
     }
 }
 
+TEST(ctrl_d_during_a_turn_has_no_effect) {
+    /* Empirically determined (not assumed): the terminal stays in cooked
+     * mode for the whole turn and nothing reads input_fd until the next
+     * oi_cli_prompt_read call, so Ctrl+D mid-turn just becomes a pending
+     * VEOF marker the tty driver holds -- oi_cli_terminal_enable's
+     * tcsetattr(..., TCSAFLUSH, ...) at the start of that next read
+     * discards it before anything ever consumes it (the same discard
+     * behavior documented elsewhere for ordinary queued bytes). The turn
+     * completes normally and the REPL is left exactly as if Ctrl+D had
+     * never been sent. */
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[1];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].delay_seconds = 2;
+    server = start_slow_mock_server(turns, 1, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-ctrl-d-turn-%d",
+             (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004l", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    free(reply);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+        unlink(metadata_path);
+        {
+            char history_path[640];
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(history_path);
+        }
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
 TEST(sigterm_during_a_turn_terminates_cleanly) {
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -1835,6 +1926,7 @@ int main(void) {
     RUN(sigint_cancels_a_running_tool_and_returns_to_the_prompt);
     RUN(recoverable_turn_error_returns_to_the_prompt);
     RUN(sigterm_during_a_turn_terminates_cleanly);
+    RUN(ctrl_d_during_a_turn_has_no_effect);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);
