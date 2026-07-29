@@ -94,6 +94,14 @@ struct oi_cli_repl_config {
     void *persist_queued_input_user_data;
     oi_cli_repl_persist_queue_resolved_cb persist_queue_resolved;
     void *persist_queue_resolved_user_data;
+    /* Crash-recovery text found by the caller's own replay (an interrupted
+     * queue consumption) to seed as the composer's initial draft -- never
+     * auto-run, just handed back as an editable line. NULL/0 (the default)
+     * means no seeding; the caller is responsible for having already closed
+     * out the durable crash-recovery window (QUEUE_RESOLVED) before this
+     * runs, since oi_cli_repl_run itself has no replay state to do so. */
+    const char *initial_draft;
+    size_t initial_draft_len;
 };
 
 oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,

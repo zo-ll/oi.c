@@ -446,6 +446,52 @@ static oi_status persist_queue_resolved(void *user_data,
     return st;
 }
 
+/*
+ * Closes out a crash-recovery window found by replay (a QUEUED_INPUT record
+ * with no matching QUEUE_RESOLVED, replay_state->has_pending_input):
+ * persists QUEUE_RESOLVED(DISCARDED) for it immediately, before anything
+ * else can run, so a second crash right after this restart can't re-litigate
+ * it, then hands its exact text back as a plain editable draft -- never an
+ * auto-resubmit, since nothing should silently run on the user's behalf
+ * after a crash. A no-op (out_draft untouched) when there's nothing pending.
+ * Only ever reachable for an explicit --session restore of a pre-existing
+ * log: an automatic session's directory is always brand new (see
+ * prepare_automatic_session's own comment), so it can never have a queued
+ * item left over from before this process even started.
+ */
+static oi_status seed_pending_draft_from_replay(
+    struct oi_cli_history_store *store,
+    struct oi_cli_history_replay_state *state,
+    struct oi_cli_string *out_draft) {
+    struct oi_cli_history_record record;
+    oi_status st;
+
+    if (!state->has_pending_input) {
+        return OI_OK;
+    }
+    /* Copied before the append below: a successful append replays and
+     * replaces *state wholesale (see persist_queued_input's own comment),
+     * which frees state->pending_input as part of clearing has_pending_input
+     * back to 0. */
+    st = oi_cli_string_set(out_draft, state->pending_input.data,
+                           state->pending_input.len);
+    if (st != OI_OK) {
+        return st;
+    }
+    oi_cli_history_record_init(&record);
+    st = oi_cli_history_record_set_queue_resolved(
+        &record, state->next_record_id, state->pending_input_turn_id,
+        state->pending_input_record_id, OI_CLI_HISTORY_QUEUE_DISCARDED);
+    if (st == OI_OK) {
+        st = oi_cli_history_store_append(store, &record, state);
+    }
+    oi_cli_history_record_free(&record);
+    if (st != OI_OK) {
+        oi_cli_string_free(out_draft);
+    }
+    return st;
+}
+
 /* Wired unconditionally into oi_cli_repl_config, even for an ephemeral
  * session with no durable persistence at all: persist_conversation_event
  * (the only writer of persistence->last_error) is then never registered as
@@ -698,6 +744,7 @@ int main(int argc, char **argv) {
     struct oi_cli_history_store history_store;
     struct oi_cli_history_replay_state replay_state;
     struct oi_cli_message_list initial_context;
+    struct oi_cli_string initial_draft = {0};
     struct persistence_context persistence = {0};
     struct oi_cli_session_location automatic_location;
     struct automatic_session_context automatic_context;
@@ -788,6 +835,10 @@ int main(int argc, char **argv) {
                     &history_store, &repairs.records[i], &replay_state);
             }
             oi_cli_history_free(&repairs);
+        }
+        if (st == OI_OK) {
+            st = seed_pending_draft_from_replay(&history_store, &replay_state,
+                                                &initial_draft);
         }
         if (st != OI_OK) {
             fprintf(stderr, "oi: failed to prepare session history: %s\n",
@@ -923,6 +974,8 @@ int main(int argc, char **argv) {
             .persist_queued_input_user_data = &persistence,
             .persist_queue_resolved = persist_queue_resolved,
             .persist_queue_resolved_user_data = &persistence,
+            .initial_draft = initial_draft.data,
+            .initial_draft_len = initial_draft.len,
         };
         st = oi_cli_repl_run(client, reactor, turn_arena, tools,
                              &repl_config);
@@ -940,6 +993,7 @@ int main(int argc, char **argv) {
 
 cleanup:
     free(loop_result.assistant_text);
+    oi_cli_string_free(&initial_draft);
     oi_cli_message_list_free(&initial_context);
     oi_cli_history_replay_state_free(&replay_state);
     oi_cli_history_store_free(&history_store);

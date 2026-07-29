@@ -511,6 +511,54 @@ static pid_t start_interactive_cli_allowing_tools(unsigned short port,
     return pid;
 }
 
+/* Same as start_interactive_cli, but against an explicit --session ID
+ * rather than a fresh automatic session directory -- needed to actually
+ * resume the same durable log across two separate process lifetimes (an
+ * automatic session's directory is always brand new, so it can never be
+ * resumed this way). */
+static pid_t start_interactive_cli_with_session(unsigned short port,
+                                                int slave_fd,
+                                                const char *session_dir,
+                                                const char *session_name) {
+    pid_t pid = fork();
+
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        char port_text[16];
+        char *argv[14];
+
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
+            _exit(126);
+        }
+        snprintf(port_text, sizeof port_text, "%u", (unsigned)port);
+        if (dup2(slave_fd, STDIN_FILENO) < 0 ||
+            dup2(slave_fd, STDOUT_FILENO) < 0 ||
+            dup2(slave_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        if (slave_fd > STDERR_FILENO) {
+            close(slave_fd);
+        }
+        argv[0] = (char *)OI_BIN;
+        argv[1] = (char *)"--host";
+        argv[2] = (char *)"127.0.0.1";
+        argv[3] = (char *)"--port";
+        argv[4] = port_text;
+        argv[5] = (char *)"--no-tls";
+        argv[6] = (char *)"--api-key";
+        argv[7] = (char *)"test-key";
+        argv[8] = (char *)"--deny-tools";
+        argv[9] = (char *)"--session-dir";
+        argv[10] = (char *)session_dir;
+        argv[11] = (char *)"--session";
+        argv[12] = (char *)session_name;
+        argv[13] = NULL;
+        execv(OI_BIN, argv);
+        _exit(127);
+    }
+    return pid;
+}
+
 static void run_cli(char *const argv[], struct run_result *out) {
     memset(out, 0, sizeof *out);
 
@@ -1992,6 +2040,29 @@ static uint64_t oilog_record_turn_id(const char *record) {
     return (uint64_t)strtoull(marker + strlen("\"turn_id\":\""), NULL, 10);
 }
 
+/* Counts every record containing all of the given needles -- used where
+ * oilog_find's "first match" isn't enough, e.g. asserting a crash-recovery
+ * pass ran exactly once, not zero or twice. */
+static size_t oilog_count(const struct oilog_records *records,
+                          const char *const *needles, size_t needle_count) {
+    size_t count = 0;
+    size_t i;
+
+    for (i = 0; i < records->count; i++) {
+        size_t j;
+
+        for (j = 0; j < needle_count; j++) {
+            if (strstr(records->items[i], needles[j]) == NULL) {
+                break;
+            }
+        }
+        if (j == needle_count) {
+            count++;
+        }
+    }
+    return count;
+}
+
 TEST(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids) {
     const char *first_reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -2383,6 +2454,135 @@ TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
         rmdir(session_path);
         rmdir(session_root);
     }
+}
+
+TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[1];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_dir[] = "/tmp";
+    char session_name[64];
+    char log_path[160];
+
+    snprintf(session_name, sizeof session_name, "oi-cli-crash-queue-%d",
+             (int)getpid());
+    snprintf(log_path, sizeof log_path, "%s/%s.oilog", session_dir,
+             session_name);
+    unlink(log_path);
+
+    /* First "life": queue something, then simulate a hard crash (SIGKILL,
+     * no graceful shutdown at all) while it's still sitting unresolved. */
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].delay_seconds = 5;
+    server = start_slow_mock_server(turns, 1, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_with_session(port, slave_fd, session_dir,
+                                             session_name);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+    CHECK(write_interactive(master_fd, "world\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+
+    CHECK_EQ(kill(cli, SIGKILL), 0);
+    waitpid(cli, NULL, 0);
+    close(master_fd);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    free(reply);
+
+    /* Second "life": same session, fresh process -- the crash-recovery
+     * window must be closed durably and the queued text handed back as a
+     * plain, editable startup draft, never auto-run. No mock server is
+     * needed: nothing here ever submits a message. */
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_with_session(1, slave_fd, session_dir,
+                                             session_name);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "world", 1));
+
+    /* Clear the restored draft (Ctrl+C is safe here -- no turn is active)
+     * before Ctrl+D, which otherwise deletes forward rather than exiting
+     * when the draft isn't empty. */
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+
+    {
+        struct oilog_records records;
+        size_t queued_index;
+        size_t resolved_index;
+        const char *queued_needles[] = {"\"type\":\"queued_input\"",
+                                        "\"content\":\"world\""};
+        const char *resolved_needles[] = {"\"type\":\"queue_resolved\"",
+                                          "\"resolution\":\"discarded\""};
+
+        oilog_records_load(log_path, &records);
+        queued_index = oilog_find(&records, 0, queued_needles, 2);
+        CHECK(queued_index != SIZE_MAX);
+        resolved_index =
+            oilog_find(&records, queued_index + 1, resolved_needles, 2);
+        CHECK(resolved_index != SIZE_MAX);
+        CHECK_EQ(oilog_record_turn_id(records.items[queued_index]),
+                 oilog_record_turn_id(records.items[resolved_index]));
+        oilog_records_free(&records);
+    }
+
+    /* Third "life": restart again immediately. The crash window is already
+     * closed (has_pending_input is now false), so this must not seed a
+     * draft again or append a second resolution record -- no duplication. */
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_with_session(1, slave_fd, session_dir,
+                                             session_name);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+
+    {
+        struct oilog_records records;
+        const char *resolved_needles[] = {"\"type\":\"queue_resolved\""};
+
+        oilog_records_load(log_path, &records);
+        CHECK_EQ(oilog_count(&records, resolved_needles, 1), (size_t)1);
+        oilog_records_free(&records);
+    }
+
+    unlink(log_path);
 }
 
 TEST(sigterm_during_a_turn_terminates_cleanly) {
@@ -2828,6 +3028,7 @@ int main(void) {
     RUN(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids);
     RUN(queued_command_while_busy_resolves_discarded_and_dispatches_live);
     RUN(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft);
+    RUN(crash_with_a_pending_item_restores_it_as_a_startup_draft);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);
