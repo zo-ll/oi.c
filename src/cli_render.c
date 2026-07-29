@@ -265,7 +265,14 @@ static oi_status render_draw(
         status = write_all(render->output_fd, buffer.data, buffer.len);
     }
     if (status == OI_OK) {
-        render->previous_rows = end.row + 1;
+        /* The repositioning above always leaves the physical cursor at
+         * `cursor.row`, not `end.row` (which can be further down whenever
+         * a command menu is showing, or the edit cursor sits before
+         * wrapped trailing content) -- previous_rows must track where the
+         * cursor actually ends up, or the next draw's clear step
+         * overshoots past this frame's top row and erases real prior
+         * terminal content. */
+        render->previous_rows = cursor.row + 1;
     }
     free(buffer.data);
     return status;
