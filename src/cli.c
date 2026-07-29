@@ -23,35 +23,6 @@
  * in their own internal modules.
  */
 
-static const char *status_str(oi_status st) {
-    switch (st) {
-    case OI_OK:
-        return "ok";
-    case OI_ERR_INVAL:
-        return "invalid argument";
-    case OI_ERR_NOMEM:
-        return "out of memory";
-    case OI_ERR_IO:
-        return "I/O error";
-    case OI_ERR_AGAIN:
-        return "would block";
-    case OI_ERR_PARSE:
-        return "parse error";
-    case OI_ERR_CLOSED:
-        return "closed";
-    case OI_ERR_EXISTS:
-        return "already exists";
-    case OI_ERR_NOTFOUND:
-        return "not found";
-    case OI_ERR_DENIED:
-        return "denied";
-    case OI_ERR_TIMEOUT:
-        return "timeout";
-    default:
-        return "unknown error";
-    }
-}
-
 static void print_usage(void) {
     printf(
         "usage: oi [flags] [\"prompt\"]\n"
@@ -406,6 +377,15 @@ static oi_status persist_cwd_setting(void *user_data, const char *path,
         path_len);
 }
 
+/* Wired unconditionally into oi_cli_repl_config, even for an ephemeral
+ * session with no durable persistence at all: persist_conversation_event
+ * (the only writer of persistence->last_error) is then never registered as
+ * on_event, so last_error naturally, permanently stays OI_OK. */
+static int persistence_has_failed(void *user_data) {
+    const struct persistence_context *persistence = user_data;
+    return persistence->last_error != OI_OK;
+}
+
 int main(int argc, char **argv) {
     const char *config_path = NULL;
     const char *session_id = NULL;
@@ -529,7 +509,7 @@ int main(int argc, char **argv) {
         oi_status st = oi_config_load_file(&cfg, config_path);
         if (st != OI_OK) {
             fprintf(stderr, "oi: failed to load config file '%s': %s\n",
-                    config_path, status_str(st));
+                    config_path, oi_status_str(st));
             oi_config_free(&cfg);
             return 1;
         }
@@ -545,7 +525,7 @@ int main(int argc, char **argv) {
         oi_status st = oi_config_set(&cfg, overrides[i].key, overrides[i].value);
         if (st != OI_OK) {
             fprintf(stderr, "oi: invalid value for --%s: %s (%s)\n",
-                    overrides[i].key, overrides[i].value, status_str(st));
+                    overrides[i].key, overrides[i].value, oi_status_str(st));
             oi_config_free(&cfg);
             return 1;
         }
@@ -571,7 +551,7 @@ int main(int argc, char **argv) {
         char *stdin_prompt = read_stdin_all(&read_status);
         if (stdin_prompt == NULL) {
             fprintf(stderr, "oi: failed to read stdin: %s\n",
-                    status_str(read_status));
+                    oi_status_str(read_status));
             oi_config_free(&cfg);
             return 1;
         }
@@ -593,7 +573,7 @@ int main(int argc, char **argv) {
         st = build_request_body(cfg.model, prompt, &w);
         if (st != OI_OK) {
             fprintf(stderr, "oi: failed to build request: %s\n",
-                    status_str(st));
+                    oi_status_str(st));
             oi_config_free(&cfg);
             if (owns_prompt) {
                 free((char *)prompt);
@@ -693,7 +673,7 @@ int main(int argc, char **argv) {
     st = oi_cli_tools_register(tools);
     if (st != OI_OK) {
         fprintf(stderr, "oi: failed to register built-in tools: %s\n",
-                status_str(st));
+                oi_status_str(st));
         exit_code = 1;
         goto cleanup;
     }
@@ -702,7 +682,7 @@ int main(int argc, char **argv) {
         st = oi_session_create(sessions, session_id, log_path, 0, &session);
         if (st != OI_OK) {
             fprintf(stderr, "oi: failed to open session '%s' at '%s': %s\n",
-                    session_id, log_path, status_str(st));
+                    session_id, log_path, oi_status_str(st));
             exit_code = 1;
             goto cleanup;
         }
@@ -710,7 +690,7 @@ int main(int argc, char **argv) {
                                        &history_store, &replay_state);
         if (st != OI_OK) {
             fprintf(stderr, "oi: failed to replay session: %s\n",
-                    status_str(st));
+                    oi_status_str(st));
             exit_code = 1;
             goto cleanup;
         }
@@ -742,7 +722,7 @@ int main(int argc, char **argv) {
         }
         if (st != OI_OK) {
             fprintf(stderr, "oi: failed to prepare session history: %s\n",
-                    status_str(st));
+                    oi_status_str(st));
             exit_code = 1;
             goto cleanup;
         }
@@ -778,7 +758,7 @@ int main(int argc, char **argv) {
         }
         if (st != OI_OK) {
             fprintf(stderr, "oi: failed to restore session settings: %s\n",
-                    status_str(st));
+                    oi_status_str(st));
             exit_code = 1;
             goto cleanup;
         }
@@ -868,6 +848,8 @@ int main(int argc, char **argv) {
             .persist_model_user_data = &persistence,
             .persist_cwd = persist_cwd_setting,
             .persist_cwd_user_data = &persistence,
+            .is_durably_failed = persistence_has_failed,
+            .is_durably_failed_user_data = &persistence,
         };
         st = oi_cli_repl_run(client, reactor, turn_arena, tools,
                              &repl_config);
@@ -876,7 +858,7 @@ int main(int argc, char **argv) {
                              prompt, &loop_result);
     }
     if (st != OI_OK) {
-        fprintf(stderr, "oi: agent loop failed: %s\n", status_str(st));
+        fprintf(stderr, "oi: agent loop failed: %s\n", oi_status_str(st));
         if (persistence.last_error != OI_OK && session != NULL) {
             oi_session_fail(session);
         }

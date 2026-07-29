@@ -378,7 +378,19 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
                 if (oi_cli_conversation_is_busy(conversation)) {
                     oi_cli_conversation_cancel(conversation);
                 }
-                break;
+                if (config->is_durably_failed != NULL &&
+                    config->is_durably_failed(
+                        config->is_durably_failed_user_data)) {
+                    break;
+                }
+                if (fprintf(config->err, "oi: turn failed: %s\n",
+                           oi_status_str(status)) < 0 ||
+                    fflush(config->err) != 0) {
+                    status = OI_ERR_IO;
+                    break;
+                }
+                status = OI_OK;
+                continue;
             }
         }
     }

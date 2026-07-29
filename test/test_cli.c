@@ -1298,6 +1298,101 @@ TEST(sigint_cancels_a_running_tool_and_returns_to_the_prompt) {
     }
 }
 
+TEST(recoverable_turn_error_returns_to_the_prompt) {
+    /* --deny-tools rejects this tool call, producing OI_ERR_DENIED -- a
+     * genuine turn failure, but not a durable-storage failure, so the REPL
+     * must print a message and return to a working prompt rather than
+     * exit. */
+    const char *denied_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_denied\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\\\"true\\\"}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t denied_len;
+    size_t answer_len;
+    char *denied_resp = build_chunked_response(
+        denied_sse, strlen(denied_sse), "HTTP/1.1 200 OK", &denied_len);
+    char *answer_resp = build_chunked_response(
+        answer_sse, strlen(answer_sse), "HTTP/1.1 200 OK", &answer_len);
+    const char *responses[] = {denied_resp, answer_resp};
+    size_t lengths[] = {denied_len, answer_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server_turns(responses, lengths, 2, &port);
+    free(denied_resp);
+    free(answer_resp);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-recoverable-error-%d", (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
+                              1));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
+    CHECK(write_interactive(master_fd, "world\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        size_t sessions_found = 0;
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+        unlink(metadata_path);
+        {
+            char history_path[640];
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+            unlink(history_path);
+        }
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
 TEST(interactive_cwd_command_changes_the_process_directory) {
     char target_dir[160];
     unsigned short port;
@@ -1650,6 +1745,7 @@ int main(void) {
     RUN(interactive_model_command_changes_the_live_model);
     RUN(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt);
     RUN(sigint_cancels_a_running_tool_and_returns_to_the_prompt);
+    RUN(recoverable_turn_error_returns_to_the_prompt);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);

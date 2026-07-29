@@ -28,6 +28,19 @@ typedef oi_status (*oi_cli_repl_persist_cwd_cb)(void *user_data,
                                                 const char *path,
                                                 size_t path_len);
 
+/*
+ * True only if durable session storage itself has failed (cli.c owns the
+ * one authoritative signal for this, persistence.last_error, already
+ * checked once at final process exit) -- distinguishes a genuine
+ * structural failure the REPL cannot recover from from an ordinary
+ * recoverable turn error (timeout, tool denial, model error), which should
+ * instead print a message and return to a working prompt. Always non-NULL:
+ * an ephemeral session (no --session, no automatic session) never
+ * exercises the persistence path at all, so it naturally, permanently
+ * reports "not failed".
+ */
+typedef int (*oi_cli_repl_is_durably_failed_cb)(void *user_data);
+
 struct oi_cli_repl_config {
     const char *model;
     int max_turns;
@@ -54,6 +67,8 @@ struct oi_cli_repl_config {
     void *persist_model_user_data;
     oi_cli_repl_persist_cwd_cb persist_cwd;
     void *persist_cwd_user_data;
+    oi_cli_repl_is_durably_failed_cb is_durably_failed;
+    void *is_durably_failed_user_data;
 };
 
 oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,

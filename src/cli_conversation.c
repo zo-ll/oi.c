@@ -45,6 +45,16 @@ struct oi_cli_conversation {
     size_t assistant_message_index;
     size_t tool_index;
     struct buffer tool_output;
+    /*
+     * False from the moment start_model_request begins awaiting a new
+     * assistant reply (the very first model round of a turn, or a later
+     * round following resolved tool results) until on_llm_done commits one
+     * -- lets close_out_incomplete_turn tell whether assistant_message_index
+     * already refers to this round's reply (and so whether its tool_calls,
+     * if any, might need repairing) or is still a stale index from a
+     * previous round.
+     */
+    int assistant_committed;
 };
 
 static oi_status buffer_append(struct buffer *buffer, const void *data,
@@ -422,6 +432,11 @@ static oi_status normalize_utf8(const unsigned char *data, size_t len,
 static oi_status start_model_request(oi_cli_conversation *conversation);
 static void start_next_tool(oi_cli_conversation *conversation);
 static oi_status repair_interrupted_turn(oi_cli_conversation *conversation);
+static oi_status close_out_incomplete_turn(oi_cli_conversation *conversation,
+                                           int first_call_may_have_started);
+static void finish_turn_with_repair(oi_cli_conversation *conversation,
+                                    oi_status status,
+                                    int first_call_may_have_started);
 
 static oi_status commit_tool_text(
     oi_cli_conversation *conversation,
@@ -528,7 +543,8 @@ static void on_tool_output(const void *data, size_t len, void *user_data) {
         oi_tool_call *tool = conversation->tool;
         conversation->tool = NULL;
         oi_tool_call_cancel(tool);
-        finish_turn(conversation, st);
+        finish_turn_with_repair(conversation, st,
+                               /*first_call_may_have_started=*/1);
     }
 }
 
@@ -565,7 +581,8 @@ static void on_tool_done(oi_tool_exit_kind kind, int code, void *user_data) {
     buffer_free(&text);
     buffer_free(&conversation->tool_output);
     if (st != OI_OK) {
-        finish_turn(conversation, st);
+        finish_turn_with_repair(conversation, st,
+                               /*first_call_may_have_started=*/1);
         return;
     }
     conversation->tool_index++;
@@ -580,7 +597,8 @@ static void start_next_tool(oi_cli_conversation *conversation) {
         if (conversation->tool_index >= assistant->tool_calls_len) {
             oi_status st = start_model_request(conversation);
             if (st != OI_OK) {
-                finish_turn(conversation, st);
+                finish_turn_with_repair(conversation, st,
+                                        /*first_call_may_have_started=*/0);
             }
             return;
         }
@@ -590,7 +608,8 @@ static void start_next_tool(oi_cli_conversation *conversation) {
         oi_status st =
             parse_arguments(conversation, &call->arguments, &arguments);
         if (st != OI_OK) {
-            finish_turn(conversation, st);
+            finish_turn_with_repair(conversation, st,
+                                    /*first_call_may_have_started=*/0);
             return;
         }
 
@@ -600,7 +619,8 @@ static void start_next_tool(oi_cli_conversation *conversation) {
             call->name.data, arguments, always_stage, NULL, on_tool_output,
             on_tool_done, conversation, &staged);
         if (st != OI_OK) {
-            finish_turn(conversation, st);
+            finish_turn_with_repair(conversation, st,
+                                    /*first_call_may_have_started=*/0);
             return;
         }
         oi_tool_decision decision =
@@ -611,7 +631,8 @@ static void start_next_tool(oi_cli_conversation *conversation) {
                       conversation->config.permission_user_data);
         if (decision != OI_TOOL_ALLOW) {
             (void)oi_tool_call_resolve(staged, 0);
-            finish_turn(conversation, OI_ERR_DENIED);
+            finish_turn_with_repair(conversation, OI_ERR_DENIED,
+                                    /*first_call_may_have_started=*/0);
             return;
         }
 
@@ -622,7 +643,8 @@ static void start_next_tool(oi_cli_conversation *conversation) {
         st = emit(conversation, &event);
         if (st != OI_OK) {
             oi_tool_call_cancel(staged);
-            finish_turn(conversation, st);
+            finish_turn_with_repair(conversation, st,
+                                    /*first_call_may_have_started=*/0);
             return;
         }
         if (!conversation->busy) {
@@ -630,18 +652,11 @@ static void start_next_tool(oi_cli_conversation *conversation) {
              * reentrantly from within the TOOL_STARTING emit above (a
              * supported pattern one layer down, mirroring
              * oi_tool_call_cancel's own documented reentrancy from within
-             * its own on_output). conversation->tool is still NULL at this
-             * point, so oi_cli_conversation_cancel's own repair pass (gated
-             * on tool != NULL) never saw this call as running and skipped
-             * it -- repair it here instead (nothing was ever spawned for
-             * it, so NOT_EXECUTED, not OUTCOME_UNKNOWN), best-effort: the
-             * turn already finished and reported whatever status it had,
-             * so there is nothing left to escalate a repair failure to. */
-            if (repair_dangling_tool_calls(
-                    conversation, /*first_call_may_have_started=*/0) ==
-                OI_OK) {
-                (void)repair_interrupted_turn(conversation);
-            }
+             * its own on_output). oi_cli_conversation_cancel's repair now
+             * runs unconditionally (no longer gated on conversation->tool
+             * != NULL), so that reentrant call already closed the turn out
+             * fully -- nothing left to do here but tear down the
+             * staged-but-never-started call. */
             oi_tool_call_cancel(staged);
             return;
         }
@@ -649,7 +664,8 @@ static void start_next_tool(oi_cli_conversation *conversation) {
         st = oi_tool_call_resolve(staged, 1);
         if (st != OI_OK) {
             conversation->tool = NULL;
-            finish_turn(conversation, st);
+            finish_turn_with_repair(conversation, st,
+                                    /*first_call_may_have_started=*/1);
             return;
         }
         if (conversation->config.tool_timeout_ms > 0) {
@@ -664,7 +680,8 @@ static void start_next_tool(oi_cli_conversation *conversation) {
             oi_tool_call *tool = conversation->tool;
             conversation->tool = NULL;
             oi_tool_call_cancel(tool);
-            finish_turn(conversation, st);
+            finish_turn_with_repair(conversation, st,
+                                    /*first_call_may_have_started=*/1);
         }
         return;
     }
@@ -709,7 +726,8 @@ static void on_llm_event(const oi_llm_event *event, void *user_data) {
         oi_llm_request *request = conversation->request;
         conversation->request = NULL;
         oi_llm_request_cancel(request);
-        finish_turn(conversation, st);
+        finish_turn_with_repair(conversation, st,
+                               /*first_call_may_have_started=*/0);
     }
 }
 
@@ -741,7 +759,8 @@ static void on_llm_done(oi_status status, int http_status,
                 status = event_status;
             }
         }
-        finish_turn(conversation, status);
+        finish_turn_with_repair(conversation, status,
+                               /*first_call_may_have_started=*/0);
         return;
     }
 
@@ -755,10 +774,13 @@ static void on_llm_done(oi_status status, int http_status,
     }
     oi_cli_message_free(&assistant);
     if (st != OI_OK) {
-        finish_turn(conversation, st);
+        finish_turn_with_repair(conversation, st,
+                               /*first_call_may_have_started=*/0);
         return;
     }
     conversation->assistant_message_index = conversation->messages.len - 1;
+    conversation->assistant_committed = 1;
+    conversation->tool_index = 0;
     size_t tool_calls_len =
         conversation->messages
             .items[conversation->assistant_message_index]
@@ -770,16 +792,21 @@ static void on_llm_done(oi_status status, int http_status,
     };
     st = emit(conversation, &response_done);
     if (st != OI_OK) {
-        finish_turn(conversation, st);
+        finish_turn_with_repair(conversation, st,
+                               /*first_call_may_have_started=*/0);
     } else if (tool_calls_len == 0) {
         finish_turn(conversation, OI_OK);
     } else {
-        conversation->tool_index = 0;
         start_next_tool(conversation);
     }
 }
 
 static oi_status start_model_request(oi_cli_conversation *conversation) {
+    /* About to await a new assistant reply (the turn's first model round,
+     * or a later one following resolved tool results): nothing commits it
+     * until on_llm_done runs, so close_out_incomplete_turn must not treat
+     * assistant_message_index as belonging to this round until then. */
+    conversation->assistant_committed = 0;
     if (conversation->model_steps >=
         conversation->config.max_model_steps) {
         return OI_ERR_INVAL;
@@ -933,9 +960,55 @@ static oi_status repair_interrupted_turn(oi_cli_conversation *conversation) {
     return st;
 }
 
-void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
+/*
+ * The single place that decides what (if anything) needs repairing before a
+ * turn ends any way other than a normal, fully-resolved completion --
+ * cancellation, tool denial, a mid-loop failure, or anything else. Whether
+ * this round's assistant message has been committed yet
+ * (assistant_committed) and, if so, whether all of its tool_calls already
+ * have a matching result (tool_index vs. tool_calls_len) together say
+ * exactly how much of the turn's protocol shape is still open; closing it
+ * is always repair_dangling_tool_calls (if anything there is still open)
+ * followed by repair_interrupted_turn (unconditionally, since neither an
+ * uncommitted assistant reply nor a pending tool loop leaves replay back at
+ * REPLAY_EXPECT_USER on its own). Returns the first repair-commit failure,
+ * if any -- a genuine structural problem that should replace the turn's
+ * original status rather than being masked by it, matching how
+ * oi_cli_conversation_cancel already treated its own repair failures.
+ */
+static oi_status close_out_incomplete_turn(oi_cli_conversation *conversation,
+                                           int first_call_may_have_started) {
     oi_status status = OI_OK;
-    int need_interrupted_marker = 0;
+    if (conversation->assistant_committed) {
+        const struct oi_cli_message *assistant =
+            &conversation->messages
+                 .items[conversation->assistant_message_index];
+        if (conversation->tool_index < assistant->tool_calls_len) {
+            status = repair_dangling_tool_calls(conversation,
+                                                first_call_may_have_started);
+        }
+    }
+    if (status == OI_OK) {
+        status = repair_interrupted_turn(conversation);
+    }
+    return status;
+}
+
+/* Convenience wrapper for the common case: repair, then finish with
+ * whichever of the repair failure or the turn's own status is worse
+ * (repair failure wins, since it's the more structural problem). */
+static void finish_turn_with_repair(oi_cli_conversation *conversation,
+                                    oi_status status,
+                                    int first_call_may_have_started) {
+    oi_status repair_status =
+        close_out_incomplete_turn(conversation, first_call_may_have_started);
+    finish_turn(conversation,
+               repair_status != OI_OK ? repair_status : status);
+}
+
+void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
+    oi_status status;
+    int first_call_may_have_started = 0;
 
     if (conversation == NULL || !conversation->busy) {
         return;
@@ -952,25 +1025,15 @@ void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
             (void)emit(conversation, &partial);
         }
         oi_llm_request_cancel(request);
-        need_interrupted_marker = 1;
     }
     if (conversation->tool != NULL) {
         oi_tool_call *tool = conversation->tool;
         conversation->tool = NULL;
         oi_tool_call_cancel(tool);
-        /* Repairs conversation->messages so it stays protocol-valid: the
-         * assistant message already committed by on_llm_done carries this
-         * call (and any later ones in the same message) with no matching
-         * tool-result yet. A repair-commit failure (e.g. a durable-storage
-         * append failure) is a genuine structural problem, not an ordinary
-         * cancel -- surface it as-is instead of masking it below. */
-        status = repair_dangling_tool_calls(conversation,
-                                            /*first_call_may_have_started=*/1);
-        need_interrupted_marker = status == OI_OK;
+        first_call_may_have_started = 1;
     }
-    if (need_interrupted_marker && status == OI_OK) {
-        status = repair_interrupted_turn(conversation);
-    }
+    status = close_out_incomplete_turn(conversation,
+                                       first_call_may_have_started);
     if (status == OI_OK) {
         conversation->cancelled = 1;
         status = OI_ERR_CLOSED;
