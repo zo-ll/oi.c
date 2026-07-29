@@ -9,6 +9,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pty.h>
@@ -136,6 +137,11 @@ static pid_t start_mock_server_turns_capture(
             int rc = select(listen_fd + 1, &rfds, NULL, NULL, &tv);
             int cfd = rc > 0 ? accept(listen_fd, NULL, NULL) : -1;
             if (cfd < 0) {
+                fprintf(stderr,
+                        "[mock_server] gave up waiting for a connection on "
+                        "turn %zu (select rc=%d)\n",
+                        turn, rc);
+                fflush(stderr);
                 break;
             }
             drain_request(cfd, capture_fd);
@@ -224,11 +230,24 @@ static int interactive_wait_for(int master_fd,
         FD_ZERO(&reads);
         FD_SET(master_fd, &reads);
         if (select(master_fd + 1, &reads, NULL, NULL, &timeout) <= 0) {
+            fprintf(stderr,
+                    "[interactive_wait_for] timed out waiting for %zu x "
+                    "%s%s%s; %zu bytes received so far:\n%.*s\n--- end ---\n",
+                    minimum_count, "\"", text, "\"", result->output_len,
+                    (int)result->output_len, result->output);
+            fflush(stderr);
             return 0;
         }
         len = read(master_fd, result->output + result->output_len,
                    sizeof result->output - 1 - result->output_len);
         if (len <= 0) {
+            fprintf(stderr,
+                    "[interactive_wait_for] read() returned %zd (errno=%d) "
+                    "waiting for %zu x \"%s\"; %zu bytes received so far:\n"
+                    "%.*s\n--- end ---\n",
+                    len, errno, minimum_count, text, result->output_len,
+                    (int)result->output_len, result->output);
+            fflush(stderr);
             return 0;
         }
         result->output_len += (size_t)len;
