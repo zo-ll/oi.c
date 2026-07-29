@@ -1311,8 +1311,6 @@ oi_status oi_cli_conversation_apply_checkpoint(
     oi_cli_conversation *conversation, size_t prefix_count,
     const char *summary, size_t summary_len) {
     struct oi_cli_message checkpoint;
-    struct oi_cli_message *items;
-    size_t remaining;
     oi_status st;
 
     if (conversation == NULL || conversation->busy || prefix_count == 0 ||
@@ -1325,7 +1323,33 @@ oi_status oi_cli_conversation_apply_checkpoint(
     if (st != OI_OK) {
         return st;
     }
+    st = oi_cli_conversation_apply_checkpoint_take_summary(
+        conversation, prefix_count, &checkpoint.content.data,
+        checkpoint.content.len);
+    if (st == OI_OK) {
+        checkpoint.content.len = 0;
+    }
+    oi_cli_message_free(&checkpoint);
+    return st;
+}
 
+oi_status oi_cli_conversation_apply_checkpoint_take_summary(
+    oi_cli_conversation *conversation, size_t prefix_count, char **summary,
+    size_t summary_len) {
+    struct oi_cli_message checkpoint;
+    struct oi_cli_message *items;
+    size_t remaining;
+
+    if (conversation == NULL || conversation->busy || prefix_count == 0 ||
+        prefix_count > conversation->messages.len || summary == NULL ||
+        *summary == NULL) {
+        return OI_ERR_INVAL;
+    }
+
+    oi_cli_message_init(&checkpoint);
+    checkpoint.role = OI_CLI_MESSAGE_ASSISTANT;
+    checkpoint.content.data = *summary;
+    checkpoint.content.len = summary_len;
     items = conversation->messages.items;
     for (size_t i = 0; i < prefix_count; i++) {
         oi_cli_message_free(&items[i]);
@@ -1334,5 +1358,6 @@ oi_status oi_cli_conversation_apply_checkpoint(
     memmove(&items[1], &items[prefix_count], remaining * sizeof *items);
     items[0] = checkpoint;
     conversation->messages.len = remaining + 1;
+    *summary = NULL;
     return OI_OK;
 }

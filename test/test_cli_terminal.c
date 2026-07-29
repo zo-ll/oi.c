@@ -85,8 +85,36 @@ TEST(non_terminal_descriptors_are_refused) {
     close(pipe_fds[1]);
 }
 
+TEST(isig_can_be_toggled_without_leaving_raw_mode) {
+    static const char paste_on[] = "\x1b[?2004h";
+    struct oi_cli_terminal terminal;
+    struct termios attributes;
+    char output[sizeof paste_on - 1];
+    int master_fd = -1;
+    int slave_fd = -1;
+
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    oi_cli_terminal_init(&terminal);
+    CHECK_EQ(oi_cli_terminal_enable(&terminal, slave_fd, slave_fd), OI_OK);
+    CHECK(read_exact(master_fd, output, sizeof output));
+
+    CHECK_EQ(oi_cli_terminal_set_isig(&terminal, 1), OI_OK);
+    CHECK_EQ(tcgetattr(slave_fd, &attributes), 0);
+    CHECK(attributes.c_lflag & ISIG);
+    CHECK_EQ(attributes.c_lflag & (ECHO | ICANON | IEXTEN), 0);
+
+    CHECK_EQ(oi_cli_terminal_set_isig(&terminal, 0), OI_OK);
+    CHECK_EQ(tcgetattr(slave_fd, &attributes), 0);
+    CHECK_EQ(attributes.c_lflag & (ECHO | ICANON | IEXTEN | ISIG), 0);
+
+    CHECK_EQ(oi_cli_terminal_restore(&terminal), OI_OK);
+    close(slave_fd);
+    close(master_fd);
+}
+
 int main(void) {
     RUN(enable_sets_raw_mode_and_restore_reinstates_it);
     RUN(non_terminal_descriptors_are_refused);
+    RUN(isig_can_be_toggled_without_leaving_raw_mode);
     return oi_test_report();
 }

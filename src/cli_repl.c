@@ -1066,12 +1066,25 @@ have_parsed_command:
                 const char *compact_body =
                     oi_json_writer_data(compact_writer, &compact_body_len);
                 struct oi_cli_compact_result compact_result;
-                status = oi_cli_compact_run(
-                    client, reactor, oi_cli_conversation_arena(conversation),
-                    signal_fd, compact_body, compact_body_len,
-                    &compact_result);
+                int compact_result_ready = 0;
+                status = oi_cli_terminal_set_isig(&composer.terminal, 1);
+                if (status == OI_OK) {
+                    status = oi_cli_compact_run(
+                        client, reactor,
+                        oi_cli_conversation_arena(conversation), signal_fd,
+                        compact_body, compact_body_len, &compact_result);
+                    compact_result_ready = status == OI_OK;
+                    oi_status restore_status =
+                        oi_cli_terminal_set_isig(&composer.terminal, 0);
+                    if (status == OI_OK && restore_status != OI_OK) {
+                        status = restore_status;
+                    }
+                }
                 oi_json_writer_destroy(compact_writer);
                 if (status != OI_OK) {
+                    if (compact_result_ready) {
+                        oi_cli_compact_result_free(&compact_result);
+                    }
                     free(prompt);
                     break;
                 }
@@ -1136,14 +1149,13 @@ have_parsed_command:
                     free(prompt);
                     continue;
                 }
-                /* Cannot fail for reasons outside programmer error (no
-                 * I/O, prefix_count already validated against this exact
-                 * messages list) -- once the durable append above has
-                 * succeeded, breaking here rather than pretending to
-                 * recover is deliberate: silently continuing with durable
-                 * and live state out of lock-step would be worse. */
-                status = oi_cli_conversation_apply_checkpoint(
-                    conversation, prefix_count, compact_result.summary,
+                /* Allocation-free ownership transfer: compact_result already
+                 * owns the summary buffer, so after the durable append there
+                 * is no resource-exhaustion failure that can leave durable
+                 * and live state out of lock-step. */
+                status =
+                    oi_cli_conversation_apply_checkpoint_take_summary(
+                    conversation, prefix_count, &compact_result.summary,
                     compact_result.summary_len);
                 size_t compacted_turns = total_turns - keep_turns;
                 oi_cli_compact_result_free(&compact_result);

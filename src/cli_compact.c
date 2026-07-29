@@ -389,6 +389,10 @@ oi_status oi_cli_compact_run(oi_llm_client *client, oi_reactor *reactor,
         if (oi_reactor_step(reactor, -1, &step_status) < 0) {
             state.status = step_status;
             state.done = 1;
+            if (state.request != NULL) {
+                oi_llm_request_cancel(state.request);
+                state.request = NULL;
+            }
         }
     }
 

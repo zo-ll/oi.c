@@ -1378,6 +1378,48 @@ TEST(checkpoint_can_consume_the_entire_message_list) {
     oi_reactor_destroy(reactor);
 }
 
+TEST(checkpoint_can_take_an_existing_summary_allocation) {
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = 9,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    oi_cli_conversation *conversation = NULL;
+    char *summary = malloc(14);
+
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+    CHECK(client != NULL);
+    CHECK(summary != NULL);
+    if (summary != NULL) {
+        memcpy(summary, "owned summary", 14);
+    }
+    build_conversation_with_two_turns(client, reactor, arena, tools,
+                                      &conversation);
+
+    CHECK_EQ(oi_cli_conversation_apply_checkpoint_take_summary(
+                 conversation, 2, &summary, 13),
+             OI_OK);
+    CHECK(summary == NULL);
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    CHECK_STREQ(messages->items[0].content.data, "owned summary");
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+}
+
 TEST(checkpoint_rejects_invalid_prefix_counts) {
     oi_reactor *reactor = oi_reactor_create();
     oi_arena *arena = oi_arena_create(64 * 1024);
@@ -1502,6 +1544,7 @@ int main(void) {
     RUN(steer_before_any_tool_starts_skips_them_all);
     RUN(checkpoint_splices_a_prefix_into_one_assistant_message);
     RUN(checkpoint_can_consume_the_entire_message_list);
+    RUN(checkpoint_can_take_an_existing_summary_allocation);
     RUN(checkpoint_rejects_invalid_prefix_counts);
     RUN(checkpoint_is_rejected_while_busy);
     return oi_test_report();

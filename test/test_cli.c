@@ -198,9 +198,9 @@ struct slow_mock_turn {
  * before the test could ever send the signal. Later turns typically use
  * delay_seconds=0 to verify the REPL is still usable after a cancel.
  */
-static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
-                                    size_t turn_count,
-                                    unsigned short *out_port) {
+static pid_t start_slow_mock_server_with_notify(
+    const struct slow_mock_turn *turns, size_t turn_count,
+    unsigned short *out_port, int accepted_notify_fd) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(listen_fd >= 0);
     int opt = 1;
@@ -236,6 +236,12 @@ static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
                 break;
             }
             drain_request(cfd, -1);
+            if (accepted_notify_fd >= 0) {
+                char notification = 'A';
+                ssize_t unused =
+                    write(accepted_notify_fd, &notification, 1);
+                (void)unused;
+            }
             if (turns[i].delay_seconds > 0) {
                 sleep((unsigned)turns[i].delay_seconds);
             }
@@ -250,11 +256,20 @@ static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
             }
             close(cfd);
         }
+        if (accepted_notify_fd >= 0) {
+            close(accepted_notify_fd);
+        }
         close(listen_fd);
         _exit(0);
     }
     close(listen_fd);
     return pid;
+}
+
+static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
+                                    size_t turn_count,
+                                    unsigned short *out_port) {
+    return start_slow_mock_server_with_notify(turns, turn_count, out_port, -1);
 }
 
 /*
@@ -421,6 +436,19 @@ static int write_interactive(int fd, const char *data, size_t len) {
             return 0;
         }
         written += (size_t)result;
+    }
+    return 1;
+}
+
+static int read_exact(int fd, char *data, size_t len) {
+    size_t received = 0;
+
+    while (received < len) {
+        ssize_t result = read(fd, data + received, len - received);
+        if (result <= 0) {
+            return 0;
+        }
+        received += (size_t)result;
     }
     return 1;
 }
@@ -4151,6 +4179,102 @@ TEST(compact_failure_leaves_durable_and_live_state_untouched) {
     unlink(capture_path);
 }
 
+TEST(typed_ctrl_c_cancels_compaction_and_returns_to_the_prompt) {
+    size_t first_len;
+    size_t second_len;
+    size_t summary_len;
+    size_t third_len;
+    char *first = build_chunked_response(
+        compact_first_sse, strlen(compact_first_sse), "HTTP/1.1 200 OK",
+        &first_len);
+    char *second = build_chunked_response(
+        compact_second_sse, strlen(compact_second_sse), "HTTP/1.1 200 OK",
+        &second_len);
+    char *summary = build_chunked_response(
+        compact_summary_sse, strlen(compact_summary_sse), "HTTP/1.1 200 OK",
+        &summary_len);
+    char *third = build_chunked_response(
+        compact_third_sse, strlen(compact_third_sse), "HTTP/1.1 200 OK",
+        &third_len);
+    struct slow_mock_turn turns[4] = {
+        {first, first_len, 0},
+        {second, second_len, 0},
+        {summary, summary_len, 3},
+        {third, third_len, 0},
+    };
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    int accepted_pipe[2] = {-1, -1};
+    struct interactive_result result;
+    char session_dir[] = "/tmp";
+    char session_name[64];
+    char log_path[160];
+
+    snprintf(session_name, sizeof session_name, "oi-cli-compact-ctrl-c-%d",
+             (int)getpid());
+    snprintf(log_path, sizeof log_path, "%s/%s.oilog", session_dir,
+             session_name);
+    unlink(log_path);
+
+    CHECK_EQ(pipe(accepted_pipe), 0);
+    server = start_slow_mock_server_with_notify(turns, 4, &port,
+                                                accepted_pipe[1]);
+    close(accepted_pipe[1]);
+    accepted_pipe[1] = -1;
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_with_session(port, slave_fd, session_dir,
+                                             session_name);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "first message\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "first reply", 1));
+    CHECK(write_interactive(master_fd, "second message\r", 15));
+    CHECK(interactive_wait_for(master_fd, &result, "second reply", 1));
+
+    CHECK(write_interactive(master_fd, "/compact 1\r", 11));
+    {
+        char accepted[3];
+        CHECK(read_exact(accepted_pipe[0], accepted, sizeof accepted));
+    }
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "oi: compaction cancelled", 1));
+
+    CHECK(write_interactive(master_fd, "third message\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "third reply", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    close(accepted_pipe[0]);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+
+    {
+        struct oilog_records records;
+        const char *checkpoint_needles[] = {"\"type\":\"checkpoint\""};
+
+        oilog_records_load(log_path, &records);
+        CHECK_EQ(oilog_count(&records, checkpoint_needles, 1), (size_t)0);
+        oilog_records_free(&records);
+    }
+
+    unlink(log_path);
+    free(first);
+    free(second);
+    free(summary);
+    free(third);
+}
+
 TEST(compact_survives_restart_and_replay_shows_the_checkpoint) {
     size_t first_len;
     size_t second_len;
@@ -4429,6 +4553,7 @@ int main(void) {
     RUN(compact_reports_usage_error_and_nothing_to_compact);
     RUN(compact_typed_while_a_turn_is_active_queues_and_runs_next);
     RUN(compact_failure_leaves_durable_and_live_state_untouched);
+    RUN(typed_ctrl_c_cancels_compaction_and_returns_to_the_prompt);
     RUN(compact_survives_restart_and_replay_shows_the_checkpoint);
     return oi_test_report();
 }
