@@ -91,10 +91,24 @@ Linux uses `$XDG_STATE_HOME/oi/sessions` or `~/.local/state/oi/sessions`.
 Existing project-local `.oilog` files are imported only after selection
 and confirmation.
 
+A private per-session directory holds exactly one session, so its metadata
+cache is always the literal `metadata.json`. The flat `--session-dir` layout
+can hold multiple `<id>.oilog` files in one directory, so there the cache is
+named `<id>.metadata.json` instead, derived by replacing the `.oilog` suffix.
+Either way the cache is a rebuildable, atomically-replaced (temp file +
+`rename()`) snapshot: `history.oilog` remains authoritative, and a missing or
+corrupt cache silently rebuilds from replayed history on the next open, with
+a diagnostic printed to the session's error stream.
+
 New interactive sessions are created lazily on the first submitted message.
 Session IDs are bounded portable ASCII filename stems. Session working
 directories and models are durable; explicit `--model` overrides and updates
-the stored model. Other runtime settings remain process-scoped.
+the stored model. A brand-new session durably records its initial effective
+model and working directory as soon as it is created, even if `/model` and
+`/cwd` are never used, so a lost metadata cache can always be rebuilt exactly
+rather than falling back to the current run's defaults. `/model` and `/cwd`
+apply live and persist immediately; other runtime settings remain
+process-scoped.
 
 Records receive stable monotonic IDs. Checkpoints record their exact source
 range so a future vector index can be rebuilt without changing session files.
