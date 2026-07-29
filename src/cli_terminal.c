@@ -76,6 +76,26 @@ oi_status oi_cli_terminal_enable(struct oi_cli_terminal *terminal,
     return OI_OK;
 }
 
+oi_status oi_cli_terminal_set_isig(struct oi_cli_terminal *terminal,
+                                   int enabled) {
+    struct termios attributes;
+
+    if (terminal == NULL || !terminal->active) {
+        return OI_ERR_INVAL;
+    }
+    if (tcgetattr(terminal->input_fd, &attributes) != 0) {
+        return OI_ERR_IO;
+    }
+    if (enabled) {
+        attributes.c_lflag |= ISIG;
+    } else {
+        attributes.c_lflag &= (tcflag_t)~ISIG;
+    }
+    return tcsetattr(terminal->input_fd, TCSANOW, &attributes) == 0
+               ? OI_OK
+               : OI_ERR_IO;
+}
+
 oi_status oi_cli_terminal_restore(struct oi_cli_terminal *terminal) {
     oi_status status = OI_OK;
 

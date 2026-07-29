@@ -200,4 +200,14 @@ oi_status oi_cli_conversation_apply_checkpoint(
     oi_cli_conversation *conversation, size_t prefix_count,
     const char *summary, size_t summary_len);
 
+/*
+ * Allocation-free variant for failure-atomic persistence. `*summary` must
+ * be a heap-owned, NUL-terminated string. On success ownership moves into
+ * the conversation and `*summary` is set to NULL; on failure the caller
+ * retains ownership and the conversation is unchanged.
+ */
+oi_status oi_cli_conversation_apply_checkpoint_take_summary(
+    oi_cli_conversation *conversation, size_t prefix_count, char **summary,
+    size_t summary_len);
+
 #endif
