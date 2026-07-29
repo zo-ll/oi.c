@@ -55,6 +55,15 @@ struct oi_cli_conversation {
      * previous round.
      */
     int assistant_committed;
+    /*
+     * Set by oi_cli_conversation_steer, consulted only at the top of
+     * start_next_tool's loop body -- unlike cancel, steering never touches
+     * request/tool directly; it just changes what happens the next time
+     * that loop runs (whether entered fresh from on_llm_done or re-entered
+     * from on_tool_done), letting whatever is already running finish
+     * naturally.
+     */
+    int steering;
 };
 
 static oi_status buffer_append(struct buffer *buffer, const void *data,
@@ -519,6 +528,42 @@ static oi_status repair_dangling_tool_calls(oi_cli_conversation *conversation,
     return first_status;
 }
 
+static const char steered_tool_not_executed_text[] =
+    "[tool not executed: skipped because a new message was queued]";
+
+/*
+ * Steering's analog of repair_dangling_tool_calls, deliberately not a
+ * reuse of it: that function's wording ("cancelled while it may have
+ * already started") is simply false here. By construction, steering is
+ * only ever consulted at the top of start_next_tool's loop -- the call
+ * actively running (if any) always finishes normally through the ordinary
+ * on_tool_done path first, so every call from tool_index onward here was
+ * never started. Unlike a cancelled turn, the assistant reply that
+ * produced these tool_calls already completed normally (RESPONSE_DONE
+ * already fired), so there is no interrupted-turn bookend to add either --
+ * the caller finishes the turn with OI_OK once this returns OI_OK.
+ */
+static oi_status skip_steered_tool_calls(oi_cli_conversation *conversation) {
+    const struct oi_cli_message *assistant =
+        &conversation->messages.items[conversation->assistant_message_index];
+    const struct oi_cli_tool_call_value *tool_calls = assistant->tool_calls;
+    size_t tool_calls_len = assistant->tool_calls_len;
+    oi_status first_status = OI_OK;
+    size_t i;
+
+    for (i = conversation->tool_index; i < tool_calls_len; i++) {
+        oi_status st = commit_tool_text(
+            conversation, &tool_calls[i], steered_tool_not_executed_text,
+            sizeof steered_tool_not_executed_text - 1,
+            OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED, NULL, 0, 0,
+            /*is_repair=*/0);
+        if (st != OI_OK && first_status == OI_OK) {
+            first_status = st;
+        }
+    }
+    return first_status;
+}
+
 static oi_tool_decision always_stage(const char *tool_name,
                                      const oi_json_value *args,
                                      void *user_data) {
@@ -594,6 +639,20 @@ static void start_next_tool(oi_cli_conversation *conversation) {
         const struct oi_cli_message *assistant =
             &conversation->messages
                  .items[conversation->assistant_message_index];
+        if (conversation->steering) {
+            /* Consulted here and only here -- entered fresh from
+             * on_llm_done (tool_index == 0) or re-entered from
+             * on_tool_done (tool_index already past whatever just
+             * finished normally) -- so it doesn't matter whether steering
+             * was requested mid-stream, mid-tool, or between rounds: any
+             * remaining tool_calls this round are skipped, and no new
+             * model round starts either (one more round would only
+             * produce more tool_calls that get skipped right back here on
+             * the next re-entry, at the cost of a wasted request). */
+            oi_status st = skip_steered_tool_calls(conversation);
+            finish_turn(conversation, st != OI_OK ? st : OI_OK);
+            return;
+        }
         if (conversation->tool_index >= assistant->tool_calls_len) {
             oi_status st = start_model_request(conversation);
             if (st != OI_OK) {
@@ -909,6 +968,7 @@ oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
     conversation->http_status = 0;
     conversation->model_steps = 0;
     conversation->cancelled = 0;
+    conversation->steering = 0;
     conversation->busy = 1;
 
     struct oi_cli_message user;
@@ -1049,6 +1109,18 @@ int oi_cli_conversation_is_busy(
 int oi_cli_conversation_was_cancelled(
     const oi_cli_conversation *conversation) {
     return conversation != NULL && conversation->cancelled;
+}
+
+void oi_cli_conversation_steer(oi_cli_conversation *conversation) {
+    if (conversation == NULL || !conversation->busy) {
+        return;
+    }
+    conversation->steering = 1;
+}
+
+int oi_cli_conversation_is_steering(
+    const oi_cli_conversation *conversation) {
+    return conversation != NULL && conversation->steering;
 }
 
 oi_status oi_cli_conversation_last_status(

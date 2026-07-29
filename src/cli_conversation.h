@@ -112,6 +112,17 @@ oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
                                     size_t content_len);
 void oi_cli_conversation_cancel(oi_cli_conversation *conversation);
 
+/*
+ * Requests that the current turn stop starting anything new (no further
+ * tool calls, no further model rounds) as soon as it reaches its own next
+ * safe point -- unlike oi_cli_conversation_cancel, this never touches
+ * whatever request/tool is already in flight; that's left to finish
+ * naturally. Idempotent; a no-op if the conversation isn't busy. Reset at
+ * the start of the next oi_cli_conversation_start.
+ */
+void oi_cli_conversation_steer(oi_cli_conversation *conversation);
+int oi_cli_conversation_is_steering(const oi_cli_conversation *conversation);
+
 int oi_cli_conversation_is_busy(const oi_cli_conversation *conversation);
 /*
  * True only when the most recent finished turn ended via

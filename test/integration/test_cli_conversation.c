@@ -32,6 +32,13 @@ struct event_sink {
     int tool_outcome_has_raw[8];
     int tool_outcome_count;
     oi_cli_conversation **cancel_on_tool_starting;
+    /* Reentrantly steers (not cancels) from within the named event, for
+     * tests exercising oi_cli_conversation_steer's single check point
+     * without needing precise external timing -- mirrors
+     * cancel_on_tool_starting's existing reentrancy pattern. */
+    oi_cli_conversation **steer_on_response_done;
+    oi_cli_conversation **steer_on_tool_message;
+    int tool_starting_count;
 };
 
 static oi_status collect_event(
@@ -51,6 +58,9 @@ static oi_status collect_event(
                     event->as.message.has_raw_tool_output;
                 sink->tool_outcomes[sink->tool_outcome_count++] =
                     event->as.message.tool_outcome;
+            }
+            if (sink->steer_on_tool_message != NULL) {
+                oi_cli_conversation_steer(*sink->steer_on_tool_message);
             }
         }
         if (event->as.message.value->role == OI_CLI_MESSAGE_ASSISTANT &&
@@ -73,6 +83,9 @@ static oi_status collect_event(
         break;
     case OI_CLI_CONVERSATION_EVENT_RESPONSE_DONE:
         sink->response_done_count++;
+        if (sink->steer_on_response_done != NULL) {
+            oi_cli_conversation_steer(*sink->steer_on_response_done);
+        }
         break;
     case OI_CLI_CONVERSATION_EVENT_TURN_DONE:
         sink->turn_done = 1;
@@ -81,6 +94,7 @@ static oi_status collect_event(
         break;
     case OI_CLI_CONVERSATION_EVENT_TOOL_STARTING:
         sink->tool_start_position = position;
+        sink->tool_starting_count++;
         if (sink->cancel_on_tool_starting != NULL) {
             oi_cli_conversation_cancel(*sink->cancel_on_tool_starting);
         }
@@ -691,6 +705,274 @@ TEST(set_model_affects_only_the_next_request) {
     mock_api_stop(&api);
 }
 
+TEST(steer_after_a_tool_completes_skips_the_next_one) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf one\\\"}\"}},"
+        "{\"index\":1,\"id\":\"call-2\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf two\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[1] = {
+        {NULL, first_response, 11},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 1));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    oi_cli_conversation *conversation = NULL;
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+        .steer_on_tool_message = &conversation,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 5000,
+        .permission = allow_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_OK);
+    CHECK(!oi_cli_conversation_was_cancelled(conversation));
+
+    /* Steering fired reentrantly from call-1's own TOOL message commit
+     * (before start_next_tool ever re-enters for call-2), so call-1 must
+     * have run for real (COMPLETED) while call-2 never started at all. */
+    CHECK_EQ(sink.tool_starting_count, 1);
+    CHECK_EQ(sink.tool_outcome_count, 2);
+    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_COMPLETED);
+    CHECK_EQ(sink.tool_outcomes[1], OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED);
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    CHECK_EQ(messages->len, 4);
+    CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_TOOL);
+    CHECK_STREQ(messages->items[2].tool_call_id.data, "call-1");
+    CHECK(strstr(messages->items[2].content.data, "one") != NULL);
+    CHECK_EQ(messages->items[3].role, OI_CLI_MESSAGE_TOOL);
+    CHECK_STREQ(messages->items[3].tool_call_id.data, "call-2");
+    CHECK(strstr(messages->items[3].content.data, "skipped") != NULL);
+
+    /* No interrupted-turn bookend: RESPONSE_DONE already fired for real,
+     * unlike a genuine cancel. */
+    CHECK_EQ(messages->items[3].role, OI_CLI_MESSAGE_TOOL);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
+TEST(steer_after_the_only_tool_prevents_a_second_model_round) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf one\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *second_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"should never be requested\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[2] = {
+        {NULL, first_response, 11},
+        {NULL, second_response, 11},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 2));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    oi_cli_conversation *conversation = NULL;
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+        .steer_on_tool_message = &conversation,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 5000,
+        .permission = allow_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_OK);
+    CHECK_EQ(sink.tool_starting_count, 1);
+    CHECK_EQ(sink.tool_outcome_count, 1);
+    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_COMPLETED);
+
+    /* Give the reactor a few more idle steps: if steering had failed to
+     * suppress the follow-up model round, the second request would show
+     * up here. */
+    for (int i = 0; i < 5; i++) {
+        oi_status step_status;
+        oi_reactor_step(reactor, 50, &step_status);
+    }
+    {
+        size_t len = 0;
+        char *second_request = mock_api_request(&api, 1, &len);
+        CHECK(second_request == NULL);
+        free(second_request);
+    }
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
+TEST(steer_before_any_tool_starts_skips_them_all) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf ran\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[1] = {
+        {NULL, first_response, 11},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 1));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    oi_cli_conversation *conversation = NULL;
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+        .steer_on_response_done = &conversation,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 5000,
+        .permission = allow_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_OK);
+    CHECK(!oi_cli_conversation_was_cancelled(conversation));
+
+    /* Steered before start_next_tool ever ran for the first time (from
+     * RESPONSE_DONE, which fires before it): the call never started at
+     * all, not even staged. */
+    CHECK_EQ(sink.tool_starting_count, 0);
+    CHECK_EQ(sink.tool_output_position, -1);
+    CHECK_EQ(sink.tool_outcome_count, 1);
+    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED);
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    CHECK_EQ(messages->len, 3);
+    CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_TOOL);
+    CHECK_STREQ(messages->items[2].tool_call_id.data, "call-1");
+    CHECK(strstr(messages->items[2].content.data, "skipped") != NULL);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
 int main(void) {
     RUN(start_is_event_driven_and_preserves_context);
     RUN(tool_start_boundary_precedes_process_output);
@@ -698,5 +980,8 @@ int main(void) {
     RUN(cancel_while_tool_running_repairs_messages);
     RUN(cancel_from_within_tool_starting_event);
     RUN(set_model_affects_only_the_next_request);
+    RUN(steer_after_a_tool_completes_skips_the_next_one);
+    RUN(steer_after_the_only_tool_prevents_a_second_model_round);
+    RUN(steer_before_any_tool_starts_skips_them_all);
     return oi_test_report();
 }
