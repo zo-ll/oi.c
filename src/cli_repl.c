@@ -189,6 +189,8 @@ static const char busy_refused_text[] =
     "reaches a safe point\n";
 static const char busy_queued_text[] =
     "oi: queued -- will run once the current turn reaches a safe point\n";
+static const char pending_discarded_text[] =
+    "oi: queued input discarded and restored to your draft\n";
 
 static void report_busy_io_error(struct repl_turn_input_context *context,
                                  int wrote_ok) {
@@ -345,6 +347,44 @@ static void handle_busy_submit(struct repl_turn_input_context *context) {
     }
 }
 
+/*
+ * Ctrl+C during a turn always cancels it (handled by the caller before this
+ * runs); this handles the one additional thing that's true only when
+ * something is also queued: the pending item must not silently survive to
+ * run after a turn the user just asked to stop entirely, so it's discarded
+ * (persisted QUEUE_RESOLVED(DISCARDED), matching the schema -- there's no
+ * "abandoned" resolution) and handed back verbatim as the live draft,
+ * rather than dropped, since Ctrl+C is "stop", not "delete what I typed".
+ */
+static void discard_pending_on_cancel(struct repl_turn_input_context *context) {
+    oi_status status = OI_OK;
+
+    if (context->pending->kind == OI_CLI_REPL_PENDING_NONE) {
+        return;
+    }
+    if (context->config->persist_queue_resolved != NULL) {
+        status = context->config->persist_queue_resolved(
+            context->config->persist_queue_resolved_user_data,
+            context->pending->record_id, /*consumed=*/0);
+    }
+    if (status == OI_OK) {
+        status = oi_cli_composer_set_draft(context->composer,
+                                           context->pending->text,
+                                           context->pending->text_len);
+    }
+    repl_pending_free(context->pending);
+    if (status != OI_OK) {
+        if (context->status == OI_OK) {
+            context->status = status;
+        }
+        return;
+    }
+    context->dirty = 1;
+    report_busy_io_error(
+        context, fputs(pending_discarded_text, context->config->err) != EOF &&
+                      fflush(context->config->err) == 0);
+}
+
 static void handle_turn_input(oi_reactor *reactor, int fd, int revents,
                               void *user_data) {
     struct repl_turn_input_context *context = user_data;
@@ -367,6 +407,7 @@ static void handle_turn_input(oi_reactor *reactor, int fd, int revents,
     }
     if (action == OI_CLI_COMPOSER_ACTION_CTRL_C) {
         oi_cli_conversation_cancel(context->conversation);
+        discard_pending_on_cancel(context);
     } else if (action == OI_CLI_COMPOSER_ACTION_SUBMIT) {
         handle_busy_submit(context);
     }
@@ -786,9 +827,16 @@ have_message:
                 status = OI_OK;
                 break;
             }
-            if (oi_cli_conversation_was_cancelled(conversation)) {
+            if (turn_input_context.status == OI_OK &&
+                oi_cli_conversation_was_cancelled(conversation)) {
                 /* Ctrl+C during this turn: always recoverable, regardless
-                 * of whatever oi_status got attached to it. */
+                 * of whatever oi_status got attached to it -- but only when
+                 * nothing else went wrong. A genuine REPL-level failure
+                 * (e.g. discard_pending_on_cancel's own persist call
+                 * failing) must not be masked as an ordinary cancel; the
+                 * turn_input_context.status != OI_OK case falls through to
+                 * the generic status != OI_OK handling below instead, which
+                 * reports it properly. */
                 if (fputs("oi: cancelled\n", config->err) == EOF ||
                     fflush(config->err) != 0) {
                     status = OI_ERR_IO;

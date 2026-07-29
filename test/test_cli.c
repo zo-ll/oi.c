@@ -2251,6 +2251,140 @@ TEST(queued_command_while_busy_resolves_discarded_and_dispatches_live) {
     }
 }
 
+TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"recovered\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[1];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    /* A generous delay: Ctrl+C only needs to land while the turn is
+     * genuinely still in flight, not for the full delay to elapse. */
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].delay_seconds = 3;
+    server = start_slow_mock_server(turns, 1, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-queue-ctrlc-%d",
+             (int)getpid());
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+
+    /* The composer only redraws once per reactor step, after any decoded
+     * SUBMIT has already been handled -- since handle_busy_submit commits
+     * and clears the draft before that redraw fires, "world" is never
+     * actually echoed while being typed here (the whole "world\r" is
+     * decoded and submitted within a single step). It only appears once
+     * it's restored below. */
+    CHECK(write_interactive(master_fd, "world\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+
+    /* Ctrl+C cancels the turn AND discards the queued item -- restoring it
+     * as a live, editable draft rather than either silently running it or
+     * dropping it. */
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(interactive_wait_for(
+        master_fd, &result, "oi: queued input discarded", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
+    /* "world" is echoed here for the only time in this whole session, as
+     * the restored draft is redrawn -- proving it came back rather than
+     * being dropped. */
+    CHECK(interactive_wait_for(master_fd, &result, "world", 1));
+
+    /* The restored draft is a normal, still-open line: clear it (Ctrl+C is
+     * safe now, no turn left to cancel) before Ctrl+D, which otherwise
+     * deletes forward instead of exiting when the draft isn't empty. */
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    free(reply);
+
+    {
+        DIR *directory = opendir(session_root);
+        struct dirent *entry;
+        char session_path[512] = {0};
+        char metadata_path[640] = {0};
+        char history_path[640] = {0};
+        size_t sessions_found = 0;
+        struct oilog_records records;
+        size_t queued_index;
+        size_t resolved_index;
+        size_t resumed_index;
+        const char *queued_needles[] = {"\"type\":\"queued_input\"",
+                                        "\"content\":\"world\""};
+        const char *resolved_needles[] = {"\"type\":\"queue_resolved\"",
+                                          "\"resolution\":\"discarded\""};
+        const char *resumed_needles[] = {"\"type\":\"message\"",
+                                         "\"role\":\"user\"",
+                                         "\"content\":\"world\""};
+
+        CHECK(directory != NULL);
+        while (directory != NULL && (entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            sessions_found++;
+            snprintf(session_path, sizeof session_path, "%s/%s",
+                     session_root, entry->d_name);
+            snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+                     session_path);
+            snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                     session_path);
+        }
+        if (directory != NULL) {
+            closedir(directory);
+        }
+        CHECK_EQ(sessions_found, 1);
+
+        oilog_records_load(history_path, &records);
+
+        queued_index = oilog_find(&records, 0, queued_needles, 2);
+        CHECK(queued_index != SIZE_MAX);
+        resolved_index =
+            oilog_find(&records, queued_index + 1, resolved_needles, 2);
+        CHECK(resolved_index != SIZE_MAX);
+        CHECK_EQ(oilog_record_turn_id(records.items[queued_index]),
+                 oilog_record_turn_id(records.items[resolved_index]));
+
+        /* The discarded item must never actually run as a real turn -- no
+         * matching user message record should exist anywhere in the log. */
+        resumed_index = oilog_find(&records, 0, resumed_needles, 3);
+        CHECK(resumed_index == SIZE_MAX);
+
+        oilog_records_free(&records);
+
+        unlink(metadata_path);
+        unlink(history_path);
+        rmdir(session_path);
+        rmdir(session_root);
+    }
+}
+
 TEST(sigterm_during_a_turn_terminates_cleanly) {
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -2693,6 +2827,7 @@ int main(void) {
     RUN(busy_submit_is_queued_and_a_second_one_is_refused);
     RUN(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids);
     RUN(queued_command_while_busy_resolves_discarded_and_dispatches_live);
+    RUN(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);

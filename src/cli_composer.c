@@ -447,3 +447,11 @@ oi_status oi_cli_composer_commit_draft(struct oi_cli_composer *composer,
     }
     return oi_cli_prompt_state_commit(&composer->state, out_text, out_len);
 }
+
+oi_status oi_cli_composer_set_draft(struct oi_cli_composer *composer,
+                                    const char *text, size_t text_len) {
+    if (composer == NULL) {
+        return OI_ERR_INVAL;
+    }
+    return oi_cli_editor_set(&composer->state.editor, text, text_len);
+}

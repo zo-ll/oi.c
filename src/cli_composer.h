@@ -136,4 +136,14 @@ oi_status oi_cli_composer_redraw(struct oi_cli_composer *composer);
 oi_status oi_cli_composer_commit_draft(struct oi_cli_composer *composer,
                                        char **out_text, size_t *out_len);
 
+/*
+ * Overwrites the current draft outright (e.g. to restore a just-discarded
+ * queued item after Ctrl+C) -- unlike commit_draft, this doesn't touch
+ * input history and isn't tied to any prior submit; it's a plain replace.
+ * Caller is responsible for redrawing afterward (e.g. via
+ * oi_cli_composer_redraw).
+ */
+oi_status oi_cli_composer_set_draft(struct oi_cli_composer *composer,
+                                    const char *text, size_t text_len);
+
 #endif
