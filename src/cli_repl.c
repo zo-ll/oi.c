@@ -9,9 +9,9 @@
 
 #include "cli_command_dispatch.h"
 #include "cli_commands.h"
+#include "cli_composer.h"
 #include "cli_input_history.h"
 #include "cli_present.h"
-#include "cli_prompt.h"
 
 #include <limits.h>
 #include <signal.h>
@@ -73,9 +73,9 @@ static void handle_turn_signal(oi_reactor *reactor, int fd, int revents,
         switch (info.ssi_signo) {
         case SIGWINCH:
             /* No editor frame is on screen during a turn; the width is
-             * re-read fresh at the start of the next oi_cli_prompt_read
-             * regardless (matches issue #23's own reasoning), so there is
-             * nothing to do here. */
+             * re-read fresh at the start of the next
+             * oi_cli_composer_wait_submit regardless (matches issue #23's
+             * own reasoning), so there is nothing to do here. */
             break;
         case SIGINT:
             oi_cli_conversation_cancel(context->conversation);
@@ -168,6 +168,8 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
                           const struct oi_cli_repl_config *config) {
     struct oi_cli_input_history input_history;
     struct oi_cli_present present;
+    struct oi_cli_composer composer;
+    int composer_initialized = 0;
     struct oi_cli_conversation_config conversation_config;
     oi_cli_conversation *conversation = NULL;
     struct oi_cli_string current_model_storage = {0};
@@ -208,6 +210,16 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         goto cleanup_history;
     }
 
+    /* Raw mode/bracketed paste now spans the whole REPL run, not each
+     * prompt read: reading and redrawing terminal input during a turn
+     * needs raw mode active during the turn too. */
+    status = oi_cli_composer_init(&composer, config->input_fd,
+                                  config->output_fd, &input_history);
+    if (status != OI_OK) {
+        goto cleanup_present;
+    }
+    composer_initialized = 1;
+
     {
         sigset_t signal_mask;
 
@@ -218,10 +230,10 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         sigaddset(&signal_mask, SIGHUP);
         /* Graceful degradation, never a hard failure: if blocking the
          * signals or creating the signalfd fails for any reason, signal_fd
-         * stays -1, which oi_cli_prompt_read already treats as "signal
-         * handling unavailable" -- the REPL still works exactly as it does
-         * without this feature (just without live resize, and without
-         * Ctrl+C/SIGTERM/SIGHUP being caught cleanly). */
+         * stays -1, which oi_cli_composer_wait_submit already treats as
+         * "signal handling unavailable" -- the REPL still works exactly as
+         * it does without this feature (just without live resize, and
+         * without Ctrl+C/SIGTERM/SIGHUP being caught cleanly). */
         if (sigprocmask(SIG_BLOCK, &signal_mask, NULL) == 0) {
             signal_fd =
                 signalfd(-1, &signal_mask, SFD_NONBLOCK | SFD_CLOEXEC);
@@ -250,9 +262,9 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         int terminate_signal = 0;
         struct oi_cli_command_parse parsed;
 
-        status = oi_cli_prompt_read(
-            config->input_fd, config->output_fd, signal_fd, &input_history,
-            &prompt, &prompt_len, &exit_requested, &terminate_signal);
+        status = oi_cli_composer_wait_submit(
+            &composer, signal_fd, &prompt, &prompt_len, &exit_requested,
+            &terminate_signal);
         /* No turn is active at this point in the loop (we're between
          * turns, about to read the next prompt), so a terminate signal
          * here needs no conversation cancellation -- just end cleanly,
@@ -363,7 +375,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
                 /* SIGTERM/SIGHUP: the conversation was already cancelled
                  * above; clean up and exit regardless of anything else.
                  * Report a clean exit (OI_OK), matching the idle-prompt
-                 * SIGTERM/SIGHUP path (oi_cli_prompt_read's own
+                 * SIGTERM/SIGHUP path (oi_cli_composer_wait_submit's own
                  * terminate_signal out-param leaves its return status
                  * OI_OK) rather than leaking the cancellation's own
                  * OI_ERR_CLOSED as if the turn itself had failed. */
@@ -405,6 +417,10 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         close(signal_fd);
     }
     oi_cli_conversation_destroy(conversation);
+    if (composer_initialized) {
+        oi_cli_composer_free(&composer);
+    }
+cleanup_present:
     oi_cli_present_free(&present);
 cleanup_history:
     oi_cli_input_history_free(&input_history);

@@ -4,12 +4,7 @@
  * (timerfd, pidfd). */
 #define _GNU_SOURCE
 
-#include "cli_prompt.h"
-
-#include "cli_input.h"
-#include "cli_prompt_state.h"
-#include "cli_render.h"
-#include "cli_terminal.h"
+#include "cli_composer.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -20,7 +15,6 @@
 #include <sys/signalfd.h>
 #include <unistd.h>
 
-#define OI_CLI_PROMPT_INPUT_CAP 4096U
 #define OI_CLI_ESCAPE_TIMEOUT_MS 40
 
 static size_t terminal_columns(int fd) {
@@ -49,12 +43,13 @@ static void consume_input(unsigned char *input, size_t *input_len,
  * SIGWINCH: there is no point redrawing a frame the caller is about to
  * tear down.
  */
-struct oi_cli_prompt_signals {
+struct oi_cli_composer_signals {
     int resize;
     int terminate_signal;
 };
 
-static void drain_signals(int signal_fd, struct oi_cli_prompt_signals *out) {
+static void drain_signals(int signal_fd,
+                          struct oi_cli_composer_signals *out) {
     struct signalfd_siginfo info;
 
     memset(out, 0, sizeof *out);
@@ -77,21 +72,22 @@ static void drain_signals(int signal_fd, struct oi_cli_prompt_signals *out) {
     }
 }
 
-static oi_status handle_resize(int output_fd, struct oi_cli_render *render,
-                               const struct oi_cli_prompt_state *state) {
-    oi_cli_render_set_columns(render, terminal_columns(output_fd));
+static oi_status handle_resize(struct oi_cli_composer *composer) {
+    oi_cli_render_set_columns(&composer->render,
+                              terminal_columns(composer->output_fd));
     return oi_cli_render_draw_commands(
-        render, &state->editor, state->command_matches,
-        state->command_match_count, state->command_selection);
+        &composer->render, &composer->state.editor,
+        composer->state.command_matches, composer->state.command_match_count,
+        composer->state.command_selection);
 }
 
-static oi_status apply_event(struct oi_cli_prompt_state *state,
-                             struct oi_cli_render *render,
+static oi_status apply_event(struct oi_cli_composer *composer,
                              const struct oi_cli_input_event *event,
                              int *out_done, char **out_text, size_t *out_len,
                              int *out_exit) {
     enum oi_cli_prompt_action action;
-    oi_status status = oi_cli_prompt_state_apply(state, event, &action);
+    oi_status status =
+        oi_cli_prompt_state_apply(&composer->state, event, &action);
 
     if (status != OI_OK) {
         return status;
@@ -101,10 +97,13 @@ static oi_status apply_event(struct oi_cli_prompt_state *state,
         return OI_OK;
     case OI_CLI_PROMPT_ACTION_REDRAW:
         return oi_cli_render_draw_commands(
-            render, &state->editor, state->command_matches,
-            state->command_match_count, state->command_selection);
+            &composer->render, &composer->state.editor,
+            composer->state.command_matches,
+            composer->state.command_match_count,
+            composer->state.command_selection);
     case OI_CLI_PROMPT_ACTION_SUBMIT:
-        status = oi_cli_prompt_state_commit(state, out_text, out_len);
+        status = oi_cli_prompt_state_commit(&composer->state, out_text,
+                                            out_len);
         if (status == OI_OK) {
             *out_done = 1;
         }
@@ -117,49 +116,67 @@ static oi_status apply_event(struct oi_cli_prompt_state *state,
     return OI_ERR_INVAL;
 }
 
-oi_status oi_cli_prompt_read(int input_fd, int output_fd, int signal_fd,
-                             struct oi_cli_input_history *history,
-                             char **out_text, size_t *out_len, int *out_exit,
-                             int *out_terminate_signal) {
-    struct oi_cli_terminal terminal;
-    struct oi_cli_input_decoder decoder;
-    struct oi_cli_prompt_state state;
-    struct oi_cli_render render;
-    unsigned char input[OI_CLI_PROMPT_INPUT_CAP];
-    size_t input_len = 0;
-    int state_initialized = 0;
-    int render_initialized = 0;
+oi_status oi_cli_composer_init(struct oi_cli_composer *composer, int input_fd,
+                               int output_fd,
+                               struct oi_cli_input_history *history) {
+    oi_status status;
+
+    if (composer == NULL || input_fd < 0 || output_fd < 0 ||
+        history == NULL) {
+        return OI_ERR_INVAL;
+    }
+    composer->input_fd = input_fd;
+    composer->output_fd = output_fd;
+    composer->input_len = 0;
+    oi_cli_terminal_init(&composer->terminal);
+    oi_cli_input_decoder_init(&composer->decoder);
+
+    status = oi_cli_terminal_enable(&composer->terminal, input_fd, output_fd);
+    if (status != OI_OK) {
+        return status;
+    }
+    status = oi_cli_prompt_state_init(&composer->state, history);
+    if (status != OI_OK) {
+        oi_cli_terminal_restore(&composer->terminal);
+        return status;
+    }
+    status = oi_cli_render_init(&composer->render, output_fd,
+                                terminal_columns(output_fd));
+    if (status != OI_OK) {
+        oi_cli_prompt_state_free(&composer->state);
+        oi_cli_terminal_restore(&composer->terminal);
+        return status;
+    }
+    return OI_OK;
+}
+
+void oi_cli_composer_free(struct oi_cli_composer *composer) {
+    if (composer == NULL) {
+        return;
+    }
+    oi_cli_prompt_state_free(&composer->state);
+    oi_cli_terminal_restore(&composer->terminal);
+}
+
+oi_status oi_cli_composer_wait_submit(struct oi_cli_composer *composer,
+                                      int signal_fd, char **out_text,
+                                      size_t *out_len, int *out_exit,
+                                      int *out_terminate_signal) {
     int done = 0;
     oi_status status;
 
-    if (input_fd < 0 || output_fd < 0 || history == NULL ||
-        out_text == NULL || out_len == NULL || out_exit == NULL ||
-        out_terminate_signal == NULL) {
+    if (composer == NULL || out_text == NULL || out_len == NULL ||
+        out_exit == NULL || out_terminate_signal == NULL) {
         return OI_ERR_INVAL;
     }
     *out_text = NULL;
     *out_len = 0;
     *out_exit = 0;
     *out_terminate_signal = 0;
-    oi_cli_terminal_init(&terminal);
-    oi_cli_input_decoder_init(&decoder);
 
-    status = oi_cli_terminal_enable(&terminal, input_fd, output_fd);
-    if (status != OI_OK) {
-        return status;
-    }
-    status = oi_cli_prompt_state_init(&state, history);
-    if (status != OI_OK) {
-        goto cleanup;
-    }
-    state_initialized = 1;
-    status =
-        oi_cli_render_init(&render, output_fd, terminal_columns(output_fd));
-    if (status != OI_OK) {
-        goto cleanup;
-    }
-    render_initialized = 1;
-    status = oi_cli_render_draw(&render, &state.editor);
+    oi_cli_render_set_columns(&composer->render,
+                              terminal_columns(composer->output_fd));
+    status = oi_cli_render_draw(&composer->render, &composer->state.editor);
     if (status != OI_OK) {
         goto cleanup;
     }
@@ -169,7 +186,7 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int signal_fd,
          * doesn't trigger an immediate, redundant second redraw. A
          * terminate signal queued in that same window must not be lost,
          * though -- honor it immediately instead. */
-        struct oi_cli_prompt_signals pending;
+        struct oi_cli_composer_signals pending;
 
         drain_signals(signal_fd, &pending);
         if (pending.terminate_signal != 0) {
@@ -179,21 +196,22 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int signal_fd,
     }
 
     while (!done) {
-        while (input_len != 0) {
+        while (composer->input_len != 0) {
             struct oi_cli_input_event event;
             size_t consumed;
 
-            status = oi_cli_input_decode(&decoder, input, input_len,
-                                         &consumed, &event);
+            status = oi_cli_input_decode(&composer->decoder, composer->input,
+                                         composer->input_len, &consumed,
+                                         &event);
             if (status == OI_ERR_AGAIN) {
                 break;
             }
             if (status != OI_OK) {
                 goto cleanup;
             }
-            consume_input(input, &input_len, consumed);
-            status = apply_event(&state, &render, &event, &done, out_text,
-                                 out_len, out_exit);
+            consume_input(composer->input, &composer->input_len, consumed);
+            status = apply_event(composer, &event, &done, out_text, out_len,
+                                 out_exit);
             if (status != OI_OK || done) {
                 break;
             }
@@ -205,13 +223,14 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int signal_fd,
         {
             struct pollfd descriptors[2];
             nfds_t ndescriptors = 1;
-            int timeout =
-                input_len != 0 && input[0] == '\x1b' && !decoder.pasting
-                    ? OI_CLI_ESCAPE_TIMEOUT_MS
-                    : -1;
+            int timeout = composer->input_len != 0 &&
+                                  composer->input[0] == '\x1b' &&
+                                  !composer->decoder.pasting
+                              ? OI_CLI_ESCAPE_TIMEOUT_MS
+                              : -1;
             int ready;
 
-            descriptors[0].fd = input_fd;
+            descriptors[0].fd = composer->input_fd;
             descriptors[0].events = POLLIN;
             descriptors[0].revents = 0;
             if (signal_fd >= 0) {
@@ -236,14 +255,15 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int signal_fd,
                 if (status != OI_OK) {
                     break;
                 }
-                consume_input(input, &input_len, consumed);
-                status = apply_event(&state, &render, &event, &done,
-                                     out_text, out_len, out_exit);
+                consume_input(composer->input, &composer->input_len,
+                             consumed);
+                status = apply_event(composer, &event, &done, out_text,
+                                     out_len, out_exit);
                 continue;
             }
             if (ndescriptors == 2 &&
                 (descriptors[1].revents & POLLIN) != 0) {
-                struct oi_cli_prompt_signals signals;
+                struct oi_cli_composer_signals signals;
 
                 drain_signals(signal_fd, &signals);
                 if (signals.terminate_signal != 0) {
@@ -252,7 +272,7 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int signal_fd,
                     continue;
                 }
                 if (signals.resize) {
-                    status = handle_resize(output_fd, &render, &state);
+                    status = handle_resize(composer);
                     if (status != OI_OK) {
                         break;
                     }
@@ -266,16 +286,18 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int signal_fd,
             if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0) {
                 ssize_t read_len;
 
-                if (input_len == sizeof input) {
+                if (composer->input_len == sizeof composer->input) {
                     status = OI_ERR_PARSE;
                     break;
                 }
                 do {
-                    read_len = read(input_fd, input + input_len,
-                                    sizeof input - input_len);
+                    read_len = read(composer->input_fd,
+                                    composer->input + composer->input_len,
+                                    sizeof composer->input -
+                                        composer->input_len);
                 } while (read_len < 0 && errno == EINTR);
                 if (read_len > 0) {
-                    input_len += (size_t)read_len;
+                    composer->input_len += (size_t)read_len;
                 } else if (read_len == 0) {
                     status = OI_ERR_CLOSED;
                     break;
@@ -288,14 +310,7 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int signal_fd,
     }
 
 cleanup:
-    if (render_initialized &&
-        oi_cli_render_finish(&render) != OI_OK && status == OI_OK) {
-        status = OI_ERR_IO;
-    }
-    if (state_initialized) {
-        oi_cli_prompt_state_free(&state);
-    }
-    if (oi_cli_terminal_restore(&terminal) != OI_OK && status == OI_OK) {
+    if (oi_cli_render_finish(&composer->render) != OI_OK && status == OI_OK) {
         status = OI_ERR_IO;
     }
     if (status != OI_OK) {

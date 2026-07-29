@@ -3,7 +3,7 @@
  * production). */
 #define _GNU_SOURCE
 
-#include "cli_prompt.h"
+#include "cli_composer.h"
 #include "test.h"
 
 #include <poll.h>
@@ -109,10 +109,17 @@ static struct prompt_result run_prompt(const char *input, size_t input_len,
         }
         oi_cli_input_history_init(&history);
         {
+            struct oi_cli_composer composer;
             int terminate_signal = 0;
-            status = oi_cli_prompt_read(slave_fd, slave_fd, -1, &history,
-                                        &text, &text_len, &exit_requested,
-                                        &terminate_signal);
+
+            status = oi_cli_composer_init(&composer, slave_fd, slave_fd,
+                                          &history);
+            if (status == OI_OK) {
+                status = oi_cli_composer_wait_submit(
+                    &composer, -1, &text, &text_len, &exit_requested,
+                    &terminate_signal);
+                oi_cli_composer_free(&composer);
+            }
         }
         result.status = status;
         result.exit_requested = exit_requested;
@@ -274,10 +281,17 @@ TEST(resize_redraws_at_the_new_width_and_preserves_submitted_text) {
         resize_fd = signalfd(-1, &winch, SFD_NONBLOCK | SFD_CLOEXEC);
         oi_cli_input_history_init(&history);
         {
+            struct oi_cli_composer composer;
             int terminate_signal = 0;
-            status = oi_cli_prompt_read(slave_fd, slave_fd, resize_fd,
-                                        &history, &text, &text_len,
-                                        &exit_requested, &terminate_signal);
+
+            status = oi_cli_composer_init(&composer, slave_fd, slave_fd,
+                                          &history);
+            if (status == OI_OK) {
+                status = oi_cli_composer_wait_submit(
+                    &composer, resize_fd, &text, &text_len, &exit_requested,
+                    &terminate_signal);
+                oi_cli_composer_free(&composer);
+            }
         }
         result.status = status;
         result.exit_requested = exit_requested;
@@ -373,9 +387,18 @@ TEST(sigterm_terminates_cleanly_and_restores_the_terminal) {
         }
         signal_fd = signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC);
         oi_cli_input_history_init(&history);
-        status = oi_cli_prompt_read(slave_fd, slave_fd, signal_fd, &history,
-                                    &text, &text_len, &exit_requested,
-                                    &terminate_signal);
+        {
+            struct oi_cli_composer composer;
+
+            status = oi_cli_composer_init(&composer, slave_fd, slave_fd,
+                                          &history);
+            if (status == OI_OK) {
+                status = oi_cli_composer_wait_submit(
+                    &composer, signal_fd, &text, &text_len, &exit_requested,
+                    &terminate_signal);
+                oi_cli_composer_free(&composer);
+            }
+        }
         result.status = status;
         result.exit_requested = exit_requested;
         result.terminate_signal = terminate_signal;

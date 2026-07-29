@@ -893,10 +893,8 @@ TEST(interactive_repl_preserves_context_across_prompts) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "first prompt\r", 13));
     CHECK(interactive_wait_for(master_fd, &result, "first-reply", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
     CHECK(write_interactive(master_fd, "second prompt\r", 14));
     CHECK(interactive_wait_for(master_fd, &result, "second-reply", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
     {
@@ -991,27 +989,12 @@ TEST(interactive_model_command_changes_the_live_model) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "/model changed-model\r", 21));
     CHECK(interactive_wait_for(master_fd, &result, "Model: changed-model", 1));
-    /* oi_cli_terminal_enable puts the fd back in raw mode via
-     * tcsetattr(..., TCSAFLUSH, ...), which discards any input received
-     * but not yet read at that moment. "Model: changed-model" is printed
-     * by command dispatch *before* the next oi_cli_prompt_read call (and
-     * therefore before that tcsetattr), so writing the next line right
-     * after seeing it races: if it lands in the queue before that
-     * tcsetattr call, it is silently discarded and never seen. Waiting
-     * for the re-enable sequence first (occurrence 2: the first was
-     * startup) proves the child is already back in raw mode. */
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
+    /* Raw mode now spans the whole session (oi_cli_terminal_enable's
+     * tcsetattr(TCSAFLUSH) only ever runs once, at startup -- see
+     * cli_composer.c), so there is no more per-command discard race here:
+     * the next line can be written as soon as the confirmation is seen. */
     CHECK(write_interactive(master_fd, "a prompt\r", 9));
     CHECK(interactive_wait_for(master_fd, &result, "changed-reply", 1));
-    /* Bracketed paste is toggled off/on around every oi_cli_prompt_read
-     * call, including the one for /model's own confirmation -- so
-     * occurrence 2 already exists in the buffer before "a prompt" is even
-     * sent. Occurrence 3 is the re-enable that starts the *next* prompt
-     * read after this turn completes; waiting for only 2 here would
-     * short-circuit without draining the turn's actual completion output,
-     * leaving it unread when \x04 is sent next (the same PTY-drain
-     * deadlock class documented on the OI_CLI_BIN fallback above). */
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
     {
@@ -1123,29 +1106,22 @@ TEST(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    /* Wait for the bracket-paste disable that oi_cli_prompt_read's cleanup
-     * unconditionally emits before returning: without this, a SIGINT sent
-     * immediately after write_interactive can race the idle-prompt's own
-     * poll() loop, which still has signal_fd registered until the read
-     * actually returns -- if both input_fd and signal_fd become readable
-     * in the same poll() call, the signal branch is checked first and the
-     * submission is never even read. Once this disable is observed,
-     * oi_cli_prompt_read has already returned and cli_repl.c's remaining
-     * turn-setup (including registering signal_fd on the reactor) runs
-     * synchronously with no further blocking until oi_reactor_step, so
-     * there is no further race once this is seen -- the mock server's 3s
-     * delay only needs to outlast that setup, not this wait. */
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004l", 1));
+    /* Wait for the "\r\n" oi_cli_composer_wait_submit's cleanup
+     * unconditionally emits (render_finish) right before it returns:
+     * without this, a SIGINT sent immediately after write_interactive can
+     * race the idle-prompt's own poll() loop, which still has signal_fd
+     * registered until the read actually returns -- if both input_fd and
+     * signal_fd become readable in the same poll() call, the signal
+     * branch is checked first and the submission is never even read.
+     * Raw mode now spans the whole session (no more per-cycle
+     * tcsetattr(TCSAFLUSH)), so once this is seen there is no further
+     * race and no further discard risk -- the mock server's 3s delay only
+     * needs to outlast the turn's own setup, not this wait. */
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
     CHECK_EQ(kill(cli, SIGINT), 0);
     CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
-    /* Wait for the fresh prompt's re-enable (occurrence 2) before writing
-     * more input -- oi_cli_terminal_enable's tcsetattr(TCSAFLUSH) discards
-     * anything queued before it runs, and "oi: cancelled" is printed
-     * before that call, not after. */
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
     {
@@ -1248,10 +1224,8 @@ TEST(sigint_cancels_a_running_tool_and_returns_to_the_prompt) {
     }
     CHECK_EQ(kill(cli, SIGINT), 0);
     CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
     {
@@ -1343,10 +1317,8 @@ TEST(recoverable_turn_error_returns_to_the_prompt) {
     CHECK(write_interactive(master_fd, "run it\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
                               1));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 3));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
     {
@@ -1432,10 +1404,12 @@ TEST(ctrl_d_during_a_turn_has_no_effect) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004l", 1));
+    /* "\r\n" (render_finish, emitted right before oi_cli_composer_wait_submit
+     * returns) proves the turn has actually started before sending Ctrl+D
+     * mid-turn, matching the same reasoning used for SIGINT above. */
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
     {
@@ -1517,13 +1491,14 @@ TEST(sigterm_during_a_turn_terminates_cleanly) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    /* Wait for the bracket-paste disable before signalling, matching the
-     * SIGINT tests above: it proves oi_cli_prompt_read has already
-     * returned and cli_repl.c's own turn setup (including registering
-     * signal_fd on the reactor) has already run, so the signal is
-     * guaranteed to be handled by the turn-time reactor callback rather
-     * than raced against the idle-prompt's own signal draining. */
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004l", 1));
+    /* Wait for "\r\n" (render_finish) before signalling, matching the
+     * SIGINT tests above: it proves oi_cli_composer_wait_submit has
+     * already returned and cli_repl.c's own turn setup (including
+     * registering signal_fd on the reactor) has already run, so the
+     * signal is guaranteed to be handled by the turn-time reactor
+     * callback rather than raced against the idle-prompt's own signal
+     * draining. */
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
     CHECK_EQ(kill(cli, SIGTERM), 0);
 
     {
@@ -1600,16 +1575,10 @@ TEST(interactive_cwd_command_changes_the_process_directory) {
     snprintf(cwd_command, sizeof cwd_command, "/cwd %s\r", target_dir);
     CHECK(write_interactive(master_fd, cwd_command, strlen(cwd_command)));
     CHECK(interactive_wait_for(master_fd, &result, "CWD:", 1));
-    /* oi_cli_terminal_enable puts the fd back in raw mode via
-     * tcsetattr(..., TCSAFLUSH, ...), which discards any input received
-     * but not yet read at that moment. The "CWD:" confirmation above is
-     * printed by command dispatch *before* the next oi_cli_prompt_read
-     * call (and therefore before that tcsetattr), so writing the next
-     * line right after seeing it races: if it lands in the queue before
-     * that tcsetattr call, it is silently discarded and never seen.
-     * Waiting for the re-enable sequence first (occurrence 2: the first
-     * was startup) proves the child is already back in raw mode. */
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
+    /* Raw mode now spans the whole session (only one tcsetattr(TCSAFLUSH)
+     * call ever, at startup), so there is no more per-command discard
+     * race here: the next line can be written as soon as the confirmation
+     * is seen. */
     CHECK(write_interactive(master_fd, "/status\r", 8));
     {
         char expected[192];
@@ -1889,7 +1858,6 @@ TEST(interactive_help_and_exit_are_dispatched_without_a_session) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "/help\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "Commands:", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 2));
     CHECK(write_interactive(master_fd, "/exit\r", 6));
     {
         int status = 0;
