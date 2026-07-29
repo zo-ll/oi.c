@@ -1052,7 +1052,7 @@ TEST(steer_after_a_tool_completes_skips_the_next_one) {
 
     const struct oi_cli_message_list *messages =
         oi_cli_conversation_messages(conversation);
-    CHECK_EQ(messages->len, 4);
+    CHECK_EQ(messages->len, 5);
     CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_TOOL);
     CHECK_STREQ(messages->items[2].tool_call_id.data, "call-1");
     CHECK(strstr(messages->items[2].content.data, "one") != NULL);
@@ -1060,9 +1060,14 @@ TEST(steer_after_a_tool_completes_skips_the_next_one) {
     CHECK_STREQ(messages->items[3].tool_call_id.data, "call-2");
     CHECK(strstr(messages->items[3].content.data, "skipped") != NULL);
 
-    /* No interrupted-turn bookend: RESPONSE_DONE already fired for real,
-     * unlike a genuine cancel. */
-    CHECK_EQ(messages->items[3].role, OI_CLI_MESSAGE_TOOL);
+    /* A steering bookend, not an interrupted-turn one: RESPONSE_DONE
+     * already fired for real, unlike a genuine cancel, but durable replay
+     * still requires an assistant message with no tool_calls to close out
+     * this turn before anything else (e.g. the queued message's own turn)
+     * can validly follow. */
+    CHECK_EQ(messages->items[4].role, OI_CLI_MESSAGE_ASSISTANT);
+    CHECK_EQ(messages->items[4].tool_calls_len, (size_t)0);
+    CHECK(strstr(messages->items[4].content.data, "queued") != NULL);
 
     oi_cli_conversation_destroy(conversation);
     oi_llm_client_destroy(client);
@@ -1233,10 +1238,16 @@ TEST(steer_before_any_tool_starts_skips_them_all) {
 
     const struct oi_cli_message_list *messages =
         oi_cli_conversation_messages(conversation);
-    CHECK_EQ(messages->len, 3);
+    CHECK_EQ(messages->len, 4);
     CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_TOOL);
     CHECK_STREQ(messages->items[2].tool_call_id.data, "call-1");
     CHECK(strstr(messages->items[2].content.data, "skipped") != NULL);
+    /* Steering's own turn-closing bookend -- see
+     * steer_after_a_tool_completes_skips_the_next_one's identical check
+     * for why durable replay requires this. */
+    CHECK_EQ(messages->items[3].role, OI_CLI_MESSAGE_ASSISTANT);
+    CHECK_EQ(messages->items[3].tool_calls_len, (size_t)0);
+    CHECK(strstr(messages->items[3].content.data, "queued") != NULL);
 
     oi_cli_conversation_destroy(conversation);
     oi_llm_client_destroy(client);

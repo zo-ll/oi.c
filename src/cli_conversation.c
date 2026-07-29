@@ -575,6 +575,42 @@ static oi_status skip_steered_tool_calls(oi_cli_conversation *conversation) {
     return first_status;
 }
 
+static const char steered_turn_ended_text[] =
+    "[assistant turn ended: a new message was queued]";
+
+/*
+ * Steering's own turn-closing bookend -- needed for exactly the reason
+ * repair_interrupted_turn's own doc comment gives (durable replay requires
+ * an assistant message with no tool_calls to return its phase machine to
+ * "expect user" before anything else can validly follow), but with
+ * accurate wording: unlike a cancelled/aborted turn, this assistant reply
+ * already completed normally (RESPONSE_DONE already fired) -- it's
+ * steering's own decision not to make the follow-up model round that
+ * would ordinarily supply that bookend, so nothing else ever will.
+ * Skipping this (as the original steering design assumed it could,
+ * reasoning "the reply already completed, so there's no interrupted-turn
+ * bookend to add") leaves the durable log with an unresolved phase the
+ * moment all of a round's tool_calls happen to have already resolved
+ * normally when steering is consulted -- the very next durable write
+ * (e.g. resolving a queued item into its own turn) then fails replay
+ * validation.
+ */
+static oi_status close_out_steered_turn(oi_cli_conversation *conversation) {
+    struct oi_cli_message message;
+    oi_status st;
+
+    oi_cli_message_init(&message);
+    st = oi_cli_message_set_assistant(&message, steered_turn_ended_text,
+                                      sizeof steered_turn_ended_text - 1);
+    if (st == OI_OK) {
+        st = commit_message(conversation, &message,
+                            OI_CLI_CONVERSATION_TOOL_NONE, NULL, 0, 0,
+                            /*is_repair=*/1);
+    }
+    oi_cli_message_free(&message);
+    return st;
+}
+
 static oi_tool_decision always_stage(const char *tool_name,
                                      const oi_json_value *args,
                                      void *user_data) {
@@ -797,9 +833,16 @@ static void start_next_tool(oi_cli_conversation *conversation) {
              * remaining tool_calls this round are skipped, and no new
              * model round starts either (one more round would only
              * produce more tool_calls that get skipped right back here on
-             * the next re-entry, at the cost of a wasted request). */
+             * the next re-entry, at the cost of a wasted request). Either
+             * way, close_out_steered_turn's bookend is still required --
+             * skipping some calls doesn't produce it, and when there was
+             * nothing left to skip (the round's only tool_call already
+             * resolved normally), nothing else would supply it at all. */
             oi_status st = skip_steered_tool_calls(conversation);
-            finish_turn(conversation, st != OI_OK ? st : OI_OK);
+            if (st == OI_OK) {
+                st = close_out_steered_turn(conversation);
+            }
+            finish_turn(conversation, st);
             return;
         }
         if (conversation->tool_index >= assistant->tool_calls_len) {

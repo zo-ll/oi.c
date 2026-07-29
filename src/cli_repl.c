@@ -14,6 +14,7 @@
 #include "cli_input_history.h"
 #include "cli_present.h"
 #include "cli_render_sanitize.h"
+#include "cli_tool_panel.h"
 
 #include <limits.h>
 #include <signal.h>
@@ -184,6 +185,15 @@ struct repl_turn_input_context {
      * borrowed pointers, which aren't guaranteed to outlive the call. */
     struct oi_cli_bytebuf permission_tool_line;
     struct oi_cli_bytebuf permission_args_line;
+    /*
+     * Live tool-execution presentation, driven by repl_conversation_event
+     * (TOOL_STARTING/_OUTPUT/a tool-role MESSAGE). Fresh (inactive) for
+     * each new turn via this struct's own zero-initialization; stays
+     * active through the rest of the turn once a tool call starts, so its
+     * last state (e.g. "shell: completed") remains visible until either
+     * another call starts in the same turn or the turn ends.
+     */
+    struct oi_cli_tool_panel panel;
 };
 
 /*
@@ -251,12 +261,34 @@ struct repl_event_context {
     struct repl_turn_input_context *turn_input;
 };
 
+/* Maps a settled tool-result outcome to the closest live-panel status --
+ * OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED covers several different reasons
+ * (denied by user, cancelled before it started, skipped by steering) that
+ * the event itself doesn't distinguish; CANCELLED is the closest single
+ * label for all of them. OUTCOME_UNKNOWN (cancelled while it may have
+ * already been running) has no better fit than FAILED. */
+static enum oi_cli_tool_panel_status tool_panel_status_for_outcome(
+    enum oi_cli_conversation_tool_outcome outcome) {
+    switch (outcome) {
+    case OI_CLI_CONVERSATION_TOOL_COMPLETED:
+        return OI_CLI_TOOL_PANEL_COMPLETED;
+    case OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN:
+        return OI_CLI_TOOL_PANEL_FAILED;
+    case OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED:
+        return OI_CLI_TOOL_PANEL_CANCELLED;
+    case OI_CLI_CONVERSATION_TOOL_NONE:
+        break;
+    }
+    return OI_CLI_TOOL_PANEL_COMPLETED;
+}
+
 static oi_status repl_conversation_event(
     const struct oi_cli_conversation_event *event, void *user_data) {
     struct repl_event_context *context = user_data;
+    struct repl_turn_input_context *turn_input = context->turn_input;
 
-    if (event->type == OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION) {
-        struct repl_turn_input_context *turn_input = context->turn_input;
+    switch (event->type) {
+    case OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION: {
         oi_status status = build_permission_header(
             &turn_input->permission_tool_line,
             &turn_input->permission_args_line,
@@ -268,6 +300,37 @@ static oi_status repl_conversation_event(
         turn_input->awaiting_permission = 1;
         turn_input->permission_selected = 0;
         turn_input->dirty = 1;
+        break;
+    }
+    case OI_CLI_CONVERSATION_EVENT_TOOL_STARTING:
+        oi_cli_tool_panel_start(&turn_input->panel,
+                                event->as.tool_starting.name->data,
+                                event->as.tool_starting.name->len);
+        turn_input->dirty = 1;
+        break;
+    case OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT: {
+        oi_status status = oi_cli_tool_panel_feed(
+            &turn_input->panel, event->as.bytes.data, event->as.bytes.len);
+        if (status != OI_OK) {
+            return status;
+        }
+        turn_input->dirty = 1;
+        break;
+    }
+    case OI_CLI_CONVERSATION_EVENT_MESSAGE:
+        if (event->as.message.value->role == OI_CLI_MESSAGE_TOOL) {
+            oi_cli_tool_panel_finish(
+                &turn_input->panel,
+                tool_panel_status_for_outcome(event->as.message.tool_outcome));
+            turn_input->dirty = 1;
+        }
+        break;
+    case OI_CLI_CONVERSATION_EVENT_ASSISTANT_DELTA:
+    case OI_CLI_CONVERSATION_EVENT_PARTIAL_ASSISTANT:
+    case OI_CLI_CONVERSATION_EVENT_RESPONSE_DONE:
+    case OI_CLI_CONVERSATION_EVENT_MODEL_ERROR:
+    case OI_CLI_CONVERSATION_EVENT_TURN_DONE:
+        break;
     }
     return oi_cli_present_event(event, context->present);
 }
@@ -1091,6 +1154,15 @@ have_message:
                         redraw_status = oi_cli_composer_draw_selector(
                             &composer, header, header_count, options, 3,
                             turn_input_context.permission_selected);
+                    } else if (turn_input_context.panel.active) {
+                        struct oi_cli_render_line
+                            panel_lines[OI_CLI_TOOL_PANEL_MAX_LINES];
+                        size_t panel_line_count = oi_cli_tool_panel_lines(
+                            &turn_input_context.panel, panel_lines,
+                            OI_CLI_TOOL_PANEL_MAX_LINES);
+
+                        redraw_status = oi_cli_composer_redraw_panel(
+                            &composer, panel_lines, panel_line_count);
                     } else {
                         redraw_status = oi_cli_composer_redraw(&composer);
                     }
@@ -1103,6 +1175,7 @@ have_message:
             }
             oi_cli_bytebuf_free(&turn_input_context.permission_tool_line);
             oi_cli_bytebuf_free(&turn_input_context.permission_args_line);
+            oi_cli_tool_panel_free(&turn_input_context.panel);
             repl_event_context.turn_input = NULL;
             if (signal_registered) {
                 oi_reactor_remove(reactor, signal_fd);
