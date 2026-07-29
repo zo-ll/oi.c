@@ -251,6 +251,58 @@ TEST(bad_arguments_are_rejected) {
     CHECK_EQ(oi_cli_render_draw(NULL, &editor), OI_ERR_INVAL);
     CHECK_EQ(oi_cli_render_draw(&render, NULL), OI_ERR_INVAL);
     CHECK_EQ(oi_cli_render_finish(NULL), OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_render_erase(NULL), OI_ERR_INVAL);
+    oi_cli_editor_free(&editor);
+}
+
+TEST(erase_is_a_no_op_before_anything_is_drawn) {
+    struct oi_cli_render render;
+    char output[8];
+    int pipe_fds[2];
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 80), OI_OK);
+    CHECK_EQ(oi_cli_render_erase(&render), OI_OK);
+    CHECK_EQ(render.previous_rows, 0);
+    /* Confirm nothing was written: closing the write end and reading
+     * should immediately see EOF (0), not any bytes. */
+    close(pipe_fds[1]);
+    CHECK_EQ(read_available(pipe_fds[0], output, sizeof output), 0);
+
+    close(pipe_fds[0]);
+}
+
+TEST(erase_clears_a_multiline_frame_and_resets_previous_rows) {
+    static const char expected[] = "\r\x1b[1A\x1b[J";
+    struct oi_cli_editor editor;
+    struct oi_cli_render render;
+    char output[128];
+    int pipe_fds[2];
+    size_t len;
+
+    CHECK_EQ(pipe(pipe_fds), 0);
+    oi_cli_editor_init(&editor);
+    CHECK_EQ(oi_cli_editor_set(&editor, "a\nb", 3), OI_OK);
+    CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 80), OI_OK);
+    CHECK_EQ(oi_cli_render_draw(&render, &editor), OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK(len > 0);
+    CHECK_EQ(render.previous_rows, 2);
+
+    CHECK_EQ(oi_cli_render_erase(&render), OI_OK);
+    len = read_available(pipe_fds[0], output, sizeof output);
+    CHECK_EQ(len, sizeof expected - 1);
+    CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
+    CHECK_EQ(render.previous_rows, 0);
+
+    /* Erasing again immediately (nothing redrawn in between) is a no-op --
+     * previous_rows is already 0, matching the "already erased" case a
+     * caller hits if a turn produces no output between two reactor steps. */
+    CHECK_EQ(oi_cli_render_erase(&render), OI_OK);
+    close(pipe_fds[1]);
+    CHECK_EQ(read_available(pipe_fds[0], output, sizeof output), 0);
+
+    close(pipe_fds[0]);
     oi_cli_editor_free(&editor);
 }
 
@@ -264,5 +316,7 @@ int main(void) {
     RUN(command_menu_is_rendered_below_the_prompt);
     RUN(second_draw_after_menu_does_not_overshoot_the_clear);
     RUN(bad_arguments_are_rejected);
+    RUN(erase_is_a_no_op_before_anything_is_drawn);
+    RUN(erase_clears_a_multiline_frame_and_resets_previous_rows);
     return oi_test_report();
 }

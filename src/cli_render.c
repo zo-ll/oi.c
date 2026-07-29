@@ -319,6 +319,35 @@ oi_status oi_cli_render_draw_commands(
                        selected_command);
 }
 
+oi_status oi_cli_render_erase(struct oi_cli_render *render) {
+    struct render_buffer buffer = {0};
+    oi_status status;
+
+    if (render == NULL || render->output_fd < 0) {
+        return OI_ERR_INVAL;
+    }
+    if (render->previous_rows == 0) {
+        return OI_OK;
+    }
+
+    status = buffer_append(&buffer, "\r", 1);
+    if (status == OI_OK && render->previous_rows > 1) {
+        status =
+            buffer_control_number(&buffer, render->previous_rows - 1, 'A');
+    }
+    if (status == OI_OK) {
+        status = buffer_append(&buffer, "\x1b[J", 3);
+    }
+    if (status == OI_OK) {
+        status = write_all(render->output_fd, buffer.data, buffer.len);
+    }
+    if (status == OI_OK) {
+        render->previous_rows = 0;
+    }
+    free(buffer.data);
+    return status;
+}
+
 oi_status oi_cli_render_finish(struct oi_cli_render *render) {
     oi_status status;
 
