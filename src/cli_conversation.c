@@ -33,6 +33,7 @@ struct oi_cli_conversation {
     oi_llm_request *request;
     oi_tool_call *tool;
     int busy;
+    int cancelled;
     oi_status last_status;
     int http_status;
     int model_steps;
@@ -433,6 +434,62 @@ static oi_status commit_tool_text(
     return st;
 }
 
+static const char cancelled_tool_unknown_text[] =
+    "[tool outcome unknown: cancelled while it may have already started]";
+static const char cancelled_tool_not_executed_text[] =
+    "[tool not executed: cancelled before it started]";
+
+/*
+ * Restores protocol validity after cancelling a running (or about-to-run)
+ * tool: the assistant message committed by on_llm_done already carries the
+ * full tool_calls array, but only calls before tool_index have a matching
+ * tool-result message. Commits a placeholder for the call at tool_index --
+ * OUTCOME_UNKNOWN (with whatever raw output it had already produced) if
+ * `first_call_may_have_started`, else NOT_EXECUTED, matching whether a
+ * process was actually spawned for it -- and a NOT_EXECUTED placeholder for
+ * each later call that never started. Makes conversation->messages
+ * immediately safe to reuse for a next turn without touching the
+ * durable-replay repair machinery at all. Captures tool_calls/tool_calls_len
+ * once, up front: each commit_tool_text call below can append to and
+ * reallocate conversation->messages.items, which would invalidate a pointer
+ * held directly into that array, but not the assistant message's own
+ * (separately-allocated, ownership-copied) tool_calls array.
+ */
+static oi_status repair_dangling_tool_calls(oi_cli_conversation *conversation,
+                                            int first_call_may_have_started) {
+    const struct oi_cli_message *assistant =
+        &conversation->messages.items[conversation->assistant_message_index];
+    const struct oi_cli_tool_call_value *tool_calls = assistant->tool_calls;
+    size_t tool_calls_len = assistant->tool_calls_len;
+    size_t cancelled_index = conversation->tool_index;
+    oi_status first_status = OI_OK;
+    size_t i;
+
+    for (i = cancelled_index; i < tool_calls_len; i++) {
+        const struct oi_cli_tool_call_value *call = &tool_calls[i];
+        oi_status st;
+
+        if (i == cancelled_index && first_call_may_have_started) {
+            st = commit_tool_text(
+                conversation, call, cancelled_tool_unknown_text,
+                sizeof cancelled_tool_unknown_text - 1,
+                OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN,
+                (const unsigned char *)conversation->tool_output.data,
+                conversation->tool_output.len, 1);
+        } else {
+            st = commit_tool_text(
+                conversation, call, cancelled_tool_not_executed_text,
+                sizeof cancelled_tool_not_executed_text - 1,
+                OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED, NULL, 0, 0);
+        }
+        if (st != OI_OK && first_status == OI_OK) {
+            first_status = st;
+        }
+    }
+    buffer_free(&conversation->tool_output);
+    return first_status;
+}
+
 static oi_tool_decision always_stage(const char *tool_name,
                                      const oi_json_value *args,
                                      void *user_data) {
@@ -552,6 +609,23 @@ static void start_next_tool(oi_cli_conversation *conversation) {
         if (st != OI_OK) {
             oi_tool_call_cancel(staged);
             finish_turn(conversation, st);
+            return;
+        }
+        if (!conversation->busy) {
+            /* The embedder's on_event callback cancelled the conversation
+             * reentrantly from within the TOOL_STARTING emit above (a
+             * supported pattern one layer down, mirroring
+             * oi_tool_call_cancel's own documented reentrancy from within
+             * its own on_output). conversation->tool is still NULL at this
+             * point, so oi_cli_conversation_cancel's own repair pass (gated
+             * on tool != NULL) never saw this call as running and skipped
+             * it -- repair it here instead (nothing was ever spawned for
+             * it, so NOT_EXECUTED, not OUTCOME_UNKNOWN), best-effort: the
+             * turn already finished and reported whatever status it had,
+             * so there is nothing left to escalate a repair failure to. */
+            (void)repair_dangling_tool_calls(conversation,
+                                             /*first_call_may_have_started=*/0);
+            oi_tool_call_cancel(staged);
             return;
         }
         conversation->tool = staged;
@@ -789,6 +863,7 @@ oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
     conversation->last_status = OI_OK;
     conversation->http_status = 0;
     conversation->model_steps = 0;
+    conversation->cancelled = 0;
     conversation->busy = 1;
 
     struct oi_cli_message user;
@@ -809,6 +884,8 @@ oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
 }
 
 void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
+    oi_status status = OI_ERR_CLOSED;
+
     if (conversation == NULL || !conversation->busy) {
         return;
     }
@@ -829,13 +906,32 @@ void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
         oi_tool_call *tool = conversation->tool;
         conversation->tool = NULL;
         oi_tool_call_cancel(tool);
+        /* Repairs conversation->messages so it stays protocol-valid: the
+         * assistant message already committed by on_llm_done carries this
+         * call (and any later ones in the same message) with no matching
+         * tool-result yet. A repair-commit failure (e.g. a durable-storage
+         * append failure) is a genuine structural problem, not an ordinary
+         * cancel -- surface it as-is instead of masking it below. */
+        status = repair_dangling_tool_calls(conversation,
+                                            /*first_call_may_have_started=*/1);
+        if (status == OI_OK) {
+            status = OI_ERR_CLOSED;
+        }
     }
-    finish_turn(conversation, OI_ERR_CLOSED);
+    if (status == OI_ERR_CLOSED) {
+        conversation->cancelled = 1;
+    }
+    finish_turn(conversation, status);
 }
 
 int oi_cli_conversation_is_busy(
     const oi_cli_conversation *conversation) {
     return conversation != NULL && conversation->busy;
+}
+
+int oi_cli_conversation_was_cancelled(
+    const oi_cli_conversation *conversation) {
+    return conversation != NULL && conversation->cancelled;
 }
 
 oi_status oi_cli_conversation_last_status(

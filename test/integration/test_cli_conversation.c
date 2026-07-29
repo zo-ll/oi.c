@@ -28,6 +28,10 @@ struct event_sink {
     int tool_message_position;
     int tool_message_has_raw;
     char last_assistant_model[64];
+    enum oi_cli_conversation_tool_outcome tool_outcomes[8];
+    int tool_outcome_has_raw[8];
+    int tool_outcome_count;
+    oi_cli_conversation **cancel_on_tool_starting;
 };
 
 static oi_status collect_event(
@@ -41,6 +45,13 @@ static oi_status collect_event(
             sink->tool_message_position = position;
             sink->tool_message_has_raw =
                 event->as.message.has_raw_tool_output;
+            if ((size_t)sink->tool_outcome_count <
+                sizeof sink->tool_outcomes / sizeof sink->tool_outcomes[0]) {
+                sink->tool_outcome_has_raw[sink->tool_outcome_count] =
+                    event->as.message.has_raw_tool_output;
+                sink->tool_outcomes[sink->tool_outcome_count++] =
+                    event->as.message.tool_outcome;
+            }
         }
         if (event->as.message.value->role == OI_CLI_MESSAGE_ASSISTANT &&
             event->as.message.model != NULL) {
@@ -70,6 +81,9 @@ static oi_status collect_event(
         break;
     case OI_CLI_CONVERSATION_EVENT_TOOL_STARTING:
         sink->tool_start_position = position;
+        if (sink->cancel_on_tool_starting != NULL) {
+            oi_cli_conversation_cancel(*sink->cancel_on_tool_starting);
+        }
         break;
     case OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT:
         if (sink->tool_output_position < 0) {
@@ -269,6 +283,301 @@ TEST(tool_start_boundary_precedes_process_output) {
     mock_api_stop(&api);
 }
 
+TEST(cancel_while_streaming_needs_no_repair) {
+    const char *response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"partial\"}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"stop\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[2] = {
+        {NULL, response, 0},
+        {NULL, response, 0},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 2));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 2,
+        .tool_timeout_ms = 1000,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(client, reactor, arena, tools,
+                                        &config, NULL, &conversation),
+             OI_OK);
+
+    /* Cancel immediately after start, before stepping the reactor at all:
+     * nothing async has had a chance to run yet, so this deterministically
+     * cancels while conversation->request != NULL and no assistant message
+     * has been committed -- no repair is needed or possible. */
+    CHECK_EQ(oi_cli_conversation_start(conversation, "question one", 12),
+             OI_OK);
+    CHECK(oi_cli_conversation_is_busy(conversation));
+    oi_cli_conversation_cancel(conversation);
+    CHECK(!oi_cli_conversation_is_busy(conversation));
+    CHECK(oi_cli_conversation_was_cancelled(conversation));
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_ERR_CLOSED);
+    CHECK_EQ(sink.tool_outcome_count, 0);
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    CHECK_EQ(messages->len, 1);
+    CHECK_STREQ(messages->items[0].content.data, "question one");
+
+    /* The conversation is still fully usable for a next turn. */
+    memset(&sink, 0, sizeof sink);
+    sink.arena = arena;
+    sink.tool_start_position = -1;
+    sink.tool_output_position = -1;
+    sink.tool_message_position = -1;
+    CHECK_EQ(oi_cli_conversation_start(conversation, "question two", 12),
+             OI_OK);
+    for (int i = 0; i < 100 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_OK);
+    CHECK(!oi_cli_conversation_was_cancelled(conversation));
+    CHECK_STREQ(sink.text, "partial");
+    {
+        size_t request_len = 0;
+        char *request = mock_api_request(&api, 0, &request_len);
+        CHECK(request != NULL);
+        CHECK(strstr(request, "question one") != NULL);
+        CHECK(strstr(request, "question two") != NULL);
+        free(request);
+    }
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
+TEST(cancel_while_tool_running_repairs_messages) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf started; sleep 2\\\"}\"}},"
+        "{\"index\":1,\"id\":\"call-2\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf second\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[1] = {
+        {NULL, first_response, 11},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 1));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 30000,
+        .permission = allow_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && sink.tool_output_position < 0; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.tool_output_position >= 0);
+    CHECK(!sink.turn_done);
+    CHECK(oi_cli_conversation_is_busy(conversation));
+
+    oi_cli_conversation_cancel(conversation);
+    CHECK(!oi_cli_conversation_is_busy(conversation));
+    CHECK(oi_cli_conversation_was_cancelled(conversation));
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_ERR_CLOSED);
+
+    CHECK_EQ(sink.tool_outcome_count, 2);
+    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN);
+    CHECK(sink.tool_outcome_has_raw[0]);
+    CHECK_EQ(sink.tool_outcomes[1], OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED);
+    CHECK(!sink.tool_outcome_has_raw[1]);
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    CHECK_EQ(messages->len, 4);
+    CHECK_EQ(messages->items[1].role, OI_CLI_MESSAGE_ASSISTANT);
+    CHECK_EQ(messages->items[1].tool_calls_len, 2);
+    CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_TOOL);
+    CHECK_STREQ(messages->items[2].tool_call_id.data, "call-1");
+    CHECK(strstr(messages->items[2].content.data, "outcome unknown") != NULL);
+    CHECK_EQ(messages->items[3].role, OI_CLI_MESSAGE_TOOL);
+    CHECK_STREQ(messages->items[3].tool_call_id.data, "call-2");
+    CHECK(strstr(messages->items[3].content.data, "not executed") != NULL);
+
+    /* No process is left running past the cancel: give the killed one a
+     * moment, then confirm no further tool output ever arrives. */
+    for (int i = 0; i < 5; i++) {
+        oi_status step_status;
+        oi_reactor_step(reactor, 50, &step_status);
+    }
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
+TEST(cancel_from_within_tool_starting_event) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"printf ran\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},"
+        "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[1] = {
+        {NULL, first_response, 11},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 1));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK(reactor != NULL);
+    CHECK(arena != NULL);
+    CHECK(tools != NULL);
+    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    CHECK(client != NULL);
+
+    oi_cli_conversation *conversation = NULL;
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+        .cancel_on_tool_starting = &conversation,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 1000,
+        .permission = allow_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK(!oi_cli_conversation_is_busy(conversation));
+    CHECK(oi_cli_conversation_was_cancelled(conversation));
+
+    /* The cancel fired reentrantly from inside the TOOL_STARTING emit,
+     * before conversation->tool was ever assigned: the tool must never
+     * have actually been spawned (no TOOL_OUTPUT), and the repair must
+     * still have happened (NOT_EXECUTED -- nothing was ever running). */
+    CHECK_EQ(sink.tool_output_position, -1);
+    CHECK_EQ(sink.tool_outcome_count, 1);
+    CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED);
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    CHECK_EQ(messages->len, 3);
+    CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_TOOL);
+    CHECK(strstr(messages->items[2].content.data, "not executed") != NULL);
+
+    /* Give the reactor a few more steps: if a process had actually been
+     * spawned despite the cancel, it would show up here. */
+    for (int i = 0; i < 5; i++) {
+        oi_status step_status;
+        oi_reactor_step(reactor, 50, &step_status);
+    }
+    CHECK_EQ(sink.tool_output_position, -1);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
 TEST(set_model_affects_only_the_next_request) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -376,6 +685,9 @@ TEST(set_model_affects_only_the_next_request) {
 int main(void) {
     RUN(start_is_event_driven_and_preserves_context);
     RUN(tool_start_boundary_precedes_process_output);
+    RUN(cancel_while_streaming_needs_no_repair);
+    RUN(cancel_while_tool_running_repairs_messages);
+    RUN(cancel_from_within_tool_starting_event);
     RUN(set_model_affects_only_the_next_request);
     return oi_test_report();
 }

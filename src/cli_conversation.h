@@ -104,6 +104,15 @@ oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
 void oi_cli_conversation_cancel(oi_cli_conversation *conversation);
 
 int oi_cli_conversation_is_busy(const oi_cli_conversation *conversation);
+/*
+ * True only when the most recent finished turn ended via
+ * oi_cli_conversation_cancel with its repair (if any) fully succeeding --
+ * i.e. an ordinary, always-recoverable user cancel, distinct from any other
+ * cause that might produce the same oi_status (e.g. OI_ERR_CLOSED can also
+ * mean a genuinely-closed LLM connection). Reset at the start of the next
+ * oi_cli_conversation_start.
+ */
+int oi_cli_conversation_was_cancelled(const oi_cli_conversation *conversation);
 oi_status oi_cli_conversation_last_status(
     const oi_cli_conversation *conversation);
 const struct oi_cli_message_list *oi_cli_conversation_messages(
