@@ -22,6 +22,7 @@
 struct prompt_result {
     int status;
     int exit_requested;
+    int terminate_signal;
     size_t text_len;
     char text[128];
 };
@@ -107,8 +108,12 @@ static struct prompt_result run_prompt(const char *input, size_t input_len,
             _exit(1);
         }
         oi_cli_input_history_init(&history);
-        status = oi_cli_prompt_read(slave_fd, slave_fd, -1, &history, &text,
-                                    &text_len, &exit_requested);
+        {
+            int terminate_signal = 0;
+            status = oi_cli_prompt_read(slave_fd, slave_fd, -1, &history,
+                                        &text, &text_len, &exit_requested,
+                                        &terminate_signal);
+        }
         result.status = status;
         result.exit_requested = exit_requested;
         result.text_len = text_len;
@@ -268,8 +273,12 @@ TEST(resize_redraws_at_the_new_width_and_preserves_submitted_text) {
         }
         resize_fd = signalfd(-1, &winch, SFD_NONBLOCK | SFD_CLOEXEC);
         oi_cli_input_history_init(&history);
-        status = oi_cli_prompt_read(slave_fd, slave_fd, resize_fd, &history,
-                                    &text, &text_len, &exit_requested);
+        {
+            int terminate_signal = 0;
+            status = oi_cli_prompt_read(slave_fd, slave_fd, resize_fd,
+                                        &history, &text, &text_len,
+                                        &exit_requested, &terminate_signal);
+        }
         result.status = status;
         result.exit_requested = exit_requested;
         result.text_len = text_len;
@@ -318,10 +327,99 @@ TEST(resize_redraws_at_the_new_width_and_preserves_submitted_text) {
     close(master_fd);
 }
 
+TEST(sigterm_terminates_cleanly_and_restores_the_terminal) {
+    struct prompt_result result;
+    struct termios original;
+    struct termios restored;
+    int result_pipe[2] = {-1, -1};
+    int master_fd = -1;
+    int slave_fd = -1;
+    pid_t child;
+
+    memset(&result, 0, sizeof result);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    CHECK_EQ(pipe(result_pipe), 0);
+    CHECK_EQ(tcgetattr(slave_fd, &original), 0);
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct oi_cli_input_history history;
+        sigset_t signals;
+        char *text = NULL;
+        size_t text_len = 0;
+        int exit_requested = 0;
+        int terminate_signal = 0;
+        int signal_fd;
+        oi_status status;
+
+        close(master_fd);
+        close(result_pipe[0]);
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
+            result.status = OI_ERR_IO;
+            (void)write_all(result_pipe[1], &result, sizeof result);
+            close(result_pipe[1]);
+            close(slave_fd);
+            _exit(1);
+        }
+        sigemptyset(&signals);
+        sigaddset(&signals, SIGTERM);
+        if (sigprocmask(SIG_BLOCK, &signals, NULL) != 0) {
+            result.status = OI_ERR_IO;
+            (void)write_all(result_pipe[1], &result, sizeof result);
+            close(result_pipe[1]);
+            close(slave_fd);
+            _exit(1);
+        }
+        signal_fd = signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC);
+        oi_cli_input_history_init(&history);
+        status = oi_cli_prompt_read(slave_fd, slave_fd, signal_fd, &history,
+                                    &text, &text_len, &exit_requested,
+                                    &terminate_signal);
+        result.status = status;
+        result.exit_requested = exit_requested;
+        result.terminate_signal = terminate_signal;
+        result.text_len = text_len;
+        if (text_len != 0 && text_len <= sizeof result.text) {
+            memcpy(result.text, text, text_len);
+        }
+        (void)write_all(result_pipe[1], &result, sizeof result);
+        free(text);
+        oi_cli_input_history_free(&history);
+        if (signal_fd >= 0) {
+            close(signal_fd);
+        }
+        close(result_pipe[1]);
+        close(slave_fd);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    wait_for_prompt_output(master_fd);
+    CHECK_EQ(kill(child, SIGTERM), 0);
+    CHECK(read_all(result_pipe[0], &result, sizeof result));
+    CHECK_EQ(result.status, OI_OK);
+    CHECK(!result.exit_requested);
+    CHECK_EQ(result.terminate_signal, SIGTERM);
+    CHECK_EQ(tcgetattr(slave_fd, &restored), 0);
+    check_restored(&original, &restored);
+
+    {
+        int child_status = 0;
+        CHECK_EQ(waitpid(child, &child_status, 0), child);
+        CHECK(WIFEXITED(child_status));
+        CHECK_EQ(WEXITSTATUS(child_status), 0);
+    }
+    close(result_pipe[0]);
+    close(slave_fd);
+    close(master_fd);
+}
+
 int main(void) {
     RUN(cursor_editing_submits_expected_text_and_restores_terminal);
     RUN(bracketed_multiline_paste_is_one_submission);
     RUN(ctrl_c_clears_and_ctrl_d_exits);
     RUN(resize_redraws_at_the_new_width_and_preserves_submitted_text);
+    RUN(sigterm_terminates_cleanly_and_restores_the_terminal);
     return oi_test_report();
 }

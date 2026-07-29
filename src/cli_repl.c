@@ -134,7 +134,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     struct oi_cli_string current_model_storage = {0};
     struct oi_cli_string *current_model;
     struct repl_setting_context setting_context;
-    int resize_fd = -1;
+    int signal_fd = -1;
     oi_status status;
 
     if (client == NULL || reactor == NULL || tools == NULL ||
@@ -170,17 +170,22 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     }
 
     {
-        sigset_t winch_mask;
+        sigset_t signal_mask;
 
-        sigemptyset(&winch_mask);
-        sigaddset(&winch_mask, SIGWINCH);
+        sigemptyset(&signal_mask);
+        sigaddset(&signal_mask, SIGWINCH);
+        sigaddset(&signal_mask, SIGINT);
+        sigaddset(&signal_mask, SIGTERM);
+        sigaddset(&signal_mask, SIGHUP);
         /* Graceful degradation, never a hard failure: if blocking the
-         * signal or creating the signalfd fails for any reason, resize_fd
-         * stays -1, which oi_cli_prompt_read already treats as "resize
-         * support unavailable" -- the REPL still works exactly as it does
-         * without this feature. */
-        if (sigprocmask(SIG_BLOCK, &winch_mask, NULL) == 0) {
-            resize_fd = signalfd(-1, &winch_mask, SFD_NONBLOCK | SFD_CLOEXEC);
+         * signals or creating the signalfd fails for any reason, signal_fd
+         * stays -1, which oi_cli_prompt_read already treats as "signal
+         * handling unavailable" -- the REPL still works exactly as it does
+         * without this feature (just without live resize, and without
+         * Ctrl+C/SIGTERM/SIGHUP being caught cleanly). */
+        if (sigprocmask(SIG_BLOCK, &signal_mask, NULL) == 0) {
+            signal_fd =
+                signalfd(-1, &signal_mask, SFD_NONBLOCK | SFD_CLOEXEC);
         }
     }
 
@@ -203,12 +208,17 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         char *prompt = NULL;
         size_t prompt_len = 0;
         int exit_requested = 0;
+        int terminate_signal = 0;
         struct oi_cli_command_parse parsed;
 
         status = oi_cli_prompt_read(
-            config->input_fd, config->output_fd, resize_fd, &input_history,
-            &prompt, &prompt_len, &exit_requested);
-        if (status != OI_OK || exit_requested) {
+            config->input_fd, config->output_fd, signal_fd, &input_history,
+            &prompt, &prompt_len, &exit_requested, &terminate_signal);
+        /* No turn is active at this point in the loop (we're between
+         * turns, about to read the next prompt), so a terminate signal
+         * here needs no conversation cancellation -- just end cleanly,
+         * exactly like Ctrl+D. */
+        if (status != OI_OK || exit_requested || terminate_signal != 0) {
             free(prompt);
             break;
         }
@@ -305,8 +315,8 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         }
     }
 
-    if (resize_fd >= 0) {
-        close(resize_fd);
+    if (signal_fd >= 0) {
+        close(signal_fd);
     }
     oi_cli_conversation_destroy(conversation);
     oi_cli_present_free(&present);

@@ -389,22 +389,26 @@ static oi_status spawn(oi_tool_call *call) {
     }
 
     if (pid == 0) {
-        sigset_t winch;
+        sigset_t blocked;
 
         close(stdin_pipe[1]);
         close(stdout_pipe[0]);
         close(err_pipe[0]);
 
-        /* cli_repl.c blocks SIGWINCH process-wide for its own signalfd;
-         * that block survives exec() and would otherwise be inherited
-         * permanently by this tool subprocess, silently breaking its own
-         * resize-awareness (e.g. if it invokes a pager or another
-         * interactive program). Unblock it here, mirroring the setpgid
-         * reset already done for process-group membership. */
-        sigemptyset(&winch);
-        sigaddset(&winch, SIGWINCH);
+        /* cli_repl.c blocks SIGWINCH/SIGINT/SIGTERM/SIGHUP process-wide
+         * for its own signalfd; that block survives exec() and would
+         * otherwise be inherited permanently by this tool subprocess,
+         * silently breaking its own signal-awareness (e.g. Ctrl+C not
+         * working as expected for a pager or another interactive program
+         * it invokes). Unblock all four here, mirroring the setpgid reset
+         * already done for process-group membership. */
+        sigemptyset(&blocked);
+        sigaddset(&blocked, SIGWINCH);
+        sigaddset(&blocked, SIGINT);
+        sigaddset(&blocked, SIGTERM);
+        sigaddset(&blocked, SIGHUP);
         if (setpgid(0, 0) != 0 ||
-            sigprocmask(SIG_UNBLOCK, &winch, NULL) != 0 ||
+            sigprocmask(SIG_UNBLOCK, &blocked, NULL) != 0 ||
             dup2(stdin_pipe[0], STDIN_FILENO) < 0 ||
             dup2(stdout_pipe[1], STDOUT_FILENO) < 0 ||
             dup2(stdout_pipe[1], STDERR_FILENO) < 0) {

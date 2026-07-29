@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -40,20 +41,44 @@ static void consume_input(unsigned char *input, size_t *input_len,
     *input_len -= consumed;
 }
 
-/* Drains every currently-readable signalfd record. SIGWINCH is a standard
- * (non-realtime) signal, so at most one is ever actually pending -- this
- * loop is defensive, not load-bearing. */
-static void drain_resize_signal(int resize_fd) {
+/*
+ * Drains every currently-readable signalfd record, classifying what was
+ * seen. Each of SIGWINCH/SIGINT/SIGTERM/SIGHUP is a standard (non-realtime)
+ * signal, so at most one of each is ever actually pending -- looping here
+ * is defensive, not load-bearing. SIGTERM/SIGHUP win over a same-drain
+ * SIGWINCH: there is no point redrawing a frame the caller is about to
+ * tear down.
+ */
+struct oi_cli_prompt_signals {
+    int resize;
+    int terminate_signal;
+};
+
+static void drain_signals(int signal_fd, struct oi_cli_prompt_signals *out) {
     struct signalfd_siginfo info;
 
-    while (read(resize_fd, &info, sizeof info) == (ssize_t)sizeof info) {
+    memset(out, 0, sizeof *out);
+    while (read(signal_fd, &info, sizeof info) == (ssize_t)sizeof info) {
+        switch (info.ssi_signo) {
+        case SIGWINCH:
+            out->resize = 1;
+            break;
+        case SIGTERM:
+        case SIGHUP:
+        case SIGINT:
+            /* SIGINT can't ordinarily fire here (raw mode clears ISIG),
+             * but treat a pending one defensively the same as
+             * SIGTERM/SIGHUP rather than silently dropping it. */
+            out->terminate_signal = (int)info.ssi_signo;
+            break;
+        default:
+            break;
+        }
     }
 }
 
-static oi_status handle_resize(int resize_fd, int output_fd,
-                               struct oi_cli_render *render,
+static oi_status handle_resize(int output_fd, struct oi_cli_render *render,
                                const struct oi_cli_prompt_state *state) {
-    drain_resize_signal(resize_fd);
     oi_cli_render_set_columns(render, terminal_columns(output_fd));
     return oi_cli_render_draw_commands(
         render, &state->editor, state->command_matches,
@@ -92,9 +117,10 @@ static oi_status apply_event(struct oi_cli_prompt_state *state,
     return OI_ERR_INVAL;
 }
 
-oi_status oi_cli_prompt_read(int input_fd, int output_fd, int resize_fd,
+oi_status oi_cli_prompt_read(int input_fd, int output_fd, int signal_fd,
                              struct oi_cli_input_history *history,
-                             char **out_text, size_t *out_len, int *out_exit) {
+                             char **out_text, size_t *out_len, int *out_exit,
+                             int *out_terminate_signal) {
     struct oi_cli_terminal terminal;
     struct oi_cli_input_decoder decoder;
     struct oi_cli_prompt_state state;
@@ -107,12 +133,14 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int resize_fd,
     oi_status status;
 
     if (input_fd < 0 || output_fd < 0 || history == NULL ||
-        out_text == NULL || out_len == NULL || out_exit == NULL) {
+        out_text == NULL || out_len == NULL || out_exit == NULL ||
+        out_terminate_signal == NULL) {
         return OI_ERR_INVAL;
     }
     *out_text = NULL;
     *out_len = 0;
     *out_exit = 0;
+    *out_terminate_signal = 0;
     oi_cli_terminal_init(&terminal);
     oi_cli_input_decoder_init(&decoder);
 
@@ -135,11 +163,19 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int resize_fd,
     if (status != OI_OK) {
         goto cleanup;
     }
-    if (resize_fd >= 0) {
+    if (signal_fd >= 0) {
         /* The draw above already used a freshly-read width; discard any
          * resize notification queued before this call started so it
-         * doesn't trigger an immediate, redundant second redraw. */
-        drain_resize_signal(resize_fd);
+         * doesn't trigger an immediate, redundant second redraw. A
+         * terminate signal queued in that same window must not be lost,
+         * though -- honor it immediately instead. */
+        struct oi_cli_prompt_signals pending;
+
+        drain_signals(signal_fd, &pending);
+        if (pending.terminate_signal != 0) {
+            *out_terminate_signal = pending.terminate_signal;
+            goto cleanup;
+        }
     }
 
     while (!done) {
@@ -178,8 +214,8 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int resize_fd,
             descriptors[0].fd = input_fd;
             descriptors[0].events = POLLIN;
             descriptors[0].revents = 0;
-            if (resize_fd >= 0) {
-                descriptors[1].fd = resize_fd;
+            if (signal_fd >= 0) {
+                descriptors[1].fd = signal_fd;
                 descriptors[1].events = POLLIN;
                 descriptors[1].revents = 0;
                 ndescriptors = 2;
@@ -207,9 +243,19 @@ oi_status oi_cli_prompt_read(int input_fd, int output_fd, int resize_fd,
             }
             if (ndescriptors == 2 &&
                 (descriptors[1].revents & POLLIN) != 0) {
-                status = handle_resize(resize_fd, output_fd, &render, &state);
-                if (status != OI_OK) {
-                    break;
+                struct oi_cli_prompt_signals signals;
+
+                drain_signals(signal_fd, &signals);
+                if (signals.terminate_signal != 0) {
+                    *out_terminate_signal = signals.terminate_signal;
+                    done = 1;
+                    continue;
+                }
+                if (signals.resize) {
+                    status = handle_resize(output_fd, &render, &state);
+                    if (status != OI_OK) {
+                        break;
+                    }
                 }
                 continue;
             }
