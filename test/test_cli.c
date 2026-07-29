@@ -204,7 +204,12 @@ static int interactive_wait_for(int master_fd,
                                 const char *text, size_t minimum_count) {
     while (result->output_len < sizeof result->output - 1) {
         fd_set reads;
-        struct timeval timeout = {10, 0};
+        /* Generous on purpose: under asan/tsan instrumentation on a
+         * loaded CI runner, a single mock-server round trip has been
+         * observed to take noticeably longer than on a quiet local
+         * machine. Each individual read-to-read gap gets its own fresh
+         * window, so this only matters when data genuinely stalls. */
+        struct timeval timeout = {30, 0};
         ssize_t len;
 
         if (count_text(result->output, text) >= minimum_count) {
