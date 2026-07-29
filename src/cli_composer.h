@@ -7,6 +7,7 @@
 #include "cli_input_history.h"
 #include "cli_prompt_state.h"
 #include "cli_render.h"
+#include "cli_selector.h"
 #include "cli_terminal.h"
 #include "oi/status.h"
 
@@ -145,5 +146,63 @@ oi_status oi_cli_composer_commit_draft(struct oi_cli_composer *composer,
  */
 oi_status oi_cli_composer_set_draft(struct oi_cli_composer *composer,
                                     const char *text, size_t text_len);
+
+/*
+ * Reports one already-decoded input event without touching
+ * composer->state (the editor/prompt-state) at all -- unlike
+ * oi_cli_composer_feed/_resolve_escape, which always apply an event to
+ * the editor via oi_cli_prompt_state_apply. A modal UI (e.g. a permission
+ * selector) must never let the in-progress draft be mutated by keys it's
+ * intercepting, so it decodes through this path instead for as long as
+ * it's showing. Return nonzero from `on_event` to stop feeding further
+ * events this call (mirrors oi_cli_composer_feed's "stop at the first
+ * decisive action" contract); any further already-buffered bytes stay
+ * buffered for the next call.
+ */
+typedef int (*oi_cli_composer_raw_event_cb)(
+    const struct oi_cli_input_event *event, void *user_data);
+
+oi_status oi_cli_composer_feed_raw(struct oi_cli_composer *composer,
+                                   oi_cli_composer_raw_event_cb on_event,
+                                   void *user_data);
+/* Same as oi_cli_composer_resolve_escape, but reporting through the raw
+ * callback (see oi_cli_composer_feed_raw) instead of the editor. */
+oi_status oi_cli_composer_resolve_escape_raw(
+    struct oi_cli_composer *composer,
+    oi_cli_composer_raw_event_cb on_event, void *user_data);
+
+/* Draws through the composer's own struct oi_cli_render instance (keeping
+ * previous_rows bookkeeping single-threaded regardless of which of these
+ * or oi_cli_composer_redraw was used last) -- see oi_cli_render_draw_panel/
+ * _draw_selector for what each actually draws. */
+oi_status oi_cli_composer_redraw_panel(
+    struct oi_cli_composer *composer,
+    const struct oi_cli_render_line *header_lines, size_t header_count);
+oi_status oi_cli_composer_draw_selector(
+    struct oi_cli_composer *composer,
+    const struct oi_cli_render_line *header_lines, size_t header_count,
+    const struct oi_cli_render_line *option_lines, size_t option_count,
+    size_t selected_option);
+
+/*
+ * Blocking modal selector for the idle (between-turns) case -- same
+ * poll()-loop shape as oi_cli_composer_wait_submit, but decoding directly
+ * via oi_cli_input_decode/_decode_escape and applying via
+ * oi_cli_selector_apply, entirely bypassing the editor/prompt-state
+ * (same principle as oi_cli_composer_feed_raw). `*out_selected` starts at
+ * `default_selected` and is updated as the user navigates; on a CANCEL
+ * (Escape or Ctrl+C) `*out_cancelled` is set and `*out_selected` must not
+ * be trusted as the user's choice -- treat a cancel as choosing the safe
+ * default, not as if `*out_selected` had been confirmed. Leaves the
+ * selector's own frame drawn (previous_rows tracking it correctly) on
+ * return either way; the caller decides what to erase/redraw next, exactly
+ * like oi_cli_composer_redraw/_redraw_panel already do.
+ */
+oi_status oi_cli_composer_select(
+    struct oi_cli_composer *composer, int signal_fd,
+    const struct oi_cli_render_line *header_lines, size_t header_count,
+    const struct oi_cli_render_line *option_lines, size_t option_count,
+    size_t default_selected, size_t *out_selected, int *out_cancelled,
+    int *out_terminate_signal);
 
 #endif

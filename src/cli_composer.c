@@ -214,6 +214,19 @@ oi_status oi_cli_composer_wait_submit(struct oi_cli_composer *composer,
                 break;
             }
         }
+        /* A lone buffered byte that's a valid but incomplete sequence (a
+         * standalone Escape keypress with nothing following yet, or the
+         * first byte of one) breaks the loop above with OI_ERR_AGAIN --
+         * that's an expected "nothing more to decode without further
+         * bytes" signal, not a real error, and must not be mistaken for
+         * one here: the whole point of falling through to the poll()
+         * below is to wait for either more bytes or the escape timeout to
+         * resolve it. Without this, a genuinely standalone Escape press
+         * would incorrectly end this call with OI_ERR_AGAIN instead of
+         * ever reaching that timeout. */
+        if (status == OI_ERR_AGAIN) {
+            status = OI_OK;
+        }
         if (status != OI_OK || done) {
             break;
         }
@@ -454,4 +467,295 @@ oi_status oi_cli_composer_set_draft(struct oi_cli_composer *composer,
         return OI_ERR_INVAL;
     }
     return oi_cli_editor_set(&composer->state.editor, text, text_len);
+}
+
+oi_status oi_cli_composer_feed_raw(struct oi_cli_composer *composer,
+                                   oi_cli_composer_raw_event_cb on_event,
+                                   void *user_data) {
+    ssize_t read_len;
+
+    if (composer == NULL || on_event == NULL) {
+        return OI_ERR_INVAL;
+    }
+    if (composer->input_len == sizeof composer->input) {
+        return OI_ERR_PARSE;
+    }
+    do {
+        read_len = read(composer->input_fd,
+                        composer->input + composer->input_len,
+                        sizeof composer->input - composer->input_len);
+    } while (read_len < 0 && errno == EINTR);
+    if (read_len == 0) {
+        return OI_ERR_CLOSED;
+    }
+    if (read_len < 0) {
+        return errno == EAGAIN || errno == EWOULDBLOCK ? OI_OK : OI_ERR_IO;
+    }
+    composer->input_len += (size_t)read_len;
+
+    while (composer->input_len != 0) {
+        struct oi_cli_input_event event;
+        size_t consumed;
+        oi_status status = oi_cli_input_decode(
+            &composer->decoder, composer->input, composer->input_len,
+            &consumed, &event);
+
+        if (status == OI_ERR_AGAIN) {
+            break;
+        }
+        if (status != OI_OK) {
+            return status;
+        }
+        consume_input(composer->input, &composer->input_len, consumed);
+        if (on_event(&event, user_data)) {
+            break;
+        }
+    }
+    return OI_OK;
+}
+
+oi_status oi_cli_composer_resolve_escape_raw(
+    struct oi_cli_composer *composer,
+    oi_cli_composer_raw_event_cb on_event, void *user_data) {
+    struct oi_cli_input_event event;
+    size_t consumed;
+    oi_status status;
+
+    if (composer == NULL || on_event == NULL) {
+        return OI_ERR_INVAL;
+    }
+    status = oi_cli_input_decode_escape(&consumed, &event);
+    if (status != OI_OK) {
+        return status;
+    }
+    consume_input(composer->input, &composer->input_len, consumed);
+    (void)on_event(&event, user_data);
+    return OI_OK;
+}
+
+oi_status oi_cli_composer_redraw_panel(
+    struct oi_cli_composer *composer,
+    const struct oi_cli_render_line *header_lines, size_t header_count) {
+    if (composer == NULL) {
+        return OI_ERR_INVAL;
+    }
+    oi_cli_render_set_columns(&composer->render,
+                              terminal_columns(composer->output_fd));
+    return oi_cli_render_draw_panel(
+        &composer->render, &composer->state.editor, header_lines,
+        header_count, composer->state.command_matches,
+        composer->state.command_match_count,
+        composer->state.command_selection);
+}
+
+oi_status oi_cli_composer_draw_selector(
+    struct oi_cli_composer *composer,
+    const struct oi_cli_render_line *header_lines, size_t header_count,
+    const struct oi_cli_render_line *option_lines, size_t option_count,
+    size_t selected_option) {
+    if (composer == NULL) {
+        return OI_ERR_INVAL;
+    }
+    oi_cli_render_set_columns(&composer->render,
+                              terminal_columns(composer->output_fd));
+    return oi_cli_render_draw_selector(&composer->render, header_lines,
+                                       header_count, option_lines,
+                                       option_count, selected_option);
+}
+
+oi_status oi_cli_composer_select(
+    struct oi_cli_composer *composer, int signal_fd,
+    const struct oi_cli_render_line *header_lines, size_t header_count,
+    const struct oi_cli_render_line *option_lines, size_t option_count,
+    size_t default_selected, size_t *out_selected, int *out_cancelled,
+    int *out_terminate_signal) {
+    size_t selected;
+    int done = 0;
+    oi_status status;
+
+    if (composer == NULL || option_lines == NULL || option_count == 0 ||
+        default_selected >= option_count || out_selected == NULL ||
+        out_cancelled == NULL || out_terminate_signal == NULL) {
+        return OI_ERR_INVAL;
+    }
+    selected = default_selected;
+    *out_cancelled = 0;
+    *out_terminate_signal = 0;
+
+    status = oi_cli_render_draw_selector(&composer->render, header_lines,
+                                        header_count, option_lines,
+                                        option_count, selected);
+    if (status != OI_OK) {
+        goto cleanup;
+    }
+    if (signal_fd >= 0) {
+        /* Same rationale as oi_cli_composer_wait_submit: discard a resize
+         * queued before this call started (the draw above already used a
+         * fresh width), but never lose a terminate signal. */
+        struct oi_cli_composer_signals pending;
+
+        drain_signals(signal_fd, &pending);
+        if (pending.terminate_signal != 0) {
+            *out_terminate_signal = pending.terminate_signal;
+            goto cleanup;
+        }
+    }
+
+    while (!done) {
+        while (composer->input_len != 0) {
+            struct oi_cli_input_event event;
+            size_t consumed;
+            enum oi_cli_selector_action action;
+
+            status = oi_cli_input_decode(&composer->decoder, composer->input,
+                                        composer->input_len, &consumed,
+                                        &event);
+            if (status == OI_ERR_AGAIN) {
+                break;
+            }
+            if (status != OI_OK) {
+                goto cleanup;
+            }
+            consume_input(composer->input, &composer->input_len, consumed);
+            status = oi_cli_selector_apply(&event, option_count, &selected,
+                                          &action);
+            if (status != OI_OK) {
+                goto cleanup;
+            }
+            if (action == OI_CLI_SELECTOR_ACTION_REDRAW) {
+                status = oi_cli_render_draw_selector(
+                    &composer->render, header_lines, header_count,
+                    option_lines, option_count, selected);
+            } else if (action == OI_CLI_SELECTOR_ACTION_CONFIRM) {
+                done = 1;
+            } else if (action == OI_CLI_SELECTOR_ACTION_CANCEL) {
+                *out_cancelled = 1;
+                done = 1;
+            }
+            if (status != OI_OK || done) {
+                break;
+            }
+        }
+        /* Same normalization as oi_cli_composer_wait_submit's identical
+         * inner/outer loop shape: OI_ERR_AGAIN here just means "nothing
+         * more to decode without further bytes," not a real error -- a
+         * standalone Escape press must fall through to the poll() below
+         * to reach its timeout-based resolution, not end this call early. */
+        if (status == OI_ERR_AGAIN) {
+            status = OI_OK;
+        }
+        if (status != OI_OK || done) {
+            break;
+        }
+
+        {
+            struct pollfd descriptors[2];
+            nfds_t ndescriptors = 1;
+            int timeout = composer->input_len != 0 &&
+                                  composer->input[0] == '\x1b' &&
+                                  !composer->decoder.pasting
+                              ? OI_CLI_COMPOSER_ESCAPE_TIMEOUT_MS
+                              : -1;
+            int ready;
+
+            descriptors[0].fd = composer->input_fd;
+            descriptors[0].events = POLLIN;
+            descriptors[0].revents = 0;
+            if (signal_fd >= 0) {
+                descriptors[1].fd = signal_fd;
+                descriptors[1].events = POLLIN;
+                descriptors[1].revents = 0;
+                ndescriptors = 2;
+            }
+
+            do {
+                ready = poll(descriptors, ndescriptors, timeout);
+            } while (ready < 0 && errno == EINTR);
+            if (ready < 0) {
+                status = OI_ERR_IO;
+                break;
+            }
+            if (ready == 0) {
+                struct oi_cli_input_event event;
+                size_t consumed;
+                enum oi_cli_selector_action action;
+
+                status = oi_cli_input_decode_escape(&consumed, &event);
+                if (status != OI_OK) {
+                    break;
+                }
+                consume_input(composer->input, &composer->input_len,
+                             consumed);
+                status = oi_cli_selector_apply(&event, option_count,
+                                              &selected, &action);
+                if (status == OI_OK) {
+                    if (action == OI_CLI_SELECTOR_ACTION_REDRAW) {
+                        status = oi_cli_render_draw_selector(
+                            &composer->render, header_lines, header_count,
+                            option_lines, option_count, selected);
+                    } else if (action == OI_CLI_SELECTOR_ACTION_CONFIRM) {
+                        done = 1;
+                    } else if (action == OI_CLI_SELECTOR_ACTION_CANCEL) {
+                        *out_cancelled = 1;
+                        done = 1;
+                    }
+                }
+                continue;
+            }
+            if (ndescriptors == 2 &&
+                (descriptors[1].revents & POLLIN) != 0) {
+                struct oi_cli_composer_signals signals;
+
+                drain_signals(signal_fd, &signals);
+                if (signals.terminate_signal != 0) {
+                    *out_terminate_signal = signals.terminate_signal;
+                    done = 1;
+                    continue;
+                }
+                if (signals.resize) {
+                    oi_cli_render_set_columns(
+                        &composer->render,
+                        terminal_columns(composer->output_fd));
+                    status = oi_cli_render_draw_selector(
+                        &composer->render, header_lines, header_count,
+                        option_lines, option_count, selected);
+                    if (status != OI_OK) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if ((descriptors[0].revents & (POLLERR | POLLNVAL)) != 0) {
+                status = OI_ERR_IO;
+                break;
+            }
+            if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0) {
+                ssize_t read_len;
+
+                if (composer->input_len == sizeof composer->input) {
+                    status = OI_ERR_PARSE;
+                    break;
+                }
+                do {
+                    read_len = read(composer->input_fd,
+                                    composer->input + composer->input_len,
+                                    sizeof composer->input -
+                                        composer->input_len);
+                } while (read_len < 0 && errno == EINTR);
+                if (read_len > 0) {
+                    composer->input_len += (size_t)read_len;
+                } else if (read_len == 0) {
+                    status = OI_ERR_CLOSED;
+                    break;
+                } else {
+                    status = OI_ERR_IO;
+                    break;
+                }
+            }
+        }
+    }
+
+cleanup:
+    *out_selected = selected;
+    return status;
 }
