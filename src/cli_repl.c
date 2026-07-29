@@ -1,7 +1,9 @@
-/* realpath(3) is a BSD/SVID extension; glibc only declares it under
- * -std=c11 when _DEFAULT_SOURCE (or an equivalent) is set, matching the
- * _GNU_SOURCE precedent in reactor_epoll.c for a different extension. */
-#define _DEFAULT_SOURCE
+/* realpath(3) is a BSD/SVID extension, and struct signalfd_siginfo /
+ * signalfd(2) are GNU/Linux extensions; _GNU_SOURCE is a superset of
+ * _DEFAULT_SOURCE (previously defined here just for realpath) and covers
+ * both, matching the same precedent in reactor_epoll.c for other GNU fd
+ * primitives (timerfd, pidfd). */
+#define _GNU_SOURCE
 
 #include "cli_repl.h"
 
@@ -12,8 +14,10 @@
 #include "cli_prompt.h"
 
 #include <limits.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -130,6 +134,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     struct oi_cli_string current_model_storage = {0};
     struct oi_cli_string *current_model;
     struct repl_setting_context setting_context;
+    int resize_fd = -1;
     oi_status status;
 
     if (client == NULL || reactor == NULL || tools == NULL ||
@@ -164,6 +169,21 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         goto cleanup_history;
     }
 
+    {
+        sigset_t winch_mask;
+
+        sigemptyset(&winch_mask);
+        sigaddset(&winch_mask, SIGWINCH);
+        /* Graceful degradation, never a hard failure: if blocking the
+         * signal or creating the signalfd fails for any reason, resize_fd
+         * stays -1, which oi_cli_prompt_read already treats as "resize
+         * support unavailable" -- the REPL still works exactly as it does
+         * without this feature. */
+        if (sigprocmask(SIG_BLOCK, &winch_mask, NULL) == 0) {
+            resize_fd = signalfd(-1, &winch_mask, SFD_NONBLOCK | SFD_CLOEXEC);
+        }
+    }
+
     setting_context.config = config;
     setting_context.current_model = current_model;
     setting_context.conversation = &conversation;
@@ -186,8 +206,8 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         struct oi_cli_command_parse parsed;
 
         status = oi_cli_prompt_read(
-            config->input_fd, config->output_fd, -1, &input_history, &prompt,
-            &prompt_len, &exit_requested);
+            config->input_fd, config->output_fd, resize_fd, &input_history,
+            &prompt, &prompt_len, &exit_requested);
         if (status != OI_OK || exit_requested) {
             free(prompt);
             break;
@@ -285,6 +305,9 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         }
     }
 
+    if (resize_fd >= 0) {
+        close(resize_fd);
+    }
     oi_cli_conversation_destroy(conversation);
     oi_cli_present_free(&present);
 cleanup_history:
