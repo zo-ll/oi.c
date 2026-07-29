@@ -3049,6 +3049,133 @@ TEST(permission_ask_typing_does_not_leak_into_the_draft) {
     waitpid(server, NULL, 0);
 }
 
+TEST(permissions_allow_requires_confirmation_and_can_be_cancelled) {
+    int master_fd = -1;
+    int slave_fd = -1;
+    pid_t cli;
+    struct interactive_result result;
+    char session_root[128];
+
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-permissions-cancel-%d", (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_asking_tools(9, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "/permissions allow\r", 20));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "Cancel (keep current policy)", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Allow all tools", 1));
+
+    /* Confirms at the default selection (index 0, "Cancel"). */
+    CHECK(write_interactive(master_fd, "\r", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: permissions unchanged",
+                               1));
+
+    /* Policy is genuinely unchanged -- still `ask`, not silently
+     * elevated. */
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "Permissions: ask", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+}
+
+TEST(permissions_allow_confirmed_elevates_policy) {
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"finished\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    size_t answer_len;
+    char *tool_response = build_chunked_response(
+        permission_tool_sse, strlen(permission_tool_sse), "HTTP/1.1 200 OK",
+        &tool_len);
+    char *answer_response = build_chunked_response(
+        answer_sse, strlen(answer_sse), "HTTP/1.1 200 OK", &answer_len);
+    const char *responses[] = {tool_response, answer_response};
+    size_t lengths[] = {tool_len, answer_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server_turns(responses, lengths, 2, &port);
+    free(tool_response);
+    free(answer_response);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-permissions-confirm-%d", (int)getpid());
+    cli = start_interactive_cli_asking_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "/permissions allow\r", 20));
+    CHECK(interactive_wait_for(master_fd, &result, "Allow all tools", 1));
+
+    /* Digit shortcut '2' -> the second option, "Allow...". */
+    CHECK(write_interactive(master_fd, "2", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Permissions: allow", 1));
+
+    /* A subsequent tool call must run immediately -- no selector, no
+     * further prompt. */
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
+    CHECK(strstr(result.output, "Tool: shell") == NULL);
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+}
+
+TEST(permissions_allow_when_already_allowed_skips_confirmation) {
+    int master_fd = -1;
+    int slave_fd = -1;
+    pid_t cli;
+    struct interactive_result result;
+    char session_root[128];
+
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-permissions-already-allowed-%d", (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_allowing_tools(9, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "/permissions allow\r", 20));
+    /* Dispatches immediately: no confirm selector at all. */
+    CHECK(interactive_wait_for(master_fd, &result, "Permissions: allow", 1));
+    CHECK(strstr(result.output, "Cancel (keep current policy)") == NULL);
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+}
+
 TEST(sigterm_during_a_turn_terminates_cleanly) {
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -3500,6 +3627,9 @@ int main(void) {
     RUN(permission_ask_ctrl_c_while_awaiting_denies_without_hanging);
     RUN(permission_ask_resize_redraws_the_selector);
     RUN(permission_ask_typing_does_not_leak_into_the_draft);
+    RUN(permissions_allow_requires_confirmation_and_can_be_cancelled);
+    RUN(permissions_allow_confirmed_elevates_policy);
+    RUN(permissions_allow_when_already_allowed_skips_confirmation);
     RUN(interactive_cwd_command_changes_the_process_directory);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);

@@ -880,6 +880,65 @@ have_parsed_command:
             continue;
         }
         if (parsed.kind == OI_CLI_COMMAND_PARSE_COMMAND) {
+            /*
+             * /permissions allow must not silently elevate the process-
+             * wide tool policy: gated here (not in cli_command_dispatch.c,
+             * which has no composer/terminal access by design and
+             * shouldn't gain any) rather than in dispatch_permissions
+             * itself, so this one insertion covers both a freshly-typed
+             * command and a dequeued pending one (issue #25's one-slot
+             * queue also funnels through this same have_parsed_command:
+             * label). /permissions ask/deny, and a redundant allow when
+             * already allowed, skip this gate and dispatch directly.
+             */
+            if (parsed.command->id == OI_CLI_COMMAND_PERMISSIONS &&
+                parsed.arguments_len == 5 &&
+                memcmp(parsed.arguments, "allow", 5) == 0 &&
+                config->permission->policy != OI_CLI_TOOLS_ALLOW) {
+                static const char elevation_option_cancel_text[] =
+                    "Cancel (keep current policy)";
+                static const char elevation_option_allow_text[] =
+                    "Allow all tools for this process (no further prompts "
+                    "until changed)";
+                static const struct oi_cli_render_line elevation_options[] = {
+                    {elevation_option_cancel_text,
+                     sizeof elevation_option_cancel_text - 1},
+                    {elevation_option_allow_text,
+                     sizeof elevation_option_allow_text - 1},
+                };
+                size_t selected = 0;
+                int cancelled = 0;
+                int elevation_terminate_signal = 0;
+
+                status = oi_cli_composer_select(
+                    &composer, signal_fd, NULL, 0, elevation_options, 2, 0,
+                    &selected, &cancelled, &elevation_terminate_signal);
+                if (status != OI_OK || elevation_terminate_signal != 0) {
+                    free(prompt);
+                    break;
+                }
+                /* Erases the confirm selector's own frame and redraws the
+                 * ordinary idle prompt in its place -- self-contained,
+                 * same as any other post-selector cleanup in this file. */
+                status = oi_cli_composer_redraw(&composer);
+                if (status != OI_OK) {
+                    free(prompt);
+                    break;
+                }
+                if (cancelled || selected == 0) {
+                    if (fputs("oi: permissions unchanged\n", config->err) ==
+                            EOF ||
+                        fflush(config->err) != 0) {
+                        status = OI_ERR_IO;
+                        free(prompt);
+                        break;
+                    }
+                    free(prompt);
+                    continue;
+                }
+                /* selected == 1 ("Allow..."): fall through to the ordinary
+                 * dispatch below, which is what actually applies it. */
+            }
             struct oi_cli_command_context command_context = {
                 .out = config->out,
                 .err = config->err,
