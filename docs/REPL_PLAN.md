@@ -45,13 +45,10 @@ without learning terminal UI or conversation-record semantics.
 
 - `/help`: show commands and key bindings.
 - `/exit`: request a graceful exit.
-- `/session`: manage the session catalog. **Not yet reachable from the REPL**
-  — the grammar below and the filesystem operations behind it are
-  implemented and unit-tested, but `cli_repl.c`/`cli.c` do not yet supply the
-  session callbacks, and `switch`, `delete`, and `import` additionally need
-  the interception that puts them behind the composer's confirmation flow.
-  Until that wiring lands, every subcommand reports that it is unavailable in
-  this context. The intended grammar is:
+- `/session`: manage the session catalog. `switch`, `delete`, and `import` are
+  handled by `cli_repl` rather than `cli_command_dispatch`, since they need
+  the live conversation or the composer's confirmation flow; the rest are
+  ordinary dispatch subcommands. The grammar is:
   - `/session` or `/session list`: list selectable sessions, most recently
     updated first. Marks the active one, shows a display name when set, and
     labels both sessions open in another process and sessions whose selector
