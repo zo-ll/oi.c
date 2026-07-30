@@ -1163,6 +1163,232 @@ TEST(restore_refuses_unknown_ids_and_will_not_clobber_a_live_session) {
     CHECK_EQ(rmdir(root), 0);
 }
 
+/* --- oi_cli_session_import --- */
+
+/*
+ * Writes a legacy-format log: raw alternating user/assistant payloads with
+ * no transition record, exactly the shape test_cli_history_store.c uses
+ * for its own legacy-replay coverage.
+ */
+static void write_legacy_log(const char *path) {
+    oi_sesslog *log = NULL;
+    unlink(path);
+    CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "old question", 12), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "old answer", 10), OI_OK);
+    oi_sesslog_close(log);
+}
+
+static void read_whole_file(const char *path, char **out_data,
+                           size_t *out_len) {
+    FILE *file = fopen(path, "rb");
+    long size;
+    CHECK(file != NULL);
+    CHECK_EQ(fseek(file, 0, SEEK_END), 0);
+    size = ftell(file);
+    CHECK(size >= 0);
+    CHECK_EQ(fseek(file, 0, SEEK_SET), 0);
+    *out_data = malloc((size_t)size);
+    CHECK(*out_data != NULL);
+    CHECK_EQ(fread(*out_data, 1, (size_t)size, file), (size_t)size);
+    CHECK_EQ(fclose(file), 0);
+    *out_len = (size_t)size;
+}
+
+TEST(import_adopts_a_legacy_log_and_leaves_the_source_untouched) {
+    char root[192];
+    char source[192];
+    char *new_id = NULL;
+    char *before = NULL;
+    char *after = NULL;
+    size_t before_len = 0;
+    size_t after_len = 0;
+    struct stat before_info;
+    struct stat after_info;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-import-%ld", (long)getpid());
+    snprintf(source, sizeof source, "/tmp/oi-legacy-source-%ld.oilog",
+             (long)getpid());
+    write_legacy_log(source);
+    read_whole_file(source, &before, &before_len);
+    CHECK_EQ(stat(source, &before_info), 0);
+
+    CHECK_EQ(oi_cli_session_import(root, source, strlen(source), &new_id,
+                                   NULL),
+             OI_OK);
+    CHECK(new_id != NULL);
+    CHECK(oi_cli_session_id_is_safe(new_id, strlen(new_id)));
+
+    /* The source is preserved byte for byte and not even its mtime moved:
+     * import only ever reads it. */
+    read_whole_file(source, &after, &after_len);
+    CHECK_EQ(after_len, before_len);
+    CHECK_EQ(memcmp(before, after, before_len), 0);
+    CHECK_EQ(stat(source, &after_info), 0);
+    CHECK_EQ(before_info.st_mtime, after_info.st_mtime);
+
+    /* The new session is a real, selectable session whose history is the
+     * imported content -- replayed here through the ordinary listing path. */
+    {
+        struct oi_cli_session_list list;
+        char imported_path[384];
+        char *imported = NULL;
+        size_t imported_len = 0;
+
+        oi_cli_session_list_init(&list);
+        CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+        CHECK_EQ(list.len, 1);
+        CHECK_STREQ(list.entries[0].id, new_id);
+        oi_cli_session_list_free(&list);
+
+        snprintf(imported_path, sizeof imported_path, "%s/%s/history.oilog",
+                 root, new_id);
+        read_whole_file(imported_path, &imported, &imported_len);
+        CHECK_EQ(imported_len, before_len);
+        CHECK_EQ(memcmp(before, imported, before_len), 0);
+        free(imported);
+    }
+    /* No scratch file left lying around. */
+    {
+        char scratch[256];
+        snprintf(scratch, sizeof scratch, "%s/.import-%ld.tmp", root,
+                 (long)getpid());
+        CHECK(access(scratch, F_OK) != 0);
+    }
+
+    free(before);
+    free(after);
+    remove_session(root, new_id);
+    free(new_id);
+    CHECK_EQ(rmdir(root), 0);
+    CHECK_EQ(unlink(source), 0);
+}
+
+TEST(import_refuses_bad_sources_and_leaves_nothing_behind) {
+    char root[192];
+    char source[192];
+    char link_path[192];
+    char *new_id = NULL;
+    char *detail = NULL;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-import-bad-%ld",
+             (long)getpid());
+    snprintf(source, sizeof source, "/tmp/oi-not-a-log-%ld.oilog",
+             (long)getpid());
+
+    /* A file that is not a session log at all. */
+    {
+        FILE *garbage = fopen(source, "w");
+        CHECK(garbage != NULL);
+        CHECK(fputs("this is not an oilog header, not remotely", garbage) >= 0);
+        CHECK_EQ(fclose(garbage), 0);
+    }
+    CHECK_EQ(oi_cli_session_import(root, source, strlen(source), &new_id,
+                                   &detail),
+             OI_ERR_PARSE);
+    CHECK(new_id == NULL);
+    CHECK_STREQ(detail, "not a valid oi session log");
+    free(detail);
+    detail = NULL;
+    /* Rejected cleanly: no session directory, no scratch file, source
+     * still there. */
+    {
+        struct oi_cli_session_list list;
+        oi_cli_session_list_init(&list);
+        CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+        CHECK_EQ(list.len, 0);
+        oi_cli_session_list_free(&list);
+    }
+    {
+        char scratch[256];
+        snprintf(scratch, sizeof scratch, "%s/.import-%ld.tmp", root,
+                 (long)getpid());
+        CHECK(access(scratch, F_OK) != 0);
+    }
+    CHECK_EQ(access(source, F_OK), 0);
+    CHECK_EQ(unlink(source), 0);
+
+    /* A symlink source is refused rather than followed. */
+    write_legacy_log(source);
+    snprintf(link_path, sizeof link_path, "/tmp/oi-legacy-link-%ld.oilog",
+             (long)getpid());
+    unlink(link_path);
+    CHECK_EQ(symlink(source, link_path), 0);
+    CHECK_EQ(oi_cli_session_import(root, link_path, strlen(link_path),
+                                   &new_id, &detail),
+             OI_ERR_INVAL);
+    CHECK_STREQ(detail, "refusing to import a symlink");
+    free(detail);
+    detail = NULL;
+    CHECK_EQ(unlink(link_path), 0);
+
+    /* A directory is not a log. */
+    CHECK_EQ(oi_cli_session_import(root, "/tmp", 4, &new_id, &detail),
+             OI_ERR_INVAL);
+    CHECK_STREQ(detail, "not a regular file");
+    free(detail);
+    detail = NULL;
+
+    /* Nothing there. */
+    CHECK_EQ(oi_cli_session_import(root, "/tmp/oi-absolutely-absent", 24,
+                                   &new_id, &detail),
+             OI_ERR_NOTFOUND);
+    free(detail);
+    detail = NULL;
+
+    CHECK_EQ(oi_cli_session_import(root, NULL, 0, &new_id, &detail),
+             OI_ERR_INVAL);
+    free(detail);
+
+    CHECK(new_id == NULL);
+    CHECK_EQ(unlink(source), 0);
+    rmdir(root);
+}
+
+TEST(import_refuses_a_source_already_inside_the_sessions_root) {
+    char root[192];
+    char imported_path[384];
+    char *new_id = NULL;
+    char *second_id = NULL;
+    char *detail = NULL;
+    char source[192];
+
+    snprintf(root, sizeof root, "/tmp/oi-session-import-self-%ld",
+             (long)getpid());
+    snprintf(source, sizeof source, "/tmp/oi-legacy-self-%ld.oilog",
+             (long)getpid());
+    write_legacy_log(source);
+    CHECK_EQ(oi_cli_session_import(root, source, strlen(source), &new_id,
+                                   NULL),
+             OI_OK);
+
+    /* Re-importing a session oi already manages is a misunderstanding
+     * worth naming, not a second copy to make. */
+    snprintf(imported_path, sizeof imported_path, "%s/%s/history.oilog", root,
+             new_id);
+    CHECK_EQ(oi_cli_session_import(root, imported_path, strlen(imported_path),
+                                   &second_id, &detail),
+             OI_ERR_INVAL);
+    CHECK(second_id == NULL);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "already an oi-managed session") != NULL);
+    free(detail);
+
+    /* Still exactly one session. */
+    {
+        struct oi_cli_session_list list;
+        oi_cli_session_list_init(&list);
+        CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+        CHECK_EQ(list.len, 1);
+        oi_cli_session_list_free(&list);
+    }
+
+    remove_session(root, new_id);
+    free(new_id);
+    CHECK_EQ(rmdir(root), 0);
+    CHECK_EQ(unlink(source), 0);
+}
+
 /* --- oi_cli_session_restore_settings / oi_cli_session_apply_setting --- */
 
 static char *save_cwd(void) { return getcwd(NULL, 0); }
@@ -1650,6 +1876,9 @@ int main(void) {
     RUN(delete_fails_closed_on_a_directory_it_did_not_create);
     RUN(trash_reports_a_cross_device_trash_directory_distinctly);
     RUN(restore_refuses_unknown_ids_and_will_not_clobber_a_live_session);
+    RUN(import_adopts_a_legacy_log_and_leaves_the_source_untouched);
+    RUN(import_refuses_bad_sources_and_leaves_nothing_behind);
+    RUN(import_refuses_a_source_already_inside_the_sessions_root);
     RUN(fresh_session_records_initial_model_and_cwd);
     RUN(unchanged_resume_writes_no_new_records_but_refreshes_metadata);
     RUN(apply_setting_writes_a_record_and_persists_through_restore);

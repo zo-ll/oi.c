@@ -253,6 +253,36 @@ oi_status oi_cli_session_delete(const char *root_override, const char *id,
 oi_status oi_cli_sessions_enumerate_trash(
     const char *root_override, struct oi_cli_session_list *out_list);
 
+/*
+ * Imports an existing ".oilog" file -- typically a legacy project-local
+ * one -- as a brand-new private session, and reports its id.
+ *
+ * The source is never opened for writing, never renamed, and never
+ * unlinked: import copies out of it and leaves it exactly as it was. That
+ * is structural here, not a convention to be careful about.
+ *
+ * The source must be a plain regular file. A symlink is refused (checked
+ * via lstat, so it is never followed), as is a file already inside the
+ * sessions root -- that is an oi-managed session already, and /session
+ * switch is the operation the user wanted.
+ *
+ * The copy is validated before it is adopted, by opening it as a session
+ * log and replaying it with the very code a real open would use. Only then
+ * is a session directory created and the validated copy moved into place.
+ * A file that fails validation leaves nothing behind.
+ *
+ * No transition or settings record is appended here. That already happens
+ * for any session the first time it is actually opened, so import stays a
+ * pure validate-and-relocate step with no duplicated durable-write logic.
+ *
+ * On OI_OK, `*out_new_id` is a caller-owned id string. On failure it is
+ * untouched and `*out_error_detail` (when non-NULL) names the cause.
+ */
+oi_status oi_cli_session_import(const char *root_override,
+                                const char *source_path,
+                                size_t source_path_len, char **out_new_id,
+                                char **out_error_detail);
+
 struct oi_cli_session_restore {
     struct oi_cli_string model;
     struct oi_cli_string cwd;

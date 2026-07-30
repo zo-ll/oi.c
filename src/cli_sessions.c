@@ -1111,6 +1111,276 @@ oi_status oi_cli_session_delete(const char *root_override, const char *id,
     return status;
 }
 
+/*
+ * True when `file_path` lives somewhere under `root`.
+ *
+ * Compares device and inode numbers while walking from the file's own
+ * directory up through its parents, rather than comparing path strings.
+ * That gets symlinks, "..", and redundant separators right for free -- a
+ * textual prefix test would need canonical paths, and realpath(3) sits
+ * behind a feature macro this project does not enable.
+ *
+ * Answers "no" on any stat failure: this decides whether to show a more
+ * helpful error, so guessing wrong merely costs a better message.
+ */
+static int path_is_inside_root(const char *file_path, const char *root) {
+    struct stat root_info;
+    char *walk;
+    unsigned depth;
+    int inside = 0;
+
+    if (stat(root, &root_info) != 0) {
+        return 0;
+    }
+    walk = strdup(file_path);
+    if (walk == NULL) {
+        return 0;
+    }
+    /* Start at the file's containing directory. */
+    {
+        char *slash = strrchr(walk, '/');
+        if (slash == NULL) {
+            free(walk);
+            walk = strdup(".");
+        } else if (slash == walk) {
+            walk[1] = '\0'; /* the file sits directly in "/" */
+        } else {
+            *slash = '\0';
+        }
+        if (walk == NULL) {
+            return 0;
+        }
+    }
+
+    for (depth = 0; depth < 256u; depth++) {
+        struct stat info;
+        struct stat parent_info;
+        char *parent = NULL;
+
+        if (stat(walk, &info) != 0) {
+            break;
+        }
+        if (info.st_dev == root_info.st_dev &&
+            info.st_ino == root_info.st_ino) {
+            inside = 1;
+            break;
+        }
+        if (join_path(walk, "..", &parent) != OI_OK) {
+            break;
+        }
+        if (stat(parent, &parent_info) != 0) {
+            free(parent);
+            break;
+        }
+        /* A directory that is its own parent is the filesystem root. */
+        if (parent_info.st_dev == info.st_dev &&
+            parent_info.st_ino == info.st_ino) {
+            free(parent);
+            break;
+        }
+        free(walk);
+        walk = parent;
+    }
+    free(walk);
+    return inside;
+}
+
+/* Copies `source` into a fresh O_EXCL file at `destination`. */
+static oi_status copy_file(const char *source, const char *destination,
+                           char **out_error_detail) {
+    char buffer[65536];
+    int in_fd;
+    int out_fd;
+    oi_status status = OI_OK;
+
+    in_fd = open(source, O_RDONLY | O_CLOEXEC);
+    if (in_fd < 0) {
+        set_error_detail(out_error_detail, strerror(errno));
+        return OI_ERR_IO;
+    }
+    /* O_EXCL: never write over an existing scratch file. A collision is a
+     * hard error rather than something to retry around. */
+    out_fd = open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (out_fd < 0) {
+        set_error_detail(out_error_detail, strerror(errno));
+        close(in_fd);
+        return OI_ERR_IO;
+    }
+    for (;;) {
+        ssize_t read_bytes = read(in_fd, buffer, sizeof buffer);
+        size_t written = 0;
+
+        if (read_bytes == 0) {
+            break;
+        }
+        if (read_bytes < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            set_error_detail(out_error_detail, strerror(errno));
+            status = OI_ERR_IO;
+            break;
+        }
+        while (written < (size_t)read_bytes) {
+            ssize_t wrote = write(out_fd, buffer + written,
+                                  (size_t)read_bytes - written);
+            if (wrote > 0) {
+                written += (size_t)wrote;
+            } else if (wrote < 0 && errno == EINTR) {
+                continue;
+            } else {
+                set_error_detail(out_error_detail, strerror(errno));
+                status = OI_ERR_IO;
+                break;
+            }
+        }
+        if (status != OI_OK) {
+            break;
+        }
+    }
+    close(in_fd);
+    if (close(out_fd) != 0 && status == OI_OK) {
+        set_error_detail(out_error_detail, strerror(errno));
+        status = OI_ERR_IO;
+    }
+    return status;
+}
+
+/*
+ * Confirms a copied file really is a session log, using exactly the code
+ * that would load it for real -- header validation plus a full strict
+ * replay. Nothing cheaper would be honest about it.
+ */
+static oi_status validate_session_log(const char *path) {
+    struct oi_cli_history_store store;
+    struct oi_cli_history_replay_state state;
+    oi_sesslog *log = NULL;
+    oi_status status = oi_sesslog_open(path, &log);
+
+    if (status != OI_OK) {
+        return status;
+    }
+    oi_cli_history_store_init(&store);
+    oi_cli_history_replay_state_init(&state);
+    status = oi_cli_history_store_load(log, &store, &state);
+    oi_cli_history_store_free(&store);
+    oi_cli_history_replay_state_free(&state);
+    oi_sesslog_close(log);
+    return status;
+}
+
+oi_status oi_cli_session_import(const char *root_override,
+                                const char *source_path,
+                                size_t source_path_len, char **out_new_id,
+                                char **out_error_detail) {
+    struct oi_cli_session_location location;
+    char scratch_name[64];
+    char *source = NULL;
+    char *root = NULL;
+    char *scratch_path = NULL;
+    struct stat info;
+    oi_status status;
+
+    if (out_error_detail != NULL) {
+        *out_error_detail = NULL;
+    }
+    if (source_path == NULL || source_path_len == 0 || out_new_id == NULL) {
+        set_error_detail(out_error_detail, "no path given");
+        return OI_ERR_INVAL;
+    }
+    source = malloc(source_path_len + 1);
+    if (source == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    memcpy(source, source_path, source_path_len);
+    source[source_path_len] = '\0';
+
+    /* lstat, not stat: S_ISREG on this result is false for a symlink, so a
+     * symlinked source is refused rather than followed. */
+    if (lstat(source, &info) != 0) {
+        set_error_detail(out_error_detail, strerror(errno));
+        free(source);
+        return errno == ENOENT ? OI_ERR_NOTFOUND : OI_ERR_IO;
+    }
+    if (!S_ISREG(info.st_mode)) {
+        set_error_detail(out_error_detail,
+                         S_ISLNK(info.st_mode)
+                             ? "refusing to import a symlink"
+                             : "not a regular file");
+        free(source);
+        return OI_ERR_INVAL;
+    }
+
+    status = resolve_root(root_override, &root);
+    if (status != OI_OK) {
+        free(source);
+        return status;
+    }
+    if (path_is_inside_root(source, root)) {
+        set_error_detail(
+            out_error_detail,
+            "that file is already an oi-managed session; use /session "
+            "switch instead");
+        free(root);
+        free(source);
+        return OI_ERR_INVAL;
+    }
+
+    /* Scratch file beside the eventual destination, so adopting it later
+     * is a same-filesystem rename. The leading '.' keeps it out of
+     * enumeration for as long as it exists. */
+    status = ensure_directory(root);
+    if (status == OI_OK) {
+        snprintf(scratch_name, sizeof scratch_name, ".import-%ld.tmp",
+                 (long)getpid());
+        status = join_path(root, scratch_name, &scratch_path);
+    }
+    free(root);
+    if (status != OI_OK) {
+        free(source);
+        return status;
+    }
+
+    status = copy_file(source, scratch_path, out_error_detail);
+    /* The source has now been read and is never touched again. */
+    free(source);
+    if (status != OI_OK) {
+        unlink(scratch_path);
+        free(scratch_path);
+        return status;
+    }
+    if (validate_session_log(scratch_path) != OI_OK) {
+        set_error_detail(out_error_detail, "not a valid oi session log");
+        unlink(scratch_path);
+        free(scratch_path);
+        return OI_ERR_PARSE;
+    }
+
+    oi_cli_session_location_init(&location);
+    status = oi_cli_session_location_create(root_override, &location);
+    if (status != OI_OK) {
+        set_error_detail(out_error_detail,
+                         "could not create a new session directory");
+        unlink(scratch_path);
+        free(scratch_path);
+        return status;
+    }
+    if (rename(scratch_path, location.history_path) != 0) {
+        set_error_detail(out_error_detail, strerror(errno));
+        unlink(scratch_path);
+        rmdir(location.directory);
+        oi_cli_session_location_free(&location);
+        free(scratch_path);
+        return OI_ERR_IO;
+    }
+    free(scratch_path);
+
+    *out_new_id = location.id;
+    location.id = NULL; /* ownership handed to the caller */
+    oi_cli_session_location_free(&location);
+    return OI_OK;
+}
+
 void oi_cli_session_restore_init(struct oi_cli_session_restore *restore) {
     if (restore != NULL) {
         memset(restore, 0, sizeof *restore);
