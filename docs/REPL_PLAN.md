@@ -45,8 +45,45 @@ without learning terminal UI or conversation-record semantics.
 
 - `/help`: show commands and key bindings.
 - `/exit`: request a graceful exit.
-- `/session`: select, switch with optional full replay, rename, trash, restore,
-  or permanently delete sessions.
+- `/session`: manage the session catalog. `switch`, `delete`, and `import` are
+  handled by `cli_repl` rather than `cli_command_dispatch`, since they need
+  the live conversation or the composer's confirmation flow; the rest are
+  ordinary dispatch subcommands. The grammar is:
+  - `/session` or `/session list`: list selectable sessions, most recently
+    updated first. Marks the active one, shows a display name when set, and
+    labels both sessions open in another process and sessions whose selector
+    metadata had to be rebuilt — a rebuilt row must not read as though its
+    cache had been authoritative.
+  - `/session trash-list`: the same listing for trashed sessions.
+  - `/session current`: show the active session's ID, path, and whether its
+    selector metadata is healthy. Health is resolved live on every call rather
+    than cached from startup, since metadata can be removed or corrupted by
+    something outside `oi` at any point in a long-running session.
+  - `/session switch ID`: switch only at an idle safe boundary. Replays and
+    repairs the target, restores its model and working directory, rebuilds
+    input history from its user messages, and then offers a full visible
+    replay. A failed switch leaves the original session active and usable.
+  - `/session rename ID NAME`: set a display name. Never moves the directory:
+    the safe ID is permanent, because every derived path depends on it. `NAME`
+    may contain spaces, is bounded, and may not contain control bytes, since
+    it is echoed to the terminal unescaped.
+  - `/session trash ID`: move a session into the recoverable trash. Refuses
+    the active session and any session open in another process.
+  - `/session restore ID`: move a trashed session back, refusing to overwrite
+    a live session of the same ID.
+  - `/session delete ID`: permanently delete an already-trashed session, after
+    an explicit confirmation. There is deliberately no one-step delete of a
+    live session — that is what makes refusing the active session, and one
+    open elsewhere, structural rather than merely checked.
+  - `/session import PATH`: after confirmation, validate a legacy `.oilog` and
+    copy it into a new private session. The source is never modified.
+
+  Enumeration accepts only bounded, portable IDs (`[A-Za-z0-9_-]`, 1-128
+  bytes) that are plain directories. Excluding `.` and `/` from that charset
+  is what rejects traversal attempts, dotfiles, the `.trash` subdirectory, and
+  planted symlinks under one rule, so no separate traversal check exists.
+  Listing a healthy session never opens its log; only a session whose cache is
+  missing or malformed is replayed, and then only its own log.
 - `/model`: edit the durable session model.
 - `/permissions`: inspect or change the process-scoped `ask`, `allow`, or `deny`
   policy; elevation to `allow` requires confirmation.
@@ -110,7 +147,11 @@ occupy the single pending slot and wait until idle.
   checkpoints.
 - `cli_sessions`: owns platform state paths, private per-session directories,
   atomic metadata caches, working directories, import, rename, selection, and
-  trash.
+  trash. Also owns safe-ID validation and every filesystem policy decision
+  behind the `/session` lifecycle: enumeration, the `.trash` convention,
+  permanent deletion, and the read-only lock probe that reports a session as
+  busy. It never enumerates on behalf of replay, and the replay/repair modules
+  never enumerate directories.
 - `cli_tools`: continues to own built-in tool definitions and permission
   decisions, using REPL-owned presentation callbacks instead of direct
   `/dev/tty` reads.
@@ -125,11 +166,34 @@ Each durable session is a private directory containing:
 
 - `history.oilog`: authoritative append-only records;
 - `metadata.json`: atomically replaced, rebuildable selector metadata;
+- `metadata.json.lock`: empty advisory-lock file serializing read-modify-write
+  of the cache, so a rename and a concurrent model/CWD refresh cannot discard
+  each other's field. A sibling file rather than the cache itself, because the
+  cache is replaced via temp+`rename()` and so has no stable inode to lock;
+  the session log's own lock cannot be reused, since the owning process holds
+  it for its whole lifetime;
 - future derived indexes, which are never authoritative.
 
 Linux uses `$XDG_STATE_HOME/oi/sessions` or `~/.local/state/oi/sessions`.
 Existing project-local `.oilog` files are imported only after selection
-and confirmation.
+and confirmation; import validates a copy by replaying it before adopting it,
+and never modifies the source.
+
+Trashed sessions live in a `.trash` subdirectory of the sessions root, moved
+there whole by a single `rename(2)`. Because the trash sits inside the same
+root, that rename is same-filesystem and therefore atomic — no partially
+trashed state can exist — and a cross-device failure is reported distinctly
+rather than as a generic I/O error. The `.trash` name is itself excluded by
+the safe-ID rule, so a trashed session simply is not visible to enumeration
+and needs no filtering.
+
+Selector metadata is schema-versioned. Version 2 adds an optional
+`display_name`; version 1 files still decode, and are upgraded on the next
+write rather than by any migration pass. The decoder checks an exact field
+count per version, so an unknown or misspelled key remains a parse error —
+and a parse error is never fatal, since the cache rebuilds from history.
+A display name lives only in the cache and is never recorded in history, so
+every path that refreshes the cache must carry the existing name forward.
 
 A private per-session directory holds exactly one session, so its metadata
 cache is always the literal `metadata.json`. The flat `--session-dir` layout

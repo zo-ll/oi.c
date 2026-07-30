@@ -36,8 +36,8 @@ TEST(write_then_read_round_trips) {
     oi_cli_session_metadata_init(&read_back);
 
     CHECK_EQ(oi_cli_session_metadata_set(&metadata, "sess-1", 6, "gpt-test",
-                                         8, "/home/az/project", 16, 100,
-                                         200),
+                                         8, "/home/az/project", 16, NULL,
+                                         0, 100, 200),
              OI_OK);
     CHECK_EQ(oi_cli_session_metadata_store_write(path, &metadata), OI_OK);
     CHECK(!path_exists(tmp_path));
@@ -133,7 +133,7 @@ TEST(preexisting_garbage_tmp_file_is_safely_clobbered) {
     fclose(f);
 
     CHECK_EQ(oi_cli_session_metadata_set(&metadata, "sess-1", 6, "gpt-test",
-                                         8, "/tmp", 4, 1, 1),
+                                         8, "/tmp", 4, NULL, 0, 1, 1),
              OI_OK);
     CHECK_EQ(oi_cli_session_metadata_store_write(path, &metadata), OI_OK);
     CHECK(!path_exists(tmp_path));
@@ -159,7 +159,7 @@ TEST(failed_rename_leaves_the_destination_untouched_and_cleans_up) {
      * directory, a distinct filename). */
     CHECK_EQ(mkdir(path, 0700), 0);
     CHECK_EQ(oi_cli_session_metadata_set(&metadata, "sess-1", 6, "gpt-test",
-                                         8, "/tmp", 4, 1, 1),
+                                         8, "/tmp", 4, NULL, 0, 1, 1),
              OI_OK);
     CHECK_EQ(oi_cli_session_metadata_store_write(path, &metadata),
              OI_ERR_IO);

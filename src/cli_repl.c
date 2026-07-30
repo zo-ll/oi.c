@@ -789,6 +789,497 @@ static oi_status dispatch_set_cwd(void *user_data, const char *path,
     return OI_OK;
 }
 
+/* --- /session subcommands that need the conversation or the composer --- */
+
+static int repl_is_space(char value) {
+    return value == ' ' || value == '\t' || value == '\r' || value == '\n';
+}
+
+/*
+ * Same split cli_command_dispatch performs, duplicated here rather than
+ * shared: it is ten lines, the two translation units have no other reason to
+ * depend on each other, and an import path must keep its internal spaces
+ * verbatim in both places.
+ */
+static void repl_split_first_token(const char *text, size_t len,
+                                   const char **out_token,
+                                   size_t *out_token_len, const char **out_rest,
+                                   size_t *out_rest_len) {
+    size_t token_len = 0;
+    size_t rest_start;
+
+    while (token_len < len && !repl_is_space(text[token_len])) {
+        token_len++;
+    }
+    rest_start = token_len;
+    while (rest_start < len && repl_is_space(text[rest_start])) {
+        rest_start++;
+    }
+    *out_token = text;
+    *out_token_len = token_len;
+    *out_rest = text + rest_start;
+    *out_rest_len = len - rest_start;
+}
+
+static int repl_token_equals(const char *token, size_t token_len,
+                             const char *value) {
+    size_t value_len = strlen(value);
+    return token_len == value_len && memcmp(token, value, value_len) == 0;
+}
+
+struct repl_session_switch_outcome {
+    int terminate; /* a terminating signal arrived during a selector */
+};
+
+/*
+ * Runs a two-option confirmation selector and reports the choice.
+ *
+ * A cancel counts as choosing the safe first option, per
+ * oi_cli_composer_select's contract. Erases the selector frame afterwards so
+ * the ordinary idle prompt is what remains on screen.
+ */
+static oi_status repl_confirm(struct oi_cli_composer *composer, int signal_fd,
+                              const char *cancel_text,
+                              const char *proceed_text, int *out_confirmed,
+                              int *out_terminate) {
+    struct oi_cli_render_line options[2];
+    size_t selected = 0;
+    int cancelled = 0;
+    oi_status status;
+
+    options[0].text = cancel_text;
+    options[0].len = strlen(cancel_text);
+    options[1].text = proceed_text;
+    options[1].len = strlen(proceed_text);
+    *out_confirmed = 0;
+    *out_terminate = 0;
+
+    status = oi_cli_composer_select(composer, signal_fd, NULL, 0, options, 2,
+                                    0, &selected, &cancelled, out_terminate);
+    if (status != OI_OK || *out_terminate != 0) {
+        return status;
+    }
+    status = oi_cli_composer_redraw(composer);
+    if (status != OI_OK) {
+        return status;
+    }
+    *out_confirmed = !cancelled && selected == 1;
+    return OI_OK;
+}
+
+static oi_status repl_confirmation_text(
+    const char *prefix, const char *target, size_t target_len,
+    const char *suffix, char **out_text) {
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    char *text;
+
+    if (prefix_len > SIZE_MAX - suffix_len - 1 ||
+        target_len > SIZE_MAX - prefix_len - suffix_len - 1) {
+        return OI_ERR_NOMEM;
+    }
+    text = malloc(prefix_len + target_len + suffix_len + 1);
+    if (text == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    memcpy(text, prefix, prefix_len);
+    memcpy(text + prefix_len, target, target_len);
+    memcpy(text + prefix_len + target_len, suffix, suffix_len);
+    text[prefix_len + target_len + suffix_len] = '\0';
+    *out_text = text;
+    return OI_OK;
+}
+
+/*
+ * Dumps a restored conversation so the user can see what they switched into.
+ *
+ * A deliberately plain role-tagged dump rather than the streaming Markdown
+ * renderer: that renderer is built around incremental state for a turn that
+ * is actively arriving, and driving it over a static list would mean
+ * fabricating turn boundaries it does not have. Legibility here is worth more
+ * than styling.
+ */
+static oi_status repl_print_replay(FILE *out,
+                                   const struct oi_cli_message_list *context) {
+    size_t index;
+
+    for (index = 0; index < context->len; index++) {
+        const struct oi_cli_message *message = &context->items[index];
+        const char *role;
+
+        switch (message->role) {
+        case OI_CLI_MESSAGE_USER:
+            role = "you";
+            break;
+        case OI_CLI_MESSAGE_ASSISTANT:
+            role = "oi";
+            break;
+        case OI_CLI_MESSAGE_TOOL:
+            role = "tool";
+            break;
+        default:
+            role = "?";
+            break;
+        }
+        if (message->content.len > 0) {
+            if (message->role == OI_CLI_MESSAGE_TOOL) {
+                if (fprintf(out, "%s [%.*s]: %.*s\n", role,
+                            (int)message->tool_call_id.len,
+                            message->tool_call_id.data,
+                            (int)message->content.len,
+                            message->content.data) < 0) {
+                    return OI_ERR_IO;
+                }
+            } else if (fprintf(out, "%s: %.*s\n", role,
+                               (int)message->content.len,
+                               message->content.data) < 0) {
+                return OI_ERR_IO;
+            }
+        }
+        for (size_t call_index = 0;
+             call_index < message->tool_calls_len; call_index++) {
+            const struct oi_cli_tool_call_value *call =
+                &message->tool_calls[call_index];
+
+            if (fprintf(out,
+                        "%s tool call:\n"
+                        "  id: %.*s\n"
+                        "  name: %.*s\n"
+                        "  arguments: %.*s\n",
+                        role, (int)call->id.len, call->id.data,
+                        (int)call->name.len, call->name.data,
+                        (int)call->arguments.len,
+                        call->arguments.data) < 0) {
+                return OI_ERR_IO;
+            }
+        }
+    }
+    return fflush(out) != 0 ? OI_ERR_IO : OI_OK;
+}
+
+static const char *repl_switch_outcome_text(
+    enum oi_cli_session_switch_outcome outcome) {
+    switch (outcome) {
+    case OI_CLI_SESSION_SWITCH_SAME:
+        return "already on that session";
+    case OI_CLI_SESSION_SWITCH_NOT_FOUND:
+        return "no such session";
+    case OI_CLI_SESSION_SWITCH_BUSY:
+        return "session is open in another process";
+    case OI_CLI_SESSION_SWITCH_INVALID:
+        return "invalid session id";
+    case OI_CLI_SESSION_SWITCH_CORRUPT:
+        return "session could not be loaded";
+    case OI_CLI_SESSION_SWITCH_OK:
+    default:
+        return "switched";
+    }
+}
+
+/*
+ * Swaps the live conversation over to another session.
+ *
+ * The ordering is the whole point. The conversation is destroyed *before*
+ * switch_session is called, because a successful switch destroys the old
+ * session's arena and the conversation allocates from it. That means this
+ * function is briefly holding no conversation at all, so every path out of
+ * here must either build a new one or rebuild the old one -- which is why the
+ * current messages are cloned up front, before anything is torn down.
+ *
+ * Returns non-OK only for a structural failure the REPL should end on.
+ */
+static oi_status repl_handle_session_switch(
+    const struct oi_cli_repl_config *config,
+    struct oi_cli_composer *composer, int signal_fd, oi_llm_client *client,
+    oi_reactor *reactor, oi_tool_registry *tools,
+    struct oi_cli_conversation_config *conversation_config,
+    struct oi_cli_string *current_model,
+    struct oi_cli_input_history *input_history, const char *rest,
+    size_t rest_len, oi_cli_conversation **conversation,
+    oi_arena **active_arena, struct oi_cli_message_list *switched_context,
+    int *has_switched_context,
+    struct repl_session_switch_outcome *out_outcome) {
+    struct oi_cli_session_switch_result result;
+    struct oi_cli_message_list rollback_context;
+    const char *id;
+    const char *extra;
+    size_t id_len;
+    size_t extra_len;
+    int had_conversation;
+    oi_status status;
+
+    out_outcome->terminate = 0;
+    repl_split_first_token(rest, rest_len, &id, &id_len, &extra, &extra_len);
+    if (id_len == 0 || extra_len != 0) {
+        return fputs("oi: usage: /session switch ID\n", config->err) == EOF ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    if (config->switch_session == NULL) {
+        return fputs("oi: /session switch is not available in this context\n",
+                     config->err) == EOF ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+
+    /*
+     * Clone the live messages before anything is destroyed: this is the only
+     * way back if the switch fails.
+     *
+     * There may be no conversation yet -- an automatic session is created
+     * lazily on the first message, so switching before then is legitimate and
+     * has nothing to tear down or restore. `had_conversation` records which
+     * case this is, because on the failure path an absent conversation must
+     * be left absent: `*active_arena` is still NULL until the first one is
+     * built, so there would be nothing to rebuild it on.
+     */
+    had_conversation = *conversation != NULL;
+    oi_cli_message_list_init(&rollback_context);
+    if (had_conversation) {
+        const struct oi_cli_message_list *live =
+            oi_cli_conversation_messages(*conversation);
+        size_t index;
+
+        for (index = 0; live != NULL && index < live->len; index++) {
+            status = oi_cli_message_list_append_clone(&rollback_context,
+                                                      &live->items[index]);
+            if (status != OI_OK) {
+                oi_cli_message_list_free(&rollback_context);
+                return status;
+            }
+        }
+        oi_cli_conversation_destroy(*conversation);
+        *conversation = NULL;
+    }
+
+    oi_cli_session_switch_result_init(&result);
+    status = config->switch_session(config->switch_session_user_data, id,
+                                    id_len, &result);
+    if (status != OI_OK) {
+        /* Structural: the loop is ending, so there is nothing to rebuild. */
+        oi_cli_session_switch_result_free(&result);
+        oi_cli_message_list_free(&rollback_context);
+        return status;
+    }
+
+    if (result.outcome != OI_CLI_SESSION_SWITCH_OK) {
+        /*
+         * Nothing durable changed and the old arena is untouched, so rebuild
+         * the conversation exactly as it was. A conversation holds no state
+         * across destroy/create beyond the arena and the message list, both
+         * of which are still here.
+         */
+        oi_status message_status = OI_OK;
+        if (fprintf(config->err, "oi: %.*s: %s\n", (int)id_len, id,
+                    repl_switch_outcome_text(result.outcome)) < 0 ||
+            fflush(config->err) != 0) {
+            message_status = OI_ERR_IO;
+        }
+        oi_cli_session_switch_result_free(&result);
+        status = OI_OK;
+        if (had_conversation) {
+            conversation_config->model = current_model->data;
+            status = oi_cli_conversation_create(
+                client, reactor, *active_arena, tools, conversation_config,
+                &rollback_context, conversation);
+        }
+        oi_cli_message_list_free(&rollback_context);
+        return status != OI_OK ? status : message_status;
+    }
+
+    /* Committed. Adopt the new session's arena, model, context, and input
+     * history, then build the conversation on top of them. */
+    oi_cli_message_list_free(&rollback_context);
+    *active_arena = oi_session_arena(result.session);
+    status = oi_cli_string_set(current_model, result.model.data,
+                               result.model.len);
+    if (status == OI_OK) {
+        oi_cli_message_list_free(switched_context);
+        *switched_context = result.initial_context;
+        result.initial_context = (struct oi_cli_message_list){0};
+        *has_switched_context = 1;
+        /* Input history is per-session: rebuild it from the user messages of
+         * the session just opened. */
+        oi_cli_input_history_free(input_history);
+        oi_cli_input_history_init(input_history);
+        status = seed_input_history(input_history, switched_context);
+    }
+    if (status == OI_OK) {
+        conversation_config->model = current_model->data;
+        status = oi_cli_conversation_create(client, reactor, *active_arena,
+                                            tools, conversation_config,
+                                            switched_context, conversation);
+    }
+    if (status != OI_OK) {
+        oi_cli_session_switch_result_free(&result);
+        return status;
+    }
+    if (fprintf(config->out, "oi: switched to session %.*s\n", (int)id_len,
+                id) < 0 ||
+        fflush(config->out) != 0) {
+        oi_cli_session_switch_result_free(&result);
+        return OI_ERR_IO;
+    }
+
+    /* Offer the restored conversation, since a bare prompt gives no hint of
+     * what was just loaded. */
+    if (switched_context->len > 0) {
+        int confirmed = 0;
+        int terminate = 0;
+
+        status = repl_confirm(composer, signal_fd, "Continue without replay",
+                              "Show the restored conversation", &confirmed,
+                              &terminate);
+        if (status != OI_OK || terminate) {
+            out_outcome->terminate = terminate;
+            oi_cli_session_switch_result_free(&result);
+            return status;
+        }
+        if (confirmed) {
+            status = repl_print_replay(config->out, switched_context);
+            if (status != OI_OK) {
+                oi_cli_session_switch_result_free(&result);
+                return status;
+            }
+        }
+    }
+    oi_cli_session_switch_result_free(&result);
+    return OI_OK;
+}
+
+static oi_status repl_handle_session_delete(
+    const struct oi_cli_repl_config *config,
+    struct oi_cli_composer *composer, int signal_fd, const char *rest,
+    size_t rest_len) {
+    const char *id;
+    const char *extra;
+    size_t id_len;
+    size_t extra_len;
+    char *detail = NULL;
+    char *confirmation = NULL;
+    int confirmed = 0;
+    int terminate = 0;
+    oi_status status;
+
+    repl_split_first_token(rest, rest_len, &id, &id_len, &extra, &extra_len);
+    if (id_len == 0 || extra_len != 0) {
+        return fputs("oi: usage: /session delete ID\n", config->err) == EOF ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    if (config->delete_session == NULL) {
+        return fputs("oi: /session delete is not available in this context\n",
+                     config->err) == EOF ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    status = repl_confirmation_text(
+        "Permanently delete session ", id, id_len, " (cannot be undone)",
+        &confirmation);
+    if (status == OI_OK) {
+        status = repl_confirm(composer, signal_fd, "Cancel", confirmation,
+                              &confirmed, &terminate);
+    }
+    free(confirmation);
+    if (status != OI_OK || terminate) {
+        return status;
+    }
+    if (!confirmed) {
+        return fputs("oi: deletion cancelled\n", config->err) == EOF ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    status = config->delete_session(config->delete_session_user_data, id,
+                                    id_len, &detail);
+    if (status == OI_OK) {
+        if (fprintf(config->out, "oi: deleted session %.*s\n", (int)id_len,
+                    id) < 0 ||
+            fflush(config->out) != 0) {
+            free(detail);
+            return OI_ERR_IO;
+        }
+    } else if (fprintf(config->err, "oi: %.*s: %s\n", (int)id_len, id,
+                       detail != NULL ? detail : "could not delete") < 0 ||
+               fflush(config->err) != 0) {
+        free(detail);
+        return OI_ERR_IO;
+    }
+    free(detail);
+    return OI_OK;
+}
+
+static oi_status repl_handle_session_import(
+    const struct oi_cli_repl_config *config,
+    struct oi_cli_composer *composer, int signal_fd, const char *rest,
+    size_t rest_len) {
+    char *new_id = NULL;
+    char *detail = NULL;
+    char *confirmation = NULL;
+    int confirmed = 0;
+    int terminate = 0;
+    oi_status status;
+
+    /* The remainder is a path taken verbatim: it may contain spaces, so it is
+     * never tokenized further. */
+    if (rest_len == 0) {
+        return fputs("oi: usage: /session import PATH\n", config->err) ==
+                           EOF ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    if (config->import_session == NULL) {
+        return fputs("oi: /session import is not available in this context\n",
+                     config->err) == EOF ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    status = repl_confirmation_text("Copy '", rest, rest_len,
+                                    "' into a new session", &confirmation);
+    if (status == OI_OK) {
+        status = repl_confirm(composer, signal_fd, "Cancel", confirmation,
+                              &confirmed, &terminate);
+    }
+    free(confirmation);
+    if (status != OI_OK || terminate) {
+        return status;
+    }
+    if (!confirmed) {
+        return fputs("oi: import cancelled\n", config->err) == EOF ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    status = config->import_session(config->import_session_user_data, rest,
+                                    rest_len, &new_id, &detail);
+    if (status == OI_OK) {
+        if (fprintf(config->out,
+                    "oi: imported as session %s (use /session switch %s to "
+                    "open it)\n",
+                    new_id, new_id) < 0 ||
+            fflush(config->out) != 0) {
+            free(new_id);
+            free(detail);
+            return OI_ERR_IO;
+        }
+    } else if (fprintf(config->err, "oi: import failed: %s\n",
+                       detail != NULL ? detail : "could not import") < 0 ||
+               fflush(config->err) != 0) {
+        free(new_id);
+        free(detail);
+        return OI_ERR_IO;
+    }
+    free(new_id);
+    free(detail);
+    return OI_OK;
+}
+
 oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
                           oi_arena *arena, oi_tool_registry *tools,
                           const struct oi_cli_repl_config *config) {
@@ -798,6 +1289,22 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     int composer_initialized = 0;
     struct oi_cli_conversation_config conversation_config;
     oi_cli_conversation *conversation = NULL;
+    /*
+     * The arena the live conversation allocates from. Loop-scoped rather
+     * than block-local to the lazy-create path, because /session switch
+     * replaces it: a successful switch destroys the old session's arena and
+     * adopts the new session's, and a failed switch has to rebuild the
+     * conversation on the unchanged old one.
+     */
+    oi_arena *active_arena = arena;
+    /*
+     * The context the conversation is (re)built from. Starts as the caller's
+     * startup context and is replaced by a switch, so the lazy-create path
+     * below and the switch path agree on what "current context" means.
+     */
+    const struct oi_cli_message_list *active_context = config->initial_context;
+    struct oi_cli_message_list switched_context;
+    int has_switched_context = 0;
     struct oi_cli_string current_model_storage = {0};
     struct oi_cli_string *current_model;
     struct repl_setting_context setting_context;
@@ -818,6 +1325,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     }
     current_model = config->pending_model != NULL ? config->pending_model
                                                   : &current_model_storage;
+    oi_cli_message_list_init(&switched_context);
 
     oi_cli_input_history_init(&input_history);
     status = seed_input_history(&input_history, config->initial_context);
@@ -1177,6 +1685,63 @@ have_parsed_command:
                 continue;
             }
             /*
+             * /session switch, delete, and import cannot go through
+             * cli_command_dispatch: switch destroys and rebuilds the live
+             * conversation, and delete and import need the composer's
+             * confirmation flow. Handled here at the same idle/safe-boundary
+             * label everything else funnels through, so a dequeued pending
+             * command behaves identically to a freshly-typed one.
+             */
+            if (parsed.command->id == OI_CLI_COMMAND_SESSION &&
+                parsed.arguments_len > 0) {
+                const char *subcommand = NULL;
+                const char *rest = NULL;
+                size_t subcommand_len = 0;
+                size_t rest_len = 0;
+                int handled = 0;
+
+                repl_split_first_token(parsed.arguments, parsed.arguments_len,
+                                       &subcommand, &subcommand_len, &rest,
+                                       &rest_len);
+
+                if (repl_token_equals(subcommand, subcommand_len, "switch")) {
+                    struct repl_session_switch_outcome outcome;
+
+                    handled = 1;
+                    status = repl_handle_session_switch(
+                        config, &composer, signal_fd, client, reactor, tools,
+                        &conversation_config, current_model, &input_history,
+                        rest, rest_len, &conversation, &active_arena,
+                        &switched_context, &has_switched_context, &outcome);
+                    if (status == OI_OK && outcome.terminate) {
+                        free(prompt);
+                        break;
+                    }
+                    if (status == OI_OK && has_switched_context) {
+                        active_context = &switched_context;
+                    }
+                } else if (repl_token_equals(subcommand, subcommand_len,
+                                             "delete")) {
+                    handled = 1;
+                    status = repl_handle_session_delete(config, &composer,
+                                                        signal_fd, rest,
+                                                        rest_len);
+                } else if (repl_token_equals(subcommand, subcommand_len,
+                                             "import")) {
+                    handled = 1;
+                    status = repl_handle_session_import(config, &composer,
+                                                        signal_fd, rest,
+                                                        rest_len);
+                }
+                if (handled) {
+                    free(prompt);
+                    if (status != OI_OK) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            /*
              * /permissions allow must not silently elevate the process-
              * wide tool policy: gated here (not in cli_command_dispatch.c,
              * which has no composer/terminal access by design and
@@ -1249,6 +1814,7 @@ have_parsed_command:
                 .set_model_user_data = &setting_context,
                 .set_cwd = dispatch_set_cwd,
                 .set_cwd_user_data = &setting_context,
+                .session = config->session_ops,
             };
             enum oi_cli_command_result command_result;
 
@@ -1267,9 +1833,11 @@ have_parsed_command:
         }
 have_message:
         if (conversation == NULL) {
-            oi_arena *conversation_arena = arena;
+            oi_arena *conversation_arena = active_arena;
 
-            if (config->prepare != NULL) {
+            /* Only the first-ever creation goes through prepare; after a
+             * switch the arena is already the new session's. */
+            if (config->prepare != NULL && !has_switched_context) {
                 status = config->prepare(config->prepare_user_data,
                                          &conversation_arena);
             }
@@ -1283,13 +1851,13 @@ have_message:
                 conversation_config.model = current_model->data;
                 status = oi_cli_conversation_create(
                     client, reactor, conversation_arena, tools,
-                    &conversation_config, config->initial_context,
-                    &conversation);
+                    &conversation_config, active_context, &conversation);
             }
             if (status != OI_OK) {
                 free(prompt);
                 break;
             }
+            active_arena = conversation_arena;
         }
 
         oi_cli_present_reset_turn(&present);
@@ -1483,6 +2051,7 @@ cleanup_present:
     oi_cli_present_free(&present);
 cleanup_history:
     oi_cli_input_history_free(&input_history);
+    oi_cli_message_list_free(&switched_context);
     oi_cli_string_free(&current_model_storage);
     return status;
 }

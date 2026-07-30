@@ -27,6 +27,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "oi/sesslog.h"
+
 /* The Makefile defines OI_CLI_BIN to match whatever $(BUILD) directory
  * this test binary itself was compiled into (build/, build-asan/, ...)
  * -- hardcoding "build/oi" here caused a real hang: under `make asan`,
@@ -4499,6 +4501,722 @@ TEST(interactive_help_and_exit_are_dispatched_without_a_session) {
     close(master_fd);
 }
 
+/* --- /session lifecycle through the real REPL --- */
+
+/*
+ * Returns the ids of every session directory under `root`, sorted, so a test
+ * can name a session created by an earlier process run. An automatic session
+ * always gets a fresh timestamped directory, so running `oi` twice is how a
+ * second switchable session comes to exist.
+ */
+struct session_ids {
+    char items[8][64];
+    size_t count;
+};
+
+static void collect_session_ids(const char *root, struct session_ids *out) {
+    DIR *directory = opendir(root);
+    struct dirent *entry;
+
+    out->count = 0;
+    CHECK(directory != NULL);
+    while (directory != NULL && (entry = readdir(directory)) != NULL) {
+        if (entry->d_name[0] == '.' || out->count >= 8) {
+            continue;
+        }
+        /* d_name can exceed the row; a session id never does, and a
+         * longer name is not one. */
+        if (strlen(entry->d_name) >= sizeof out->items[0]) {
+            continue;
+        }
+        memcpy(out->items[out->count], entry->d_name,
+               strlen(entry->d_name) + 1);
+        out->count++;
+    }
+    if (directory != NULL) {
+        closedir(directory);
+    }
+    /* Ids embed a timestamp and a counter, so lexical order is creation
+     * order -- enough to say "the first session" deterministically. */
+    for (size_t i = 0; i + 1 < out->count; i++) {
+        for (size_t j = i + 1; j < out->count; j++) {
+            if (strcmp(out->items[j], out->items[i]) < 0) {
+                char swap[64];
+                memcpy(swap, out->items[i], sizeof swap);
+                memcpy(out->items[i], out->items[j], sizeof swap);
+                memcpy(out->items[j], swap, sizeof swap);
+            }
+        }
+    }
+}
+
+static void remove_session_tree(const char *root, const char *id) {
+    char path[640];
+    snprintf(path, sizeof path, "%s/%s/history.oilog", root, id);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/%s/metadata.json", root, id);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/%s/metadata.json.lock", root, id);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/%s", root, id);
+    rmdir(path);
+}
+
+/*
+ * Runs one interactive session that sends `message`, waits for `reply_text`
+ * in the transcript, and exits cleanly. Used to leave a real session with
+ * real content behind for a later run to switch into.
+ */
+static void run_one_interactive_turn(const char *session_root,
+                                     const char *message,
+                                     const char *reply_text) {
+    char reply_sse[256];
+    size_t reply_len;
+    char *reply;
+    const char *responses[1];
+    size_t lengths[1];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char line[256];
+
+    snprintf(reply_sse, sizeof reply_sse,
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+             "\"%s\"}}]}\n\n"
+             "data: [DONE]\n\n",
+             reply_text);
+    reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                   "HTTP/1.1 200 OK", &reply_len);
+    responses[0] = reply;
+    lengths[0] = reply_len;
+    server = start_mock_server_turns(responses, lengths, 1, &port);
+    free(reply);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    snprintf(line, sizeof line, "%s\r", message);
+    CHECK(write_interactive(master_fd, line, strlen(line)));
+    CHECK(interactive_wait_for(master_fd, &result, reply_text, 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        CHECK(WIFEXITED(status));
+        CHECK_EQ(WEXITSTATUS(status), 0);
+    }
+    close(master_fd);
+    waitpid(server, NULL, 0);
+}
+
+static void run_one_interactive_tool_turn(const char *session_root) {
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_replay\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\\\"printf replay-tool-result\\\"}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"remembered-answer\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    size_t answer_len;
+    char *tool_response = build_chunked_response(
+        tool_sse, strlen(tool_sse), "HTTP/1.1 200 OK", &tool_len);
+    char *answer_response = build_chunked_response(
+        answer_sse, strlen(answer_sse), "HTTP/1.1 200 OK", &answer_len);
+    const char *responses[] = {tool_response, answer_response};
+    size_t lengths[] = {tool_len, answer_len};
+    unsigned short port;
+    pid_t server =
+        start_mock_server_turns(responses, lengths, 2, &port);
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+
+    free(tool_response);
+    free(answer_response);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_allowing_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "remembered question\r", 20));
+    CHECK(interactive_wait_for(master_fd, &result, "remembered-answer", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        CHECK(WIFEXITED(status));
+        CHECK_EQ(WEXITSTATUS(status), 0);
+    }
+    close(master_fd);
+    waitpid(server, NULL, 0);
+}
+
+TEST(interactive_session_list_and_current_describe_the_active_session) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"list-reply\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply;
+    const char *responses[1];
+    size_t lengths[1];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+    struct session_ids ids;
+
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-session-list-%d", (int)getpid());
+    /* A prior run leaves one real session behind to list. */
+    run_one_interactive_turn(session_root, "first message", "first-reply");
+
+    reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                   "HTTP/1.1 200 OK", &reply_len);
+    responses[0] = reply;
+    lengths[0] = reply_len;
+    server = start_mock_server_turns(responses, lengths, 1, &port);
+    free(reply);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+
+    /*
+     * An automatic session is created lazily on the first message, so before
+     * one is sent this process genuinely has no session -- worth asserting,
+     * since /session current has to say so rather than inventing one.
+     */
+    CHECK(write_interactive(master_fd, "/session current\r", 17));
+    CHECK(interactive_wait_for(master_fd, &result, "Session: (not created)",
+                               1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "list-reply", 1));
+
+    /*
+     * Both sessions exist now. Ids embed a timestamp and counter, so the
+     * later one is this process's own -- which is the row that must carry
+     * the current marker.
+     */
+    collect_session_ids(session_root, &ids);
+    CHECK_EQ(ids.count, 2);
+    CHECK(write_interactive(master_fd, "/session list\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "Sessions (2):", 1));
+    {
+        char current_row[128];
+        snprintf(current_row, sizeof current_row, "* %s", ids.items[1]);
+        CHECK(interactive_wait_for(master_fd, &result, current_row, 1));
+    }
+
+    CHECK(write_interactive(master_fd, "/session current\r", 17));
+    CHECK(interactive_wait_for(master_fd, &result, "Status: healthy", 1));
+    {
+        char expected_path[640];
+        snprintf(expected_path, sizeof expected_path, "Path: %s/%s",
+                 session_root, ids.items[1]);
+        CHECK(interactive_wait_for(master_fd, &result, expected_path, 1));
+    }
+
+    /* Renaming the *other* session shows up in the listing. */
+    {
+        char line[160];
+        snprintf(line, sizeof line, "/session rename %s my old work\r",
+                 ids.items[0]);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
+    }
+    CHECK(interactive_wait_for(master_fd, &result, "Renamed session", 1));
+    CHECK(write_interactive(master_fd, "/session list\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "\"my old work\"", 1));
+
+    /* Trashing the session you are sitting in is refused. */
+    CHECK(write_interactive(master_fd, "/session trash ", 15));
+    {
+        char tail[128];
+        snprintf(tail, sizeof tail, "%s\r", ids.items[1]);
+        CHECK(write_interactive(master_fd, tail, strlen(tail)));
+    }
+    CHECK(interactive_wait_for(master_fd, &result, "active session", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    for (size_t i = 0; i < ids.count; i++) {
+        remove_session_tree(session_root, ids.items[i]);
+    }
+    rmdir(session_root);
+}
+
+TEST(interactive_session_switch_restores_context_and_offers_replay) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"second-reply\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply;
+    const char *responses[1];
+    size_t lengths[1];
+    char capture_path[160];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+    struct session_ids ids;
+
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-session-switch-%d", (int)getpid());
+    snprintf(capture_path, sizeof capture_path,
+             "/tmp/oi-cli-session-switch-req-%d", (int)getpid());
+    unlink(capture_path);
+
+    /* Session A, with a real tool-using exchange in it, from an earlier
+     * process. This also makes the visible replay prove that it does not
+     * collapse model-visible tool details into a mere count. */
+    run_one_interactive_tool_turn(session_root);
+    collect_session_ids(session_root, &ids);
+    CHECK_EQ(ids.count, 1);
+
+    reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                   "HTTP/1.1 200 OK", &reply_len);
+    responses[0] = reply;
+    lengths[0] = reply_len;
+    server = start_mock_server_turns_capture(responses, lengths, 1, &port,
+                                             capture_path);
+    free(reply);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+
+    /* Switch into A. */
+    {
+        char line[128];
+        snprintf(line, sizeof line, "/session switch %s\r", ids.items[0]);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
+    }
+    CHECK(interactive_wait_for(master_fd, &result, "switched to session", 1));
+
+    /* The replay offer appears; choosing it prints the restored exchange. */
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "Show the restored conversation", 1));
+    CHECK(write_interactive(master_fd, "2", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "you: remembered question",
+                               1));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: remembered-answer",
+                               1));
+    CHECK(interactive_wait_for(master_fd, &result, "id: call_replay", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "name: shell", 1));
+    CHECK(interactive_wait_for(
+        master_fd, &result,
+        "arguments: {\"command\":\"printf replay-tool-result\"}", 1));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "tool [call_replay]: replay-tool-result", 1));
+
+    /* /session current now reports A. */
+    CHECK(write_interactive(master_fd, "/session current\r", 17));
+    {
+        char expected[128];
+        snprintf(expected, sizeof expected, "Session: %s", ids.items[0]);
+        CHECK(interactive_wait_for(master_fd, &result, expected, 1));
+    }
+    {
+        char expected[640];
+        snprintf(expected, sizeof expected, "Path: %s/%s", session_root,
+                 ids.items[0]);
+        CHECK(interactive_wait_for(master_fd, &result, expected, 1));
+    }
+
+    /* A follow-up message lands in A's log, and carries A's restored
+     * context to the model rather than starting over. */
+    CHECK(write_interactive(master_fd, "follow up\r", 10));
+    CHECK(interactive_wait_for(master_fd, &result, "second-reply", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        FILE *capture = fopen(capture_path, "r");
+        char requests[16384];
+        size_t request_len =
+            capture == NULL ? 0
+                            : fread(requests, 1, sizeof requests - 1, capture);
+        CHECK(capture != NULL);
+        if (capture != NULL) {
+            fclose(capture);
+        }
+        requests[request_len] = '\0';
+        /* The restored context really went to the model. */
+        CHECK(strstr(requests, "remembered question") != NULL);
+        CHECK(strstr(requests, "follow up") != NULL);
+    }
+    unlink(capture_path);
+
+    /* And the durable record of the follow-up is in A's log, not the
+     * session this process started in. */
+    {
+        char history_path[640];
+        struct oilog_records records;
+        const char *needles[1];
+
+        snprintf(history_path, sizeof history_path, "%s/%s/history.oilog",
+                 session_root, ids.items[0]);
+        oilog_records_load(history_path, &records);
+        needles[0] = "follow up";
+        CHECK_EQ(oilog_count(&records, needles, 1), (size_t)1);
+        oilog_records_free(&records);
+    }
+
+    {
+        struct session_ids after;
+        collect_session_ids(session_root, &after);
+        for (size_t i = 0; i < after.count; i++) {
+            remove_session_tree(session_root, after.items[i]);
+        }
+    }
+    rmdir(session_root);
+}
+
+TEST(interactive_session_switch_reports_a_missing_target_and_keeps_working) {
+    const char *reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"still-here\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    const char *responses[] = {reply};
+    size_t lengths[] = {reply_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-session-noswitch-%d", (int)getpid());
+    server = start_mock_server_turns(responses, lengths, 1, &port);
+    free(reply);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+
+    /* Send a message first, so there is a live conversation to preserve. */
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "still-here", 1));
+
+    /* A failed switch must leave the REPL working, not end it. */
+    CHECK(write_interactive(master_fd, "/session switch nosuchsession\r", 30));
+    CHECK(interactive_wait_for(master_fd, &result, "no such session", 1));
+    /* Bad syntax and unsafe ids are refused the same way. */
+    CHECK(write_interactive(master_fd, "/session switch\r", 16));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "usage: /session switch ID", 1));
+    CHECK(write_interactive(master_fd, "/session switch ../escape\r", 26));
+    CHECK(interactive_wait_for(master_fd, &result, "invalid session id", 1));
+
+    /* Still alive and still the original session. */
+    CHECK(write_interactive(master_fd, "/session current\r", 17));
+    CHECK(interactive_wait_for(master_fd, &result, "Status: healthy", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        struct session_ids ids;
+        collect_session_ids(session_root, &ids);
+        for (size_t i = 0; i < ids.count; i++) {
+            remove_session_tree(session_root, ids.items[i]);
+        }
+    }
+    rmdir(session_root);
+}
+
+TEST(interactive_session_trash_restore_and_confirmed_delete) {
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+    char trashed_dir[640];
+    char live_dir[640];
+    struct session_ids ids;
+
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-session-trash-%d", (int)getpid());
+    /* An earlier session to operate on, so the active one is never the
+     * target. */
+    run_one_interactive_turn(session_root, "old work", "old-reply");
+    collect_session_ids(session_root, &ids);
+    CHECK_EQ(ids.count, 1);
+    snprintf(live_dir, sizeof live_dir, "%s/%s", session_root,
+             ids.items[0]);
+    snprintf(trashed_dir, sizeof trashed_dir, "%s/.trash/%s", session_root,
+             ids.items[0]);
+
+    server = start_mock_server_turns(NULL, NULL, 0, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+
+    /* Trash, and confirm it moved on disk. */
+    {
+        char line[128];
+        snprintf(line, sizeof line, "/session trash %s\r", ids.items[0]);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
+    }
+    CHECK(interactive_wait_for(master_fd, &result, "Trashed session", 1));
+    CHECK(access(trashed_dir, F_OK) == 0);
+    CHECK(access(live_dir, F_OK) != 0);
+
+    /* It shows in the trash listing and not the live one. */
+    CHECK(write_interactive(master_fd, "/session trash-list\r", 20));
+    CHECK(interactive_wait_for(master_fd, &result, "Trashed sessions (1):",
+                               1));
+
+    /* Restore, and confirm it came back. */
+    {
+        char line[128];
+        snprintf(line, sizeof line, "/session restore %s\r", ids.items[0]);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
+    }
+    CHECK(interactive_wait_for(master_fd, &result, "Restored session", 1));
+    CHECK(access(live_dir, F_OK) == 0);
+
+    /* Deleting a live session is refused: it must be trashed first. */
+    {
+        char line[128];
+        snprintf(line, sizeof line, "/session delete %s\r", ids.items[0]);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
+    }
+    {
+        char confirmation[256];
+        snprintf(confirmation, sizeof confirmation,
+                 "Permanently delete session %s (cannot be undone)",
+                 ids.items[0]);
+        CHECK(interactive_wait_for(master_fd, &result, confirmation, 1));
+    }
+    /* Cancel at the default selection first -- nothing may be removed. */
+    CHECK(write_interactive(master_fd, "\r", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "deletion cancelled", 1));
+    CHECK(access(live_dir, F_OK) == 0);
+
+    /* Trash it, then confirm the deletion for real. */
+    {
+        char line[128];
+        snprintf(line, sizeof line, "/session trash %s\r", ids.items[0]);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
+    }
+    CHECK(interactive_wait_for(master_fd, &result, "Trashed session", 2));
+    {
+        char line[128];
+        snprintf(line, sizeof line, "/session delete %s\r", ids.items[0]);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
+    }
+    {
+        char confirmation[256];
+        snprintf(confirmation, sizeof confirmation,
+                 "Permanently delete session %s (cannot be undone)",
+                 ids.items[0]);
+        CHECK(interactive_wait_for(master_fd, &result, confirmation, 2));
+    }
+    CHECK(write_interactive(master_fd, "2", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "deleted session", 1));
+    CHECK(access(trashed_dir, F_OK) != 0);
+    CHECK(access(live_dir, F_OK) != 0);
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    {
+        struct session_ids after;
+        char trash_root[256];
+        collect_session_ids(session_root, &after);
+        for (size_t i = 0; i < after.count; i++) {
+            remove_session_tree(session_root, after.items[i]);
+        }
+        snprintf(trash_root, sizeof trash_root, "%s/.trash", session_root);
+        rmdir(trash_root);
+    }
+    rmdir(session_root);
+}
+
+TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+    char source_path[160];
+    char *before = NULL;
+    long before_len = 0;
+
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-session-import-%d", (int)getpid());
+    snprintf(source_path, sizeof source_path, "/tmp/oi-cli-legacy-%d.oilog",
+             (int)getpid());
+    unlink(source_path);
+
+    /* A legacy log: raw alternating payloads, no transition record. */
+    {
+        oi_sesslog *log = NULL;
+        CHECK_EQ(oi_sesslog_open(source_path, &log), OI_OK);
+        CHECK_EQ(oi_sesslog_append(log, "legacy question", 15), OI_OK);
+        CHECK_EQ(oi_sesslog_append(log, "legacy answer", 13), OI_OK);
+        oi_sesslog_close(log);
+    }
+    {
+        FILE *source = fopen(source_path, "rb");
+        CHECK(source != NULL);
+        CHECK_EQ(fseek(source, 0, SEEK_END), 0);
+        before_len = ftell(source);
+        CHECK(before_len > 0);
+        rewind(source);
+        before = malloc((size_t)before_len);
+        CHECK(before != NULL);
+        CHECK_EQ(fread(before, 1, (size_t)before_len, source),
+                 (size_t)before_len);
+        fclose(source);
+    }
+
+    server = start_mock_server_turns(NULL, NULL, 0, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(port, slave_fd, session_root);
+    close(slave_fd);
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+
+    /* Cancel first: nothing may be imported. */
+    {
+        char line[256];
+        snprintf(line, sizeof line, "/session import %s\r", source_path);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
+    }
+    {
+        char confirmation[384];
+        snprintf(confirmation, sizeof confirmation,
+                 "Copy '%s' into a new session", source_path);
+        CHECK(interactive_wait_for(master_fd, &result, confirmation, 1));
+    }
+    CHECK(write_interactive(master_fd, "\r", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "import cancelled", 1));
+    /* No message has been sent, so this process has no session of its own
+     * yet and a cancelled import created nothing. */
+    CHECK(write_interactive(master_fd, "/session list\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "Sessions: none", 1));
+
+    /* Now confirm. */
+    {
+        char line[256];
+        snprintf(line, sizeof line, "/session import %s\r", source_path);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
+    }
+    {
+        char confirmation[384];
+        snprintf(confirmation, sizeof confirmation,
+                 "Copy '%s' into a new session", source_path);
+        CHECK(interactive_wait_for(master_fd, &result, confirmation, 2));
+    }
+    CHECK(write_interactive(master_fd, "2", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "imported as session", 1));
+    /* The imported session is now selectable. */
+    CHECK(write_interactive(master_fd, "/session list\r", 14));
+    CHECK(interactive_wait_for(master_fd, &result, "Sessions (1):", 1));
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+
+    /* The source file is byte-for-byte what it was. */
+    {
+        FILE *source = fopen(source_path, "rb");
+        char *after;
+        long after_len;
+        CHECK(source != NULL);
+        CHECK_EQ(fseek(source, 0, SEEK_END), 0);
+        after_len = ftell(source);
+        CHECK_EQ(after_len, before_len);
+        rewind(source);
+        after = malloc((size_t)after_len);
+        CHECK(after != NULL);
+        CHECK_EQ(fread(after, 1, (size_t)after_len, source),
+                 (size_t)after_len);
+        fclose(source);
+        CHECK_EQ(memcmp(before, after, (size_t)before_len), 0);
+        free(after);
+    }
+    free(before);
+    unlink(source_path);
+
+    {
+        struct session_ids ids;
+        collect_session_ids(session_root, &ids);
+        for (size_t i = 0; i < ids.count; i++) {
+            remove_session_tree(session_root, ids.items[i]);
+        }
+    }
+    rmdir(session_root);
+}
+
 int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(help_exits_zero);
@@ -4555,5 +5273,10 @@ int main(void) {
     RUN(compact_failure_leaves_durable_and_live_state_untouched);
     RUN(typed_ctrl_c_cancels_compaction_and_returns_to_the_prompt);
     RUN(compact_survives_restart_and_replay_shows_the_checkpoint);
+    RUN(interactive_session_list_and_current_describe_the_active_session);
+    RUN(interactive_session_switch_restores_context_and_offers_replay);
+    RUN(interactive_session_switch_reports_a_missing_target_and_keeps_working);
+    RUN(interactive_session_trash_restore_and_confirmed_delete);
+    RUN(interactive_session_import_requires_confirmation_and_keeps_the_source);
     return oi_test_report();
 }

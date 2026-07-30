@@ -8,6 +8,8 @@
 #include "cli_sessions.h"
 #include "cli_history_repair.h"
 #include "cli_history_store.h"
+#include "cli_session_metadata.h"
+#include "cli_session_metadata_store.h"
 #include "cli_tools.h"
 #include "oi/config.h"
 #include "oi/json.h"
@@ -173,6 +175,7 @@ struct persistence_context {
     struct oi_cli_history_replay_state *state;
     uint64_t turn_id;
     struct oi_cli_string model; /* owned; may be updated live by /model */
+    const char *session_path;   /* borrowed directory or explicit log path */
     const char *metadata_path;  /* borrowed, stable for the process lifetime */
     const char *session_id;    /* borrowed */
     oi_status last_error;
@@ -190,6 +193,171 @@ struct automatic_session_context {
     const char *default_cwd;
     FILE *diagnostics;
 };
+
+/*
+ * Everything the /session lifecycle commands need in order to act on
+ * main()'s own locals. Those locals are private to this translation unit, so
+ * the policy lives in cli_sessions/cli_session_switch and only the adoption
+ * of a new session happens here.
+ */
+struct session_admin_context {
+    oi_session_registry *registry;
+    oi_session **session;
+    const char *root_override;
+    const char *default_model;
+    const char *default_cwd;
+    struct oi_cli_history_store *store;
+    struct oi_cli_history_replay_state *state;
+    struct persistence_context *persistence;
+    /* Owned slot holding the metadata path of the most recently switched-to
+     * session. persistence->metadata_path points into it after a switch, so
+     * it must outlive every use and is freed once at cleanup. */
+    char **switched_metadata_path;
+    /* Same ownership arrangement for the user-facing session directory. */
+    char **switched_session_path;
+};
+
+static oi_status admin_list_sessions(void *user_data,
+                                     struct oi_cli_session_list *out_list) {
+    struct session_admin_context *context = user_data;
+    return oi_cli_sessions_enumerate(context->root_override, out_list);
+}
+
+static oi_status admin_list_trashed(void *user_data,
+                                    struct oi_cli_session_list *out_list) {
+    struct session_admin_context *context = user_data;
+    return oi_cli_sessions_enumerate_trash(context->root_override, out_list);
+}
+
+static oi_status admin_current_session(
+    void *user_data, struct oi_cli_command_session_current *out_current) {
+    struct session_admin_context *context = user_data;
+    const char *id = oi_session_id(*context->session);
+
+    out_current->id = id;
+    out_current->path = context->persistence->session_path;
+    out_current->healthy = 0;
+    if (id == NULL || context->persistence->metadata_path == NULL) {
+        return OI_OK;
+    }
+    /*
+     * Resolved live on every call rather than cached from startup: the cache
+     * can be removed or corrupted by something outside oi at any point in a
+     * long-running session, and a single bounded read is cheap.
+     */
+    {
+        struct oi_cli_session_metadata metadata;
+        oi_cli_session_metadata_init(&metadata);
+        if (oi_cli_session_metadata_store_read(
+                context->persistence->metadata_path, &metadata) == OI_OK &&
+            metadata.session_id.len == strlen(id) &&
+            memcmp(metadata.session_id.data, id, metadata.session_id.len) ==
+                0) {
+            out_current->healthy = 1;
+        }
+        oi_cli_session_metadata_free(&metadata);
+    }
+    return OI_OK;
+}
+
+static oi_status admin_rename_session(void *user_data, const char *id,
+                                      size_t id_len, const char *name,
+                                      size_t name_len,
+                                      char **out_error_detail) {
+    struct session_admin_context *context = user_data;
+    return oi_cli_session_rename(context->root_override, id, id_len, name,
+                                 name_len, out_error_detail);
+}
+
+static oi_status admin_trash_session(void *user_data, const char *id,
+                                     size_t id_len,
+                                     char **out_error_detail) {
+    struct session_admin_context *context = user_data;
+    /* Passing the active id is what makes "cannot trash the session you are
+     * in" enforceable down in the policy layer. */
+    return oi_cli_session_trash(context->root_override, id, id_len,
+                                oi_session_id(*context->session),
+                                out_error_detail);
+}
+
+static oi_status admin_restore_session(void *user_data, const char *id,
+                                       size_t id_len,
+                                       char **out_error_detail) {
+    struct session_admin_context *context = user_data;
+    return oi_cli_session_restore_trashed(context->root_override, id, id_len,
+                                          out_error_detail);
+}
+
+static oi_status admin_delete_session(void *user_data, const char *id,
+                                      size_t id_len,
+                                      char **out_error_detail) {
+    struct session_admin_context *context = user_data;
+    return oi_cli_session_delete(context->root_override, id, id_len,
+                                 out_error_detail);
+}
+
+static oi_status admin_import_session(void *user_data, const char *path,
+                                      size_t path_len, char **out_new_id,
+                                      char **out_error_detail) {
+    struct session_admin_context *context = user_data;
+    return oi_cli_session_import(context->root_override, path, path_len,
+                                 out_new_id, out_error_detail);
+}
+
+/*
+ * Adopts a different session as the active one.
+ *
+ * oi_cli_session_switch does all the risky work and touches nothing that is
+ * currently live, so by the time it returns OK the only thing left is an
+ * ownership handover. Destroying the old session here is safe precisely
+ * because cli_repl.c has already destroyed the conversation that was
+ * allocating from its arena -- the precondition documented on the callback.
+ */
+static oi_status admin_switch_session(
+    void *user_data, const char *id, size_t id_len,
+    struct oi_cli_session_switch_result *out_result) {
+    struct session_admin_context *context = user_data;
+    oi_status status;
+
+    status = oi_cli_session_switch(
+        context->registry, context->root_override,
+        oi_session_id(*context->session), id, id_len, context->default_model,
+        context->default_cwd, stderr, out_result);
+    if (status != OI_OK ||
+        out_result->outcome != OI_CLI_SESSION_SWITCH_OK) {
+        return status;
+    }
+
+    /* Commit point. NULL-safe: switching before the first message means
+     * there is no session or history to release yet. */
+    oi_session_destroy(context->registry, *context->session);
+    oi_cli_history_store_free(context->store);
+    oi_cli_history_replay_state_free(context->state);
+
+    /* Move, rather than copy: the result's copies are re-inited so freeing it
+     * afterwards cannot double-free what was handed over. */
+    *context->store = out_result->store;
+    oi_cli_history_store_init(&out_result->store);
+    *context->state = out_result->state;
+    oi_cli_history_replay_state_init(&out_result->state);
+    *context->session = out_result->session;
+    free(*context->switched_metadata_path);
+    *context->switched_metadata_path = out_result->metadata_path;
+    out_result->metadata_path = NULL;
+    free(*context->switched_session_path);
+    *context->switched_session_path = out_result->path;
+    out_result->path = NULL;
+
+    context->persistence->store = context->store;
+    context->persistence->state = context->state;
+    context->persistence->turn_id = context->state->next_turn_id;
+    context->persistence->session_path = *context->switched_session_path;
+    context->persistence->metadata_path = *context->switched_metadata_path;
+    context->persistence->session_id = oi_session_id(*context->session);
+    context->persistence->last_error = OI_OK;
+    return oi_cli_string_set(&context->persistence->model,
+                             out_result->model.data, out_result->model.len);
+}
 
 static oi_status prepare_automatic_session(void *user_data,
                                            oi_arena **out_arena) {
@@ -260,6 +428,7 @@ static oi_status prepare_automatic_session(void *user_data,
     context->persistence->store = context->store;
     context->persistence->state = context->state;
     context->persistence->turn_id = context->state->next_turn_id;
+    context->persistence->session_path = context->location->directory;
     context->persistence->metadata_path = context->location->metadata_path;
     context->persistence->session_id = context->location->id;
     context->persistence->last_error = OI_OK;
@@ -791,10 +960,14 @@ int main(int argc, char **argv) {
     struct oi_cli_message_list initial_context;
     struct oi_cli_string initial_draft = {0};
     struct persistence_context persistence = {0};
+    struct session_admin_context session_admin;
+    char *switched_metadata_path = NULL;
+    char *switched_session_path = NULL;
     struct oi_cli_session_location automatic_location;
     struct automatic_session_context automatic_context;
     oi_cli_session_location_init(&automatic_location);
     memset(&automatic_context, 0, sizeof automatic_context);
+    memset(&session_admin, 0, sizeof session_admin);
     oi_cli_history_store_init(&history_store);
     oi_cli_history_replay_state_init(&replay_state);
     oi_cli_message_list_init(&initial_context);
@@ -930,6 +1103,7 @@ int main(int argc, char **argv) {
         persistence.store = &history_store;
         persistence.state = &replay_state;
         persistence.turn_id = replay_state.next_turn_id;
+        persistence.session_path = log_path;
         persistence.metadata_path = explicit_metadata_path;
         persistence.session_id = session_id;
         persistence.last_error = OI_OK;
@@ -942,6 +1116,17 @@ int main(int argc, char **argv) {
         }
         turn_arena = ephemeral_arena;
     }
+    session_admin.registry = sessions;
+    session_admin.session = &session;
+    session_admin.root_override = session_dir_set ? session_dir : NULL;
+    session_admin.default_model = cfg.model;
+    session_admin.default_cwd = default_cwd;
+    session_admin.store = &history_store;
+    session_admin.state = &replay_state;
+    session_admin.persistence = &persistence;
+    session_admin.switched_metadata_path = &switched_metadata_path;
+    session_admin.switched_session_path = &switched_session_path;
+
     if (automatic_session) {
         automatic_context.registry = sessions;
         automatic_context.session = &session;
@@ -1023,6 +1208,22 @@ int main(int argc, char **argv) {
             .persist_checkpoint_user_data = &persistence,
             .initial_draft = initial_draft.data,
             .initial_draft_len = initial_draft.len,
+            .session_ops =
+                {
+                    .user_data = &session_admin,
+                    .list = admin_list_sessions,
+                    .list_trashed = admin_list_trashed,
+                    .current = admin_current_session,
+                    .rename = admin_rename_session,
+                    .trash = admin_trash_session,
+                    .restore = admin_restore_session,
+                },
+            .switch_session = admin_switch_session,
+            .switch_session_user_data = &session_admin,
+            .delete_session = admin_delete_session,
+            .delete_session_user_data = &session_admin,
+            .import_session = admin_import_session,
+            .import_session_user_data = &session_admin,
         };
         st = oi_cli_repl_run(client, reactor, turn_arena, tools,
                              &repl_config);
@@ -1055,6 +1256,8 @@ cleanup:
     oi_cli_string_free(&persistence.model);
     oi_cli_string_free(&pending_model);
     free(explicit_metadata_path);
+    free(switched_metadata_path);
+    free(switched_session_path);
     free(default_cwd);
     if (owns_prompt) {
         free((char *)prompt);
