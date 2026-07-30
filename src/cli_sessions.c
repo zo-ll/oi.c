@@ -360,6 +360,7 @@ void oi_cli_session_list_free(struct oi_cli_session_list *list) {
     }
     for (index = 0; index < list->len; index++) {
         free(list->entries[index].id);
+        oi_cli_string_free(&list->entries[index].display_name);
         oi_cli_string_free(&list->entries[index].model);
         oi_cli_string_free(&list->entries[index].cwd);
     }
@@ -424,6 +425,11 @@ static oi_status describe_session(const char *id, const char *directory,
     oi_cli_session_metadata_init(&metadata);
     if (oi_cli_session_metadata_store_read(metadata_path, &metadata) ==
         OI_OK) {
+        if (metadata.display_name.len > 0) {
+            (void)oi_cli_string_set(&out->display_name,
+                                    metadata.display_name.data,
+                                    metadata.display_name.len);
+        }
         (void)oi_cli_string_set(&out->model, metadata.model.data,
                                 metadata.model.len);
         (void)oi_cli_string_set(&out->cwd, metadata.cwd.data,
@@ -649,10 +655,18 @@ static oi_status append_setting_record(
     return status;
 }
 
+/*
+ * Rewrites the whole metadata cache from the values passed in, so every
+ * caller has to hand back the session's existing `display_name`: it lives
+ * only in this file, and rebuilding without it would silently drop a
+ * user's session name on the next /model or /cwd change. Pass NULL/0 only
+ * when the session genuinely has no name.
+ */
 static void refresh_metadata(const char *metadata_path,
                              const char *session_id, const char *model,
                              size_t model_len, const char *cwd,
-                             size_t cwd_len, int64_t created_at,
+                             size_t cwd_len, const char *display_name,
+                             size_t display_name_len, int64_t created_at,
                              FILE *diagnostics) {
     struct oi_cli_session_metadata metadata;
     oi_status status;
@@ -662,8 +676,8 @@ static void refresh_metadata(const char *metadata_path,
     oi_cli_session_metadata_init(&metadata);
     status = oi_cli_session_metadata_set(
         &metadata, session_id, strlen(session_id), model, model_len, cwd,
-        cwd_len, created_at, updated_at < created_at ? created_at
-                                                     : updated_at);
+        cwd_len, display_name, display_name_len, created_at,
+        updated_at < created_at ? created_at : updated_at);
     if (status == OI_OK) {
         status = oi_cli_session_metadata_store_write(metadata_path,
                                                       &metadata);
@@ -683,6 +697,9 @@ oi_status oi_cli_session_restore_settings(
     const char *default_model, const char *default_cwd, FILE *diagnostics,
     struct oi_cli_session_restore *out_restore) {
     struct oi_cli_session_metadata meta;
+    /* Carries the session's existing name past the point where `meta` is
+     * freed, so refreshing the cache below preserves it. */
+    struct oi_cli_string preserved_name;
     int metadata_valid = 0;
     int64_t created_at;
     time_t now;
@@ -700,6 +717,7 @@ oi_status oi_cli_session_restore_settings(
     }
     oi_cli_session_restore_init(out_restore);
     oi_cli_session_metadata_init(&meta);
+    memset(&preserved_name, 0, sizeof preserved_name);
 
     if (!is_new_session) {
         oi_status read_status =
@@ -791,8 +809,15 @@ oi_status oi_cli_session_restore_settings(
         status = oi_cli_string_set(&out_restore->cwd, resolved_cwd,
                                    resolved_cwd_len);
     }
+    /* Same reason, for the name: it survives only in `meta`, which is
+     * about to go away, and refresh_metadata below must not drop it. */
+    if (status == OI_OK && metadata_valid && meta.display_name.len > 0) {
+        status = oi_cli_string_set(&preserved_name, meta.display_name.data,
+                                   meta.display_name.len);
+    }
     oi_cli_session_metadata_free(&meta);
     if (status != OI_OK) {
+        oi_cli_string_free(&preserved_name);
         return status;
     }
 
@@ -829,12 +854,15 @@ oi_status oi_cli_session_restore_settings(
         }
     }
     if (status != OI_OK) {
+        oi_cli_string_free(&preserved_name);
         return status;
     }
 
     refresh_metadata(metadata_path, session_id, out_restore->model.data,
                      out_restore->model.len, out_restore->cwd.data,
-                     out_restore->cwd.len, created_at, diagnostics);
+                     out_restore->cwd.len, preserved_name.data,
+                     preserved_name.len, created_at, diagnostics);
+    oi_cli_string_free(&preserved_name);
     return OI_OK;
 }
 
@@ -844,6 +872,7 @@ oi_status oi_cli_session_apply_setting(
     const char *session_id,
     enum oi_cli_history_session_setting_field field, const char *value,
     size_t value_len) {
+    struct oi_cli_string preserved_name;
     oi_status status;
     int64_t created_at;
     time_t now;
@@ -859,6 +888,7 @@ oi_status oi_cli_session_apply_setting(
 
     now = time(NULL);
     created_at = now == (time_t)-1 ? 0 : (int64_t)now;
+    memset(&preserved_name, 0, sizeof preserved_name);
     {
         struct oi_cli_session_metadata existing;
         oi_cli_session_metadata_init(&existing);
@@ -868,6 +898,13 @@ oi_status oi_cli_session_apply_setting(
             memcmp(existing.session_id.data, session_id,
                    existing.session_id.len) == 0) {
             created_at = existing.created_at;
+            /* Carry the name forward: a /model or /cwd change must not
+             * cost the session the name the user gave it. */
+            if (existing.display_name.len > 0) {
+                (void)oi_cli_string_set(&preserved_name,
+                                        existing.display_name.data,
+                                        existing.display_name.len);
+            }
         }
         oi_cli_session_metadata_free(&existing);
     }
@@ -884,6 +921,7 @@ oi_status oi_cli_session_apply_setting(
                                                      : state->last_cwd.data,
         field == OI_CLI_HISTORY_SESSION_SETTING_CWD ? value_len
                                                      : state->last_cwd.len,
-        created_at, NULL);
+        preserved_name.data, preserved_name.len, created_at, NULL);
+    oi_cli_string_free(&preserved_name);
     return OI_OK;
 }

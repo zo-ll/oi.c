@@ -293,7 +293,7 @@ static void seed_session(const char *root, const char *id, const char *model,
         oi_cli_session_metadata_init(&metadata);
         CHECK_EQ(oi_cli_session_metadata_set(&metadata, id, strlen(id), model,
                                              strlen(model), cwd, strlen(cwd),
-                                             created_at, updated_at),
+                                             NULL, 0, created_at, updated_at),
                  OI_OK);
         CHECK_EQ(oi_cli_session_metadata_store_write(metadata_path,
                                                      &metadata),
@@ -854,7 +854,7 @@ TEST(mismatched_session_id_in_metadata_is_treated_as_corrupt) {
     oi_cli_session_metadata_init(&wrong_owner);
     CHECK_EQ(oi_cli_session_metadata_set(&wrong_owner, "some-other-session",
                                          18, "gpt-wrong", 9, "/nonexistent",
-                                         12, 1, 1),
+                                         12, NULL, 0, 1, 1),
              OI_OK);
     CHECK_EQ(oi_cli_session_metadata_store_write(fresh.metadata_path,
                                                  &wrong_owner),
@@ -968,6 +968,83 @@ TEST(explicit_model_override_wins_and_persists) {
     free(target_dir);
 }
 
+TEST(a_display_name_survives_setting_changes_and_reopens) {
+    char *original_cwd = save_cwd();
+    char *target_dir = make_tmp_dir("named");
+    struct fresh_store fresh;
+    struct oi_cli_session_restore restore;
+
+    fresh_store_open(&fresh, fresh_log_path("named"), 0);
+    oi_cli_session_restore_init(&restore);
+    CHECK_EQ(oi_cli_session_restore_settings(
+                 &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
+                 1, NULL, "gpt-default", target_dir, NULL, &restore),
+             OI_OK);
+    oi_cli_session_restore_free(&restore);
+
+    /* Name the session, the way /session rename will. */
+    {
+        struct oi_cli_session_metadata named;
+        oi_cli_session_metadata_init(&named);
+        CHECK_EQ(oi_cli_session_metadata_store_read(fresh.metadata_path,
+                                                    &named),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_set(
+                     &named, "sess-1", 6, named.model.data, named.model.len,
+                     named.cwd.data, named.cwd.len, "my session", 10,
+                     named.created_at, named.updated_at),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_store_write(fresh.metadata_path,
+                                                     &named),
+                 OI_OK);
+        oi_cli_session_metadata_free(&named);
+    }
+
+    /*
+     * The name lives only in metadata.json, and both of the paths that
+     * refresh that cache rebuild it from scratch -- so each has to carry
+     * the name forward or a plain /model change would silently discard it.
+     */
+    CHECK_EQ(oi_cli_session_apply_setting(
+                 &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
+                 OI_CLI_HISTORY_SESSION_SETTING_MODEL, "gpt-changed", 11),
+             OI_OK);
+    {
+        struct oi_cli_session_metadata after;
+        oi_cli_session_metadata_init(&after);
+        CHECK_EQ(oi_cli_session_metadata_store_read(fresh.metadata_path,
+                                                    &after),
+                 OI_OK);
+        CHECK_STREQ(after.model.data, "gpt-changed");
+        CHECK_STREQ(after.display_name.data, "my session");
+        oi_cli_session_metadata_free(&after);
+    }
+
+    /* Same for reopening the session. */
+    oi_cli_session_restore_init(&restore);
+    CHECK_EQ(oi_cli_session_restore_settings(
+                 &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
+                 0, NULL, "gpt-default", target_dir, NULL, &restore),
+             OI_OK);
+    oi_cli_session_restore_free(&restore);
+    {
+        struct oi_cli_session_metadata after;
+        oi_cli_session_metadata_init(&after);
+        CHECK_EQ(oi_cli_session_metadata_store_read(fresh.metadata_path,
+                                                    &after),
+                 OI_OK);
+        CHECK_STREQ(after.display_name.data, "my session");
+        oi_cli_session_metadata_free(&after);
+    }
+
+    unlink(fresh.metadata_path);
+    fresh_store_close(&fresh);
+    restore_cwd(original_cwd);
+    unlink(fresh_log_path("named"));
+    rmdir(target_dir);
+    free(target_dir);
+}
+
 TEST(restore_settings_rejects_bad_arguments) {
     struct oi_cli_history_store store;
     struct oi_cli_history_replay_state state;
@@ -1014,6 +1091,7 @@ int main(void) {
     RUN(mismatched_session_id_in_metadata_is_treated_as_corrupt);
     RUN(missing_prior_cwd_falls_back_with_a_diagnostic);
     RUN(explicit_model_override_wins_and_persists);
+    RUN(a_display_name_survives_setting_changes_and_reopens);
     RUN(restore_settings_rejects_bad_arguments);
     return oi_test_report();
 }

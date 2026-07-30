@@ -125,7 +125,11 @@ enum oi_cli_session_lock_state {
  * Only `id` is always present.
  */
 struct oi_cli_session_list_entry {
-    char *id;                  /* owned; always non-NULL */
+    char *id; /* owned; always non-NULL */
+    /* User-chosen label; empty means unset, so display the id instead.
+     * Never recoverable from history -- it lives only in the cache -- so
+     * a degraded entry always reports it empty. */
+    struct oi_cli_string display_name;
     struct oi_cli_string model; /* empty if unknown */
     struct oi_cli_string cwd;   /* empty if unknown */
     int64_t created_at;         /* Unix epoch seconds; 0 if unknown */
