@@ -42,8 +42,8 @@ TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
 CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c src/cli_conversation.c src/cli_utf8.c src/cli_editor.c src/cli_input_history.c src/cli_terminal.c src/cli_input.c src/cli_prompt_state.c src/cli_render.c src/cli_selector.c src/cli_composer.c src/cli_present.c src/cli_repl.c src/cli_sessions.c src/cli_commands.c src/cli_command_dispatch.c src/cli_bytebuf.c src/cli_utf8_stream.c src/cli_render_sanitize.c src/cli_markdown.c src/cli_render_style.c src/cli_markdown_inline.c src/cli_markdown_block.c src/cli_render_stream.c src/cli_session_metadata.c src/cli_session_metadata_codec.c src/cli_session_metadata_store.c src/cli_tool_panel.c src/cli_compact.c src/cli_session_switch.c
 
-.PHONY: all lib so cli install test check abi-check asan ubsan tsan valgrind \
-	fuzz fuzz-run test-integration clean
+.PHONY: all lib so cli install test quick check verify tier-audit timings \
+	abi-check asan ubsan tsan valgrind fuzz fuzz-run test-integration clean
 
 all: lib cli
 
@@ -208,8 +208,64 @@ $(BUILD)/test_cli_history_repair: test/test_cli_history_repair.c src/cli_history
 $(BUILD)/test_cli_history_store: test/test_cli_history_store.c src/cli_history_store.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history.c src/cli_message.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_history_store.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history.c src/cli_message.c $(LIB) -o $@ $(LDLIBS)
 
+# Tests that touch no PTY, socket, fork, signal, or other global process
+# state, and so are safe to run as the routine edit-test loop (`make quick`).
+#
+# Membership is spelled out rather than derived, deliberately: a test that
+# grows a socket must be moved out of this list by someone who noticed, not
+# silently reclassified by a pattern match. The `tier-audit` target below
+# fails the build if this list plus IMPURE_TESTS stops covering every binary.
+PURE_TESTS = \
+	test_arena test_cli_bytebuf test_cli_command_dispatch test_cli_commands \
+	test_cli_compact test_cli_editor test_cli_history test_cli_history_codec \
+	test_cli_history_repair test_cli_history_replay test_cli_history_store \
+	test_cli_input test_cli_input_history test_cli_markdown \
+	test_cli_markdown_block test_cli_markdown_inline test_cli_message \
+	test_cli_present test_cli_prompt_state test_cli_render \
+	test_cli_render_sanitize test_cli_render_stream test_cli_render_style \
+	test_cli_selector test_cli_session_metadata \
+	test_cli_session_metadata_codec test_cli_session_metadata_store \
+	test_cli_tool_panel test_cli_tools test_cli_utf8 test_cli_utf8_stream \
+	test_config test_json test_llm_http test_llm_sse test_reactor \
+	test_session test_sesslog test_tool_registry
+
+# Tests that do touch that state: PTYs, sockets, forked helpers, or signals.
+# Slower and ordering-sensitive, so they stay out of `quick` and are not
+# candidates for blanket parallelism.
+IMPURE_TESTS = \
+	test_cli test_cli_composer test_cli_sessions test_cli_terminal \
+	test_llm test_llm_conn test_tool_exec
+
+PURE_TEST_BINS = $(PURE_TESTS:%=$(BUILD)/%)
+
 test: $(TEST_BINS) $(CLI_BIN)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t =="; $$t; done
+
+# The routine edit-test loop: deterministic unit tests only.
+quick: $(PURE_TEST_BINS)
+	@set -e; for t in $(PURE_TEST_BINS); do echo "== $$t =="; $$t; done
+
+# Fails if PURE_TESTS + IMPURE_TESTS stops accounting for every test binary,
+# so a newly added test cannot quietly belong to no tier and go unrun by
+# everything except the full `check`.
+tier-audit:
+	@all=`echo $(TEST_SRCS) | tr ' ' '\n' | sed 's|test/||;s|\.c$$||'`; \
+	tiers="$(PURE_TESTS) $(IMPURE_TESTS)"; \
+	tiers=`echo $$tiers | tr ' ' '\n'`; \
+	missing=`printf '%s\n' $$all $$tiers $$tiers | sort | uniq -u`; \
+	extra=`printf '%s\n' $$tiers $$all $$all | sort | uniq -u`; \
+	status=0; \
+	if [ -n "$$missing" ]; then \
+		echo "tier-audit: test(s) belong to no tier:"; \
+		echo "$$missing" | sed 's/^/  /'; status=1; \
+	fi; \
+	if [ -n "$$extra" ]; then \
+		echo "tier-audit: tier lists name test(s) that do not exist:"; \
+		echo "$$extra" | sed 's/^/  /'; status=1; \
+	fi; \
+	[ $$status -eq 0 ] && \
+		echo "tier-audit: all `printf '%s\n' $$all | wc -l | tr -d ' '` test binaries are tiered"; \
+	exit $$status
 
 # Integration tests get their own build subdir so their binaries don't
 # collide with the unit tests' $(BUILD)/test_% pattern rule. Helper
@@ -246,7 +302,64 @@ test-integration: $(INTEGRATION_BINS)
 # rather than `test` alone, so instrumentation covers the integration
 # tests too -- they are where the reactor, the socket paths, and the
 # tool subprocesses actually run together.
-check: test test-integration
+check: tier-audit test test-integration
+
+# The pre-merge and release gate: everything `check` covers, under both
+# compilers and every instrumentation the project has, plus the ABI export
+# check and a bounded fuzz smoke run.
+#
+# Sequenced rather than parallel: these targets each rebuild into their own
+# BUILD directory, and running them concurrently on a developer machine
+# competes for the same cores the sanitized tests' own timing assumptions
+# depend on.
+VERIFY_FUZZ_RUNS ?= 200000
+
+verify:
+	@echo "== verify: gcc =="
+	$(MAKE) CC=gcc check
+	@echo "== verify: clang =="
+	$(MAKE) CC=clang check
+	@echo "== verify: abi =="
+	$(MAKE) abi-check
+	@echo "== verify: asan =="
+	$(MAKE) asan
+	@echo "== verify: ubsan =="
+	$(MAKE) ubsan
+	@echo "== verify: tsan =="
+	$(MAKE) tsan
+	@echo "== verify: valgrind =="
+	$(MAKE) valgrind
+	@echo "== verify: fuzz =="
+	$(MAKE) fuzz-run FUZZ_RUNS=$(VERIFY_FUZZ_RUNS)
+	@echo "== verify: all gates passed =="
+
+# Records wall time for the compile phase, every test binary, and each tier,
+# so the effect of a change to any of them can be compared rather than
+# guessed at. Writes a Markdown table on stdout.
+timings:
+	@echo "| Phase | Seconds |"; \
+	echo "| --- | --- |"; \
+	$(MAKE) clean >/dev/null 2>&1; \
+	start=`date +%s.%N`; \
+	$(MAKE) $(TEST_BINS) $(INTEGRATION_BINS) $(CLI_BIN) >/dev/null 2>&1; \
+	end=`date +%s.%N`; \
+	echo "| compile (serial, clean) | `echo "$$end - $$start" | bc` |"; \
+	start=`date +%s.%N`; \
+	for t in $(PURE_TEST_BINS); do $$t >/dev/null 2>&1 || true; done; \
+	end=`date +%s.%N`; \
+	echo "| quick tier (run only) | `echo "$$end - $$start" | bc` |"; \
+	start=`date +%s.%N`; \
+	for t in $(TEST_BINS) $(INTEGRATION_BINS); do $$t >/dev/null 2>&1 || true; done; \
+	end=`date +%s.%N`; \
+	echo "| check tier (run only) | `echo "$$end - $$start" | bc` |"; \
+	echo; \
+	echo "| Binary | Seconds |"; \
+	echo "| --- | --- |"; \
+	for t in $(TEST_BINS) $(INTEGRATION_BINS); do \
+		start=`date +%s.%N`; $$t >/dev/null 2>&1 || true; \
+		end=`date +%s.%N`; \
+		printf '| %s | %s |\n' "$$t" "`echo "$$end - $$start" | bc`"; \
+	done | sort -t'|' -k3 -rn
 
 abi-check: $(LIB_SO_REAL)
 	@nm -D --defined-only --format=posix $(LIB_SO_REAL) | \
