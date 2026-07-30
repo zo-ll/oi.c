@@ -342,20 +342,41 @@ check: tier-audit test test-integration
 # compilers and every instrumentation the project has, plus the ABI export
 # check and a bounded fuzz smoke run.
 #
-# The two compiler passes must use separate BUILD trees. Make decides what to
-# rebuild from timestamps, not from the value of CC, so running both passes
-# against the same build/ leaves the second one reporting "up to date" and
-# silently re-running the first compiler's binaries -- the dual-compiler gate
-# would pass without clang ever having compiled anything. Same reason the
-# sanitizer targets each use their own tree.
+# The two compiler passes must use separate BUILD trees, and each tree must be
+# deleted immediately before its pass. Three distinct hazards, all of which
+# let this gate pass without a compiler having run:
+#
+#  - Make decides what to rebuild from timestamps, not from the value of CC.
+#    Running both passes against one build/ leaves the second reporting "up to
+#    date" and re-running the first compiler's binaries.
+#  - Separate trees alone are not enough. A build-gcc/ left holding artifacts
+#    from some earlier run -- a stray `make BUILD=build-gcc CC=clang`, an
+#    interrupted pass -- is still "up to date", so the gcc pass compiles
+#    nothing and the stamp then certifies gcc for clang's objects. Deleting
+#    the tree first makes reuse impossible, which is the only thing that makes
+#    the stamp mean anything.
+#  - `$(MAKE) ... check compiler-stamp` names two goals in one sub-make, which
+#    under -j may run concurrently, writing the stamp while compilation is
+#    still going. They are separate $(MAKE) lines instead: lines within a
+#    recipe run in order regardless of -j.
+#
+# The rebuild cost is deliberate. verify is the pre-merge gate, not the edit
+# loop; `check` and `quick` remain incremental.
 #
 # Sequenced rather than parallel: each pass is a full rebuild, and running
 # them concurrently competes for the cores the sanitized tests' own timing
 # assumptions depend on.
 VERIFY_FUZZ_RUNS ?= 200000
 
-# Records which compiler populated this BUILD tree, so verify-compilers can
-# show the passes really differed instead of assuming it.
+# Records which compiler populated this BUILD tree.
+#
+# The stamp names $(CC), which is only the *requested* compiler -- it says
+# nothing about what produced the objects already in the tree. That is
+# trustworthy only because verify deletes each tree immediately before its
+# pass, so the tree it stamps was necessarily built from scratch by that
+# compiler and nothing could have been reused. Do not call this against a
+# tree that was not just rebuilt: it would happily certify someone else's
+# artifacts.
 compiler-stamp: | $(BUILD)
 	@$(CC) --version | head -1 > $(BUILD)/compiler.txt
 
@@ -381,9 +402,13 @@ verify-compilers:
 
 verify:
 	@echo "== verify: gcc =="
-	$(MAKE) CC=gcc BUILD=build-gcc check compiler-stamp
+	rm -rf build-gcc
+	$(MAKE) CC=gcc BUILD=build-gcc check
+	$(MAKE) CC=gcc BUILD=build-gcc compiler-stamp
 	@echo "== verify: clang =="
-	$(MAKE) CC=clang BUILD=build-clang check compiler-stamp
+	rm -rf build-clang
+	$(MAKE) CC=clang BUILD=build-clang check
+	$(MAKE) CC=clang BUILD=build-clang compiler-stamp
 	@echo "== verify: compilers =="
 	@$(MAKE) verify-compilers
 	@echo "== verify: abi =="
