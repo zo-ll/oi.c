@@ -789,6 +789,380 @@ TEST(rename_refuses_unnameable_and_invalid_targets) {
     CHECK_EQ(rmdir(root), 0);
 }
 
+/* --- trash / restore / delete --- */
+
+static int path_is_directory(const char *path) {
+    struct stat info;
+    return lstat(path, &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+static int path_is_directory_of(const char *root, const char *id) {
+    char path[384];
+    snprintf(path, sizeof path, "%s/%s", root, id);
+    return path_is_directory(path);
+}
+
+TEST(trash_and_restore_round_trip_preserving_history) {
+    char root[192];
+    char live[320];
+    char trashed[384];
+    char history_path[448];
+    struct oi_cli_session_list list;
+    off_t original_size;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-trash-%ld", (long)getpid());
+    seed_session(root, "sess-trash", "gpt-a", "/tmp", 100, 200, 1);
+    CHECK_EQ(oi_cli_session_rename(root, "sess-trash", 10, "keep me", 7, NULL),
+             OI_OK);
+    snprintf(live, sizeof live, "%s/sess-trash", root);
+    snprintf(trashed, sizeof trashed, "%s/.trash/sess-trash", root);
+    snprintf(history_path, sizeof history_path, "%s/history.oilog", live);
+    {
+        struct stat info;
+        CHECK_EQ(stat(history_path, &info), 0);
+        original_size = info.st_size;
+    }
+
+    CHECK_EQ(oi_cli_session_trash(root, "sess-trash", 10, NULL, NULL), OI_OK);
+    /* The whole directory moved; nothing was copied or rewritten. */
+    CHECK(!path_is_directory(live));
+    CHECK(path_is_directory(trashed));
+    {
+        struct stat info;
+        snprintf(history_path, sizeof history_path, "%s/history.oilog",
+                 trashed);
+        CHECK_EQ(stat(history_path, &info), 0);
+        CHECK_EQ(info.st_size, original_size);
+    }
+
+    /* A trashed session drops out of the live listing with no filtering
+     * logic -- it is simply not in the root anymore. */
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 0);
+    oi_cli_session_list_free(&list);
+    /* ...and shows up in the trash listing instead, name intact. */
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate_trash(root, &list), OI_OK);
+    CHECK_EQ(list.len, 1);
+    CHECK_STREQ(list.entries[0].id, "sess-trash");
+    CHECK_STREQ(list.entries[0].display_name.data, "keep me");
+    CHECK_STREQ(list.entries[0].model.data, "gpt-a");
+    oi_cli_session_list_free(&list);
+
+    CHECK_EQ(oi_cli_session_restore_trashed(root, "sess-trash", 10, NULL),
+             OI_OK);
+    CHECK(path_is_directory(live));
+    CHECK(!path_is_directory(trashed));
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 1);
+    CHECK_STREQ(list.entries[0].display_name.data, "keep me");
+    oi_cli_session_list_free(&list);
+
+    remove_session(root, "sess-trash");
+    {
+        char trash_root[256];
+        snprintf(trash_root, sizeof trash_root, "%s/.trash", root);
+        rmdir(trash_root);
+    }
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(trash_refuses_the_active_session_and_unknown_ids) {
+    char root[192];
+    char *detail = NULL;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-trash-refuse-%ld",
+             (long)getpid());
+    seed_session(root, "sess-active", "gpt-a", "/tmp", 100, 200, 1);
+
+    /* Trashing the session you are sitting in would leave the running
+     * process writing into a directory that has moved. */
+    CHECK_EQ(oi_cli_session_trash(root, "sess-active", 11, "sess-active",
+                                  &detail),
+             OI_ERR_INVAL);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "active session") != NULL);
+    free(detail);
+    detail = NULL;
+    CHECK(path_is_directory_of(root, "sess-active"));
+
+    /* A different active session is no obstacle. */
+    CHECK_EQ(oi_cli_session_trash(root, "sess-active", 11, "some-other",
+                                  &detail),
+             OI_OK);
+    CHECK_EQ(oi_cli_session_restore_trashed(root, "sess-active", 11, NULL),
+             OI_OK);
+
+    CHECK_EQ(oi_cli_session_trash(root, "absent", 6, NULL, &detail),
+             OI_ERR_NOTFOUND);
+    CHECK_STREQ(detail, "no such session");
+    free(detail);
+    detail = NULL;
+    CHECK_EQ(oi_cli_session_trash(root, "..", 2, NULL, &detail),
+             OI_ERR_INVAL);
+    CHECK_STREQ(detail, "invalid session id");
+    free(detail);
+
+    remove_session(root, "sess-active");
+    {
+        char trash_root[256];
+        snprintf(trash_root, sizeof trash_root, "%s/.trash", root);
+        rmdir(trash_root);
+    }
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(trash_refuses_a_session_open_in_another_process) {
+    char root[192];
+    char history_path[384];
+    char *detail = NULL;
+    int to_child[2];
+    int to_parent[2];
+    pid_t child;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-trash-busy-%ld",
+             (long)getpid());
+    seed_session(root, "sess-held", "gpt-a", "/tmp", 100, 200, 1);
+    snprintf(history_path, sizeof history_path, "%s/sess-held/history.oilog",
+             root);
+
+    CHECK_EQ(pipe(to_child), 0);
+    CHECK_EQ(pipe(to_parent), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        oi_sesslog *log = NULL;
+        char byte = 0;
+        close(to_child[1]);
+        close(to_parent[0]);
+        if (oi_sesslog_open(history_path, &log) != OI_OK) {
+            _exit(1);
+        }
+        if (write(to_parent[1], "x", 1) != 1) {
+            _exit(1);
+        }
+        if (read(to_child[0], &byte, 1) != 1) {
+            _exit(1);
+        }
+        oi_sesslog_close(log);
+        _exit(0);
+    }
+    close(to_child[0]);
+    close(to_parent[1]);
+    {
+        char byte = 0;
+        CHECK_EQ(read(to_parent[0], &byte, 1), 1);
+    }
+
+    /* Moving a directory out from under a live process is exactly what
+     * durable history exists to prevent. */
+    CHECK_EQ(oi_cli_session_trash(root, "sess-held", 9, NULL, &detail),
+             OI_ERR_EXISTS);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "another process") != NULL);
+    free(detail);
+    CHECK(path_is_directory_of(root, "sess-held"));
+
+    CHECK_EQ(write(to_child[1], "x", 1), 1);
+    {
+        int wait_status = 0;
+        CHECK_EQ(waitpid(child, &wait_status, 0), child);
+        CHECK(WIFEXITED(wait_status));
+        CHECK_EQ(WEXITSTATUS(wait_status), 0);
+    }
+    close(to_child[1]);
+    close(to_parent[0]);
+
+    /* Released, so the same call now succeeds. */
+    CHECK_EQ(oi_cli_session_trash(root, "sess-held", 9, NULL, NULL), OI_OK);
+
+    CHECK_EQ(oi_cli_session_delete(root, "sess-held", 9, NULL), OI_OK);
+    {
+        char trash_root[256];
+        snprintf(trash_root, sizeof trash_root, "%s/.trash", root);
+        CHECK_EQ(rmdir(trash_root), 0);
+    }
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(delete_only_reaches_trashed_sessions_and_removes_them_completely) {
+    char root[192];
+    char trashed[384];
+    char *detail = NULL;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-delete-%ld", (long)getpid());
+    seed_session(root, "sess-live", "gpt-a", "/tmp", 100, 200, 1);
+    snprintf(trashed, sizeof trashed, "%s/.trash/sess-live", root);
+
+    /*
+     * A live session is not in the trash, so delete cannot find it -- that
+     * is what makes "refuses the current session" structural rather than a
+     * check that could be forgotten.
+     */
+    CHECK_EQ(oi_cli_session_delete(root, "sess-live", 9, &detail),
+             OI_ERR_NOTFOUND);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "trash it") != NULL);
+    free(detail);
+    detail = NULL;
+    CHECK(path_is_directory_of(root, "sess-live"));
+
+    CHECK_EQ(oi_cli_session_trash(root, "sess-live", 9, NULL, NULL), OI_OK);
+    CHECK(path_is_directory(trashed));
+    CHECK_EQ(oi_cli_session_delete(root, "sess-live", 9, NULL), OI_OK);
+    /* Gone: files and directory both. */
+    CHECK(!path_is_directory(trashed));
+    {
+        struct oi_cli_session_list list;
+        oi_cli_session_list_init(&list);
+        CHECK_EQ(oi_cli_sessions_enumerate_trash(root, &list), OI_OK);
+        CHECK_EQ(list.len, 0);
+        oi_cli_session_list_free(&list);
+    }
+    /* And a second delete simply reports nothing to delete. */
+    CHECK_EQ(oi_cli_session_delete(root, "sess-live", 9, NULL),
+             OI_ERR_NOTFOUND);
+    CHECK_EQ(oi_cli_session_delete(root, "..", 2, NULL), OI_ERR_INVAL);
+
+    {
+        char trash_root[256];
+        snprintf(trash_root, sizeof trash_root, "%s/.trash", root);
+        CHECK_EQ(rmdir(trash_root), 0);
+    }
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(delete_fails_closed_on_a_directory_it_did_not_create) {
+    char root[192];
+    char nested[448];
+    char *detail = NULL;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-delete-closed-%ld",
+             (long)getpid());
+    seed_session(root, "sess-odd", "gpt-a", "/tmp", 100, 200, 1);
+    CHECK_EQ(oi_cli_session_trash(root, "sess-odd", 8, NULL, NULL), OI_OK);
+
+    /* Something oi never puts in a session directory. */
+    snprintf(nested, sizeof nested, "%s/.trash/sess-odd/unexpected", root);
+    CHECK_EQ(mkdir(nested, 0700), 0);
+
+    /* Rather than recursing into whatever it finds, deletion stops. */
+    CHECK_EQ(oi_cli_session_delete(root, "sess-odd", 8, &detail), OI_ERR_IO);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "unexpected entry") != NULL);
+    free(detail);
+    CHECK(path_is_directory(nested));
+
+    CHECK_EQ(rmdir(nested), 0);
+    CHECK_EQ(oi_cli_session_delete(root, "sess-odd", 8, NULL), OI_OK);
+    {
+        char trash_root[256];
+        snprintf(trash_root, sizeof trash_root, "%s/.trash", root);
+        CHECK_EQ(rmdir(trash_root), 0);
+    }
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(trash_reports_a_cross_device_trash_directory_distinctly) {
+    char root[192];
+    char trash_link[256];
+    char foreign_trash[192];
+    char *detail = NULL;
+    int reachable;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-exdev-%ld", (long)getpid());
+    /*
+     * The trash normally lives inside the sessions root, making every
+     * trash/restore a same-filesystem rename. A user who relocates it --
+     * here, a symlink onto another filesystem -- deserves a specific
+     * message rather than a bare I/O error.
+     *
+     * Skipped where /dev/shm is not a separate filesystem, since EXDEV
+     * then genuinely cannot be provoked.
+     */
+    snprintf(foreign_trash, sizeof foreign_trash, "/dev/shm/oi-exdev-%ld",
+             (long)getpid());
+    {
+        struct stat tmp_info;
+        struct stat shm_info;
+        reachable = stat("/tmp", &tmp_info) == 0 &&
+                    stat("/dev/shm", &shm_info) == 0 &&
+                    tmp_info.st_dev != shm_info.st_dev &&
+                    mkdir(foreign_trash, 0700) == 0;
+    }
+    if (!reachable) {
+        return;
+    }
+
+    seed_session(root, "sess-exdev", "gpt-a", "/tmp", 100, 200, 1);
+    snprintf(trash_link, sizeof trash_link, "%s/.trash", root);
+    CHECK_EQ(symlink(foreign_trash, trash_link), 0);
+
+    CHECK_EQ(oi_cli_session_trash(root, "sess-exdev", 10, NULL, &detail),
+             OI_ERR_IO);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "different filesystem") != NULL);
+    free(detail);
+    /* Failure-atomic: the session is still exactly where it was. */
+    CHECK(path_is_directory_of(root, "sess-exdev"));
+
+    CHECK_EQ(unlink(trash_link), 0);
+    remove_session(root, "sess-exdev");
+    CHECK_EQ(rmdir(root), 0);
+    CHECK_EQ(rmdir(foreign_trash), 0);
+}
+
+TEST(restore_refuses_unknown_ids_and_will_not_clobber_a_live_session) {
+    char root[192];
+    char *detail = NULL;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-restore-bad-%ld",
+             (long)getpid());
+    seed_session(root, "sess-dup", "gpt-a", "/tmp", 100, 200, 1);
+
+    CHECK_EQ(oi_cli_session_restore_trashed(root, "absent", 6, &detail),
+             OI_ERR_NOTFOUND);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "no trashed session") != NULL);
+    free(detail);
+    detail = NULL;
+    CHECK_EQ(oi_cli_session_restore_trashed(root, "..", 2, &detail),
+             OI_ERR_INVAL);
+    CHECK_STREQ(detail, "invalid session id");
+    free(detail);
+    detail = NULL;
+
+    /* Contrive the collision generated ids make impossible, and confirm
+     * restore refuses rather than renaming over a live session. */
+    CHECK_EQ(oi_cli_session_trash(root, "sess-dup", 8, NULL, NULL), OI_OK);
+    seed_session(root, "sess-dup", "gpt-live", "/tmp", 300, 400, 1);
+    CHECK_EQ(oi_cli_session_restore_trashed(root, "sess-dup", 8, &detail),
+             OI_ERR_EXISTS);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "already exists") != NULL);
+    free(detail);
+    /* The live session is untouched. */
+    {
+        struct oi_cli_session_list list;
+        oi_cli_session_list_init(&list);
+        CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+        CHECK_EQ(list.len, 1);
+        CHECK_STREQ(list.entries[0].model.data, "gpt-live");
+        oi_cli_session_list_free(&list);
+    }
+
+    CHECK_EQ(oi_cli_session_delete(root, "sess-dup", 8, NULL), OI_OK);
+    remove_session(root, "sess-dup");
+    {
+        char trash_root[256];
+        snprintf(trash_root, sizeof trash_root, "%s/.trash", root);
+        CHECK_EQ(rmdir(trash_root), 0);
+    }
+    CHECK_EQ(rmdir(root), 0);
+}
+
 /* --- oi_cli_session_restore_settings / oi_cli_session_apply_setting --- */
 
 static char *save_cwd(void) { return getcwd(NULL, 0); }
@@ -1269,6 +1643,13 @@ int main(void) {
     RUN(rename_sets_a_display_name_without_moving_the_directory);
     RUN(rename_repairs_a_missing_metadata_cache_from_history);
     RUN(rename_refuses_unnameable_and_invalid_targets);
+    RUN(trash_and_restore_round_trip_preserving_history);
+    RUN(trash_refuses_the_active_session_and_unknown_ids);
+    RUN(trash_refuses_a_session_open_in_another_process);
+    RUN(delete_only_reaches_trashed_sessions_and_removes_them_completely);
+    RUN(delete_fails_closed_on_a_directory_it_did_not_create);
+    RUN(trash_reports_a_cross_device_trash_directory_distinctly);
+    RUN(restore_refuses_unknown_ids_and_will_not_clobber_a_live_session);
     RUN(fresh_session_records_initial_model_and_cwd);
     RUN(unchanged_resume_writes_no_new_records_but_refreshes_metadata);
     RUN(apply_setting_writes_a_record_and_persists_through_restore);

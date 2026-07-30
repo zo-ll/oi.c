@@ -276,6 +276,25 @@ static oi_status resolve_root(const char *root_override, char **out_root) {
 }
 
 /*
+ * The trash lives inside the sessions root, so trash and restore are
+ * same-filesystem renames by construction. Its name starts with '.', so
+ * oi_cli_session_id_is_safe already excludes it from enumeration and it
+ * can never collide with a real session id.
+ */
+static oi_status resolve_trash_root(const char *root_override,
+                                    char **out_trash_root) {
+    char *root = NULL;
+    oi_status status = resolve_root(root_override, &root);
+
+    if (status != OI_OK) {
+        return status;
+    }
+    status = join_path(root, ".trash", out_trash_root);
+    free(root);
+    return status;
+}
+
+/*
  * Read-only check for whether another process holds `history_path`'s
  * lock, taking flock(2) directly rather than going through
  * oi_sesslog_open. That matters: oi_sesslog_open creates the file when
@@ -478,31 +497,24 @@ static int compare_entries(const void *left, const void *right) {
     return strcmp(b->id, a->id);
 }
 
-oi_status oi_cli_sessions_enumerate(const char *root_override,
-                                    struct oi_cli_session_list *out_list) {
+/* Scans one directory of session directories -- the live root or the
+ * trash, which have identical layout. */
+static oi_status enumerate_directory(const char *root,
+                                     struct oi_cli_session_list *out_list) {
     struct oi_cli_session_list list;
     struct dirent *entry;
-    char *root = NULL;
     DIR *dir;
     oi_status status;
 
-    if (out_list == NULL) {
-        return OI_ERR_INVAL;
-    }
-    status = resolve_root(root_override, &root);
-    if (status != OI_OK) {
-        return status;
-    }
     dir = opendir(root);
     if (dir == NULL) {
-        /* No root yet simply means no sessions have been created. */
-        status = (errno == ENOENT || errno == ENOTDIR) ? OI_OK : OI_ERR_IO;
-        free(root);
-        if (status == OI_OK) {
+        /* An absent directory simply means nothing is in it yet. */
+        if (errno == ENOENT || errno == ENOTDIR) {
             oi_cli_session_list_free(out_list);
             oi_cli_session_list_init(out_list);
+            return OI_OK;
         }
-        return status;
+        return OI_ERR_IO;
     }
 
     oi_cli_session_list_init(&list);
@@ -533,12 +545,10 @@ oi_status oi_cli_sessions_enumerate(const char *root_override,
         if (status != OI_OK) {
             closedir(dir);
             oi_cli_session_list_free(&list);
-            free(root);
             return status;
         }
     }
     closedir(dir);
-    free(root);
 
     if (list.len > 1) {
         qsort(list.entries, list.len, sizeof *list.entries, compare_entries);
@@ -546,6 +556,40 @@ oi_status oi_cli_sessions_enumerate(const char *root_override,
     oi_cli_session_list_free(out_list);
     *out_list = list;
     return OI_OK;
+}
+
+oi_status oi_cli_sessions_enumerate(const char *root_override,
+                                    struct oi_cli_session_list *out_list) {
+    char *root = NULL;
+    oi_status status;
+
+    if (out_list == NULL) {
+        return OI_ERR_INVAL;
+    }
+    status = resolve_root(root_override, &root);
+    if (status != OI_OK) {
+        return status;
+    }
+    status = enumerate_directory(root, out_list);
+    free(root);
+    return status;
+}
+
+oi_status oi_cli_sessions_enumerate_trash(
+    const char *root_override, struct oi_cli_session_list *out_list) {
+    char *trash_root = NULL;
+    oi_status status;
+
+    if (out_list == NULL) {
+        return OI_ERR_INVAL;
+    }
+    status = resolve_trash_root(root_override, &trash_root);
+    if (status != OI_OK) {
+        return status;
+    }
+    status = enumerate_directory(trash_root, out_list);
+    free(trash_root);
+    return status;
 }
 
 oi_status oi_cli_session_location_create(
@@ -785,6 +829,285 @@ oi_status oi_cli_session_rename(const char *root_override, const char *id,
     free(metadata_path);
     free(directory);
     oi_cli_session_metadata_free(&metadata);
+    return status;
+}
+
+/*
+ * Refuses to touch a session another process has open. Shared by trash,
+ * restore, and delete: moving or removing a directory out from under a
+ * live process is exactly the kind of surprise durable history exists to
+ * prevent.
+ */
+static oi_status refuse_if_busy(const char *directory,
+                                char **out_error_detail) {
+    char *history_path = NULL;
+    oi_status status = join_path(directory, session_history_name,
+                                &history_path);
+
+    if (status != OI_OK) {
+        return status;
+    }
+    switch (probe_lock(history_path)) {
+    case OI_CLI_SESSION_LOCK_BUSY:
+        set_error_detail(out_error_detail,
+                         "session is open in another process");
+        status = OI_ERR_EXISTS;
+        break;
+    case OI_CLI_SESSION_LOCK_UNKNOWN:
+        set_error_detail(out_error_detail,
+                         "cannot determine whether the session is in use");
+        status = OI_ERR_IO;
+        break;
+    case OI_CLI_SESSION_LOCK_FREE:
+    default:
+        status = OI_OK;
+        break;
+    }
+    free(history_path);
+    return status;
+}
+
+/*
+ * Moves a session directory between the live root and the trash. Both
+ * callers hand in an already-resolved source and a destination parent.
+ */
+static oi_status move_session_directory(const char *source,
+                                        const char *destination_parent,
+                                        const char *id, size_t id_len,
+                                        char **out_error_detail) {
+    char terminated[OI_CLI_SESSION_SAFE_ID_MAX_LEN + 1];
+    char *destination = NULL;
+    oi_status status;
+
+    memcpy(terminated, id, id_len);
+    terminated[id_len] = '\0';
+    status = ensure_directory(destination_parent);
+    if (status != OI_OK) {
+        set_error_detail(out_error_detail,
+                         "could not create the destination directory");
+        return status;
+    }
+    status = join_path(destination_parent, terminated, &destination);
+    if (status != OI_OK) {
+        return status;
+    }
+    /* Atomic within a filesystem: either the whole directory moved or
+     * nothing did, so there is no half-trashed state to recover from. */
+    if (rename(source, destination) != 0) {
+        if (errno == EXDEV) {
+            set_error_detail(
+                out_error_detail,
+                "the trash directory is on a different filesystem");
+        } else {
+            set_error_detail(out_error_detail, strerror(errno));
+        }
+        status = OI_ERR_IO;
+    }
+    free(destination);
+    return status;
+}
+
+oi_status oi_cli_session_trash(const char *root_override, const char *id,
+                               size_t id_len, const char *current_session_id,
+                               char **out_error_detail) {
+    char *root = NULL;
+    char *trash_root = NULL;
+    char *directory = NULL;
+    oi_status status;
+
+    if (out_error_detail != NULL) {
+        *out_error_detail = NULL;
+    }
+    if (!oi_cli_session_id_is_safe(id, id_len)) {
+        set_error_detail(out_error_detail, "invalid session id");
+        return OI_ERR_INVAL;
+    }
+    /* Ids are unique, so an exact match is unambiguous. */
+    if (current_session_id != NULL &&
+        strlen(current_session_id) == id_len &&
+        memcmp(current_session_id, id, id_len) == 0) {
+        set_error_detail(out_error_detail,
+                         "cannot trash the active session -- switch away "
+                         "from it first");
+        return OI_ERR_INVAL;
+    }
+
+    status = resolve_root(root_override, &root);
+    if (status != OI_OK) {
+        return status;
+    }
+    status = oi_cli_session_resolve(root, id, id_len, &directory);
+    if (status != OI_OK) {
+        free(root);
+        set_error_detail(out_error_detail,
+                         status == OI_ERR_NOTFOUND
+                             ? "no such session"
+                             : "session directory is not usable");
+        return status;
+    }
+    status = refuse_if_busy(directory, out_error_detail);
+    if (status == OI_OK) {
+        status = join_path(root, ".trash", &trash_root);
+    }
+    if (status == OI_OK) {
+        status = move_session_directory(directory, trash_root, id, id_len,
+                                        out_error_detail);
+    }
+    free(trash_root);
+    free(directory);
+    free(root);
+    return status;
+}
+
+oi_status oi_cli_session_restore_trashed(const char *root_override,
+                                         const char *id, size_t id_len,
+                                         char **out_error_detail) {
+    char *root = NULL;
+    char *trash_root = NULL;
+    char *directory = NULL;
+    char *live_directory = NULL;
+    oi_status status;
+
+    if (out_error_detail != NULL) {
+        *out_error_detail = NULL;
+    }
+    if (!oi_cli_session_id_is_safe(id, id_len)) {
+        set_error_detail(out_error_detail, "invalid session id");
+        return OI_ERR_INVAL;
+    }
+    status = resolve_root(root_override, &root);
+    if (status != OI_OK) {
+        return status;
+    }
+    status = join_path(root, ".trash", &trash_root);
+    if (status != OI_OK) {
+        free(root);
+        return status;
+    }
+    status = oi_cli_session_resolve(trash_root, id, id_len, &directory);
+    if (status != OI_OK) {
+        set_error_detail(out_error_detail,
+                         status == OI_ERR_NOTFOUND
+                             ? "no trashed session with that id"
+                             : "trashed session directory is not usable");
+        free(trash_root);
+        free(root);
+        return status;
+    }
+    /* Generated ids are unique, so this should be impossible -- check it
+     * anyway rather than let a rename clobber a live session. */
+    if (oi_cli_session_resolve(root, id, id_len, &live_directory) == OI_OK) {
+        free(live_directory);
+        set_error_detail(out_error_detail,
+                         "a live session with that id already exists");
+        free(directory);
+        free(trash_root);
+        free(root);
+        return OI_ERR_EXISTS;
+    }
+    /* A trashed session should never be locked; checking costs nothing. */
+    status = refuse_if_busy(directory, out_error_detail);
+    if (status == OI_OK) {
+        status = move_session_directory(directory, root, id, id_len,
+                                        out_error_detail);
+    }
+    free(directory);
+    free(trash_root);
+    free(root);
+    return status;
+}
+
+/*
+ * Empties and removes one trashed session directory.
+ *
+ * Deliberately not a generic recursive delete: a session directory holds a
+ * known, flat set of regular files (history.oilog, metadata.json, and
+ * possibly a metadata.json.tmp from an interrupted write). Anything else --
+ * a nested directory, a symlink, a device -- means this is not a directory
+ * oi created, so it fails closed instead of recursing. Deletion should
+ * never remove something it did not put there.
+ */
+static oi_status remove_session_directory(const char *directory,
+                                          char **out_error_detail) {
+    struct dirent *entry;
+    DIR *dir = opendir(directory);
+    oi_status status = OI_OK;
+
+    if (dir == NULL) {
+        set_error_detail(out_error_detail, strerror(errno));
+        return OI_ERR_IO;
+    }
+    while (status == OI_OK && (entry = readdir(dir)) != NULL) {
+        char *path = NULL;
+        struct stat info;
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        status = join_path(directory, entry->d_name, &path);
+        if (status != OI_OK) {
+            break;
+        }
+        if (lstat(path, &info) != 0) {
+            set_error_detail(out_error_detail, strerror(errno));
+            status = OI_ERR_IO;
+        } else if (!S_ISREG(info.st_mode)) {
+            set_error_detail(out_error_detail,
+                             "session directory holds an unexpected entry; "
+                             "refusing to delete it");
+            status = OI_ERR_IO;
+        } else if (unlink(path) != 0) {
+            set_error_detail(out_error_detail, strerror(errno));
+            status = OI_ERR_IO;
+        }
+        free(path);
+    }
+    closedir(dir);
+    if (status == OI_OK && rmdir(directory) != 0) {
+        set_error_detail(out_error_detail, strerror(errno));
+        status = OI_ERR_IO;
+    }
+    return status;
+}
+
+oi_status oi_cli_session_delete(const char *root_override, const char *id,
+                                size_t id_len, char **out_error_detail) {
+    char *trash_root = NULL;
+    char *directory = NULL;
+    oi_status status;
+
+    if (out_error_detail != NULL) {
+        *out_error_detail = NULL;
+    }
+    if (!oi_cli_session_id_is_safe(id, id_len)) {
+        set_error_detail(out_error_detail, "invalid session id");
+        return OI_ERR_INVAL;
+    }
+    status = resolve_trash_root(root_override, &trash_root);
+    if (status != OI_OK) {
+        return status;
+    }
+    /*
+     * Scoped to the trash, which is what makes refusing the current
+     * session and refusing a session open elsewhere structural: neither is
+     * in the trash, so neither can be found here at all.
+     */
+    status = oi_cli_session_resolve(trash_root, id, id_len, &directory);
+    free(trash_root);
+    if (status != OI_OK) {
+        set_error_detail(out_error_detail,
+                         status == OI_ERR_NOTFOUND
+                             ? "no trashed session with that id -- trash it "
+                               "first"
+                             : "trashed session directory is not usable");
+        return status;
+    }
+    status = refuse_if_busy(directory, out_error_detail);
+    if (status == OI_OK) {
+        status = remove_session_directory(directory, out_error_detail);
+    }
+    free(directory);
     return status;
 }
 

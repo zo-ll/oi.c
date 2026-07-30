@@ -206,6 +206,53 @@ oi_status oi_cli_session_rename(const char *root_override, const char *id,
                                 size_t new_name_len,
                                 char **out_error_detail);
 
+/*
+ * Trash, restore, and permanent delete.
+ *
+ * Trashing renames a session's whole private directory from <root>/<id> to
+ * <root>/.trash/<id>. A directory rename was chosen over a "trashed" flag
+ * in the cache for three reasons: rename(2) within a filesystem is atomic,
+ * so no partial state exists; a trashed session simply is not in <root>
+ * anymore, which keeps oi_cli_sessions_enumerate correct with no filtering
+ * (".trash" already fails oi_cli_session_id_is_safe); and the trash lives
+ * under the same root as every session, so the rename is same-filesystem
+ * by construction.
+ *
+ * Cross-device is therefore not expected, but is detected and reported
+ * distinctly rather than folded into a generic I/O error -- a relocated or
+ * bind-mounted .trash would otherwise fail inexplicably.
+ *
+ * Delete only ever operates on an already-trashed session; there is no
+ * one-step hard delete of a live one. That makes "refuses the current
+ * session" and "refuses a session open elsewhere" structural rather than
+ * merely checked: a live session is not in .trash, so delete cannot reach
+ * it at all.
+ *
+ * `current_session_id` may be NULL when no session is active. All three
+ * set `*out_error_detail` (caller-owned) on failure when it is non-NULL.
+ *
+ *   OI_ERR_INVAL    unsafe id, or trashing the active session
+ *   OI_ERR_NOTFOUND no such session in the relevant location
+ *   OI_ERR_EXISTS   held by another process, or (restore) the id is live
+ *   OI_ERR_IO       the rename or removal failed; detail says why
+ */
+oi_status oi_cli_session_trash(const char *root_override, const char *id,
+                               size_t id_len, const char *current_session_id,
+                               char **out_error_detail);
+oi_status oi_cli_session_restore_trashed(const char *root_override,
+                                         const char *id, size_t id_len,
+                                         char **out_error_detail);
+oi_status oi_cli_session_delete(const char *root_override, const char *id,
+                                size_t id_len, char **out_error_detail);
+
+/*
+ * Enumerates trashed sessions, so /session restore can offer a choice.
+ * Same contract and cost model as oi_cli_sessions_enumerate; an absent
+ * trash directory yields an empty list rather than an error.
+ */
+oi_status oi_cli_sessions_enumerate_trash(
+    const char *root_override, struct oi_cli_session_list *out_list);
+
 struct oi_cli_session_restore {
     struct oi_cli_string model;
     struct oi_cli_string cwd;
