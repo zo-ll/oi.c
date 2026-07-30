@@ -42,8 +42,9 @@ TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
 CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c src/cli_conversation.c src/cli_utf8.c src/cli_editor.c src/cli_input_history.c src/cli_terminal.c src/cli_input.c src/cli_prompt_state.c src/cli_render.c src/cli_selector.c src/cli_composer.c src/cli_present.c src/cli_repl.c src/cli_sessions.c src/cli_commands.c src/cli_command_dispatch.c src/cli_bytebuf.c src/cli_utf8_stream.c src/cli_render_sanitize.c src/cli_markdown.c src/cli_render_style.c src/cli_markdown_inline.c src/cli_markdown_block.c src/cli_render_stream.c src/cli_session_metadata.c src/cli_session_metadata_codec.c src/cli_session_metadata_store.c src/cli_tool_panel.c src/cli_compact.c src/cli_session_switch.c
 
-.PHONY: all lib so cli install test quick check verify tier-audit timings \
-	abi-check asan ubsan tsan valgrind fuzz fuzz-run test-integration clean
+.PHONY: all lib so cli install test quick check verify verify-compilers \
+	compiler-stamp tier-audit timings abi-check asan ubsan tsan valgrind \
+	fuzz fuzz-run test-integration clean
 
 all: lib cli
 
@@ -241,19 +242,39 @@ PURE_TEST_BINS = $(PURE_TESTS:%=$(BUILD)/%)
 test: $(TEST_BINS) $(CLI_BIN)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t =="; $$t; done
 
-# The routine edit-test loop: deterministic unit tests only.
-quick: $(PURE_TEST_BINS)
+# The routine edit-test loop: runs deterministic unit tests only, but still
+# builds $(CLI_BIN). Without that dependency this target passes while
+# production-only sources (src/cli.c, src/cli_repl.c, src/cli_loop.c) no
+# longer compile, since no pure test links them -- a fast tier that cannot
+# notice a broken build is worse than no fast tier.
+quick: $(PURE_TEST_BINS) $(CLI_BIN)
 	@set -e; for t in $(PURE_TEST_BINS); do echo "== $$t =="; $$t; done
 
 # Fails if PURE_TESTS + IMPURE_TESTS stops accounting for every test binary,
 # so a newly added test cannot quietly belong to no tier and go unrun by
 # everything except the full `check`.
+#
+# Checks both halves of the invariant. Set coverage alone is not enough: a
+# test named in both tiers still satisfies "every test is tiered" while
+# actually being run twice by `check` and misfiled in `quick`, so exclusivity
+# is checked separately.
+#
+# Negative cases, each reproducible by editing the lists above and re-running:
+#   missing     -- delete a name from PURE_TESTS
+#   nonexistent -- add a name matching no test/test_*.c
+#   duplicate   -- repeat a name within one tier
+#   overlap     -- add a PURE_TESTS name to IMPURE_TESTS as well
 tier-audit:
 	@all=`echo $(TEST_SRCS) | tr ' ' '\n' | sed 's|test/||;s|\.c$$||'`; \
-	tiers="$(PURE_TESTS) $(IMPURE_TESTS)"; \
-	tiers=`echo $$tiers | tr ' ' '\n'`; \
+	pure=`echo $(PURE_TESTS) | tr ' ' '\n'`; \
+	impure=`echo $(IMPURE_TESTS) | tr ' ' '\n'`; \
+	tiers=`printf '%s\n' $$pure $$impure`; \
 	missing=`printf '%s\n' $$all $$tiers $$tiers | sort | uniq -u`; \
 	extra=`printf '%s\n' $$tiers $$all $$all | sort | uniq -u`; \
+	pure_dupes=`printf '%s\n' $$pure | sort | uniq -d`; \
+	impure_dupes=`printf '%s\n' $$impure | sort | uniq -d`; \
+	overlap=`printf '%s\n' \`printf '%s\n' $$pure | sort -u\` \
+		\`printf '%s\n' $$impure | sort -u\` | sort | uniq -d`; \
 	status=0; \
 	if [ -n "$$missing" ]; then \
 		echo "tier-audit: test(s) belong to no tier:"; \
@@ -263,8 +284,21 @@ tier-audit:
 		echo "tier-audit: tier lists name test(s) that do not exist:"; \
 		echo "$$extra" | sed 's/^/  /'; status=1; \
 	fi; \
-	[ $$status -eq 0 ] && \
-		echo "tier-audit: all `printf '%s\n' $$all | wc -l | tr -d ' '` test binaries are tiered"; \
+	if [ -n "$$pure_dupes" ]; then \
+		echo "tier-audit: PURE_TESTS lists the same test twice:"; \
+		echo "$$pure_dupes" | sed 's/^/  /'; status=1; \
+	fi; \
+	if [ -n "$$impure_dupes" ]; then \
+		echo "tier-audit: IMPURE_TESTS lists the same test twice:"; \
+		echo "$$impure_dupes" | sed 's/^/  /'; status=1; \
+	fi; \
+	if [ -n "$$overlap" ]; then \
+		echo "tier-audit: test(s) in both PURE_TESTS and IMPURE_TESTS:"; \
+		echo "$$overlap" | sed 's/^/  /'; status=1; \
+	fi; \
+	if [ $$status -eq 0 ]; then \
+		echo "tier-audit: `printf '%s\n' $$all | wc -l | tr -d ' '` test binaries, each in exactly one tier"; \
+	fi; \
 	exit $$status
 
 # Integration tests get their own build subdir so their binaries don't
@@ -308,17 +342,50 @@ check: tier-audit test test-integration
 # compilers and every instrumentation the project has, plus the ABI export
 # check and a bounded fuzz smoke run.
 #
-# Sequenced rather than parallel: these targets each rebuild into their own
-# BUILD directory, and running them concurrently on a developer machine
-# competes for the same cores the sanitized tests' own timing assumptions
-# depend on.
+# The two compiler passes must use separate BUILD trees. Make decides what to
+# rebuild from timestamps, not from the value of CC, so running both passes
+# against the same build/ leaves the second one reporting "up to date" and
+# silently re-running the first compiler's binaries -- the dual-compiler gate
+# would pass without clang ever having compiled anything. Same reason the
+# sanitizer targets each use their own tree.
+#
+# Sequenced rather than parallel: each pass is a full rebuild, and running
+# them concurrently competes for the cores the sanitized tests' own timing
+# assumptions depend on.
 VERIFY_FUZZ_RUNS ?= 200000
+
+# Records which compiler populated this BUILD tree, so verify-compilers can
+# show the passes really differed instead of assuming it.
+compiler-stamp: | $(BUILD)
+	@$(CC) --version | head -1 > $(BUILD)/compiler.txt
+
+verify-compilers:
+	@gcc_id=`cat build-gcc/compiler.txt 2>/dev/null`; \
+	clang_id=`cat build-clang/compiler.txt 2>/dev/null`; \
+	if [ -z "$$gcc_id" ] || [ -z "$$clang_id" ]; then \
+		echo "verify: a compiler pass left no stamp"; exit 1; \
+	fi; \
+	if [ "$$gcc_id" = "$$clang_id" ]; then \
+		echo "verify: both passes used the same compiler:"; \
+		echo "  $$gcc_id"; exit 1; \
+	fi; \
+	case "$$gcc_id" in *gcc*|*GCC*) ;; \
+		*) echo "verify: build-gcc was not built by gcc: $$gcc_id"; exit 1;; \
+	esac; \
+	case "$$clang_id" in *clang*|*Clang*) ;; \
+		*) echo "verify: build-clang was not built by clang: $$clang_id"; \
+		   exit 1;; \
+	esac; \
+	echo "verify: gcc   -> $$gcc_id"; \
+	echo "verify: clang -> $$clang_id"
 
 verify:
 	@echo "== verify: gcc =="
-	$(MAKE) CC=gcc check
+	$(MAKE) CC=gcc BUILD=build-gcc check compiler-stamp
 	@echo "== verify: clang =="
-	$(MAKE) CC=clang check
+	$(MAKE) CC=clang BUILD=build-clang check compiler-stamp
+	@echo "== verify: compilers =="
+	@$(MAKE) verify-compilers
 	@echo "== verify: abi =="
 	$(MAKE) abi-check
 	@echo "== verify: asan =="
@@ -336,30 +403,61 @@ verify:
 # Records wall time for the compile phase, every test binary, and each tier,
 # so the effect of a change to any of them can be compared rather than
 # guessed at. Writes a Markdown table on stdout.
+# Timings are only meaningful for a build that actually succeeded and tests
+# that actually passed, so a failure fails this target. Measurement output is
+# still printed first -- the point is to see where the time went even on a bad
+# run -- but the exit status never reports success for an incomplete build.
+#
+# Per-binary failures are recorded in a file rather than a shell variable
+# because that loop is piped into sort, and a pipeline's exit status is the
+# last command's.
 timings:
-	@echo "| Phase | Seconds |"; \
+	@failures=`mktemp`; \
+	echo "| Phase | Seconds |"; \
 	echo "| --- | --- |"; \
 	$(MAKE) clean >/dev/null 2>&1; \
 	start=`date +%s.%N`; \
-	$(MAKE) $(TEST_BINS) $(INTEGRATION_BINS) $(CLI_BIN) >/dev/null 2>&1; \
-	end=`date +%s.%N`; \
-	echo "| compile (serial, clean) | `echo "$$end - $$start" | bc` |"; \
+	if $(MAKE) $(TEST_BINS) $(INTEGRATION_BINS) $(CLI_BIN) \
+			>$$failures.build 2>&1; then \
+		end=`date +%s.%N`; \
+		echo "| compile (serial, clean) | `echo "$$end - $$start" | bc` |"; \
+	else \
+		echo; \
+		echo "timings: compilation failed; no timings are meaningful" >&2; \
+		tail -20 $$failures.build >&2; \
+		rm -f $$failures $$failures.build; \
+		exit 1; \
+	fi; \
+	rm -f $$failures.build; \
 	start=`date +%s.%N`; \
-	for t in $(PURE_TEST_BINS); do $$t >/dev/null 2>&1 || true; done; \
+	for t in $(PURE_TEST_BINS); do \
+		$$t >/dev/null 2>&1 || echo "$$t" >> $$failures; \
+	done; \
 	end=`date +%s.%N`; \
 	echo "| quick tier (run only) | `echo "$$end - $$start" | bc` |"; \
 	start=`date +%s.%N`; \
-	for t in $(TEST_BINS) $(INTEGRATION_BINS); do $$t >/dev/null 2>&1 || true; done; \
+	for t in $(TEST_BINS) $(INTEGRATION_BINS); do \
+		$$t >/dev/null 2>&1 || echo "$$t" >> $$failures; \
+	done; \
 	end=`date +%s.%N`; \
 	echo "| check tier (run only) | `echo "$$end - $$start" | bc` |"; \
 	echo; \
 	echo "| Binary | Seconds |"; \
 	echo "| --- | --- |"; \
 	for t in $(TEST_BINS) $(INTEGRATION_BINS); do \
-		start=`date +%s.%N`; $$t >/dev/null 2>&1 || true; \
+		start=`date +%s.%N`; \
+		$$t >/dev/null 2>&1 || echo "$$t" >> $$failures; \
 		end=`date +%s.%N`; \
 		printf '| %s | %s |\n' "$$t" "`echo "$$end - $$start" | bc`"; \
-	done | sort -t'|' -k3 -rn
+	done | sort -t'|' -k3 -rn; \
+	if [ -s $$failures ]; then \
+		echo; \
+		echo "timings: these binaries failed, so the report is not a pass:" >&2; \
+		sort -u $$failures | sed 's/^/  /' >&2; \
+		rm -f $$failures; \
+		exit 1; \
+	fi; \
+	rm -f $$failures
 
 abi-check: $(LIB_SO_REAL)
 	@nm -D --defined-only --format=posix $(LIB_SO_REAL) | \
@@ -467,4 +565,5 @@ fuzz-run: $(FUZZ_BINS)
 	done
 
 clean:
-	rm -rf $(BUILD) build-asan build-ubsan build-tsan $(FUZZ_BUILD)
+	rm -rf $(BUILD) build-gcc build-clang build-asan build-ubsan \
+		build-tsan $(FUZZ_BUILD)
