@@ -112,7 +112,7 @@ $(CLI_TEST_LIB): $(CLI_TEST_OBJS)
 	ar rcs $@ $^
 
 $(CLI_BIN): $(CLI_OBJS) $(LIB) | $(BUILD)
-	$(CC) $(CLI_OBJS) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CFLAGS) $(CLI_OBJS) $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/test_%: test/test_%.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS)
