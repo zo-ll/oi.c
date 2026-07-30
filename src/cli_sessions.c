@@ -484,8 +484,19 @@ static oi_status describe_session(const char *id, const char *directory,
     out->lock_state = probe_lock(history_path);
 
     oi_cli_session_metadata_init(&metadata);
+    /*
+     * The cache must prove it belongs to this directory before it is
+     * believed. A metadata.json naming a different session -- a stray copy,
+     * a half-finished manual move, a restored backup -- parses perfectly
+     * well, so without this check a session would be listed as healthy
+     * while showing another session's model, cwd, and name. Treat it
+     * exactly like a corrupt cache: degraded, and rebuilt from the history
+     * that is actually in this directory.
+     */
     if (oi_cli_session_metadata_store_read(metadata_path, &metadata) ==
-        OI_OK) {
+            OI_OK &&
+        metadata.session_id.len == strlen(id) &&
+        memcmp(metadata.session_id.data, id, metadata.session_id.len) == 0) {
         if (metadata.display_name.len > 0) {
             (void)oi_cli_string_set(&out->display_name,
                                     metadata.display_name.data,
@@ -498,8 +509,9 @@ static oi_status describe_session(const char *id, const char *directory,
         out->created_at = metadata.created_at;
         out->updated_at = metadata.updated_at;
     } else {
-        /* Missing or malformed cache. The session is still real and still
-         * selectable -- rebuild what history can tell us and say so. */
+        /* Missing, malformed, or belonging to another session. Either way
+         * the session is still real and still selectable -- rebuild what
+         * history can tell us and say so. */
         out->degraded = 1;
         if (out->lock_state != OI_CLI_SESSION_LOCK_BUSY) {
             rebuild_from_history(history_path, &out->model, &out->cwd,

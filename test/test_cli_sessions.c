@@ -434,6 +434,57 @@ TEST(enumerate_rebuilds_missing_and_malformed_metadata_from_history) {
     CHECK_EQ(rmdir(root), 0);
 }
 
+TEST(enumerate_distrusts_metadata_belonging_to_another_session) {
+    char root[192];
+    char metadata_path[384];
+    struct oi_cli_session_list list;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-enum-mismatch-%ld",
+             (long)getpid());
+    seed_session(root, "real-session", "gpt-real", "/tmp", 100, 200, 1);
+    CHECK_EQ(oi_cli_session_rename(root, "real-session", 12, "real name", 9,
+                                   NULL),
+             OI_OK);
+
+    /*
+     * A perfectly valid cache that names a *different* session -- a stray
+     * copy, an interrupted manual move, a restored backup. It parses, so
+     * without an ownership check this session would be listed as healthy
+     * while displaying another session's model, cwd, and name.
+     */
+    snprintf(metadata_path, sizeof metadata_path,
+             "%s/real-session/metadata.json", root);
+    {
+        struct oi_cli_session_metadata impostor;
+        oi_cli_session_metadata_init(&impostor);
+        CHECK_EQ(oi_cli_session_metadata_set(&impostor, "some-other-session",
+                                             18, "gpt-wrong", 9,
+                                             "/wrong/place", 12,
+                                             "wrong name", 10, 1, 2),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_store_write(metadata_path,
+                                                     &impostor),
+                 OI_OK);
+        oi_cli_session_metadata_free(&impostor);
+    }
+
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 1);
+    CHECK_STREQ(list.entries[0].id, "real-session");
+    /* Flagged, not trusted. */
+    CHECK_EQ(list.entries[0].degraded, 1);
+    /* Rebuilt from the history actually in this directory... */
+    CHECK_STREQ(list.entries[0].model.data, "gpt-real");
+    CHECK_STREQ(list.entries[0].cwd.data, "/tmp");
+    /* ...and none of the impostor's values leaked into the row. */
+    CHECK(list.entries[0].display_name.len == 0);
+    oi_cli_session_list_free(&list);
+
+    remove_session(root, "real-session");
+    CHECK_EQ(rmdir(root), 0);
+}
+
 TEST(enumerate_lists_an_unreplayable_session_with_only_its_id) {
     char root[192];
     char history_path[384];
@@ -2035,6 +2086,7 @@ int main(void) {
     RUN(enumerate_lists_sessions_newest_first_and_skips_non_sessions);
     RUN(enumerate_reports_an_empty_list_for_a_root_that_does_not_exist);
     RUN(enumerate_rebuilds_missing_and_malformed_metadata_from_history);
+    RUN(enumerate_distrusts_metadata_belonging_to_another_session);
     RUN(enumerate_lists_an_unreplayable_session_with_only_its_id);
     RUN(enumerate_reports_a_session_held_by_another_process_as_busy);
     RUN(enumerate_does_not_rewrite_the_logs_it_lists);
