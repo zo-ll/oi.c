@@ -209,9 +209,12 @@ oi_status oi_cli_sessions_enumerate(const char *root_override,
  * from history before writing, so naming a damaged session repairs it
  * rather than failing.
  *
- * Needs no lock: it writes only metadata.json, which is already safe to
- * write while another process appends to the log -- the same reason
- * /model and /cwd take no lock to refresh the cache.
+ * Takes no session lock -- it writes only metadata.json, which is safe to
+ * write while another process appends to the log. It does take the cache's
+ * own advisory lock across its read-merge-write, so a concurrent model/cwd
+ * refresh cannot lose the name and this cannot lose the model. If that lock
+ * is unavailable the rename fails rather than proceeding: unlike an optional
+ * cache refresh, the metadata write is the whole operation here.
  *
  * `*out_error_detail`, when non-NULL on return, is a caller-owned string
  * naming the specific cause and is set only on failure.
@@ -219,9 +222,10 @@ oi_status oi_cli_sessions_enumerate(const char *root_override,
  *   OI_ERR_INVAL    unsafe id, or a name that is empty, too long, or
  *                   contains a control byte
  *   OI_ERR_NOTFOUND no live session with that id
- *   OI_ERR_IO       the metadata write failed, or the session has neither a
- *                   cache nor a readable history to rebuild one from, so
- *                   there is nowhere to record a name
+ *   OI_ERR_IO       the metadata write failed, the cache lock could not be
+ *                   acquired, or the session has neither a cache nor a
+ *                   readable history to rebuild one from, so there is
+ *                   nowhere to record a name
  */
 oi_status oi_cli_session_rename(const char *root_override, const char *id,
                                 size_t id_len, const char *new_name,

@@ -16,6 +16,23 @@
 #include "cli_session_metadata_store.h"
 #include "oi/sesslog.h"
 
+/* Reads a whole file for byte-for-byte comparisons. */
+static void read_whole_file(const char *path, char **out_data,
+                           size_t *out_len) {
+    FILE *file = fopen(path, "rb");
+    long size;
+    CHECK(file != NULL);
+    CHECK_EQ(fseek(file, 0, SEEK_END), 0);
+    size = ftell(file);
+    CHECK(size >= 0);
+    CHECK_EQ(fseek(file, 0, SEEK_SET), 0);
+    *out_data = malloc((size_t)size);
+    CHECK(*out_data != NULL);
+    CHECK_EQ(fread(*out_data, 1, (size_t)size, file), (size_t)size);
+    CHECK_EQ(fclose(file), 0);
+    *out_len = (size_t)size;
+}
+
 TEST(default_root_uses_xdg_state_home) {
     char state_home[128];
     char *root = NULL;
@@ -920,6 +937,114 @@ TEST(a_rename_waits_for_a_settings_update_and_merges_its_value) {
     CHECK_EQ(rmdir(root), 0);
 }
 
+TEST(a_planted_lock_symlink_is_refused_and_never_followed) {
+    char root[192];
+    char history_path[384];
+    char metadata_path[384];
+    char lock_path[420];
+    char decoy_path[192];
+    struct oi_cli_history_store store;
+    struct oi_cli_history_replay_state state;
+    oi_sesslog *log = NULL;
+    char *detail = NULL;
+
+    /*
+     * The lock path is the one path in this module built by appending to a
+     * name rather than resolved through oi_cli_session_resolve, so it needs
+     * its own symlink defence: followed, a planted "metadata.json.lock"
+     * would be opened O_RDWR|O_CREAT at whatever it pointed to.
+     */
+    snprintf(root, sizeof root, "/tmp/oi-session-locksym-%ld",
+             (long)getpid());
+    seed_session(root, "sess-lock", "gpt-before", "/tmp", 100, 200, 1);
+    snprintf(history_path, sizeof history_path, "%s/sess-lock/history.oilog",
+             root);
+    snprintf(metadata_path, sizeof metadata_path,
+             "%s/sess-lock/metadata.json", root);
+    snprintf(lock_path, sizeof lock_path, "%s.lock", metadata_path);
+    snprintf(decoy_path, sizeof decoy_path, "/tmp/oi-locksym-decoy-%ld",
+             (long)getpid());
+
+    {
+        FILE *decoy = fopen(decoy_path, "w");
+        CHECK(decoy != NULL);
+        CHECK(fputs("do not touch", decoy) >= 0);
+        CHECK_EQ(fclose(decoy), 0);
+    }
+    unlink(lock_path);
+    CHECK_EQ(symlink(decoy_path, lock_path), 0);
+
+    /* Rename cannot skip: the metadata write is the whole operation, so it
+     * must fail rather than proceed unlocked. */
+    CHECK_EQ(oi_cli_session_rename(root, "sess-lock", 9, "new name", 8,
+                                   &detail),
+             OI_ERR_IO);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "lock") != NULL);
+    free(detail);
+    /* No name was recorded... */
+    {
+        struct oi_cli_string name = read_display_name(root, "sess-lock");
+        CHECK(name.data == NULL);
+        oi_cli_string_free(&name);
+    }
+    /* ...and the symlink target was neither followed nor written. */
+    {
+        char *contents = NULL;
+        size_t len = 0;
+        struct stat info;
+        read_whole_file(decoy_path, &contents, &len);
+        CHECK_EQ(len, (size_t)12);
+        CHECK_EQ(memcmp(contents, "do not touch", 12), 0);
+        free(contents);
+        CHECK_EQ(lstat(lock_path, &info), 0);
+        CHECK(S_ISLNK(info.st_mode));
+    }
+
+    /*
+     * A settings change is the opposite case: history is authoritative and
+     * already durable, so the optional cache refresh is skipped rather than
+     * raced, and the change itself still succeeds.
+     */
+    CHECK_EQ(oi_sesslog_open(history_path, &log), OI_OK);
+    oi_cli_history_store_init(&store);
+    oi_cli_history_replay_state_init(&state);
+    CHECK_EQ(oi_cli_history_store_load(log, &store, &state), OI_OK);
+    CHECK_EQ(oi_cli_session_apply_setting(
+                 &store, &state, metadata_path, "sess-lock",
+                 OI_CLI_HISTORY_SESSION_SETTING_MODEL, "gpt-after", 9),
+             OI_OK);
+    /* Durable in history... */
+    CHECK_STREQ(state.last_model.data, "gpt-after");
+    /* ...while the cache was left alone rather than written unlocked. */
+    {
+        struct oi_cli_session_metadata stale;
+        oi_cli_session_metadata_init(&stale);
+        CHECK_EQ(oi_cli_session_metadata_store_read(metadata_path, &stale),
+                 OI_OK);
+        CHECK_STREQ(stale.model.data, "gpt-before");
+        oi_cli_session_metadata_free(&stale);
+    }
+    oi_cli_history_store_free(&store);
+    oi_cli_history_replay_state_free(&state);
+    oi_sesslog_close(log);
+
+    /* With the symlink gone, both operations work again and the cache
+     * self-heals to the durable truth. */
+    CHECK_EQ(unlink(lock_path), 0);
+    CHECK_EQ(oi_cli_session_rename(root, "sess-lock", 9, "new name", 8, NULL),
+             OI_OK);
+    {
+        struct oi_cli_string name = read_display_name(root, "sess-lock");
+        CHECK_STREQ(name.data, "new name");
+        oi_cli_string_free(&name);
+    }
+
+    CHECK_EQ(unlink(decoy_path), 0);
+    remove_session(root, "sess-lock");
+    CHECK_EQ(rmdir(root), 0);
+}
+
 TEST(rename_refuses_unnameable_and_invalid_targets) {
     char root[192];
     char history_path[384];
@@ -1014,6 +1139,7 @@ static int path_is_directory_of(const char *root, const char *id) {
     snprintf(path, sizeof path, "%s/%s", root, id);
     return path_is_directory(path);
 }
+
 
 TEST(trash_and_restore_round_trip_preserving_history) {
     char root[192];
@@ -1428,22 +1554,6 @@ static void write_legacy_log(const char *path) {
     CHECK_EQ(oi_sesslog_append(log, "old question", 12), OI_OK);
     CHECK_EQ(oi_sesslog_append(log, "old answer", 10), OI_OK);
     oi_sesslog_close(log);
-}
-
-static void read_whole_file(const char *path, char **out_data,
-                           size_t *out_len) {
-    FILE *file = fopen(path, "rb");
-    long size;
-    CHECK(file != NULL);
-    CHECK_EQ(fseek(file, 0, SEEK_END), 0);
-    size = ftell(file);
-    CHECK(size >= 0);
-    CHECK_EQ(fseek(file, 0, SEEK_SET), 0);
-    *out_data = malloc((size_t)size);
-    CHECK(*out_data != NULL);
-    CHECK_EQ(fread(*out_data, 1, (size_t)size, file), (size_t)size);
-    CHECK_EQ(fclose(file), 0);
-    *out_len = (size_t)size;
 }
 
 TEST(import_adopts_a_legacy_log_and_leaves_the_source_untouched) {
@@ -2294,6 +2404,7 @@ int main(void) {
     RUN(rename_repairs_a_missing_metadata_cache_from_history);
     RUN(rename_merges_with_the_current_cache_not_a_stale_copy);
     RUN(a_rename_waits_for_a_settings_update_and_merges_its_value);
+    RUN(a_planted_lock_symlink_is_refused_and_never_followed);
     RUN(rename_refuses_unnameable_and_invalid_targets);
     RUN(trash_and_restore_round_trip_preserving_history);
     RUN(trash_refuses_the_active_session_and_unknown_ids);

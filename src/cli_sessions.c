@@ -326,15 +326,25 @@ static oi_status resolve_trash_root(const char *root_override,
  * either: the owning process holds it for its whole lifetime, so a rename
  * from another process would wait forever.
  *
- * Held only across a bounded read and write, so blocking is fine. Returns -1
- * when the lock cannot be taken, which callers treat as "proceed unlocked"
- * rather than failing: losing a display name is much better than refusing to
- * persist a model change.
+ * Held only across a bounded read and write, so blocking is fine.
+ *
+ * Returns -1 if the lock cannot be taken. Callers must not treat that as
+ * permission to proceed unlocked, and the two do different things: a rename
+ * fails, because the metadata write *is* the operation, while a settings
+ * refresh skips the write, because the change it mirrors is already durable
+ * in history and the cache rebuilds from it on the next open.
+ *
+ * The lock file is opened O_NOFOLLOW and confirmed to be a regular file. It
+ * is the one path here derived by appending to a name rather than resolved
+ * through oi_cli_session_resolve, so without that a planted
+ * "metadata.json.lock" symlink would be followed and opened O_RDWR|O_CREAT,
+ * letting an attacker aim it at an arbitrary file or device.
  */
 static int metadata_lock_acquire(const char *metadata_path) {
     static const char suffix[] = ".lock";
     size_t len = strlen(metadata_path);
     char *lock_path = malloc(len + sizeof suffix);
+    struct stat info;
     int fd;
 
     if (lock_path == NULL) {
@@ -342,9 +352,17 @@ static int metadata_lock_acquire(const char *metadata_path) {
     }
     memcpy(lock_path, metadata_path, len);
     memcpy(lock_path + len, suffix, sizeof suffix);
-    fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    /* O_NOFOLLOW rejects a symlink at the final component with ELOOP, and
+     * still creates a plain file when nothing is there. */
+    fd = open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
     free(lock_path);
     if (fd < 0) {
+        return -1;
+    }
+    /* Belt and braces: O_NOFOLLOW covers symlinks, this covers a fifo,
+     * device, or directory planted under the same name. */
+    if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
+        close(fd);
         return -1;
     }
     while (flock(fd, LOCK_EX) != 0) {
@@ -890,8 +908,20 @@ oi_status oi_cli_session_rename(const char *root_override, const char *id,
      * two interleave and one silently discards the other's field -- a rename
      * writing back a model it read before a concurrent /model landed, or a
      * /model writing back an empty name.
+     *
+     * Unlike a settings refresh, a rename cannot simply skip when the lock is
+     * unavailable: the metadata write *is* the operation. Proceeding unlocked
+     * would risk reverting a concurrent model change, so this fails and says
+     * so instead of quietly doing something unsafe or nothing at all.
      */
     lock_fd = metadata_lock_acquire(metadata_path);
+    if (lock_fd < 0) {
+        set_error_detail(out_error_detail,
+                         "could not lock the session metadata cache");
+        free(metadata_path);
+        free(directory);
+        return OI_ERR_IO;
+    }
 
     oi_cli_session_metadata_init(&metadata);
     status = load_or_rebuild_metadata(directory, id, id_len, &metadata);
@@ -1628,10 +1658,29 @@ static void refresh_metadata(const char *metadata_path,
     const char *display_name = NULL;
     size_t display_name_len = 0;
     int64_t created_at = created_at_fallback;
-    int lock_fd = metadata_lock_acquire(metadata_path);
+    int lock_fd;
     oi_status status;
-    time_t now = time(NULL);
-    int64_t updated_at = now == (time_t)-1 ? created_at : (int64_t)now;
+    time_t now;
+    int64_t updated_at;
+
+    lock_fd = metadata_lock_acquire(metadata_path);
+    if (lock_fd < 0) {
+        /*
+         * Skip the refresh rather than race it. Whatever this would have
+         * mirrored is already durable in history, and the cache rebuilds
+         * from history on the next open, so doing nothing costs nothing.
+         * Writing unlocked could instead discard a display name a
+         * concurrent rename just set.
+         */
+        if (diagnostics != NULL) {
+            fprintf(diagnostics,
+                    "oi: skipped refreshing session metadata: could not lock "
+                    "the cache\n");
+        }
+        return;
+    }
+    now = time(NULL);
+    updated_at = now == (time_t)-1 ? created_at : (int64_t)now;
 
     oi_cli_session_metadata_init(&existing);
     if (oi_cli_session_metadata_store_read(metadata_path, &existing) ==
