@@ -264,9 +264,10 @@ static void set_error_detail(char **out_error_detail, const char *detail) {
     *out_error_detail = strdup(detail);
 }
 
-/* Resolves the sessions root a lifecycle command should act on: the
- * caller's override when given, else the platform default. */
-static oi_status resolve_root(const char *root_override, char **out_root) {
+oi_status oi_cli_sessions_root(const char *root_override, char **out_root) {
+    if (out_root == NULL) {
+        return OI_ERR_INVAL;
+    }
     if (root_override != NULL) {
         if (root_override[0] == '\0') {
             return OI_ERR_INVAL;
@@ -275,6 +276,20 @@ static oi_status resolve_root(const char *root_override, char **out_root) {
         return *out_root == NULL ? OI_ERR_NOMEM : OI_OK;
     }
     return oi_cli_sessions_default_root(out_root);
+}
+
+/* Shorthand for the many internal callers that already validated their
+ * arguments and only need the root. */
+static oi_status resolve_root(const char *root_override, char **out_root) {
+    return oi_cli_sessions_root(root_override, out_root);
+}
+
+oi_status oi_cli_session_history_path(const char *directory,
+                                      char **out_history_path) {
+    if (directory == NULL || out_history_path == NULL) {
+        return OI_ERR_INVAL;
+    }
+    return join_path(directory, session_history_name, out_history_path);
 }
 
 /*

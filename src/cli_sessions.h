@@ -42,6 +42,21 @@ oi_status oi_cli_session_location_create(
 oi_status oi_cli_sessions_default_root(char **out_root);
 
 /*
+ * Resolves the sessions root a lifecycle operation should act on: a
+ * caller-owned copy of `root_override` when it is non-NULL, else the
+ * platform default. OI_ERR_INVAL for an empty override.
+ */
+oi_status oi_cli_sessions_root(const char *root_override, char **out_root);
+
+/*
+ * Builds the caller-owned path of the authoritative history log inside a
+ * private session directory. Keeps that file name a single fact owned by
+ * this module rather than a string every caller repeats.
+ */
+oi_status oi_cli_session_history_path(const char *directory,
+                                      char **out_history_path);
+
+/*
  * Syntax-only check -- never touches the filesystem: is `id` usable as a
  * single path component directly under the sessions root?
  *

@@ -40,7 +40,7 @@ SHARED_FLAGS = -shared -Wl,-soname,liboi.so.$(ABI_MAJOR) \
 TEST_SRCS = $(wildcard test/test_*.c)
 TEST_BINS = $(TEST_SRCS:test/%.c=$(BUILD)/%)
 CLI_BIN = $(BUILD)/oi
-CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c src/cli_conversation.c src/cli_utf8.c src/cli_editor.c src/cli_input_history.c src/cli_terminal.c src/cli_input.c src/cli_prompt_state.c src/cli_render.c src/cli_selector.c src/cli_composer.c src/cli_present.c src/cli_repl.c src/cli_sessions.c src/cli_commands.c src/cli_command_dispatch.c src/cli_bytebuf.c src/cli_utf8_stream.c src/cli_render_sanitize.c src/cli_markdown.c src/cli_render_style.c src/cli_markdown_inline.c src/cli_markdown_block.c src/cli_render_stream.c src/cli_session_metadata.c src/cli_session_metadata_codec.c src/cli_session_metadata_store.c src/cli_tool_panel.c src/cli_compact.c
+CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_history.c src/cli_history_codec.c src/cli_history_replay.c src/cli_history_repair.c src/cli_history_store.c src/cli_conversation.c src/cli_utf8.c src/cli_editor.c src/cli_input_history.c src/cli_terminal.c src/cli_input.c src/cli_prompt_state.c src/cli_render.c src/cli_selector.c src/cli_composer.c src/cli_present.c src/cli_repl.c src/cli_sessions.c src/cli_commands.c src/cli_command_dispatch.c src/cli_bytebuf.c src/cli_utf8_stream.c src/cli_render_sanitize.c src/cli_markdown.c src/cli_render_style.c src/cli_markdown_inline.c src/cli_markdown_block.c src/cli_render_stream.c src/cli_session_metadata.c src/cli_session_metadata_codec.c src/cli_session_metadata_store.c src/cli_tool_panel.c src/cli_compact.c src/cli_session_switch.c
 
 .PHONY: all lib so cli install test check abi-check asan ubsan tsan valgrind \
 	fuzz fuzz-run test-integration clean
@@ -231,6 +231,9 @@ $(INTEGRATION_BUILD)/test_cli_conversation: test/integration/test_cli_conversati
 
 $(INTEGRATION_BUILD)/test_cli_compact: test/integration/test_cli_compact.c src/cli_compact.c src/cli_bytebuf.c $(LIB) | $(INTEGRATION_BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_compact.c src/cli_bytebuf.c $(LIB) -o $@ $(LDLIBS)
+
+$(INTEGRATION_BUILD)/test_cli_session_switch: test/integration/test_cli_session_switch.c src/cli_session_switch.c src/cli_history_repair.c $(CLI_SESSIONS_TEST_DEPS) $(LIB) | $(INTEGRATION_BUILD)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< src/cli_session_switch.c src/cli_history_repair.c $(CLI_SESSIONS_TEST_DEPS) $(LIB) -o $@ $(LDLIBS)
 
 test-integration: $(INTEGRATION_BINS)
 	@if [ -z "$(INTEGRATION_BINS)" ]; then \
