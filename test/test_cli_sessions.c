@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "cli_session_metadata.h"
@@ -226,6 +227,383 @@ TEST(resolve_accepts_a_real_directory_and_refuses_everything_else) {
 
     snprintf(path, sizeof path, "%s/live", root);
     CHECK_EQ(rmdir(path), 0);
+    CHECK_EQ(rmdir(root), 0);
+}
+
+/* --- oi_cli_sessions_enumerate --- */
+
+/*
+ * Builds a session directory the way a real run leaves one behind:
+ * a history.oilog carrying a transition plus durable model/cwd settings,
+ * and (unless `write_metadata` is 0) a matching metadata.json cache.
+ */
+static void seed_session(const char *root, const char *id, const char *model,
+                         const char *cwd, int64_t created_at,
+                         int64_t updated_at, int write_metadata) {
+    char directory[320];
+    char history_path[384];
+    char metadata_path[384];
+    struct oi_cli_history_store store;
+    struct oi_cli_history_replay_state state;
+    struct oi_cli_history_record record;
+    oi_sesslog *log = NULL;
+
+    CHECK(mkdir(root, 0700) == 0 || errno == EEXIST);
+    snprintf(directory, sizeof directory, "%s/%s", root, id);
+    CHECK(mkdir(directory, 0700) == 0 || errno == EEXIST);
+    snprintf(history_path, sizeof history_path, "%s/history.oilog",
+             directory);
+    snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+             directory);
+
+    CHECK_EQ(oi_sesslog_open(history_path, &log), OI_OK);
+    oi_cli_history_store_init(&store);
+    oi_cli_history_replay_state_init(&state);
+    CHECK_EQ(oi_cli_history_store_load(log, &store, &state), OI_OK);
+
+    oi_cli_history_record_init(&record);
+    CHECK_EQ(oi_cli_history_record_set_transition(&record,
+                                                  state.next_record_id, 0),
+             OI_OK);
+    CHECK_EQ(oi_cli_history_store_append(&store, &record, &state), OI_OK);
+    oi_cli_history_record_free(&record);
+
+    oi_cli_history_record_init(&record);
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, state.next_record_id,
+                 OI_CLI_HISTORY_SESSION_SETTING_MODEL, model, strlen(model)),
+             OI_OK);
+    CHECK_EQ(oi_cli_history_store_append(&store, &record, &state), OI_OK);
+    oi_cli_history_record_free(&record);
+
+    oi_cli_history_record_init(&record);
+    CHECK_EQ(oi_cli_history_record_set_session_setting(
+                 &record, state.next_record_id,
+                 OI_CLI_HISTORY_SESSION_SETTING_CWD, cwd, strlen(cwd)),
+             OI_OK);
+    CHECK_EQ(oi_cli_history_store_append(&store, &record, &state), OI_OK);
+    oi_cli_history_record_free(&record);
+
+    oi_cli_history_store_free(&store);
+    oi_cli_history_replay_state_free(&state);
+    oi_sesslog_close(log);
+
+    if (write_metadata) {
+        struct oi_cli_session_metadata metadata;
+        oi_cli_session_metadata_init(&metadata);
+        CHECK_EQ(oi_cli_session_metadata_set(&metadata, id, strlen(id), model,
+                                             strlen(model), cwd, strlen(cwd),
+                                             created_at, updated_at),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_store_write(metadata_path,
+                                                     &metadata),
+                 OI_OK);
+        oi_cli_session_metadata_free(&metadata);
+    }
+}
+
+static void remove_session(const char *root, const char *id) {
+    char path[384];
+    snprintf(path, sizeof path, "%s/%s/history.oilog", root, id);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/%s/metadata.json", root, id);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/%s", root, id);
+    rmdir(path);
+}
+
+static const struct oi_cli_session_list_entry *find_entry(
+    const struct oi_cli_session_list *list, const char *id) {
+    size_t index;
+    for (index = 0; index < list->len; index++) {
+        if (strcmp(list->entries[index].id, id) == 0) {
+            return &list->entries[index];
+        }
+    }
+    return NULL;
+}
+
+TEST(enumerate_lists_sessions_newest_first_and_skips_non_sessions) {
+    char root[192];
+    char path[320];
+    struct oi_cli_session_list list;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-enum-%ld", (long)getpid());
+    seed_session(root, "sess-older", "gpt-a", "/tmp", 100, 200, 1);
+    seed_session(root, "sess-newer", "gpt-b", "/tmp", 300, 400, 1);
+
+    /* Entries that are not oi sessions must be skipped in silence. */
+    snprintf(path, sizeof path, "%s/.trash", root);
+    CHECK(mkdir(path, 0700) == 0 || errno == EEXIST);
+    snprintf(path, sizeof path, "%s/.hidden", root);
+    CHECK(mkdir(path, 0700) == 0 || errno == EEXIST);
+    snprintf(path, sizeof path, "%s/stray-file", root);
+    {
+        FILE *stray = fopen(path, "w");
+        CHECK(stray != NULL);
+        CHECK_EQ(fclose(stray), 0);
+    }
+    snprintf(path, sizeof path, "%s/a-symlink", root);
+    unlink(path);
+    CHECK_EQ(symlink("/tmp", path), 0);
+
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 2);
+    /* Most recently updated first. */
+    CHECK_STREQ(list.entries[0].id, "sess-newer");
+    CHECK_STREQ(list.entries[1].id, "sess-older");
+    CHECK_STREQ(list.entries[0].model.data, "gpt-b");
+    CHECK_STREQ(list.entries[0].cwd.data, "/tmp");
+    CHECK_EQ(list.entries[0].created_at, 300);
+    CHECK_EQ(list.entries[0].updated_at, 400);
+    CHECK_EQ(list.entries[0].degraded, 0);
+    CHECK_EQ(list.entries[0].lock_state, OI_CLI_SESSION_LOCK_FREE);
+    oi_cli_session_list_free(&list);
+
+    snprintf(path, sizeof path, "%s/a-symlink", root);
+    CHECK_EQ(unlink(path), 0);
+    snprintf(path, sizeof path, "%s/stray-file", root);
+    CHECK_EQ(unlink(path), 0);
+    snprintf(path, sizeof path, "%s/.trash", root);
+    CHECK_EQ(rmdir(path), 0);
+    snprintf(path, sizeof path, "%s/.hidden", root);
+    CHECK_EQ(rmdir(path), 0);
+    remove_session(root, "sess-older");
+    remove_session(root, "sess-newer");
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(enumerate_reports_an_empty_list_for_a_root_that_does_not_exist) {
+    char root[192];
+    struct oi_cli_session_list list;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-enum-absent-%ld",
+             (long)getpid());
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 0);
+    oi_cli_session_list_free(&list);
+
+    CHECK_EQ(oi_cli_sessions_enumerate(root, NULL), OI_ERR_INVAL);
+}
+
+TEST(enumerate_rebuilds_missing_and_malformed_metadata_from_history) {
+    char root[192];
+    char metadata_path[384];
+    struct oi_cli_session_list list;
+    const struct oi_cli_session_list_entry *entry;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-enum-degraded-%ld",
+             (long)getpid());
+    seed_session(root, "no-metadata", "gpt-recovered", "/tmp", 1, 2, 0);
+    seed_session(root, "bad-metadata", "gpt-salvaged", "/tmp", 3, 4, 1);
+
+    /* Corrupt the second session's cache. */
+    snprintf(metadata_path, sizeof metadata_path, "%s/bad-metadata/"
+             "metadata.json", root);
+    {
+        FILE *corrupt = fopen(metadata_path, "w");
+        CHECK(corrupt != NULL);
+        CHECK(fputs("{ this is not valid json", corrupt) >= 0);
+        CHECK_EQ(fclose(corrupt), 0);
+    }
+
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 2);
+
+    /* Both are still listed, both flagged, both recovered from the log --
+     * which is the authoritative record the cache only ever mirrored. */
+    entry = find_entry(&list, "no-metadata");
+    CHECK(entry != NULL);
+    CHECK_EQ(entry->degraded, 1);
+    CHECK_STREQ(entry->model.data, "gpt-recovered");
+    CHECK_STREQ(entry->cwd.data, "/tmp");
+    /* mtime stands in for the timestamps the cache would have held. */
+    CHECK(entry->updated_at > 0);
+
+    entry = find_entry(&list, "bad-metadata");
+    CHECK(entry != NULL);
+    CHECK_EQ(entry->degraded, 1);
+    CHECK_STREQ(entry->model.data, "gpt-salvaged");
+    oi_cli_session_list_free(&list);
+
+    remove_session(root, "no-metadata");
+    remove_session(root, "bad-metadata");
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(enumerate_lists_an_unreplayable_session_with_only_its_id) {
+    char root[192];
+    char history_path[384];
+    struct oi_cli_session_list list;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-enum-garbage-%ld",
+             (long)getpid());
+    seed_session(root, "garbage-log", "gpt-x", "/tmp", 1, 2, 0);
+
+    /* A log whose header is not an oi log at all: nothing is recoverable,
+     * but the session must remain listable so it can be trashed. */
+    snprintf(history_path, sizeof history_path, "%s/garbage-log/"
+             "history.oilog", root);
+    {
+        FILE *garbage = fopen(history_path, "w");
+        CHECK(garbage != NULL);
+        CHECK(fputs("definitely not an oilog header", garbage) >= 0);
+        CHECK_EQ(fclose(garbage), 0);
+    }
+
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 1);
+    CHECK_STREQ(list.entries[0].id, "garbage-log");
+    CHECK_EQ(list.entries[0].degraded, 1);
+    CHECK(list.entries[0].model.data == NULL);
+    CHECK(list.entries[0].cwd.data == NULL);
+    oi_cli_session_list_free(&list);
+
+    remove_session(root, "garbage-log");
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(enumerate_reports_a_session_held_by_another_process_as_busy) {
+    char root[192];
+    char history_path[384];
+    struct oi_cli_session_list list;
+    int to_child[2];
+    int to_parent[2];
+    pid_t child;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-enum-busy-%ld",
+             (long)getpid());
+    seed_session(root, "held-session", "gpt-held", "/tmp", 10, 20, 1);
+    seed_session(root, "free-session", "gpt-free", "/tmp", 30, 40, 1);
+    snprintf(history_path, sizeof history_path, "%s/held-session/"
+             "history.oilog", root);
+
+    CHECK_EQ(pipe(to_child), 0);
+    CHECK_EQ(pipe(to_parent), 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        /* Hold the log's lock exactly as a second live oi would, tell the
+         * parent it is held, then wait to be released. */
+        oi_sesslog *log = NULL;
+        char byte = 0;
+        close(to_child[1]);
+        close(to_parent[0]);
+        if (oi_sesslog_open(history_path, &log) != OI_OK) {
+            _exit(1);
+        }
+        if (write(to_parent[1], "x", 1) != 1) {
+            _exit(1);
+        }
+        if (read(to_child[0], &byte, 1) != 1) {
+            _exit(1);
+        }
+        oi_sesslog_close(log);
+        _exit(0);
+    }
+    close(to_child[0]);
+    close(to_parent[1]);
+    {
+        char byte = 0;
+        CHECK_EQ(read(to_parent[0], &byte, 1), 1);
+    }
+
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 2);
+    /* Busy is a normal selectable state, not an error and not an omission. */
+    CHECK_EQ(find_entry(&list, "held-session")->lock_state,
+             OI_CLI_SESSION_LOCK_BUSY);
+    CHECK_EQ(find_entry(&list, "held-session")->degraded, 0);
+    CHECK_STREQ(find_entry(&list, "held-session")->model.data, "gpt-held");
+    CHECK_EQ(find_entry(&list, "free-session")->lock_state,
+             OI_CLI_SESSION_LOCK_FREE);
+    oi_cli_session_list_free(&list);
+
+    /* Release the holder; the same session now probes as free. */
+    CHECK_EQ(write(to_child[1], "x", 1), 1);
+    {
+        int wait_status = 0;
+        CHECK_EQ(waitpid(child, &wait_status, 0), child);
+        CHECK(WIFEXITED(wait_status));
+        CHECK_EQ(WEXITSTATUS(wait_status), 0);
+    }
+    close(to_child[1]);
+    close(to_parent[0]);
+
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(find_entry(&list, "held-session")->lock_state,
+             OI_CLI_SESSION_LOCK_FREE);
+    oi_cli_session_list_free(&list);
+
+    remove_session(root, "held-session");
+    remove_session(root, "free-session");
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(enumerate_does_not_rewrite_the_logs_it_lists) {
+    char root[192];
+    char history_path[384];
+    struct oi_cli_session_list list;
+    struct stat before;
+    struct stat after;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-enum-readonly-%ld",
+             (long)getpid());
+    seed_session(root, "untouched", "gpt-a", "/tmp", 1, 2, 1);
+    snprintf(history_path, sizeof history_path, "%s/untouched/history.oilog",
+             root);
+    CHECK_EQ(stat(history_path, &before), 0);
+
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 1);
+    oi_cli_session_list_free(&list);
+
+    /* Listing is a read: the healthy path takes no exclusive lock and
+     * must leave every byte and the mtime alone. */
+    CHECK_EQ(stat(history_path, &after), 0);
+    CHECK_EQ(before.st_size, after.st_size);
+    CHECK_EQ(before.st_mtime, after.st_mtime);
+
+    /*
+     * The case that actually distinguishes a read-only flock probe from
+     * opening the log through oi_sesslog_open: a record left incomplete
+     * by a crash. oi_sesslog_open recovers such a log by truncating that
+     * trailing fragment, which is right when a session is being opened
+     * for use and wrong as a side effect of listing. With the cache
+     * intact there is no reason to touch the log at all, so the fragment
+     * must survive being listed.
+     */
+    {
+        /* A length prefix claiming far more than the bytes that follow --
+         * exactly what a crash mid-append leaves behind. */
+        static const unsigned char fragment[] = {
+            0xff, 0xff, 0xff, 0xff, 'p', 'a', 'r', 't'};
+        FILE *appender = fopen(history_path, "ab");
+        CHECK(appender != NULL);
+        CHECK_EQ(fwrite(fragment, 1, sizeof fragment, appender),
+                 sizeof fragment);
+        CHECK_EQ(fclose(appender), 0);
+    }
+    CHECK_EQ(stat(history_path, &before), 0);
+
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 1);
+    /* Cache still valid, so the entry reads clean and needs no replay. */
+    CHECK_EQ(list.entries[0].degraded, 0);
+    oi_cli_session_list_free(&list);
+
+    CHECK_EQ(stat(history_path, &after), 0);
+    CHECK_EQ(before.st_size, after.st_size);
+
+    remove_session(root, "untouched");
     CHECK_EQ(rmdir(root), 0);
 }
 
@@ -623,6 +1001,12 @@ int main(void) {
     RUN(metadata_path_derivation_rules);
     RUN(safe_ids_accept_only_bounded_portable_components);
     RUN(resolve_accepts_a_real_directory_and_refuses_everything_else);
+    RUN(enumerate_lists_sessions_newest_first_and_skips_non_sessions);
+    RUN(enumerate_reports_an_empty_list_for_a_root_that_does_not_exist);
+    RUN(enumerate_rebuilds_missing_and_malformed_metadata_from_history);
+    RUN(enumerate_lists_an_unreplayable_session_with_only_its_id);
+    RUN(enumerate_reports_a_session_held_by_another_process_as_busy);
+    RUN(enumerate_does_not_rewrite_the_logs_it_lists);
     RUN(fresh_session_records_initial_model_and_cwd);
     RUN(unchanged_resume_writes_no_new_records_but_refreshes_metadata);
     RUN(apply_setting_writes_a_record_and_persists_through_restore);

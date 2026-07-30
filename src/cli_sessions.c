@@ -1,17 +1,26 @@
 #include "cli_sessions.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "cli_session_metadata.h"
 #include "cli_session_metadata_store.h"
+#include "oi/sesslog.h"
 
 #define OI_CLI_SESSION_ID_CAP 64U
+
+/* The one file name every private session directory holds its
+ * authoritative history in (docs/REPL_PLAN.md's storage model). */
+static const char session_history_name[] = "history.oilog";
 
 static oi_status join_path(const char *left, const char *right,
                            char **out_path) {
@@ -236,6 +245,286 @@ oi_status oi_cli_session_resolve(const char *root, const char *id,
         return OI_ERR_INVAL;
     }
     *out_directory = directory;
+    return OI_OK;
+}
+
+/* Resolves the sessions root a lifecycle command should act on: the
+ * caller's override when given, else the platform default. */
+static oi_status resolve_root(const char *root_override, char **out_root) {
+    if (root_override != NULL) {
+        if (root_override[0] == '\0') {
+            return OI_ERR_INVAL;
+        }
+        *out_root = strdup(root_override);
+        return *out_root == NULL ? OI_ERR_NOMEM : OI_OK;
+    }
+    return oi_cli_sessions_default_root(out_root);
+}
+
+/*
+ * Read-only check for whether another process holds `history_path`'s
+ * lock, taking flock(2) directly rather than going through
+ * oi_sesslog_open. That matters: oi_sesslog_open creates the file when
+ * absent and truncates a trailing record left incomplete by a crash, and
+ * neither belongs in a probe that merely answers "is this session busy?"
+ * -- listing sessions must not rewrite their logs as a side effect.
+ *
+ * flock(2) needs no write access, so an O_RDONLY descriptor is enough,
+ * and the lock is released by closing it.
+ */
+static enum oi_cli_session_lock_state probe_lock(const char *history_path) {
+    enum oi_cli_session_lock_state state;
+    int fd = open(history_path, O_RDONLY | O_CLOEXEC);
+
+    if (fd < 0) {
+        /* No log at all: nothing holds a lock on it either. Any other
+         * failure (permissions) leaves the answer genuinely unknown. */
+        return errno == ENOENT ? OI_CLI_SESSION_LOCK_FREE
+                               : OI_CLI_SESSION_LOCK_UNKNOWN;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        flock(fd, LOCK_UN);
+        state = OI_CLI_SESSION_LOCK_FREE;
+    } else {
+        state = (errno == EWOULDBLOCK || errno == EINTR)
+                    ? OI_CLI_SESSION_LOCK_BUSY
+                    : OI_CLI_SESSION_LOCK_UNKNOWN;
+    }
+    close(fd);
+    return state;
+}
+
+/*
+ * Recovers a damaged session's model/cwd by replaying its own history --
+ * the authoritative record metadata.json is only ever a cache of.
+ * Replays exactly one session's log, never more.
+ *
+ * Best effort by contract: on any failure (the log is locked by another
+ * process, absent, or undecodable) the outputs are simply left as the
+ * caller initialized them. A session nothing can be recovered for still
+ * has to be listable.
+ */
+static void rebuild_from_history(const char *history_path,
+                                 struct oi_cli_string *out_model,
+                                 struct oi_cli_string *out_cwd,
+                                 int64_t *out_created_at,
+                                 int64_t *out_updated_at) {
+    struct oi_cli_history_store store;
+    struct oi_cli_history_replay_state state;
+    oi_sesslog *log = NULL;
+    struct stat info;
+
+    /* Timestamps first: the log's own mtime is a usable stand-in for
+     * "last active" and survives even an undecodable log. */
+    if (stat(history_path, &info) == 0) {
+        if (*out_created_at == 0) {
+            *out_created_at = (int64_t)info.st_mtime;
+        }
+        if (*out_updated_at == 0) {
+            *out_updated_at = (int64_t)info.st_mtime;
+        }
+    }
+    if (oi_sesslog_open(history_path, &log) != OI_OK) {
+        return;
+    }
+    oi_cli_history_store_init(&store);
+    oi_cli_history_replay_state_init(&state);
+    if (oi_cli_history_store_load(log, &store, &state) == OI_OK) {
+        if (state.last_model.data != NULL) {
+            (void)oi_cli_string_set(out_model, state.last_model.data,
+                                    state.last_model.len);
+        }
+        if (state.last_cwd.data != NULL) {
+            (void)oi_cli_string_set(out_cwd, state.last_cwd.data,
+                                    state.last_cwd.len);
+        }
+    }
+    oi_cli_history_store_free(&store);
+    oi_cli_history_replay_state_free(&state);
+    oi_sesslog_close(log);
+}
+
+void oi_cli_session_list_init(struct oi_cli_session_list *list) {
+    if (list != NULL) {
+        list->entries = NULL;
+        list->len = 0;
+        list->cap = 0;
+    }
+}
+
+void oi_cli_session_list_free(struct oi_cli_session_list *list) {
+    size_t index;
+
+    if (list == NULL) {
+        return;
+    }
+    for (index = 0; index < list->len; index++) {
+        free(list->entries[index].id);
+        oi_cli_string_free(&list->entries[index].model);
+        oi_cli_string_free(&list->entries[index].cwd);
+    }
+    free(list->entries);
+    oi_cli_session_list_init(list);
+}
+
+static oi_status session_list_reserve(struct oi_cli_session_list *list) {
+    struct oi_cli_session_list_entry *entries;
+    size_t cap;
+
+    if (list->len != list->cap) {
+        return OI_OK;
+    }
+    cap = list->cap == 0 ? 8 : list->cap;
+    if (list->cap != 0) {
+        if (cap > SIZE_MAX / 2) {
+            return OI_ERR_NOMEM;
+        }
+        cap *= 2;
+    }
+    if (cap > SIZE_MAX / sizeof *entries) {
+        return OI_ERR_NOMEM;
+    }
+    entries = realloc(list->entries, cap * sizeof *entries);
+    if (entries == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    list->entries = entries;
+    list->cap = cap;
+    return OI_OK;
+}
+
+/* Builds one entry for `id`, whose directory is `directory`. */
+static oi_status describe_session(const char *id, const char *directory,
+                                  struct oi_cli_session_list_entry *out) {
+    struct oi_cli_session_metadata metadata;
+    char *history_path = NULL;
+    char *metadata_path = NULL;
+    oi_status status;
+
+    memset(out, 0, sizeof *out);
+    out->id = strdup(id);
+    if (out->id == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    status = join_path(directory, session_history_name, &history_path);
+    if (status == OI_OK) {
+        status = join_path(directory, "metadata.json", &metadata_path);
+    }
+    if (status != OI_OK) {
+        free(history_path);
+        free(out->id);
+        out->id = NULL;
+        return status;
+    }
+
+    /* Probe before any replay: a busy session cannot be replayed, and
+     * knowing that up front avoids attempting it. */
+    out->lock_state = probe_lock(history_path);
+
+    oi_cli_session_metadata_init(&metadata);
+    if (oi_cli_session_metadata_store_read(metadata_path, &metadata) ==
+        OI_OK) {
+        (void)oi_cli_string_set(&out->model, metadata.model.data,
+                                metadata.model.len);
+        (void)oi_cli_string_set(&out->cwd, metadata.cwd.data,
+                                metadata.cwd.len);
+        out->created_at = metadata.created_at;
+        out->updated_at = metadata.updated_at;
+    } else {
+        /* Missing or malformed cache. The session is still real and still
+         * selectable -- rebuild what history can tell us and say so. */
+        out->degraded = 1;
+        if (out->lock_state != OI_CLI_SESSION_LOCK_BUSY) {
+            rebuild_from_history(history_path, &out->model, &out->cwd,
+                                 &out->created_at, &out->updated_at);
+        }
+    }
+    oi_cli_session_metadata_free(&metadata);
+    free(history_path);
+    free(metadata_path);
+    return OI_OK;
+}
+
+/* Most recently updated first; ties broken by id so the order is
+ * deterministic (an id encodes its creation time, so this stays
+ * chronologically sensible). */
+static int compare_entries(const void *left, const void *right) {
+    const struct oi_cli_session_list_entry *a = left;
+    const struct oi_cli_session_list_entry *b = right;
+
+    if (a->updated_at != b->updated_at) {
+        return a->updated_at > b->updated_at ? -1 : 1;
+    }
+    return strcmp(b->id, a->id);
+}
+
+oi_status oi_cli_sessions_enumerate(const char *root_override,
+                                    struct oi_cli_session_list *out_list) {
+    struct oi_cli_session_list list;
+    struct dirent *entry;
+    char *root = NULL;
+    DIR *dir;
+    oi_status status;
+
+    if (out_list == NULL) {
+        return OI_ERR_INVAL;
+    }
+    status = resolve_root(root_override, &root);
+    if (status != OI_OK) {
+        return status;
+    }
+    dir = opendir(root);
+    if (dir == NULL) {
+        /* No root yet simply means no sessions have been created. */
+        status = (errno == ENOENT || errno == ENOTDIR) ? OI_OK : OI_ERR_IO;
+        free(root);
+        if (status == OI_OK) {
+            oi_cli_session_list_free(out_list);
+            oi_cli_session_list_init(out_list);
+        }
+        return status;
+    }
+
+    oi_cli_session_list_init(&list);
+    while ((entry = readdir(dir)) != NULL) {
+        char *directory = NULL;
+
+        /* Rejects ".", "..", ".trash", and every other non-session entry
+         * in one test -- see oi_cli_session_id_is_safe. */
+        if (!oi_cli_session_id_is_safe(entry->d_name,
+                                       strlen(entry->d_name))) {
+            continue;
+        }
+        /* Also refuses a symlink standing in for a session directory. */
+        if (oi_cli_session_resolve(root, entry->d_name,
+                                   strlen(entry->d_name),
+                                   &directory) != OI_OK) {
+            continue;
+        }
+        status = session_list_reserve(&list);
+        if (status == OI_OK) {
+            status = describe_session(entry->d_name, directory,
+                                      &list.entries[list.len]);
+            if (status == OI_OK) {
+                list.len++;
+            }
+        }
+        free(directory);
+        if (status != OI_OK) {
+            closedir(dir);
+            oi_cli_session_list_free(&list);
+            free(root);
+            return status;
+        }
+    }
+    closedir(dir);
+    free(root);
+
+    if (list.len > 1) {
+        qsort(list.entries, list.len, sizeof *list.entries, compare_entries);
+    }
+    oi_cli_session_list_free(out_list);
+    *out_list = list;
     return OI_OK;
 }
 

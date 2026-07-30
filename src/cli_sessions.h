@@ -101,6 +101,74 @@ oi_status oi_cli_session_metadata_path_for_log(
     const char *log_path, int is_private_directory,
     char **out_metadata_path);
 
+/*
+ * Whether another process currently holds a session log's flock. Probed
+ * read-only (see oi_cli_sessions_enumerate) -- a busy session is a normal
+ * selectable-but-not-openable state, never an error.
+ */
+enum oi_cli_session_lock_state {
+    OI_CLI_SESSION_LOCK_FREE = 0,
+    OI_CLI_SESSION_LOCK_BUSY,
+    OI_CLI_SESSION_LOCK_UNKNOWN /* the probe itself failed */
+};
+
+/*
+ * One selectable session, as shown by /session list.
+ *
+ * These fields are presentational, deliberately kept separate from
+ * struct oi_cli_session_metadata: that struct's validity invariant
+ * requires a non-empty model and cwd, which a session whose metadata is
+ * missing and whose history cannot be replayed genuinely does not have.
+ * Such a session must still be listed (so the user can trash it), so
+ * every field here is individually optional -- `model`/`cwd` may be
+ * empty (data == NULL) and the timestamps may be 0, meaning "unknown".
+ * Only `id` is always present.
+ */
+struct oi_cli_session_list_entry {
+    char *id;                  /* owned; always non-NULL */
+    struct oi_cli_string model; /* empty if unknown */
+    struct oi_cli_string cwd;   /* empty if unknown */
+    int64_t created_at;         /* Unix epoch seconds; 0 if unknown */
+    int64_t updated_at;         /* 0 if unknown */
+    int degraded; /* metadata.json was missing or malformed */
+    enum oi_cli_session_lock_state lock_state;
+};
+
+struct oi_cli_session_list {
+    struct oi_cli_session_list_entry *entries; /* owned */
+    size_t len;
+    size_t cap;
+};
+
+void oi_cli_session_list_init(struct oi_cli_session_list *list);
+void oi_cli_session_list_free(struct oi_cli_session_list *list);
+
+/*
+ * Enumerates every live session directly under the sessions root
+ * (`root_override`, or the platform default when NULL), most recently
+ * updated first. `out_list` must be initialized, and is replaced only on
+ * success.
+ *
+ * Entries in the root that are not sessions -- anything failing
+ * oi_cli_session_id_is_safe (dotfiles and the ".trash" subdirectory
+ * included) and anything that is not a plain directory -- are skipped
+ * silently: they are not oi's data, so they are not the user's problem.
+ *
+ * Cost is bounded per entry and never replays a healthy session's log:
+ * the fast path is one flock probe plus one bounded metadata.json read.
+ * A session whose metadata.json is missing or malformed is marked
+ * `degraded` and rebuilt by replaying that one session's history -- so
+ * the worst case is one replay per damaged session, never a replay of
+ * every log. A degraded session that is also busy cannot be replayed at
+ * all (another process holds the lock) and is listed with whatever is
+ * known, which may be nothing beyond its id.
+ *
+ * A missing root is not an error: it means no sessions exist yet, and
+ * yields an empty list.
+ */
+oi_status oi_cli_sessions_enumerate(const char *root_override,
+                                    struct oi_cli_session_list *out_list);
+
 struct oi_cli_session_restore {
     struct oi_cli_string model;
     struct oi_cli_string cwd;
