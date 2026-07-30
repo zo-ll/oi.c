@@ -581,17 +581,15 @@ oi_status oi_cli_composer_select(
     selected = default_selected;
     *out_cancelled = 0;
     *out_terminate_signal = 0;
-
-    status = oi_cli_render_draw_selector(&composer->render, header_lines,
-                                        header_count, option_lines,
-                                        option_count, selected);
-    if (status != OI_OK) {
-        goto cleanup;
-    }
+    status = OI_OK;
     if (signal_fd >= 0) {
-        /* Same rationale as oi_cli_composer_wait_submit: discard a resize
-         * queued before this call started (the draw above already used a
-         * fresh width), but never lose a terminate signal. */
+        /*
+         * Discard a resize queued before this call started, then draw with
+         * the current width. This drain must precede the draw: draining
+         * afterward can swallow a resize delivered between the draw and the
+         * drain, leaving the selector rendered at a stale width until some
+         * unrelated input causes another redraw.
+         */
         struct oi_cli_composer_signals pending;
 
         drain_signals(signal_fd, &pending);
@@ -599,6 +597,12 @@ oi_status oi_cli_composer_select(
             *out_terminate_signal = pending.terminate_signal;
             goto cleanup;
         }
+    }
+    status = oi_cli_render_draw_selector(&composer->render, header_lines,
+                                         header_count, option_lines,
+                                         option_count, selected);
+    if (status != OI_OK) {
+        goto cleanup;
     }
 
     while (!done) {
