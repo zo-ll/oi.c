@@ -4660,24 +4660,31 @@ TEST(interactive_session_list_and_current_describe_the_active_session) {
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "list-reply", 1));
 
-    /* The current run's own session plus the earlier one. */
+    /*
+     * Both sessions exist now. Ids embed a timestamp and counter, so the
+     * later one is this process's own -- which is the row that must carry
+     * the current marker.
+     */
+    collect_session_ids(session_root, &ids);
+    CHECK_EQ(ids.count, 2);
     CHECK(write_interactive(master_fd, "/session list\r", 14));
     CHECK(interactive_wait_for(master_fd, &result, "Sessions (2):", 1));
-    /* Exactly one row is marked current, and it is this process's. */
-    CHECK(interactive_wait_for(master_fd, &result, "* ", 1));
+    {
+        char current_row[128];
+        snprintf(current_row, sizeof current_row, "* %s", ids.items[1]);
+        CHECK(interactive_wait_for(master_fd, &result, current_row, 1));
+    }
 
     CHECK(write_interactive(master_fd, "/session current\r", 17));
     CHECK(interactive_wait_for(master_fd, &result, "Status: healthy", 1));
     CHECK(strstr(result.output, "Path: ") != NULL);
 
-    /* Renaming shows up in the listing. */
-    CHECK(write_interactive(master_fd, "/session rename ", 16));
-    collect_session_ids(session_root, &ids);
-    CHECK_EQ(ids.count, 2);
+    /* Renaming the *other* session shows up in the listing. */
     {
-        char tail[128];
-        snprintf(tail, sizeof tail, "%s my old work\r", ids.items[0]);
-        CHECK(write_interactive(master_fd, tail, strlen(tail)));
+        char line[160];
+        snprintf(line, sizeof line, "/session rename %s my old work\r",
+                 ids.items[0]);
+        CHECK(write_interactive(master_fd, line, strlen(line)));
     }
     CHECK(interactive_wait_for(master_fd, &result, "Renamed session", 1));
     CHECK(write_interactive(master_fd, "/session list\r", 14));
