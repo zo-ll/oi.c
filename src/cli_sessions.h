@@ -159,13 +159,18 @@ void oi_cli_session_list_free(struct oi_cli_session_list *list);
  * silently: they are not oi's data, so they are not the user's problem.
  *
  * Cost is bounded per entry and never replays a healthy session's log:
- * the fast path is one flock probe plus one bounded metadata.json read.
+ * the fast path is one flock probe plus one bounded metadata.json read,
+ * and it never opens the log, so listing does not write to it.
+ *
  * A session whose metadata.json is missing or malformed is marked
  * `degraded` and rebuilt by replaying that one session's history -- so
  * the worst case is one replay per damaged session, never a replay of
- * every log. A degraded session that is also busy cannot be replayed at
- * all (another process holds the lock) and is listed with whatever is
- * known, which may be nothing beyond its id.
+ * every log. Note that this path does open the log, and so performs
+ * oi_sesslog_open's documented crash recovery on it (truncating an
+ * incomplete trailing record); that is the same repair a real open would
+ * do, and only damaged sessions reach it. A degraded session that is also
+ * busy cannot be replayed at all (another process holds the lock) and is
+ * listed with whatever is known, which may be nothing beyond its id.
  *
  * A missing root is not an error: it means no sessions exist yet, and
  * yields an empty list.
@@ -199,7 +204,9 @@ oi_status oi_cli_sessions_enumerate(const char *root_override,
  *   OI_ERR_INVAL    unsafe id, or a name that is empty, too long, or
  *                   contains a control byte
  *   OI_ERR_NOTFOUND no live session with that id
- *   OI_ERR_IO       the metadata write failed
+ *   OI_ERR_IO       the metadata write failed, or the session has neither a
+ *                   cache nor a readable history to rebuild one from, so
+ *                   there is nowhere to record a name
  */
 oi_status oi_cli_session_rename(const char *root_override, const char *id,
                                 size_t id_len, const char *new_name,
@@ -234,7 +241,9 @@ oi_status oi_cli_session_rename(const char *root_override, const char *id,
  *   OI_ERR_INVAL    unsafe id, or trashing the active session
  *   OI_ERR_NOTFOUND no such session in the relevant location
  *   OI_ERR_EXISTS   held by another process, or (restore) the id is live
- *   OI_ERR_IO       the rename or removal failed; detail says why
+ *   OI_ERR_IO       the rename or removal failed, whether the session is in
+ *                   use could not be determined, or (delete) the directory
+ *                   holds something oi did not put there; detail says which
  */
 oi_status oi_cli_session_trash(const char *root_override, const char *id,
                                size_t id_len, const char *current_session_id,

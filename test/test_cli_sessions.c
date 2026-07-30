@@ -1280,7 +1280,7 @@ TEST(import_refuses_bad_sources_and_leaves_nothing_behind) {
     {
         FILE *garbage = fopen(source, "w");
         CHECK(garbage != NULL);
-        CHECK(fputs("this is not an oilog header, not remotely", garbage) >= 0);
+        CHECK(fputs("this is not an oilog header", garbage) >= 0);
         CHECK_EQ(fclose(garbage), 0);
     }
     CHECK_EQ(oi_cli_session_import(root, source, strlen(source), &new_id,
@@ -1343,6 +1343,56 @@ TEST(import_refuses_bad_sources_and_leaves_nothing_behind) {
     CHECK(new_id == NULL);
     CHECK_EQ(unlink(source), 0);
     rmdir(root);
+}
+
+TEST(import_works_around_a_stale_scratch_file) {
+    char root[192];
+    char source[192];
+    char stale[256];
+    char *new_id = NULL;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-import-stale-%ld",
+             (long)getpid());
+    snprintf(source, sizeof source, "/tmp/oi-legacy-stale-%ld.oilog",
+             (long)getpid());
+    write_legacy_log(source);
+    CHECK(mkdir(root, 0700) == 0 || errno == EEXIST);
+
+    /*
+     * A scratch file left behind by a killed earlier run. Since the copy is
+     * created O_EXCL to avoid ever overwriting anything, a fixed name would
+     * let this block every future import from a process that reused the
+     * same pid.
+     */
+    snprintf(stale, sizeof stale, "%s/.import-%ld-0.tmp", root,
+             (long)getpid());
+    {
+        FILE *leftover = fopen(stale, "w");
+        CHECK(leftover != NULL);
+        CHECK(fputs("junk from a crashed run", leftover) >= 0);
+        CHECK_EQ(fclose(leftover), 0);
+    }
+
+    CHECK_EQ(oi_cli_session_import(root, source, strlen(source), &new_id,
+                                   NULL),
+             OI_OK);
+    CHECK(new_id != NULL);
+    /* The stale file was stepped over, not overwritten. */
+    CHECK_EQ(access(stale, F_OK), 0);
+    {
+        char *contents = NULL;
+        size_t len = 0;
+        read_whole_file(stale, &contents, &len);
+        CHECK_EQ(len, (size_t)23);
+        CHECK_EQ(memcmp(contents, "junk from a crashed run", 23), 0);
+        free(contents);
+    }
+
+    CHECK_EQ(unlink(stale), 0);
+    remove_session(root, new_id);
+    free(new_id);
+    CHECK_EQ(rmdir(root), 0);
+    CHECK_EQ(unlink(source), 0);
 }
 
 TEST(import_refuses_a_source_already_inside_the_sessions_root) {
@@ -1878,6 +1928,7 @@ int main(void) {
     RUN(restore_refuses_unknown_ids_and_will_not_clobber_a_live_session);
     RUN(import_adopts_a_legacy_log_and_leaves_the_source_untouched);
     RUN(import_refuses_bad_sources_and_leaves_nothing_behind);
+    RUN(import_works_around_a_stale_scratch_file);
     RUN(import_refuses_a_source_already_inside_the_sessions_root);
     RUN(fresh_session_records_initial_model_and_cwd);
     RUN(unchanged_resume_writes_no_new_records_but_refreshes_metadata);

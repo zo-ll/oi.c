@@ -200,7 +200,9 @@ int oi_cli_session_id_is_safe(const char *id, size_t id_len) {
         return 0;
     }
     for (index = 0; index < id_len; index++) {
-        char byte = id[index];
+        /* Unsigned so the comparisons do not depend on whether plain char
+         * is signed on this target; a high-bit byte must fail either way. */
+        unsigned char byte = (unsigned char)id[index];
         int allowed = (byte >= 'A' && byte <= 'Z') ||
                       (byte >= 'a' && byte <= 'z') ||
                       (byte >= '0' && byte <= '9') || byte == '_' ||
@@ -300,7 +302,7 @@ static oi_status resolve_trash_root(const char *root_override,
  * oi_sesslog_open. That matters: oi_sesslog_open creates the file when
  * absent and truncates a trailing record left incomplete by a crash, and
  * neither belongs in a probe that merely answers "is this session busy?"
- * -- listing sessions must not rewrite their logs as a side effect.
+ * -- so a healthy session is never written to just by being listed.
  *
  * flock(2) needs no write access, so an O_RDONLY descriptor is enough,
  * and the lock is released by closing it.
@@ -319,7 +321,10 @@ static enum oi_cli_session_lock_state probe_lock(const char *history_path) {
         flock(fd, LOCK_UN);
         state = OI_CLI_SESSION_LOCK_FREE;
     } else {
-        state = (errno == EWOULDBLOCK || errno == EINTR)
+        /* Only "would have blocked" actually means another process holds
+         * it. Anything else -- EINTR included, which says nothing about
+         * the lock -- is honestly unknown rather than assumed busy. */
+        state = (errno == EWOULDBLOCK || errno == EAGAIN)
                     ? OI_CLI_SESSION_LOCK_BUSY
                     : OI_CLI_SESSION_LOCK_UNKNOWN;
     }
@@ -336,6 +341,14 @@ static enum oi_cli_session_lock_state probe_lock(const char *history_path) {
  * process, absent, or undecodable) the outputs are simply left as the
  * caller initialized them. A session nothing can be recovered for still
  * has to be listable.
+ *
+ * Unlike probe_lock, this does open the log through oi_sesslog_open, which
+ * takes the exclusive lock and performs that function's documented crash
+ * recovery -- truncating a trailing record left incomplete by a crash.
+ * That is unavoidable here, since replay needs an open log, and it is the
+ * same recovery a real open of this session would do. It is confined to
+ * sessions whose cache is already missing or malformed; a healthy session
+ * never reaches this path.
  */
 static void rebuild_from_history(const char *history_path,
                                  struct oi_cli_string *out_model,
@@ -685,6 +698,9 @@ oi_status oi_cli_session_location_create(
  * validity rules require both, and inventing placeholders would be worse
  * than failing, since the cache is what a later open trusts to restore
  * them. Such a session can still be listed and trashed.
+ *
+ * `out_metadata` must be initialized and empty on entry; it is replaced
+ * only on success.
  */
 static oi_status load_or_rebuild_metadata(
     const char *directory, const char *id, size_t id_len,
@@ -879,6 +895,11 @@ static oi_status move_session_directory(const char *source,
     char *destination = NULL;
     oi_status status;
 
+    /* Both callers validate first, but this writes into a fixed buffer, so
+     * it proves the bound itself rather than inheriting it by assumption. */
+    if (!oi_cli_session_id_is_safe(id, id_len)) {
+        return OI_ERR_INVAL;
+    }
     memcpy(terminated, id, id_len);
     terminated[id_len] = '\0';
     status = ensure_directory(destination_parent);
@@ -1185,25 +1206,58 @@ static int path_is_inside_root(const char *file_path, const char *root) {
     return inside;
 }
 
-/* Copies `source` into a fresh O_EXCL file at `destination`. */
-static oi_status copy_file(const char *source, const char *destination,
-                           char **out_error_detail) {
+/*
+ * Creates the import scratch file, O_EXCL, under `root`.
+ *
+ * O_EXCL never writes over an existing file, so a stale scratch left by a
+ * killed earlier run would otherwise block every future import from a
+ * process that happened to reuse its pid. Stepping through a bounded
+ * sequence of names sidesteps that without ever overwriting anything.
+ */
+static oi_status create_scratch_file(const char *root, char **out_path,
+                                     int *out_fd,
+                                     char **out_error_detail) {
+    unsigned attempt;
+
+    for (attempt = 0; attempt < 64u; attempt++) {
+        char name[64];
+        char *path = NULL;
+        oi_status status;
+        int fd;
+
+        snprintf(name, sizeof name, ".import-%ld-%u.tmp", (long)getpid(),
+                 attempt);
+        status = join_path(root, name, &path);
+        if (status != OI_OK) {
+            return status;
+        }
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            *out_path = path;
+            *out_fd = fd;
+            return OI_OK;
+        }
+        free(path);
+        if (errno != EEXIST) {
+            set_error_detail(out_error_detail, strerror(errno));
+            return OI_ERR_IO;
+        }
+    }
+    set_error_detail(out_error_detail,
+                     "could not create a scratch file for the import");
+    return OI_ERR_EXISTS;
+}
+
+/* Copies `source` into the already-open `out_fd`, which the caller owns. */
+static oi_status copy_into_fd(const char *source, int out_fd,
+                              char **out_error_detail) {
     char buffer[65536];
     int in_fd;
-    int out_fd;
     oi_status status = OI_OK;
 
     in_fd = open(source, O_RDONLY | O_CLOEXEC);
     if (in_fd < 0) {
         set_error_detail(out_error_detail, strerror(errno));
-        return OI_ERR_IO;
-    }
-    /* O_EXCL: never write over an existing scratch file. A collision is a
-     * hard error rather than something to retry around. */
-    out_fd = open(destination, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (out_fd < 0) {
-        set_error_detail(out_error_detail, strerror(errno));
-        close(in_fd);
         return OI_ERR_IO;
     }
     for (;;) {
@@ -1239,10 +1293,6 @@ static oi_status copy_file(const char *source, const char *destination,
         }
     }
     close(in_fd);
-    if (close(out_fd) != 0 && status == OI_OK) {
-        set_error_detail(out_error_detail, strerror(errno));
-        status = OI_ERR_IO;
-    }
     return status;
 }
 
@@ -1274,10 +1324,10 @@ oi_status oi_cli_session_import(const char *root_override,
                                 size_t source_path_len, char **out_new_id,
                                 char **out_error_detail) {
     struct oi_cli_session_location location;
-    char scratch_name[64];
     char *source = NULL;
     char *root = NULL;
     char *scratch_path = NULL;
+    int scratch_fd = -1;
     struct stat info;
     oi_status status;
 
@@ -1331,9 +1381,8 @@ oi_status oi_cli_session_import(const char *root_override,
      * enumeration for as long as it exists. */
     status = ensure_directory(root);
     if (status == OI_OK) {
-        snprintf(scratch_name, sizeof scratch_name, ".import-%ld.tmp",
-                 (long)getpid());
-        status = join_path(root, scratch_name, &scratch_path);
+        status = create_scratch_file(root, &scratch_path, &scratch_fd,
+                                    out_error_detail);
     }
     free(root);
     if (status != OI_OK) {
@@ -1341,9 +1390,13 @@ oi_status oi_cli_session_import(const char *root_override,
         return status;
     }
 
-    status = copy_file(source, scratch_path, out_error_detail);
+    status = copy_into_fd(source, scratch_fd, out_error_detail);
     /* The source has now been read and is never touched again. */
     free(source);
+    if (close(scratch_fd) != 0 && status == OI_OK) {
+        set_error_detail(out_error_detail, strerror(errno));
+        status = OI_ERR_IO;
+    }
     if (status != OI_OK) {
         unlink(scratch_path);
         free(scratch_path);
