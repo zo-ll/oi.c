@@ -1087,16 +1087,32 @@ TEST(delete_only_reaches_trashed_sessions_and_removes_them_completely) {
 
 TEST(delete_fails_closed_on_a_directory_it_did_not_create) {
     char root[192];
+    char trashed[384];
     char nested[448];
+    char history_path[448];
+    char metadata_path[448];
     char *detail = NULL;
+    off_t history_size;
 
     snprintf(root, sizeof root, "/tmp/oi-session-delete-closed-%ld",
              (long)getpid());
     seed_session(root, "sess-odd", "gpt-a", "/tmp", 100, 200, 1);
+    CHECK_EQ(oi_cli_session_rename(root, "sess-odd", 8, "keep me", 7, NULL),
+             OI_OK);
     CHECK_EQ(oi_cli_session_trash(root, "sess-odd", 8, NULL, NULL), OI_OK);
 
+    snprintf(trashed, sizeof trashed, "%s/.trash/sess-odd", root);
+    snprintf(history_path, sizeof history_path, "%s/history.oilog", trashed);
+    snprintf(metadata_path, sizeof metadata_path, "%s/metadata.json",
+             trashed);
+    {
+        struct stat info;
+        CHECK_EQ(stat(history_path, &info), 0);
+        history_size = info.st_size;
+    }
+
     /* Something oi never puts in a session directory. */
-    snprintf(nested, sizeof nested, "%s/.trash/sess-odd/unexpected", root);
+    snprintf(nested, sizeof nested, "%s/unexpected", trashed);
     CHECK_EQ(mkdir(nested, 0700), 0);
 
     /* Rather than recursing into whatever it finds, deletion stops. */
@@ -1106,7 +1122,29 @@ TEST(delete_fails_closed_on_a_directory_it_did_not_create) {
     free(detail);
     CHECK(path_is_directory(nested));
 
+    /*
+     * Failing closed has to mean the session is still there. Deciding and
+     * deleting in one pass used to unlink the history and metadata first and
+     * only then hit the unexpected entry, reporting failure over a session
+     * that could no longer be restored.
+     */
+    {
+        struct stat info;
+        CHECK_EQ(stat(history_path, &info), 0);
+        CHECK_EQ(info.st_size, history_size);
+        CHECK_EQ(stat(metadata_path, &info), 0);
+    }
+    /* And it is still genuinely restorable, name and all. */
     CHECK_EQ(rmdir(nested), 0);
+    CHECK_EQ(oi_cli_session_restore_trashed(root, "sess-odd", 8, NULL),
+             OI_OK);
+    {
+        struct oi_cli_string name = read_display_name(root, "sess-odd");
+        CHECK_STREQ(name.data, "keep me");
+        oi_cli_string_free(&name);
+    }
+
+    CHECK_EQ(oi_cli_session_trash(root, "sess-odd", 8, NULL, NULL), OI_OK);
     CHECK_EQ(oi_cli_session_delete(root, "sess-odd", 8, NULL), OI_OK);
     {
         char trash_root[256];

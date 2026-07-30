@@ -1078,9 +1078,20 @@ oi_status oi_cli_session_restore_trashed(const char *root_override,
 static oi_status remove_session_directory(const char *directory,
                                           char **out_error_detail) {
     struct dirent *entry;
-    DIR *dir = opendir(directory);
+    DIR *dir;
     oi_status status = OI_OK;
 
+    /*
+     * Pass one: inspect every entry and remove nothing.
+     *
+     * Validating and unlinking in a single pass meant an unexpected entry
+     * discovered late -- after history.oilog and metadata.json had already
+     * been unlinked -- reported failure over a session that no longer
+     * existed and could no longer be restored. "Fails closed" has to mean
+     * the directory is untouched, so the decision is made in full before
+     * any removal begins.
+     */
+    dir = opendir(directory);
     if (dir == NULL) {
         set_error_detail(out_error_detail, strerror(errno));
         return OI_ERR_IO;
@@ -1105,7 +1116,35 @@ static oi_status remove_session_directory(const char *directory,
                              "session directory holds an unexpected entry; "
                              "refusing to delete it");
             status = OI_ERR_IO;
-        } else if (unlink(path) != 0) {
+        }
+        free(path);
+    }
+    closedir(dir);
+    if (status != OI_OK) {
+        return status;
+    }
+
+    /* Pass two: everything is a plain regular file, so remove it all. */
+    dir = opendir(directory);
+    if (dir == NULL) {
+        set_error_detail(out_error_detail, strerror(errno));
+        return OI_ERR_IO;
+    }
+    while (status == OI_OK && (entry = readdir(dir)) != NULL) {
+        char *path = NULL;
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        status = join_path(directory, entry->d_name, &path);
+        if (status != OI_OK) {
+            break;
+        }
+        /* A racing creation between the passes could still surface here.
+         * unlink refuses a directory with EISDIR, so this stays fail-safe
+         * rather than removing something unexpected. */
+        if (unlink(path) != 0) {
             set_error_detail(out_error_detail, strerror(errno));
             status = OI_ERR_IO;
         }
