@@ -330,10 +330,19 @@ void oi_cli_session_restore_free(struct oi_cli_session_restore *restore);
  * checked before this run appended anything (including its own
  * transition record).
  *
- * `explicit_model` (may be NULL) always wins. Otherwise: for an existing
- * session, valid metadata whose session_id matches `session_id` wins;
- * else `state`'s last-known model/cwd from replayed history; else
- * `default_model`/`default_cwd`. A missing/unreachable resolved cwd
+ * `explicit_model` (may be NULL) always wins. Otherwise replayed history
+ * wins: `state`'s last-known model/cwd; then, only if history records no
+ * such setting at all, valid metadata whose session_id matches
+ * `session_id`; then `default_model`/`default_cwd`.
+ *
+ * History outranking the cache is load-bearing. The cache is refreshed
+ * best-effort *after* a change is already durable in history, so a failed
+ * refresh leaves it stale. Were the cache consulted first, that one failed
+ * write would make the next open resolve the stale value and then append
+ * it back into the authoritative log -- an unwritable cache would silently
+ * rewrite history. The cache's only unique contribution is `created_at`.
+ *
+ * A missing/unreachable resolved cwd
  * falls back to `default_cwd` (the caller should pass the process's
  * actual current directory, captured before any chdir could have
  * happened) with a diagnostic on `diagnostics` (ignored if NULL), never

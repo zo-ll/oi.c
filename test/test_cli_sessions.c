@@ -1877,6 +1877,128 @@ TEST(a_display_name_survives_setting_changes_and_reopens) {
     free(target_dir);
 }
 
+TEST(a_stale_metadata_cache_never_overrides_or_rewrites_history) {
+    char *original_cwd = save_cwd();
+    char *target_dir = make_tmp_dir("stale-cache");
+    struct fresh_store fresh;
+    struct oi_cli_session_restore restore;
+    size_t history_len_before;
+
+    fresh_store_open(&fresh, fresh_log_path("stale-cache"), 0);
+    oi_cli_session_restore_init(&restore);
+    CHECK_EQ(oi_cli_session_restore_settings(
+                 &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
+                 1, NULL, "gpt-old", target_dir, NULL, &restore),
+             OI_OK);
+    oi_cli_session_restore_free(&restore);
+
+    /* A durable model change: history is authoritative for it. */
+    CHECK_EQ(oi_cli_session_apply_setting(
+                 &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
+                 OI_CLI_HISTORY_SESSION_SETTING_MODEL, "gpt-new", 7),
+             OI_OK);
+    CHECK_STREQ(fresh.state.last_model.data, "gpt-new");
+
+    /*
+     * Simulate the metadata refresh having failed: the cache still names
+     * the old model, and is otherwise perfectly valid and owned by this
+     * session, so it would pass every validity check.
+     *
+     * The cache must not win. If it did, this open would resolve "gpt-old",
+     * notice it differs from what history last recorded, and append that
+     * stale value back -- letting an unwritable cache silently rewrite the
+     * authoritative log.
+     */
+    {
+        struct oi_cli_session_metadata stale;
+        oi_cli_session_metadata_init(&stale);
+        CHECK_EQ(oi_cli_session_metadata_store_read(fresh.metadata_path,
+                                                    &stale),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_set(
+                     &stale, "sess-1", 6, "gpt-old", 7, target_dir,
+                     strlen(target_dir), NULL, 0, stale.created_at,
+                     stale.updated_at),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_store_write(fresh.metadata_path,
+                                                     &stale),
+                 OI_OK);
+        oi_cli_session_metadata_free(&stale);
+    }
+
+    history_len_before = fresh.store.typed_history.len;
+    oi_cli_session_restore_init(&restore);
+    CHECK_EQ(oi_cli_session_restore_settings(
+                 &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
+                 0, NULL, "gpt-default", target_dir, NULL, &restore),
+             OI_OK);
+    /* History won. */
+    CHECK_STREQ(restore.model.data, "gpt-new");
+    CHECK_STREQ(fresh.state.last_model.data, "gpt-new");
+    /* And nothing was appended, because nothing actually changed. */
+    CHECK_EQ(fresh.store.typed_history.len, history_len_before);
+    oi_cli_session_restore_free(&restore);
+
+    /* The refresh also repaired the cache back to the durable truth. */
+    {
+        struct oi_cli_session_metadata repaired;
+        oi_cli_session_metadata_init(&repaired);
+        CHECK_EQ(oi_cli_session_metadata_store_read(fresh.metadata_path,
+                                                    &repaired),
+                 OI_OK);
+        CHECK_STREQ(repaired.model.data, "gpt-new");
+        oi_cli_session_metadata_free(&repaired);
+    }
+
+    unlink(fresh.metadata_path);
+    fresh_store_close(&fresh);
+    restore_cwd(original_cwd);
+    unlink(fresh_log_path("stale-cache"));
+    rmdir(target_dir);
+    free(target_dir);
+}
+
+TEST(the_metadata_cache_still_supplies_settings_history_never_recorded) {
+    char *original_cwd = save_cwd();
+    char *target_dir = make_tmp_dir("cache-fallback");
+    struct fresh_store fresh;
+    struct oi_cli_session_restore restore;
+
+    /* A session whose history has a transition but no setting records --
+     * the cache is then the only place a prior model could survive, so it
+     * must still be used as a fallback rather than ignored outright. */
+    fresh_store_open(&fresh, fresh_log_path("cache-fallback"), 0);
+    {
+        struct oi_cli_session_metadata cached;
+        oi_cli_session_metadata_init(&cached);
+        CHECK_EQ(oi_cli_session_metadata_set(&cached, "sess-1", 6,
+                                             "gpt-from-cache", 14, target_dir,
+                                             strlen(target_dir), NULL, 0, 10,
+                                             20),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_store_write(fresh.metadata_path,
+                                                     &cached),
+                 OI_OK);
+        oi_cli_session_metadata_free(&cached);
+    }
+    CHECK(fresh.state.last_model.data == NULL);
+
+    oi_cli_session_restore_init(&restore);
+    CHECK_EQ(oi_cli_session_restore_settings(
+                 &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
+                 0, NULL, "gpt-default", target_dir, NULL, &restore),
+             OI_OK);
+    CHECK_STREQ(restore.model.data, "gpt-from-cache");
+    oi_cli_session_restore_free(&restore);
+
+    unlink(fresh.metadata_path);
+    fresh_store_close(&fresh);
+    restore_cwd(original_cwd);
+    unlink(fresh_log_path("cache-fallback"));
+    rmdir(target_dir);
+    free(target_dir);
+}
+
 TEST(restore_settings_rejects_bad_arguments) {
     struct oi_cli_history_store store;
     struct oi_cli_history_replay_state state;
@@ -1938,6 +2060,8 @@ int main(void) {
     RUN(missing_prior_cwd_falls_back_with_a_diagnostic);
     RUN(explicit_model_override_wins_and_persists);
     RUN(a_display_name_survives_setting_changes_and_reopens);
+    RUN(a_stale_metadata_cache_never_overrides_or_rewrites_history);
+    RUN(the_metadata_cache_still_supplies_settings_history_never_recorded);
     RUN(restore_settings_rejects_bad_arguments);
     return oi_test_report();
 }

@@ -1586,26 +1586,41 @@ oi_status oi_cli_session_restore_settings(
         }
     }
 
+    /*
+     * Replayed history outranks the metadata cache for both settings.
+     *
+     * This ordering is load-bearing, not a preference. metadata.json is
+     * refreshed on a best-effort basis after a change is already durable in
+     * history -- oi_cli_session_apply_setting deliberately ignores a
+     * metadata write failure because history is authoritative. If the cache
+     * were consulted first, a single failed refresh would make the next
+     * open resolve the *stale* model or cwd, and then, seeing it differ
+     * from what history last recorded, append that stale value back into
+     * the authoritative log. A cache that cannot be written would end up
+     * silently rewriting history. So the cache is only a fallback for a
+     * session whose history records no setting at all, and its unique
+     * contribution is created_at, which history never stores.
+     */
     if (explicit_model != NULL) {
         resolved_model = explicit_model;
         resolved_model_len = strlen(explicit_model);
-    } else if (metadata_valid) {
-        resolved_model = meta.model.data;
-        resolved_model_len = meta.model.len;
     } else if (state->last_model.data != NULL) {
         resolved_model = state->last_model.data;
         resolved_model_len = state->last_model.len;
+    } else if (metadata_valid && meta.model.len > 0) {
+        resolved_model = meta.model.data;
+        resolved_model_len = meta.model.len;
     } else {
         resolved_model = default_model;
         resolved_model_len = strlen(default_model);
     }
 
-    if (metadata_valid) {
-        resolved_cwd = meta.cwd.data;
-        resolved_cwd_len = meta.cwd.len;
-    } else if (state->last_cwd.data != NULL) {
+    if (state->last_cwd.data != NULL) {
         resolved_cwd = state->last_cwd.data;
         resolved_cwd_len = state->last_cwd.len;
+    } else if (metadata_valid && meta.cwd.len > 0) {
+        resolved_cwd = meta.cwd.data;
+        resolved_cwd_len = meta.cwd.len;
     } else {
         resolved_cwd = default_cwd;
         resolved_cwd_len = strlen(default_cwd);
