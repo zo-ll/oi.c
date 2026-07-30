@@ -607,6 +607,188 @@ TEST(enumerate_does_not_rewrite_the_logs_it_lists) {
     CHECK_EQ(rmdir(root), 0);
 }
 
+/* --- oi_cli_session_rename --- */
+
+static struct oi_cli_string read_display_name(const char *root,
+                                              const char *id) {
+    char metadata_path[384];
+    struct oi_cli_session_metadata metadata;
+    struct oi_cli_string name;
+
+    memset(&name, 0, sizeof name);
+    snprintf(metadata_path, sizeof metadata_path, "%s/%s/metadata.json", root,
+             id);
+    oi_cli_session_metadata_init(&metadata);
+    if (oi_cli_session_metadata_store_read(metadata_path, &metadata) ==
+            OI_OK &&
+        metadata.display_name.len > 0) {
+        CHECK_EQ(oi_cli_string_set(&name, metadata.display_name.data,
+                                   metadata.display_name.len),
+                 OI_OK);
+    }
+    oi_cli_session_metadata_free(&metadata);
+    return name;
+}
+
+TEST(rename_sets_a_display_name_without_moving_the_directory) {
+    char root[192];
+    char directory[320];
+    struct oi_cli_session_list list;
+    struct oi_cli_string name;
+    struct stat info;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-rename-%ld", (long)getpid());
+    seed_session(root, "sess-rename", "gpt-a", "/tmp", 100, 200, 1);
+    snprintf(directory, sizeof directory, "%s/sess-rename", root);
+
+    CHECK_EQ(oi_cli_session_rename(root, "sess-rename", 11, "my refactor", 11,
+                                   NULL),
+             OI_OK);
+
+    /* The name is recorded... */
+    name = read_display_name(root, "sess-rename");
+    CHECK_STREQ(name.data, "my refactor");
+    oi_cli_string_free(&name);
+    /* ...and the directory keeps its original id, because every derived
+     * path depends on it. */
+    CHECK_EQ(stat(directory, &info), 0);
+    CHECK(S_ISDIR(info.st_mode));
+
+    /* Renaming again replaces the previous name. */
+    CHECK_EQ(oi_cli_session_rename(root, "sess-rename", 11, "second", 6,
+                                   NULL),
+             OI_OK);
+    name = read_display_name(root, "sess-rename");
+    CHECK_STREQ(name.data, "second");
+    oi_cli_string_free(&name);
+
+    /* And the model/cwd the cache carried are untouched by all of this. */
+    oi_cli_session_list_init(&list);
+    CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+    CHECK_EQ(list.len, 1);
+    CHECK_STREQ(list.entries[0].display_name.data, "second");
+    CHECK_STREQ(list.entries[0].model.data, "gpt-a");
+    CHECK_STREQ(list.entries[0].cwd.data, "/tmp");
+    CHECK_EQ(list.entries[0].created_at, 100);
+    oi_cli_session_list_free(&list);
+
+    remove_session(root, "sess-rename");
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(rename_repairs_a_missing_metadata_cache_from_history) {
+    char root[192];
+    struct oi_cli_string name;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-rename-repair-%ld",
+             (long)getpid());
+    /* No metadata.json at all: the name still has to land somewhere, so
+     * the cache is rebuilt from history first. */
+    seed_session(root, "no-cache", "gpt-recovered", "/tmp", 0, 0, 0);
+
+    CHECK_EQ(oi_cli_session_rename(root, "no-cache", 8, "named anyway", 12,
+                                   NULL),
+             OI_OK);
+    name = read_display_name(root, "no-cache");
+    CHECK_STREQ(name.data, "named anyway");
+    oi_cli_string_free(&name);
+    {
+        /* Repaired, not invented: model and cwd came from the log. */
+        struct oi_cli_session_list list;
+        oi_cli_session_list_init(&list);
+        CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
+        CHECK_EQ(list.len, 1);
+        CHECK_EQ(list.entries[0].degraded, 0);
+        CHECK_STREQ(list.entries[0].model.data, "gpt-recovered");
+        oi_cli_session_list_free(&list);
+    }
+
+    remove_session(root, "no-cache");
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(rename_refuses_unnameable_and_invalid_targets) {
+    char root[192];
+    char history_path[384];
+    char *detail = NULL;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-rename-bad-%ld",
+             (long)getpid());
+    seed_session(root, "sess-ok", "gpt-a", "/tmp", 100, 200, 1);
+
+    /* Unsafe ids never reach the filesystem. */
+    CHECK_EQ(oi_cli_session_rename(root, "..", 2, "x", 1, &detail),
+             OI_ERR_INVAL);
+    CHECK_STREQ(detail, "invalid session id");
+    free(detail);
+    detail = NULL;
+    CHECK_EQ(oi_cli_session_rename(root, "a/b", 3, "x", 1, NULL),
+             OI_ERR_INVAL);
+
+    /* A session that does not exist. */
+    CHECK_EQ(oi_cli_session_rename(root, "absent", 6, "x", 1, &detail),
+             OI_ERR_NOTFOUND);
+    CHECK_STREQ(detail, "no such session");
+    free(detail);
+    detail = NULL;
+
+    /* Names that would be unsafe or useless to display. */
+    CHECK_EQ(oi_cli_session_rename(root, "sess-ok", 7, "", 0, &detail),
+             OI_ERR_INVAL);
+    CHECK_STREQ(detail, "a session name cannot be empty");
+    free(detail);
+    detail = NULL;
+    CHECK_EQ(oi_cli_session_rename(root, "sess-ok", 7, NULL, 0, NULL),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_session_rename(root, "sess-ok", 7, "two\nlines", 9,
+                                   &detail),
+             OI_ERR_INVAL);
+    CHECK_STREQ(detail,
+                "a session name cannot contain control characters");
+    free(detail);
+    detail = NULL;
+    {
+        char oversized[OI_CLI_SESSION_METADATA_MAX_DISPLAY_NAME + 1];
+        memset(oversized, 'a', sizeof oversized);
+        CHECK_EQ(oi_cli_session_rename(root, "sess-ok", 7, oversized,
+                                       sizeof oversized, &detail),
+                 OI_ERR_INVAL);
+        CHECK_STREQ(detail, "session name is too long");
+        free(detail);
+        detail = NULL;
+    }
+    /* A rejected rename leaves the session exactly as it was. */
+    {
+        struct oi_cli_string name = read_display_name(root, "sess-ok");
+        CHECK(name.data == NULL);
+        oi_cli_string_free(&name);
+    }
+
+    /*
+     * A session with neither a cache nor a readable log has no model or
+     * cwd to write alongside a name, and filling those in with invented
+     * values would corrupt what a later open trusts. Refuse instead.
+     */
+    seed_session(root, "hopeless", "gpt-x", "/tmp", 0, 0, 0);
+    snprintf(history_path, sizeof history_path, "%s/hopeless/history.oilog",
+             root);
+    {
+        FILE *garbage = fopen(history_path, "w");
+        CHECK(garbage != NULL);
+        CHECK(fputs("not an oilog", garbage) >= 0);
+        CHECK_EQ(fclose(garbage), 0);
+    }
+    CHECK_EQ(oi_cli_session_rename(root, "hopeless", 8, "wishful", 7, &detail),
+             OI_ERR_IO);
+    CHECK(detail != NULL);
+    CHECK(strstr(detail, "cannot be read") != NULL);
+    free(detail);
+
+    remove_session(root, "sess-ok");
+    remove_session(root, "hopeless");
+    CHECK_EQ(rmdir(root), 0);
+}
+
 /* --- oi_cli_session_restore_settings / oi_cli_session_apply_setting --- */
 
 static char *save_cwd(void) { return getcwd(NULL, 0); }
@@ -1084,6 +1266,9 @@ int main(void) {
     RUN(enumerate_lists_an_unreplayable_session_with_only_its_id);
     RUN(enumerate_reports_a_session_held_by_another_process_as_busy);
     RUN(enumerate_does_not_rewrite_the_logs_it_lists);
+    RUN(rename_sets_a_display_name_without_moving_the_directory);
+    RUN(rename_repairs_a_missing_metadata_cache_from_history);
+    RUN(rename_refuses_unnameable_and_invalid_targets);
     RUN(fresh_session_records_initial_model_and_cwd);
     RUN(unchanged_resume_writes_no_new_records_but_refreshes_metadata);
     RUN(apply_setting_writes_a_record_and_persists_through_restore);

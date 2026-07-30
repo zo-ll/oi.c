@@ -248,6 +248,20 @@ oi_status oi_cli_session_resolve(const char *root, const char *id,
     return OI_OK;
 }
 
+/*
+ * Records why a lifecycle operation failed, for the command layer to show
+ * verbatim. Best effort: a failed strdup just leaves the caller with no
+ * detail, which is strictly better than turning a useful error into an
+ * out-of-memory one.
+ */
+static void set_error_detail(char **out_error_detail, const char *detail) {
+    if (out_error_detail == NULL) {
+        return;
+    }
+    free(*out_error_detail);
+    *out_error_detail = strdup(detail);
+}
+
 /* Resolves the sessions root a lifecycle command should act on: the
  * caller's override when given, else the platform default. */
 static oi_status resolve_root(const char *root_override, char **out_root) {
@@ -616,6 +630,162 @@ oi_status oi_cli_session_location_create(
     }
     *out_location = location;
     return OI_OK;
+}
+
+/*
+ * Produces a complete, writable metadata struct for an existing session:
+ * the cache when it is valid and belongs to this session, otherwise one
+ * rebuilt from the session's own history.
+ *
+ * OI_ERR_PARSE when neither source yields a model and cwd -- the cache's
+ * validity rules require both, and inventing placeholders would be worse
+ * than failing, since the cache is what a later open trusts to restore
+ * them. Such a session can still be listed and trashed.
+ */
+static oi_status load_or_rebuild_metadata(
+    const char *directory, const char *id, size_t id_len,
+    struct oi_cli_session_metadata *out_metadata) {
+    struct oi_cli_session_metadata cached;
+    struct oi_cli_string model;
+    struct oi_cli_string cwd;
+    char *history_path = NULL;
+    char *metadata_path = NULL;
+    int64_t created_at = 0;
+    int64_t updated_at = 0;
+    oi_status status;
+
+    status = join_path(directory, session_history_name, &history_path);
+    if (status == OI_OK) {
+        status = join_path(directory, "metadata.json", &metadata_path);
+    }
+    if (status != OI_OK) {
+        free(history_path);
+        return status;
+    }
+
+    oi_cli_session_metadata_init(&cached);
+    if (oi_cli_session_metadata_store_read(metadata_path, &cached) == OI_OK &&
+        cached.session_id.len == id_len &&
+        memcmp(cached.session_id.data, id, id_len) == 0) {
+        free(history_path);
+        free(metadata_path);
+        *out_metadata = cached;
+        return OI_OK;
+    }
+    oi_cli_session_metadata_free(&cached);
+
+    memset(&model, 0, sizeof model);
+    memset(&cwd, 0, sizeof cwd);
+    rebuild_from_history(history_path, &model, &cwd, &created_at,
+                         &updated_at);
+    if (model.len == 0 || cwd.len == 0) {
+        status = OI_ERR_PARSE;
+    } else {
+        status = oi_cli_session_metadata_set(out_metadata, id, id_len,
+                                            model.data, model.len, cwd.data,
+                                            cwd.len, NULL, 0, created_at,
+                                            updated_at < created_at
+                                                ? created_at
+                                                : updated_at);
+    }
+    oi_cli_string_free(&model);
+    oi_cli_string_free(&cwd);
+    free(history_path);
+    free(metadata_path);
+    return status;
+}
+
+oi_status oi_cli_session_rename(const char *root_override, const char *id,
+                                size_t id_len, const char *new_name,
+                                size_t new_name_len,
+                                char **out_error_detail) {
+    struct oi_cli_session_metadata metadata;
+    char *root = NULL;
+    char *directory = NULL;
+    char *metadata_path = NULL;
+    time_t now;
+    int64_t updated_at;
+    oi_status status;
+
+    if (out_error_detail != NULL) {
+        *out_error_detail = NULL;
+    }
+    if (!oi_cli_session_id_is_safe(id, id_len)) {
+        set_error_detail(out_error_detail, "invalid session id");
+        return OI_ERR_INVAL;
+    }
+    /* No "clear the name" spelling in this grammar: an empty argument is a
+     * usage mistake, not a request to unset. */
+    if (new_name == NULL || new_name_len == 0) {
+        set_error_detail(out_error_detail, "a session name cannot be empty");
+        return OI_ERR_INVAL;
+    }
+    if (new_name_len > OI_CLI_SESSION_METADATA_MAX_DISPLAY_NAME) {
+        set_error_detail(out_error_detail, "session name is too long");
+        return OI_ERR_INVAL;
+    }
+
+    status = resolve_root(root_override, &root);
+    if (status != OI_OK) {
+        return status;
+    }
+    status = oi_cli_session_resolve(root, id, id_len, &directory);
+    free(root);
+    if (status != OI_OK) {
+        set_error_detail(out_error_detail,
+                         status == OI_ERR_NOTFOUND
+                             ? "no such session"
+                             : "session directory is not usable");
+        return status;
+    }
+
+    oi_cli_session_metadata_init(&metadata);
+    status = load_or_rebuild_metadata(directory, id, id_len, &metadata);
+    if (status != OI_OK) {
+        free(directory);
+        oi_cli_session_metadata_free(&metadata);
+        set_error_detail(out_error_detail,
+                         status == OI_ERR_PARSE
+                             ? "session metadata is missing and its history "
+                               "cannot be read, so a name cannot be recorded"
+                             : "session metadata could not be read");
+        return status == OI_ERR_PARSE ? OI_ERR_IO : status;
+    }
+
+    now = time(NULL);
+    updated_at = now == (time_t)-1 ? metadata.updated_at : (int64_t)now;
+    if (updated_at < metadata.created_at) {
+        updated_at = metadata.created_at;
+    }
+    /* Passing `metadata`'s own fields back in is safe: the setter copies
+     * every argument into a replacement struct and only frees the
+     * destination once all of those copies have succeeded. */
+    status = oi_cli_session_metadata_set(
+        &metadata, id, id_len, metadata.model.data, metadata.model.len,
+        metadata.cwd.data, metadata.cwd.len, new_name, new_name_len,
+        metadata.created_at, updated_at);
+    if (status != OI_OK) {
+        /* The only remaining rejection is a control byte in the name. */
+        set_error_detail(out_error_detail,
+                         "a session name cannot contain control characters");
+        free(directory);
+        oi_cli_session_metadata_free(&metadata);
+        return OI_ERR_INVAL;
+    }
+
+    status = join_path(directory, "metadata.json", &metadata_path);
+    if (status == OI_OK) {
+        status = oi_cli_session_metadata_store_write(metadata_path,
+                                                     &metadata);
+        if (status != OI_OK) {
+            set_error_detail(out_error_detail,
+                             "could not write session metadata");
+        }
+    }
+    free(metadata_path);
+    free(directory);
+    oi_cli_session_metadata_free(&metadata);
+    return status;
 }
 
 void oi_cli_session_restore_init(struct oi_cli_session_restore *restore) {

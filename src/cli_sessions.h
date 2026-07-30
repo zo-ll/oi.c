@@ -173,6 +173,39 @@ void oi_cli_session_list_free(struct oi_cli_session_list *list);
 oi_status oi_cli_sessions_enumerate(const char *root_override,
                                     struct oi_cli_session_list *out_list);
 
+/*
+ * Sets a session's display name, leaving its directory and history
+ * untouched.
+ *
+ * The safe directory id is permanent by design. Every path in the storage
+ * model is derived from it -- history.oilog, metadata.json, the registry
+ * entry of a live session, and anything outside oi pointing at the
+ * directory -- so renaming the directory to change a cosmetic label would
+ * mean updating all of them atomically. A name is a label; it is not
+ * worth that.
+ *
+ * Only live sessions can be renamed; a trashed one is not addressable
+ * here (restore it first). Rebuilds a missing or malformed metadata cache
+ * from history before writing, so naming a damaged session repairs it
+ * rather than failing.
+ *
+ * Needs no lock: it writes only metadata.json, which is already safe to
+ * write while another process appends to the log -- the same reason
+ * /model and /cwd take no lock to refresh the cache.
+ *
+ * `*out_error_detail`, when non-NULL on return, is a caller-owned string
+ * naming the specific cause and is set only on failure.
+ *
+ *   OI_ERR_INVAL    unsafe id, or a name that is empty, too long, or
+ *                   contains a control byte
+ *   OI_ERR_NOTFOUND no live session with that id
+ *   OI_ERR_IO       the metadata write failed
+ */
+oi_status oi_cli_session_rename(const char *root_override, const char *id,
+                                size_t id_len, const char *new_name,
+                                size_t new_name_len,
+                                char **out_error_detail);
+
 struct oi_cli_session_restore {
     struct oi_cli_string model;
     struct oi_cli_string cwd;
