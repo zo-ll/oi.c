@@ -312,6 +312,58 @@ static oi_status resolve_trash_root(const char *root_override,
 }
 
 /*
+ * Serializes read-modify-write of one session's metadata.json.
+ *
+ * Both updaters -- a settings refresh carrying the display name forward, and
+ * a rename carrying model/cwd forward -- must read the current cache, merge
+ * one field, and replace the file. Without a lock those interleave and lose
+ * each other's field: a rename that read before a concurrent /model landed
+ * will write the stale model back, and vice versa.
+ *
+ * The lock is a sibling "<metadata path>.lock" rather than metadata.json
+ * itself, because the store replaces that file via temp+rename, so its inode
+ * is not stable enough to lock. The session log's own flock cannot be reused
+ * either: the owning process holds it for its whole lifetime, so a rename
+ * from another process would wait forever.
+ *
+ * Held only across a bounded read and write, so blocking is fine. Returns -1
+ * when the lock cannot be taken, which callers treat as "proceed unlocked"
+ * rather than failing: losing a display name is much better than refusing to
+ * persist a model change.
+ */
+static int metadata_lock_acquire(const char *metadata_path) {
+    static const char suffix[] = ".lock";
+    size_t len = strlen(metadata_path);
+    char *lock_path = malloc(len + sizeof suffix);
+    int fd;
+
+    if (lock_path == NULL) {
+        return -1;
+    }
+    memcpy(lock_path, metadata_path, len);
+    memcpy(lock_path + len, suffix, sizeof suffix);
+    fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    free(lock_path);
+    if (fd < 0) {
+        return -1;
+    }
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno != EINTR) {
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}
+
+static void metadata_lock_release(int fd) {
+    if (fd >= 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+    }
+}
+
+/*
  * Read-only check for whether another process holds `history_path`'s
  * lock, taking flock(2) directly rather than going through
  * oi_sesslog_open. That matters: oi_sesslog_open creates the file when
@@ -790,6 +842,7 @@ oi_status oi_cli_session_rename(const char *root_override, const char *id,
     char *root = NULL;
     char *directory = NULL;
     char *metadata_path = NULL;
+    int lock_fd;
     time_t now;
     int64_t updated_at;
     oi_status status;
@@ -826,9 +879,25 @@ oi_status oi_cli_session_rename(const char *root_override, const char *id,
         return status;
     }
 
+    status = join_path(directory, "metadata.json", &metadata_path);
+    if (status != OI_OK) {
+        free(directory);
+        return status;
+    }
+    /*
+     * Read, merge, and replace under the metadata lock. A live process
+     * refreshing model/cwd does the mirror-image update, so without this the
+     * two interleave and one silently discards the other's field -- a rename
+     * writing back a model it read before a concurrent /model landed, or a
+     * /model writing back an empty name.
+     */
+    lock_fd = metadata_lock_acquire(metadata_path);
+
     oi_cli_session_metadata_init(&metadata);
     status = load_or_rebuild_metadata(directory, id, id_len, &metadata);
     if (status != OI_OK) {
+        metadata_lock_release(lock_fd);
+        free(metadata_path);
         free(directory);
         oi_cli_session_metadata_free(&metadata);
         set_error_detail(out_error_detail,
@@ -855,20 +924,19 @@ oi_status oi_cli_session_rename(const char *root_override, const char *id,
         /* The only remaining rejection is a control byte in the name. */
         set_error_detail(out_error_detail,
                          "a session name cannot contain control characters");
+        metadata_lock_release(lock_fd);
+        free(metadata_path);
         free(directory);
         oi_cli_session_metadata_free(&metadata);
         return OI_ERR_INVAL;
     }
 
-    status = join_path(directory, "metadata.json", &metadata_path);
-    if (status == OI_OK) {
-        status = oi_cli_session_metadata_store_write(metadata_path,
-                                                     &metadata);
-        if (status != OI_OK) {
-            set_error_detail(out_error_detail,
-                             "could not write session metadata");
-        }
+    status = oi_cli_session_metadata_store_write(metadata_path, &metadata);
+    if (status != OI_OK) {
+        set_error_detail(out_error_detail,
+                         "could not write session metadata");
     }
+    metadata_lock_release(lock_fd);
     free(metadata_path);
     free(directory);
     oi_cli_session_metadata_free(&metadata);
@@ -1538,28 +1606,53 @@ static oi_status append_setting_record(
 }
 
 /*
- * Rewrites the whole metadata cache from the values passed in, so every
- * caller has to hand back the session's existing `display_name`: it lives
- * only in this file, and rebuilding without it would silently drop a
- * user's session name on the next /model or /cwd change. Pass NULL/0 only
- * when the session genuinely has no name.
+ * Refreshes the cache's model/cwd while preserving the fields it alone
+ * holds -- the display name, and created_at.
+ *
+ * The read and the write happen under the metadata lock, so this cannot
+ * lose a display name set concurrently by a rename, and a rename cannot
+ * lose the model/cwd written here. Re-reading inside the lock is also why
+ * no caller has to thread the existing name through: whatever is on disk
+ * at write time is what gets carried forward.
+ *
+ * `created_at_fallback` is used only when the cache holds nothing usable
+ * for this session.
  */
 static void refresh_metadata(const char *metadata_path,
                              const char *session_id, const char *model,
                              size_t model_len, const char *cwd,
-                             size_t cwd_len, const char *display_name,
-                             size_t display_name_len, int64_t created_at,
+                             size_t cwd_len, int64_t created_at_fallback,
                              FILE *diagnostics) {
     struct oi_cli_session_metadata metadata;
+    struct oi_cli_session_metadata existing;
+    const char *display_name = NULL;
+    size_t display_name_len = 0;
+    int64_t created_at = created_at_fallback;
+    int lock_fd = metadata_lock_acquire(metadata_path);
     oi_status status;
     time_t now = time(NULL);
     int64_t updated_at = now == (time_t)-1 ? created_at : (int64_t)now;
 
+    oi_cli_session_metadata_init(&existing);
+    if (oi_cli_session_metadata_store_read(metadata_path, &existing) ==
+            OI_OK &&
+        existing.session_id.len == strlen(session_id) &&
+        memcmp(existing.session_id.data, session_id,
+               existing.session_id.len) == 0) {
+        created_at = existing.created_at;
+        if (existing.display_name.len > 0) {
+            display_name = existing.display_name.data;
+            display_name_len = existing.display_name.len;
+        }
+    }
+    if (updated_at < created_at) {
+        updated_at = created_at;
+    }
+
     oi_cli_session_metadata_init(&metadata);
     status = oi_cli_session_metadata_set(
         &metadata, session_id, strlen(session_id), model, model_len, cwd,
-        cwd_len, display_name, display_name_len, created_at,
-        updated_at < created_at ? created_at : updated_at);
+        cwd_len, display_name, display_name_len, created_at, updated_at);
     if (status == OI_OK) {
         status = oi_cli_session_metadata_store_write(metadata_path,
                                                       &metadata);
@@ -1570,6 +1663,8 @@ static void refresh_metadata(const char *metadata_path,
                 (int)status);
     }
     oi_cli_session_metadata_free(&metadata);
+    oi_cli_session_metadata_free(&existing);
+    metadata_lock_release(lock_fd);
 }
 
 oi_status oi_cli_session_restore_settings(
@@ -1579,9 +1674,6 @@ oi_status oi_cli_session_restore_settings(
     const char *default_model, const char *default_cwd, FILE *diagnostics,
     struct oi_cli_session_restore *out_restore) {
     struct oi_cli_session_metadata meta;
-    /* Carries the session's existing name past the point where `meta` is
-     * freed, so refreshing the cache below preserves it. */
-    struct oi_cli_string preserved_name;
     int metadata_valid = 0;
     int64_t created_at;
     time_t now;
@@ -1599,7 +1691,6 @@ oi_status oi_cli_session_restore_settings(
     }
     oi_cli_session_restore_init(out_restore);
     oi_cli_session_metadata_init(&meta);
-    memset(&preserved_name, 0, sizeof preserved_name);
 
     if (!is_new_session) {
         oi_status read_status =
@@ -1706,15 +1797,8 @@ oi_status oi_cli_session_restore_settings(
         status = oi_cli_string_set(&out_restore->cwd, resolved_cwd,
                                    resolved_cwd_len);
     }
-    /* Same reason, for the name: it survives only in `meta`, which is
-     * about to go away, and refresh_metadata below must not drop it. */
-    if (status == OI_OK && metadata_valid && meta.display_name.len > 0) {
-        status = oi_cli_string_set(&preserved_name, meta.display_name.data,
-                                   meta.display_name.len);
-    }
     oi_cli_session_metadata_free(&meta);
     if (status != OI_OK) {
-        oi_cli_string_free(&preserved_name);
         return status;
     }
 
@@ -1751,15 +1835,15 @@ oi_status oi_cli_session_restore_settings(
         }
     }
     if (status != OI_OK) {
-        oi_cli_string_free(&preserved_name);
         return status;
     }
 
+    /* refresh_metadata re-reads under the metadata lock, so the display
+     * name and created_at are carried forward without being threaded
+     * through this function. */
     refresh_metadata(metadata_path, session_id, out_restore->model.data,
                      out_restore->model.len, out_restore->cwd.data,
-                     out_restore->cwd.len, preserved_name.data,
-                     preserved_name.len, created_at, diagnostics);
-    oi_cli_string_free(&preserved_name);
+                     out_restore->cwd.len, created_at, diagnostics);
     return OI_OK;
 }
 
@@ -1769,7 +1853,6 @@ oi_status oi_cli_session_apply_setting(
     const char *session_id,
     enum oi_cli_history_session_setting_field field, const char *value,
     size_t value_len) {
-    struct oi_cli_string preserved_name;
     oi_status status;
     int64_t created_at;
     time_t now;
@@ -1785,27 +1868,10 @@ oi_status oi_cli_session_apply_setting(
 
     now = time(NULL);
     created_at = now == (time_t)-1 ? 0 : (int64_t)now;
-    memset(&preserved_name, 0, sizeof preserved_name);
-    {
-        struct oi_cli_session_metadata existing;
-        oi_cli_session_metadata_init(&existing);
-        if (oi_cli_session_metadata_store_read(metadata_path, &existing) ==
-                OI_OK &&
-            existing.session_id.len == strlen(session_id) &&
-            memcmp(existing.session_id.data, session_id,
-                   existing.session_id.len) == 0) {
-            created_at = existing.created_at;
-            /* Carry the name forward: a /model or /cwd change must not
-             * cost the session the name the user gave it. */
-            if (existing.display_name.len > 0) {
-                (void)oi_cli_string_set(&preserved_name,
-                                        existing.display_name.data,
-                                        existing.display_name.len);
-            }
-        }
-        oi_cli_session_metadata_free(&existing);
-    }
 
+    /* created_at and the display name are both recovered inside
+     * refresh_metadata, under the metadata lock, so a concurrent rename
+     * cannot lose either this change or its own. */
     refresh_metadata(
         metadata_path, session_id,
         field == OI_CLI_HISTORY_SESSION_SETTING_MODEL
@@ -1818,7 +1884,6 @@ oi_status oi_cli_session_apply_setting(
                                                      : state->last_cwd.data,
         field == OI_CLI_HISTORY_SESSION_SETTING_CWD ? value_len
                                                      : state->last_cwd.len,
-        preserved_name.data, preserved_name.len, created_at, NULL);
-    oi_cli_string_free(&preserved_name);
+        created_at, NULL);
     return OI_OK;
 }

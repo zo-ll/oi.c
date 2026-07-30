@@ -163,6 +163,12 @@ Each durable session is a private directory containing:
 
 - `history.oilog`: authoritative append-only records;
 - `metadata.json`: atomically replaced, rebuildable selector metadata;
+- `metadata.json.lock`: empty advisory-lock file serializing read-modify-write
+  of the cache, so a rename and a concurrent model/CWD refresh cannot discard
+  each other's field. A sibling file rather than the cache itself, because the
+  cache is replaced via temp+`rename()` and so has no stable inode to lock;
+  the session log's own lock cannot be reused, since the owning process holds
+  it for its whole lifetime;
 - future derived indexes, which are never authoritative.
 
 Linux uses `$XDG_STATE_HOME/oi/sessions` or `~/.local/state/oi/sessions`.

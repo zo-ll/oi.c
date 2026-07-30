@@ -5,8 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cli_session_metadata.h"
@@ -307,6 +310,9 @@ static void remove_session(const char *root, const char *id) {
     snprintf(path, sizeof path, "%s/%s/history.oilog", root, id);
     unlink(path);
     snprintf(path, sizeof path, "%s/%s/metadata.json", root, id);
+    unlink(path);
+    /* Left behind by any metadata update that took the lock. */
+    snprintf(path, sizeof path, "%s/%s/metadata.json.lock", root, id);
     unlink(path);
     snprintf(path, sizeof path, "%s/%s", root, id);
     rmdir(path);
@@ -755,6 +761,162 @@ TEST(rename_repairs_a_missing_metadata_cache_from_history) {
     }
 
     remove_session(root, "no-cache");
+    CHECK_EQ(rmdir(root), 0);
+}
+
+TEST(rename_merges_with_the_current_cache_not_a_stale_copy) {
+    char root[192];
+    char metadata_path[384];
+    struct oi_cli_string name;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-rename-merge-%ld",
+             (long)getpid());
+    seed_session(root, "sess-merge", "gpt-first", "/tmp", 100, 200, 1);
+    snprintf(metadata_path, sizeof metadata_path,
+             "%s/sess-merge/metadata.json", root);
+
+    CHECK_EQ(oi_cli_session_rename(root, "sess-merge", 10, "first name", 10,
+                                   NULL),
+             OI_OK);
+
+    /* Another process changes the model, the way /model does. */
+    {
+        struct oi_cli_session_metadata changed;
+        oi_cli_session_metadata_init(&changed);
+        CHECK_EQ(oi_cli_session_metadata_store_read(metadata_path, &changed),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_set(
+                     &changed, "sess-merge", 10, "gpt-second", 10, "/tmp", 4,
+                     changed.display_name.data, changed.display_name.len,
+                     changed.created_at, changed.updated_at),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_store_write(metadata_path, &changed),
+                 OI_OK);
+        oi_cli_session_metadata_free(&changed);
+    }
+
+    /* A second rename must merge against what is on disk now, not against
+     * anything it read earlier, so the new model survives. */
+    CHECK_EQ(oi_cli_session_rename(root, "sess-merge", 10, "second name", 11,
+                                   NULL),
+             OI_OK);
+    {
+        struct oi_cli_session_metadata after;
+        oi_cli_session_metadata_init(&after);
+        CHECK_EQ(oi_cli_session_metadata_store_read(metadata_path, &after),
+                 OI_OK);
+        CHECK_STREQ(after.model.data, "gpt-second");
+        CHECK_STREQ(after.display_name.data, "second name");
+        oi_cli_session_metadata_free(&after);
+    }
+    name = read_display_name(root, "sess-merge");
+    CHECK_STREQ(name.data, "second name");
+    oi_cli_string_free(&name);
+
+    remove_session(root, "sess-merge");
+    CHECK_EQ(rmdir(root), 0);
+}
+
+/* Waits a beat, long enough that a rename which was never going to block
+ * would certainly have finished. */
+static void short_pause(void) {
+    struct timespec pause;
+    pause.tv_sec = 0;
+    pause.tv_nsec = 300L * 1000L * 1000L;
+    (void)nanosleep(&pause, NULL);
+}
+
+TEST(a_rename_waits_for_a_settings_update_and_merges_its_value) {
+    char root[192];
+    char metadata_path[384];
+    char lock_path[420];
+    int lock_fd;
+    pid_t child;
+
+    /*
+     * Both updaters read metadata.json, merge one field, and replace the
+     * file. Interleaved, each discards the other's field -- a rename that
+     * read before a concurrent /model landed writes the stale model back.
+     *
+     * The window is far too narrow to hit reliably by hammering, so this
+     * tests the property that closes it instead: a rename cannot read until
+     * whoever is mid-update has finished. The test holds the metadata lock
+     * itself -- reaching into an implementation detail deliberately,
+     * because mutual exclusion is exactly what is being asserted.
+     */
+    snprintf(root, sizeof root, "/tmp/oi-session-race-%ld", (long)getpid());
+    seed_session(root, "racer", "gpt-initial", "/tmp", 100, 200, 1);
+    snprintf(metadata_path, sizeof metadata_path, "%s/racer/metadata.json",
+             root);
+    snprintf(lock_path, sizeof lock_path, "%s.lock", metadata_path);
+
+    /* Stand in for a live process partway through refreshing settings: hold
+     * the lock, then publish a new model while still holding it. */
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    CHECK(lock_fd >= 0);
+    CHECK_EQ(flock(lock_fd, LOCK_EX), 0);
+    {
+        struct oi_cli_session_metadata updated;
+        oi_cli_session_metadata_init(&updated);
+        CHECK_EQ(oi_cli_session_metadata_set(&updated, "racer", 5,
+                                             "gpt-committed", 13, "/tmp", 4,
+                                             NULL, 0, 100, 300),
+                 OI_OK);
+        CHECK_EQ(oi_cli_session_metadata_store_write(metadata_path, &updated),
+                 OI_OK);
+        oi_cli_session_metadata_free(&updated);
+    }
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        close(lock_fd);
+        _exit(oi_cli_session_rename(root, "racer", 5, "chosen name", 11,
+                                    NULL) == OI_OK
+                  ? 0
+                  : 1);
+    }
+
+    /* While the lock is held the rename must not have landed. */
+    short_pause();
+    {
+        struct oi_cli_session_metadata midway;
+        oi_cli_session_metadata_init(&midway);
+        CHECK_EQ(oi_cli_session_metadata_store_read(metadata_path, &midway),
+                 OI_OK);
+        CHECK_EQ(midway.display_name.len, (size_t)0);
+        oi_cli_session_metadata_free(&midway);
+    }
+
+    /* Release, and let the rename proceed. */
+    CHECK_EQ(flock(lock_fd, LOCK_UN), 0);
+    close(lock_fd);
+    {
+        int wait_status = 0;
+        CHECK_EQ(waitpid(child, &wait_status, 0), child);
+        CHECK(WIFEXITED(wait_status));
+        CHECK_EQ(WEXITSTATUS(wait_status), 0);
+    }
+
+    /*
+     * Both fields survive. The model assertion is the anti-lost-update one:
+     * the rename read after acquiring the lock, so it saw "gpt-committed"
+     * and carried it forward. Reading before locking would have merged the
+     * pre-update model and silently reverted the change.
+     */
+    {
+        struct oi_cli_session_metadata final_state;
+        oi_cli_session_metadata_init(&final_state);
+        CHECK_EQ(oi_cli_session_metadata_store_read(metadata_path,
+                                                    &final_state),
+                 OI_OK);
+        CHECK_STREQ(final_state.session_id.data, "racer");
+        CHECK_STREQ(final_state.model.data, "gpt-committed");
+        CHECK_STREQ(final_state.display_name.data, "chosen name");
+        oi_cli_session_metadata_free(&final_state);
+    }
+
+    remove_session(root, "racer");
     CHECK_EQ(rmdir(root), 0);
 }
 
@@ -2130,6 +2292,8 @@ int main(void) {
     RUN(enumerate_does_not_rewrite_the_logs_it_lists);
     RUN(rename_sets_a_display_name_without_moving_the_directory);
     RUN(rename_repairs_a_missing_metadata_cache_from_history);
+    RUN(rename_merges_with_the_current_cache_not_a_stale_copy);
+    RUN(a_rename_waits_for_a_settings_update_and_merges_its_value);
     RUN(rename_refuses_unnameable_and_invalid_targets);
     RUN(trash_and_restore_round_trip_preserving_history);
     RUN(trash_refuses_the_active_session_and_unknown_ids);
