@@ -49,7 +49,8 @@ struct oi_cli_session_switch_result {
     struct oi_cli_message_list initial_context;
     struct oi_cli_string model;
     struct oi_cli_string cwd;
-    char *metadata_path;
+    char *path;          /* owned private session directory */
+    char *metadata_path; /* owned selector-cache path */
 };
 
 void oi_cli_session_switch_result_init(

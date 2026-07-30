@@ -18,6 +18,7 @@ void oi_cli_session_switch_result_init(
     oi_cli_message_list_init(&result->initial_context);
     memset(&result->model, 0, sizeof result->model);
     memset(&result->cwd, 0, sizeof result->cwd);
+    result->path = NULL;
     result->metadata_path = NULL;
 }
 
@@ -33,6 +34,7 @@ void oi_cli_session_switch_result_free(
     oi_cli_message_list_free(&result->initial_context);
     oi_cli_string_free(&result->model);
     oi_cli_string_free(&result->cwd);
+    free(result->path);
     free(result->metadata_path);
     oi_cli_session_switch_result_init(result);
 }
@@ -134,13 +136,14 @@ oi_status oi_cli_session_switch(
         out_result->outcome = OI_CLI_SESSION_SWITCH_NOT_FOUND;
         return OI_OK;
     }
+    result.path = directory;
+    directory = NULL;
 
-    status = oi_cli_session_history_path(directory, &history_path);
+    status = oi_cli_session_history_path(result.path, &history_path);
     if (status == OI_OK) {
         status = oi_cli_session_metadata_path_for_log(history_path, 1,
                                                       &result.metadata_path);
     }
-    free(directory);
     if (status != OI_OK) {
         oi_cli_session_switch_result_free(&result);
         free(history_path);

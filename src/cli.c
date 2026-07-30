@@ -175,6 +175,7 @@ struct persistence_context {
     struct oi_cli_history_replay_state *state;
     uint64_t turn_id;
     struct oi_cli_string model; /* owned; may be updated live by /model */
+    const char *session_path;   /* borrowed directory or explicit log path */
     const char *metadata_path;  /* borrowed, stable for the process lifetime */
     const char *session_id;    /* borrowed */
     oi_status last_error;
@@ -212,6 +213,8 @@ struct session_admin_context {
      * session. persistence->metadata_path points into it after a switch, so
      * it must outlive every use and is freed once at cleanup. */
     char **switched_metadata_path;
+    /* Same ownership arrangement for the user-facing session directory. */
+    char **switched_session_path;
 };
 
 static oi_status admin_list_sessions(void *user_data,
@@ -232,7 +235,7 @@ static oi_status admin_current_session(
     const char *id = oi_session_id(*context->session);
 
     out_current->id = id;
-    out_current->path = context->persistence->metadata_path;
+    out_current->path = context->persistence->session_path;
     out_current->healthy = 0;
     if (id == NULL || context->persistence->metadata_path == NULL) {
         return OI_OK;
@@ -341,10 +344,14 @@ static oi_status admin_switch_session(
     free(*context->switched_metadata_path);
     *context->switched_metadata_path = out_result->metadata_path;
     out_result->metadata_path = NULL;
+    free(*context->switched_session_path);
+    *context->switched_session_path = out_result->path;
+    out_result->path = NULL;
 
     context->persistence->store = context->store;
     context->persistence->state = context->state;
     context->persistence->turn_id = context->state->next_turn_id;
+    context->persistence->session_path = *context->switched_session_path;
     context->persistence->metadata_path = *context->switched_metadata_path;
     context->persistence->session_id = oi_session_id(*context->session);
     context->persistence->last_error = OI_OK;
@@ -421,6 +428,7 @@ static oi_status prepare_automatic_session(void *user_data,
     context->persistence->store = context->store;
     context->persistence->state = context->state;
     context->persistence->turn_id = context->state->next_turn_id;
+    context->persistence->session_path = context->location->directory;
     context->persistence->metadata_path = context->location->metadata_path;
     context->persistence->session_id = context->location->id;
     context->persistence->last_error = OI_OK;
@@ -954,6 +962,7 @@ int main(int argc, char **argv) {
     struct persistence_context persistence = {0};
     struct session_admin_context session_admin;
     char *switched_metadata_path = NULL;
+    char *switched_session_path = NULL;
     struct oi_cli_session_location automatic_location;
     struct automatic_session_context automatic_context;
     oi_cli_session_location_init(&automatic_location);
@@ -1094,6 +1103,7 @@ int main(int argc, char **argv) {
         persistence.store = &history_store;
         persistence.state = &replay_state;
         persistence.turn_id = replay_state.next_turn_id;
+        persistence.session_path = log_path;
         persistence.metadata_path = explicit_metadata_path;
         persistence.session_id = session_id;
         persistence.last_error = OI_OK;
@@ -1115,6 +1125,7 @@ int main(int argc, char **argv) {
     session_admin.state = &replay_state;
     session_admin.persistence = &persistence;
     session_admin.switched_metadata_path = &switched_metadata_path;
+    session_admin.switched_session_path = &switched_session_path;
 
     if (automatic_session) {
         automatic_context.registry = sessions;
@@ -1246,6 +1257,7 @@ cleanup:
     oi_cli_string_free(&pending_model);
     free(explicit_metadata_path);
     free(switched_metadata_path);
+    free(switched_session_path);
     free(default_cwd);
     if (owns_prompt) {
         free((char *)prompt);

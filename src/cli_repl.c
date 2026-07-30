@@ -867,6 +867,29 @@ static oi_status repl_confirm(struct oi_cli_composer *composer, int signal_fd,
     return OI_OK;
 }
 
+static oi_status repl_confirmation_text(
+    const char *prefix, const char *target, size_t target_len,
+    const char *suffix, char **out_text) {
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    char *text;
+
+    if (prefix_len > SIZE_MAX - suffix_len - 1 ||
+        target_len > SIZE_MAX - prefix_len - suffix_len - 1) {
+        return OI_ERR_NOMEM;
+    }
+    text = malloc(prefix_len + target_len + suffix_len + 1);
+    if (text == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    memcpy(text, prefix, prefix_len);
+    memcpy(text + prefix_len, target, target_len);
+    memcpy(text + prefix_len + target_len, suffix, suffix_len);
+    text[prefix_len + target_len + suffix_len] = '\0';
+    *out_text = text;
+    return OI_OK;
+}
+
 /*
  * Dumps a restored conversation so the user can see what they switched into.
  *
@@ -899,18 +922,36 @@ static oi_status repl_print_replay(FILE *out,
             break;
         }
         if (message->content.len > 0) {
-            if (fprintf(out, "%s: %.*s\n", role, (int)message->content.len,
-                        message->content.data) < 0) {
+            if (message->role == OI_CLI_MESSAGE_TOOL) {
+                if (fprintf(out, "%s [%.*s]: %.*s\n", role,
+                            (int)message->tool_call_id.len,
+                            message->tool_call_id.data,
+                            (int)message->content.len,
+                            message->content.data) < 0) {
+                    return OI_ERR_IO;
+                }
+            } else if (fprintf(out, "%s: %.*s\n", role,
+                               (int)message->content.len,
+                               message->content.data) < 0) {
                 return OI_ERR_IO;
             }
         }
-        /* Tool calls carry no content of their own but are part of what the
-         * model can see, so say they happened. */
-        if (message->tool_calls_len > 0 &&
-            fprintf(out, "%s: (%zu tool call%s)\n", role,
-                    message->tool_calls_len,
-                    message->tool_calls_len == 1 ? "" : "s") < 0) {
-            return OI_ERR_IO;
+        for (size_t call_index = 0;
+             call_index < message->tool_calls_len; call_index++) {
+            const struct oi_cli_tool_call_value *call =
+                &message->tool_calls[call_index];
+
+            if (fprintf(out,
+                        "%s tool call:\n"
+                        "  id: %.*s\n"
+                        "  name: %.*s\n"
+                        "  arguments: %.*s\n",
+                        role, (int)call->id.len, call->id.data,
+                        (int)call->name.len, call->name.data,
+                        (int)call->arguments.len,
+                        call->arguments.data) < 0) {
+                return OI_ERR_IO;
+            }
         }
     }
     return fflush(out) != 0 ? OI_ERR_IO : OI_OK;
@@ -1117,6 +1158,7 @@ static oi_status repl_handle_session_delete(
     size_t id_len;
     size_t extra_len;
     char *detail = NULL;
+    char *confirmation = NULL;
     int confirmed = 0;
     int terminate = 0;
     oi_status status;
@@ -1135,10 +1177,14 @@ static oi_status repl_handle_session_delete(
                    ? OI_ERR_IO
                    : OI_OK;
     }
-    status = repl_confirm(composer, signal_fd, "Cancel",
-                          "Permanently delete this trashed session (cannot "
-                          "be undone)",
-                          &confirmed, &terminate);
+    status = repl_confirmation_text(
+        "Permanently delete session ", id, id_len, " (cannot be undone)",
+        &confirmation);
+    if (status == OI_OK) {
+        status = repl_confirm(composer, signal_fd, "Cancel", confirmation,
+                              &confirmed, &terminate);
+    }
+    free(confirmation);
     if (status != OI_OK || terminate) {
         return status;
     }
@@ -1173,6 +1219,7 @@ static oi_status repl_handle_session_import(
     size_t rest_len) {
     char *new_id = NULL;
     char *detail = NULL;
+    char *confirmation = NULL;
     int confirmed = 0;
     int terminate = 0;
     oi_status status;
@@ -1193,10 +1240,13 @@ static oi_status repl_handle_session_import(
                    ? OI_ERR_IO
                    : OI_OK;
     }
-    status = repl_confirm(composer, signal_fd, "Cancel",
-                          "Copy this log into a new session (the original is "
-                          "left unchanged)",
-                          &confirmed, &terminate);
+    status = repl_confirmation_text("Copy '", rest, rest_len,
+                                    "' into a new session", &confirmation);
+    if (status == OI_OK) {
+        status = repl_confirm(composer, signal_fd, "Cancel", confirmation,
+                              &confirmed, &terminate);
+    }
+    free(confirmation);
     if (status != OI_OK || terminate) {
         return status;
     }

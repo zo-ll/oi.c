@@ -187,6 +187,11 @@ TEST(switch_opens_replays_and_restores_the_target) {
     CHECK_STREQ(result.initial_context.items[0].content.data, "question 0");
     CHECK_STREQ(result.initial_context.items[1].content.data, "answer 0");
     CHECK_STREQ(result.initial_context.items[3].content.data, "answer 1");
+    {
+        char expected_path[384];
+        snprintf(expected_path, sizeof expected_path, "%s/%s", root, id);
+        CHECK_STREQ(result.path, expected_path);
+    }
     CHECK(result.metadata_path != NULL);
     CHECK(strstr(result.metadata_path, "metadata.json") != NULL);
     /* The store/state moved out and are usable by the caller. */

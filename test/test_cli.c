@@ -4614,6 +4614,54 @@ static void run_one_interactive_turn(const char *session_root,
     waitpid(server, NULL, 0);
 }
 
+static void run_one_interactive_tool_turn(const char *session_root) {
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_replay\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\\\"printf replay-tool-result\\\"}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"remembered-answer\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    size_t answer_len;
+    char *tool_response = build_chunked_response(
+        tool_sse, strlen(tool_sse), "HTTP/1.1 200 OK", &tool_len);
+    char *answer_response = build_chunked_response(
+        answer_sse, strlen(answer_sse), "HTTP/1.1 200 OK", &answer_len);
+    const char *responses[] = {tool_response, answer_response};
+    size_t lengths[] = {tool_len, answer_len};
+    unsigned short port;
+    pid_t server =
+        start_mock_server_turns(responses, lengths, 2, &port);
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+
+    free(tool_response);
+    free(answer_response);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli_allowing_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "remembered question\r", 20));
+    CHECK(interactive_wait_for(master_fd, &result, "remembered-answer", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        CHECK(WIFEXITED(status));
+        CHECK_EQ(WEXITSTATUS(status), 0);
+    }
+    close(master_fd);
+    waitpid(server, NULL, 0);
+}
+
 TEST(interactive_session_list_and_current_describe_the_active_session) {
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -4677,7 +4725,12 @@ TEST(interactive_session_list_and_current_describe_the_active_session) {
 
     CHECK(write_interactive(master_fd, "/session current\r", 17));
     CHECK(interactive_wait_for(master_fd, &result, "Status: healthy", 1));
-    CHECK(strstr(result.output, "Path: ") != NULL);
+    {
+        char expected_path[640];
+        snprintf(expected_path, sizeof expected_path, "Path: %s/%s",
+                 session_root, ids.items[1]);
+        CHECK(interactive_wait_for(master_fd, &result, expected_path, 1));
+    }
 
     /* Renaming the *other* session shows up in the listing. */
     {
@@ -4740,9 +4793,10 @@ TEST(interactive_session_switch_restores_context_and_offers_replay) {
              "/tmp/oi-cli-session-switch-req-%d", (int)getpid());
     unlink(capture_path);
 
-    /* Session A, with a real exchange in it, from an earlier process. */
-    run_one_interactive_turn(session_root, "remembered question",
-                             "remembered-answer");
+    /* Session A, with a real tool-using exchange in it, from an earlier
+     * process. This also makes the visible replay prove that it does not
+     * collapse model-visible tool details into a mere count. */
+    run_one_interactive_tool_turn(session_root);
     collect_session_ids(session_root, &ids);
     CHECK_EQ(ids.count, 1);
 
@@ -4775,12 +4829,25 @@ TEST(interactive_session_switch_restores_context_and_offers_replay) {
                                1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: remembered-answer",
                                1));
+    CHECK(interactive_wait_for(master_fd, &result, "id: call_replay", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "name: shell", 1));
+    CHECK(interactive_wait_for(
+        master_fd, &result,
+        "arguments: {\"command\":\"printf replay-tool-result\"}", 1));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "tool [call_replay]: replay-tool-result", 1));
 
     /* /session current now reports A. */
     CHECK(write_interactive(master_fd, "/session current\r", 17));
     {
         char expected[128];
         snprintf(expected, sizeof expected, "Session: %s", ids.items[0]);
+        CHECK(interactive_wait_for(master_fd, &result, expected, 1));
+    }
+    {
+        char expected[640];
+        snprintf(expected, sizeof expected, "Path: %s/%s", session_root,
+                 ids.items[0]);
         CHECK(interactive_wait_for(master_fd, &result, expected, 1));
     }
 
@@ -4966,7 +5033,13 @@ TEST(interactive_session_trash_restore_and_confirmed_delete) {
         snprintf(line, sizeof line, "/session delete %s\r", ids.items[0]);
         CHECK(write_interactive(master_fd, line, strlen(line)));
     }
-    CHECK(interactive_wait_for(master_fd, &result, "Permanently delete", 1));
+    {
+        char confirmation[256];
+        snprintf(confirmation, sizeof confirmation,
+                 "Permanently delete session %s (cannot be undone)",
+                 ids.items[0]);
+        CHECK(interactive_wait_for(master_fd, &result, confirmation, 1));
+    }
     /* Cancel at the default selection first -- nothing may be removed. */
     CHECK(write_interactive(master_fd, "\r", 1));
     CHECK(interactive_wait_for(master_fd, &result, "deletion cancelled", 1));
@@ -4984,7 +5057,13 @@ TEST(interactive_session_trash_restore_and_confirmed_delete) {
         snprintf(line, sizeof line, "/session delete %s\r", ids.items[0]);
         CHECK(write_interactive(master_fd, line, strlen(line)));
     }
-    CHECK(interactive_wait_for(master_fd, &result, "Permanently delete", 2));
+    {
+        char confirmation[256];
+        snprintf(confirmation, sizeof confirmation,
+                 "Permanently delete session %s (cannot be undone)",
+                 ids.items[0]);
+        CHECK(interactive_wait_for(master_fd, &result, confirmation, 2));
+    }
     CHECK(write_interactive(master_fd, "2", 1));
     CHECK(interactive_wait_for(master_fd, &result, "deleted session", 1));
     CHECK(access(trashed_dir, F_OK) != 0);
@@ -5066,7 +5145,12 @@ TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
         snprintf(line, sizeof line, "/session import %s\r", source_path);
         CHECK(write_interactive(master_fd, line, strlen(line)));
     }
-    CHECK(interactive_wait_for(master_fd, &result, "Copy this log", 1));
+    {
+        char confirmation[384];
+        snprintf(confirmation, sizeof confirmation,
+                 "Copy '%s' into a new session", source_path);
+        CHECK(interactive_wait_for(master_fd, &result, confirmation, 1));
+    }
     CHECK(write_interactive(master_fd, "\r", 1));
     CHECK(interactive_wait_for(master_fd, &result, "import cancelled", 1));
     /* No message has been sent, so this process has no session of its own
@@ -5080,7 +5164,12 @@ TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
         snprintf(line, sizeof line, "/session import %s\r", source_path);
         CHECK(write_interactive(master_fd, line, strlen(line)));
     }
-    CHECK(interactive_wait_for(master_fd, &result, "Copy this log", 2));
+    {
+        char confirmation[384];
+        snprintf(confirmation, sizeof confirmation,
+                 "Copy '%s' into a new session", source_path);
+        CHECK(interactive_wait_for(master_fd, &result, confirmation, 2));
+    }
     CHECK(write_interactive(master_fd, "2", 1));
     CHECK(interactive_wait_for(master_fd, &result, "imported as session", 1));
     /* The imported session is now selectable. */
