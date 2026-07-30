@@ -107,6 +107,128 @@ TEST(metadata_path_derivation_rules) {
              OI_ERR_INVAL);
 }
 
+/* --- oi_cli_session_id_is_safe / oi_cli_session_resolve --- */
+
+TEST(safe_ids_accept_only_bounded_portable_components) {
+    char overlong[OI_CLI_SESSION_SAFE_ID_MAX_LEN + 2];
+    char at_limit[OI_CLI_SESSION_SAFE_ID_MAX_LEN + 1];
+
+    /* The shape oi actually generates. */
+    CHECK_EQ(oi_cli_session_id_is_safe("20260730-091500-1234-000", 24), 1);
+    CHECK_EQ(oi_cli_session_id_is_safe("a", 1), 1);
+    CHECK_EQ(oi_cli_session_id_is_safe("A_b-9", 5), 1);
+    /* A leading dash is legal: ids never reach an option parser. */
+    CHECK_EQ(oi_cli_session_id_is_safe("-lead", 5), 1);
+
+    CHECK_EQ(oi_cli_session_id_is_safe(NULL, 4), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe("", 0), 0);
+
+    /* Traversal and separators fall out of the charset rule alone. */
+    CHECK_EQ(oi_cli_session_id_is_safe(".", 1), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe("..", 2), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe("../escape", 9), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe("a/b", 3), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe("/abs", 4), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe(".trash", 6), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe(".hidden", 7), 0);
+    /* No '.' at all, so a plausible-looking dotted id is still refused. */
+    CHECK_EQ(oi_cli_session_id_is_safe("history.oilog", 13), 0);
+
+    /* Anything outside [A-Za-z0-9_-]. */
+    CHECK_EQ(oi_cli_session_id_is_safe("has space", 9), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe("semi;colon", 10), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe("new\nline", 8), 0);
+    CHECK_EQ(oi_cli_session_id_is_safe("\x7f", 1), 0);
+    /* High-bit bytes are rejected regardless of char's signedness. */
+    CHECK_EQ(oi_cli_session_id_is_safe("\xc3\xa9", 2), 0);
+
+    /* An embedded NUL cannot be smuggled past by over-reporting id_len:
+     * '\0' simply isn't in the allowed charset. */
+    CHECK_EQ(oi_cli_session_id_is_safe("ok\0hidden", 9), 0);
+    /* ...and the honest prefix of that same buffer is still fine. */
+    CHECK_EQ(oi_cli_session_id_is_safe("ok\0hidden", 2), 1);
+
+    memset(at_limit, 'a', sizeof at_limit - 1);
+    at_limit[sizeof at_limit - 1] = '\0';
+    CHECK_EQ(oi_cli_session_id_is_safe(at_limit,
+                                       OI_CLI_SESSION_SAFE_ID_MAX_LEN),
+             1);
+    memset(overlong, 'a', sizeof overlong - 1);
+    overlong[sizeof overlong - 1] = '\0';
+    CHECK_EQ(oi_cli_session_id_is_safe(overlong,
+                                       OI_CLI_SESSION_SAFE_ID_MAX_LEN + 1),
+             0);
+}
+
+TEST(resolve_accepts_a_real_directory_and_refuses_everything_else) {
+    char root[160];
+    char path[256];
+    char *directory = NULL;
+
+    snprintf(root, sizeof root, "/tmp/oi-session-resolve-%ld", (long)getpid());
+    CHECK(mkdir(root, 0700) == 0 || errno == EEXIST);
+
+    /* A genuine session directory resolves to its joined path. */
+    snprintf(path, sizeof path, "%s/live", root);
+    CHECK(mkdir(path, 0700) == 0 || errno == EEXIST);
+    CHECK_EQ(oi_cli_session_resolve(root, "live", 4, &directory), OI_OK);
+    CHECK_STREQ(directory, path);
+    free(directory);
+    directory = NULL;
+
+    /* Nothing there at all. */
+    CHECK_EQ(oi_cli_session_resolve(root, "absent", 6, &directory),
+             OI_ERR_NOTFOUND);
+    CHECK(directory == NULL);
+
+    /* A symlink pointing at a real directory is refused, not followed --
+     * this is the symlink-escape case. */
+    snprintf(path, sizeof path, "%s/link", root);
+    unlink(path);
+    CHECK_EQ(symlink("/tmp", path), 0);
+    CHECK_EQ(oi_cli_session_resolve(root, "link", 4, &directory),
+             OI_ERR_INVAL);
+    CHECK(directory == NULL);
+    CHECK_EQ(unlink(path), 0);
+
+    /* A dangling symlink is refused as a wrong type, not reported
+     * missing: lstat succeeds on the link itself. */
+    snprintf(path, sizeof path, "%s/dangling", root);
+    unlink(path);
+    CHECK_EQ(symlink("/tmp/oi-does-not-exist-anywhere", path), 0);
+    CHECK_EQ(oi_cli_session_resolve(root, "dangling", 8, &directory),
+             OI_ERR_INVAL);
+    CHECK_EQ(unlink(path), 0);
+
+    /* A stray regular file where a directory belongs. */
+    snprintf(path, sizeof path, "%s/plainfile", root);
+    {
+        FILE *stray = fopen(path, "w");
+        CHECK(stray != NULL);
+        CHECK_EQ(fclose(stray), 0);
+    }
+    CHECK_EQ(oi_cli_session_resolve(root, "plainfile", 9, &directory),
+             OI_ERR_INVAL);
+    CHECK_EQ(unlink(path), 0);
+
+    /* Unsafe ids never reach the filesystem. */
+    CHECK_EQ(oi_cli_session_resolve(root, "..", 2, &directory), OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_session_resolve(root, "a/b", 3, &directory),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_session_resolve(root, "", 0, &directory), OI_ERR_INVAL);
+
+    /* Bad arguments. */
+    CHECK_EQ(oi_cli_session_resolve(NULL, "live", 4, &directory),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_session_resolve("", "live", 4, &directory),
+             OI_ERR_INVAL);
+    CHECK_EQ(oi_cli_session_resolve(root, "live", 4, NULL), OI_ERR_INVAL);
+
+    snprintf(path, sizeof path, "%s/live", root);
+    CHECK_EQ(rmdir(path), 0);
+    CHECK_EQ(rmdir(root), 0);
+}
+
 /* --- oi_cli_session_restore_settings / oi_cli_session_apply_setting --- */
 
 static char *save_cwd(void) { return getcwd(NULL, 0); }
@@ -499,6 +621,8 @@ int main(void) {
     RUN(two_creations_are_unique);
     RUN(bad_arguments_are_rejected);
     RUN(metadata_path_derivation_rules);
+    RUN(safe_ids_accept_only_bounded_portable_components);
+    RUN(resolve_accepts_a_real_directory_and_refuses_everything_else);
     RUN(fresh_session_records_initial_model_and_cwd);
     RUN(unchanged_resume_writes_no_new_records_but_refreshes_metadata);
     RUN(apply_setting_writes_a_record_and_persists_through_restore);

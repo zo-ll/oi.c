@@ -183,6 +183,62 @@ oi_status oi_cli_sessions_default_root(char **out_root) {
     return home_root(out_root);
 }
 
+int oi_cli_session_id_is_safe(const char *id, size_t id_len) {
+    size_t index;
+
+    if (id == NULL || id_len == 0 ||
+        id_len > OI_CLI_SESSION_SAFE_ID_MAX_LEN) {
+        return 0;
+    }
+    for (index = 0; index < id_len; index++) {
+        char byte = id[index];
+        int allowed = (byte >= 'A' && byte <= 'Z') ||
+                      (byte >= 'a' && byte <= 'z') ||
+                      (byte >= '0' && byte <= '9') || byte == '_' ||
+                      byte == '-';
+        if (!allowed) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+oi_status oi_cli_session_resolve(const char *root, const char *id,
+                                 size_t id_len, char **out_directory) {
+    char terminated[OI_CLI_SESSION_SAFE_ID_MAX_LEN + 1];
+    char *directory = NULL;
+    struct stat info;
+    oi_status status;
+
+    if (root == NULL || root[0] == '\0' || out_directory == NULL ||
+        !oi_cli_session_id_is_safe(id, id_len)) {
+        return OI_ERR_INVAL;
+    }
+    /* Bounded by the id_len ceiling oi_cli_session_id_is_safe just
+     * enforced, so this cannot overrun `terminated`. */
+    memcpy(terminated, id, id_len);
+    terminated[id_len] = '\0';
+
+    status = join_path(root, terminated, &directory);
+    if (status != OI_OK) {
+        return status;
+    }
+    if (lstat(directory, &info) != 0) {
+        status = (errno == ENOENT || errno == ENOTDIR) ? OI_ERR_NOTFOUND
+                                                       : OI_ERR_IO;
+        free(directory);
+        return status;
+    }
+    /* S_ISDIR on the lstat result: a symlink -- even one pointing at a
+     * perfectly good directory -- is S_ISLNK here and so refused. */
+    if (!S_ISDIR(info.st_mode)) {
+        free(directory);
+        return OI_ERR_INVAL;
+    }
+    *out_directory = directory;
+    return OI_OK;
+}
+
 oi_status oi_cli_session_location_create(
     const char *root_override,
     struct oi_cli_session_location *out_location) {

@@ -9,6 +9,14 @@
 #include "cli_message.h"
 #include "oi/status.h"
 
+/*
+ * Longest session id the lifecycle commands accept. Deliberately
+ * independent of the internal buffer used to *generate* new ids: an id
+ * that came back off the filesystem is untrusted input, and only has to
+ * be bounded, not necessarily producible by this version of oi.
+ */
+#define OI_CLI_SESSION_SAFE_ID_MAX_LEN 128u
+
 struct oi_cli_session_location {
     char *id;
     char *directory;
@@ -32,6 +40,52 @@ oi_status oi_cli_session_location_create(
 
 /* Returns the caller-owned platform default sessions directory. */
 oi_status oi_cli_sessions_default_root(char **out_root);
+
+/*
+ * Syntax-only check -- never touches the filesystem: is `id` usable as a
+ * single path component directly under the sessions root?
+ *
+ * Accepts 1..OI_CLI_SESSION_SAFE_ID_MAX_LEN bytes drawn only from
+ * [A-Za-z0-9_-]. Leaving '.' and '/' out of that charset is what
+ * structurally rejects "", ".", "..", every hidden entry (including the
+ * ".trash" subdirectory the lifecycle commands keep there), embedded NUL
+ * bytes, and every embedded path separator -- so no separate traversal
+ * check exists, or is wanted, anywhere above this function.
+ *
+ * A leading '-' is accepted: session ids are never handed to an
+ * argv/getopt-style parser, so there is no option-injection reading for
+ * one to be confused with.
+ *
+ * Returns 1 when safe, 0 otherwise (`id == NULL` included).
+ */
+int oi_cli_session_id_is_safe(const char *id, size_t id_len);
+
+/*
+ * Resolves a session id to its live directory under `root`, applying
+ * oi_cli_session_id_is_safe itself -- callers need not pre-validate.
+ *
+ * The entry is checked with lstat(2), never stat(2), and must satisfy
+ * S_ISDIR on that result: a symlink at <root>/<id> therefore fails
+ * outright instead of being followed, which is how an attempt to escape
+ * the sessions root via a planted symlink is refused.
+ *
+ * On OI_OK `*out_directory` is a caller-owned string; on every error it
+ * is left untouched.
+ *
+ *   OI_ERR_INVAL    bad arguments, unsafe id, or the entry exists but is
+ *                   not a plain directory (symlink, regular file, device)
+ *   OI_ERR_NOTFOUND nothing exists at that path
+ *   OI_ERR_IO       lstat(2) failed for any other reason, e.g. EACCES
+ *
+ * Residual TOCTOU, accepted knowingly: a same-privilege local attacker
+ * could swap the directory between this check and a later open of a file
+ * inside it. Closing that would mean threading a dirfd through
+ * oi_sesslog_open and the metadata store -- oi_sesslog_open lives in the
+ * public header include/oi/sesslog.h, which CLI-only lifecycle policy
+ * must not change. Documented rather than half-closed.
+ */
+oi_status oi_cli_session_resolve(const char *root, const char *id,
+                                 size_t id_len, char **out_directory);
 
 /*
  * Derives a session's metadata path from its ".oilog" history path.
