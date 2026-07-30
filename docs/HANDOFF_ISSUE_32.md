@@ -2,6 +2,10 @@
 
 Date: 2026-07-30
 
+> **Completed:** This is a historical mid-implementation handoff. Issue #32
+> was subsequently completed in PR #35. See [TESTING.md](TESTING.md) for the
+> final workflow, architecture, measurements, and verification results.
+
 Repository: `zo-ll/oi.c`
 
 Branch: `issue-32-test-feedback-time`
