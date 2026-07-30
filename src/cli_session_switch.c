@@ -152,14 +152,20 @@ oi_status oi_cli_session_switch(
                                &result.session);
     free(history_path);
     if (status != OI_OK) {
+        result.session = NULL;
+        oi_cli_session_switch_result_free(&result);
+        /* Running out of memory is structural, not a property of the
+         * target: reporting it as "corrupt" would blame a session that is
+         * perfectly fine and hide a real failure from the caller. */
+        if (status == OI_ERR_NOMEM) {
+            return status;
+        }
         /* OI_ERR_EXISTS is the flock already being held -- either by
          * another process, or by this one if the id is somehow already
          * registered. Either way it is not switchable right now. */
         out_result->outcome = status == OI_ERR_EXISTS
                                   ? OI_CLI_SESSION_SWITCH_BUSY
                                   : OI_CLI_SESSION_SWITCH_CORRUPT;
-        result.session = NULL;
-        oi_cli_session_switch_result_free(&result);
         return OI_OK;
     }
 
@@ -197,10 +203,26 @@ oi_status oi_cli_session_switch(
 
     /*
      * restore_settings chdir()s into the target's working directory. If it
-     * fails partway, the caller keeps using the old session, so the process
+     * then fails, the caller keeps using the old session, so the process
      * must not be left standing in the target's directory.
+     *
+     * That rollback is only possible if the current directory is known, so
+     * a getcwd failure refuses the switch outright rather than proceeding
+     * into a chdir it could not undo. Better to decline a switch than to
+     * leave the old session running from an unknown directory.
      */
     saved_cwd = getcwd(NULL, 0);
+    if (saved_cwd == NULL) {
+        oi_session_destroy(registry, result.session);
+        result.session = NULL;
+        oi_cli_session_switch_result_free(&result);
+        if (diagnostics != NULL) {
+            fprintf(diagnostics,
+                    "oi: cannot switch sessions without knowing the current "
+                    "working directory\n");
+        }
+        return OI_ERR_IO;
+    }
     oi_cli_session_restore_init(&restore);
     status = oi_cli_session_restore_settings(
         &result.store, &result.state, result.metadata_path, terminated,
@@ -216,11 +238,16 @@ oi_status oi_cli_session_switch(
     }
     oi_cli_session_restore_free(&restore);
     if (status != OI_OK) {
-        /* Put the process back where the caller left it. If even that
-         * fails the caller must hear about it -- it keeps using the old
-         * session, and would now be doing so from the wrong directory. */
-        if (saved_cwd != NULL && chdir(saved_cwd) != 0 &&
-            diagnostics != NULL) {
+        /*
+         * Put the process back where the caller left it. If even that
+         * fails, the old session cannot safely continue -- it would be
+         * running from the target's directory -- so this stops being a
+         * recoverable business outcome and becomes a real error. Reporting
+         * it as merely "corrupt target" would tell the caller to carry on
+         * in a directory it did not choose.
+         */
+        int restored = chdir(saved_cwd) == 0;
+        if (!restored && diagnostics != NULL) {
             fprintf(diagnostics,
                     "oi: could not return to \"%s\" after a failed session "
                     "switch\n",
@@ -230,6 +257,9 @@ oi_status oi_cli_session_switch(
         oi_session_destroy(registry, result.session);
         result.session = NULL;
         oi_cli_session_switch_result_free(&result);
+        if (!restored) {
+            return OI_ERR_IO;
+        }
         if (status == OI_ERR_NOMEM) {
             return status;
         }

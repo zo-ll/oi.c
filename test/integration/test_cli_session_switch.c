@@ -138,6 +138,8 @@ static void remove_session(const char *root, const char *id) {
     unlink(path);
     snprintf(path, sizeof path, "%s/%s/metadata.json", root, id);
     unlink(path);
+    snprintf(path, sizeof path, "%s/%s/metadata.json.lock", root, id);
+    unlink(path);
     snprintf(path, sizeof path, "%s/%s", root, id);
     rmdir(path);
 }
@@ -490,6 +492,96 @@ TEST(a_failed_switch_leaves_the_working_directory_alone) {
     free(original_cwd);
 }
 
+TEST(a_switch_failing_after_the_target_cwd_is_applied_still_rolls_back) {
+    char *root = test_root("cwd-after");
+    char *start_dir = test_root("cwd-after-start");
+    char *target_dir = test_root("cwd-after-target");
+    char *original_cwd = getcwd(NULL, 0);
+    oi_session_registry *registry = oi_session_registry_create();
+    struct oi_cli_session_switch_result result;
+    char *oversized_model;
+    char *id;
+
+    CHECK(registry != NULL);
+    CHECK(original_cwd != NULL);
+    CHECK(mkdir(start_dir, 0700) == 0 || errno == EEXIST);
+    CHECK(mkdir(target_dir, 0700) == 0 || errno == EEXIST);
+
+    /*
+     * A session with a transition but no durable settings and no metadata
+     * cache, so both model and cwd resolve to the defaults passed in.
+     */
+    {
+        struct oi_cli_session_location location;
+        struct oi_cli_history_store store;
+        struct oi_cli_history_replay_state state;
+        struct oi_cli_history_record record;
+        oi_sesslog *log = NULL;
+
+        oi_cli_session_location_init(&location);
+        CHECK_EQ(oi_cli_session_location_create(root, &location), OI_OK);
+        CHECK_EQ(oi_sesslog_open(location.history_path, &log), OI_OK);
+        oi_cli_history_store_init(&store);
+        oi_cli_history_replay_state_init(&state);
+        CHECK_EQ(oi_cli_history_store_load(log, &store, &state), OI_OK);
+        oi_cli_history_record_init(&record);
+        CHECK_EQ(oi_cli_history_record_set_transition(&record,
+                                                     state.next_record_id, 0),
+                 OI_OK);
+        CHECK_EQ(oi_cli_history_store_append(&store, &record, &state), OI_OK);
+        oi_cli_history_record_free(&record);
+        oi_cli_history_store_free(&store);
+        oi_cli_history_replay_state_free(&state);
+        oi_sesslog_close(log);
+        id = strdup(location.id);
+        CHECK(id != NULL);
+        oi_cli_session_location_free(&location);
+    }
+
+    /*
+     * A default model longer than a durable setting value may be. Settings
+     * restoration chdir()s into the resolved cwd *first* and only then
+     * appends the model record, so this fails strictly after the working
+     * directory has already moved -- the case the earlier rollback test,
+     * which fails before any chdir, does not reach.
+     */
+    oversized_model = malloc(OI_CLI_HISTORY_MAX_SETTING_VALUE + 2);
+    CHECK(oversized_model != NULL);
+    memset(oversized_model, 'm', OI_CLI_HISTORY_MAX_SETTING_VALUE + 1);
+    oversized_model[OI_CLI_HISTORY_MAX_SETTING_VALUE + 1] = '\0';
+
+    CHECK_EQ(chdir(start_dir), 0);
+    oi_cli_session_switch_result_init(&result);
+    CHECK_EQ(oi_cli_session_switch(registry, root, NULL, id, strlen(id),
+                                   oversized_model, target_dir, NULL,
+                                   &result),
+             OI_OK);
+    CHECK(result.outcome != OI_CLI_SESSION_SWITCH_OK);
+    CHECK(result.session == NULL);
+    /* Rolled back out of target_dir, all the way to where we started. */
+    {
+        char now[512];
+        CHECK(getcwd(now, sizeof now) != NULL);
+        CHECK_STREQ(now, start_dir);
+    }
+    /* And nothing was left registered. */
+    CHECK_EQ(registry_size(registry, id), 0u);
+    oi_cli_session_switch_result_free(&result);
+
+    CHECK_EQ(chdir(original_cwd), 0);
+    free(oversized_model);
+    oi_session_registry_destroy(registry);
+    remove_session(root, id);
+    rmdir(root);
+    rmdir(start_dir);
+    rmdir(target_dir);
+    free(id);
+    free(root);
+    free(start_dir);
+    free(target_dir);
+    free(original_cwd);
+}
+
 TEST(switch_repairs_an_interrupted_turn_in_the_target) {
     char *root = test_root("repair");
     char *cwd = getcwd(NULL, 0);
@@ -571,6 +663,7 @@ int main(void) {
     RUN(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing);
     RUN(switch_recovers_a_truncated_tail_but_refuses_an_undecodable_log);
     RUN(a_failed_switch_leaves_the_working_directory_alone);
+    RUN(a_switch_failing_after_the_target_cwd_is_applied_still_rolls_back);
     RUN(switch_repairs_an_interrupted_turn_in_the_target);
     return oi_test_report();
 }

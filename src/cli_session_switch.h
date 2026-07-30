@@ -72,6 +72,13 @@ void oi_cli_session_switch_result_free(
  * returning, so a failed switch does not leave the process sitting in the
  * target's directory while the caller keeps using the old session.
  *
+ * That guarantee is upheld rather than attempted. If the current directory
+ * cannot be read up front, the switch is refused with OI_ERR_IO before any
+ * chdir happens, since a rollback would then be impossible. If the rollback
+ * chdir itself fails, the result is OI_ERR_IO too, not a recoverable
+ * outcome: the caller must not be told to carry on with the old session
+ * from a directory it never chose.
+ *
  * `default_model` and `default_cwd` must both be non-empty; they are the
  * fallbacks used when neither the target's metadata nor its replayed
  * history names one. `diagnostics` may be NULL. `current_session_id` may be
