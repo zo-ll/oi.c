@@ -66,6 +66,17 @@ oi_status oi_cli_session_metadata_encode(
                                   metadata->cwd.len);
     }
     if (st == OI_OK) {
+        st = write_key(writer, "display_name", 12);
+    }
+    if (st == OI_OK) {
+        /* Always emitted, "" when unset, keeping a version 2 object at a
+         * fixed seven fields. */
+        st = oi_json_write_string(writer, metadata->display_name.data == NULL
+                                              ? ""
+                                              : metadata->display_name.data,
+                                  metadata->display_name.len);
+    }
+    if (st == OI_OK) {
         st = write_key(writer, "created_at", 10);
     }
     if (st == OI_OK) {
@@ -181,8 +192,7 @@ oi_status oi_cli_session_metadata_decode(
     }
     oi_json_value *object = oi_json_parser_root(parser);
     if (st == OI_OK &&
-        (object == NULL || oi_json_type_of(object) != OI_JSON_OBJECT ||
-         oi_json_object_len(object) != 6)) {
+        (object == NULL || oi_json_type_of(object) != OI_JSON_OBJECT)) {
         st = OI_ERR_PARSE;
     }
 
@@ -190,16 +200,29 @@ oi_status oi_cli_session_metadata_decode(
     const char *session_id = NULL;
     const char *model = NULL;
     const char *cwd = NULL;
+    const char *display_name = NULL;
     size_t session_id_len = 0;
     size_t model_len = 0;
     size_t cwd_len = 0;
+    size_t display_name_len = 0;
     int64_t created_at = 0;
     int64_t updated_at = 0;
+    if (st == OI_OK && (oi_json_get_number(oi_json_object_get(object,
+                                                             "version"),
+                                           &version) != OI_OK ||
+                        (version != 1 && version != 2))) {
+        st = OI_ERR_PARSE;
+    }
+    /* Exact count per version: version 1 has six fields and version 2
+     * adds display_name for seven. Checking the count this way keeps an
+     * unknown or misspelled key a parse error instead of something
+     * silently ignored, which is the whole point of the strict decode. */
     if (st == OI_OK &&
-        (oi_json_get_number(oi_json_object_get(object, "version"),
-                            &version) != OI_OK ||
-         version != OI_CLI_SESSION_METADATA_SCHEMA_VERSION ||
-         get_string_field(object, "session_id", &session_id,
+        oi_json_object_len(object) != (version == 2 ? 7u : 6u)) {
+        st = OI_ERR_PARSE;
+    }
+    if (st == OI_OK &&
+        (get_string_field(object, "session_id", &session_id,
                           &session_id_len) != OI_OK ||
          get_string_field(object, "model", &model, &model_len) != OI_OK ||
          get_string_field(object, "cwd", &cwd, &cwd_len) != OI_OK ||
@@ -207,13 +230,22 @@ oi_status oi_cli_session_metadata_decode(
          parse_int64_field(object, "updated_at", &updated_at) != OI_OK)) {
         st = OI_ERR_PARSE;
     }
+    if (st == OI_OK && version == 2 &&
+        get_string_field(object, "display_name", &display_name,
+                         &display_name_len) != OI_OK) {
+        st = OI_ERR_PARSE;
+    }
 
     struct oi_cli_session_metadata replacement;
     oi_cli_session_metadata_init(&replacement);
     if (st == OI_OK) {
+        /* Sets the current schema version regardless of what was read, so
+         * a version 1 file comes back as an in-memory version 2 struct
+         * and the next write emits version 2. */
         st = oi_cli_session_metadata_set(&replacement, session_id,
                                          session_id_len, model, model_len,
-                                         cwd, cwd_len, created_at,
+                                         cwd, cwd_len, display_name,
+                                         display_name_len, created_at,
                                          updated_at);
         if (st == OI_ERR_INVAL) {
             st = OI_ERR_PARSE;
