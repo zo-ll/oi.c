@@ -4,8 +4,10 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "cli_command_dispatch.h"
 #include "cli_conversation.h"
 #include "cli_message.h"
+#include "cli_session_switch.h"
 #include "cli_tools.h"
 #include "oi/arena.h"
 #include "oi/llm.h"
@@ -15,6 +17,39 @@
 
 typedef oi_status (*oi_cli_repl_prepare_cb)(void *user_data,
                                             oi_arena **out_arena);
+
+/*
+ * Opens a different session and hands over everything the REPL needs to
+ * adopt it.
+ *
+ * Hard precondition: the caller must have destroyed the live conversation
+ * before invoking this, because a successful switch destroys the old
+ * session's arena -- which the conversation was allocating from. Nothing
+ * may still reference that arena.
+ *
+ * Returns non-OK only for a structural failure. Every refusal a user can
+ * provoke arrives as `out_result->outcome`, so a switch that cannot happen
+ * never ends the REPL. On any non-OK outcome the implementation has already
+ * rolled itself back and the previous session remains open and usable.
+ */
+typedef oi_status (*oi_cli_repl_switch_session_cb)(
+    void *user_data, const char *id, size_t id_len,
+    struct oi_cli_session_switch_result *out_result);
+
+/* Permanently deletes an already-trashed session. Only ever called after
+ * the REPL has obtained an explicit confirmation. */
+typedef oi_status (*oi_cli_repl_delete_session_cb)(void *user_data,
+                                                   const char *id,
+                                                   size_t id_len,
+                                                   char **out_error_detail);
+
+/* Imports a legacy log as a new session, reporting its id. Only ever
+ * called after the REPL has obtained an explicit confirmation. */
+typedef oi_status (*oi_cli_repl_import_session_cb)(void *user_data,
+                                                   const char *path,
+                                                   size_t path_len,
+                                                   char **out_new_id,
+                                                   char **out_error_detail);
 
 /*
  * Durable persistence for a /model or /cwd change, implemented by the
@@ -122,6 +157,25 @@ struct oi_cli_repl_config {
      * runs, since oi_cli_repl_run itself has no replay state to do so. */
     const char *initial_draft;
     size_t initial_draft_len;
+
+    /*
+     * /session's read-only and low-risk subcommands, passed straight
+     * through to cli_command_dispatch. All-NULL leaves /session reporting
+     * that it is unavailable rather than misbehaving.
+     */
+    struct oi_cli_command_session_ops session_ops;
+
+    /*
+     * The three subcommands dispatch cannot serve, because they need the
+     * live conversation or the composer's confirmation flow. Each is NULL
+     * when unavailable.
+     */
+    oi_cli_repl_switch_session_cb switch_session;
+    void *switch_session_user_data;
+    oi_cli_repl_delete_session_cb delete_session;
+    void *delete_session_user_data;
+    oi_cli_repl_import_session_cb import_session;
+    void *import_session_user_data;
 };
 
 oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
