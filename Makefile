@@ -154,9 +154,22 @@ IMPURE_TESTS = \
 	test_llm test_llm_conn test_tool_exec
 
 PURE_TEST_BINS = $(PURE_TESTS:%=$(BUILD)/%)
+IMPURE_TEST_BINS = $(IMPURE_TESTS:%=$(BUILD)/%)
+PURE_TEST_RUNS = $(PURE_TESTS:%=run-%)
 
+.PHONY: $(PURE_TEST_RUNS)
+
+$(PURE_TEST_RUNS): run-%: $(BUILD)/%
+	@echo "== $(BUILD)/$* =="
+	@$(BUILD)/$*
+
+# Unit-test runner. A recursive make lets `make -j check` use its jobserver for
+# the explicitly audited pure binaries. The impure binaries always run in one
+# serial loop afterward, so PTYs, sockets, forks, signals, and other
+# process-global behavior never overlap merely because the build was parallel.
 test: $(TEST_BINS) $(CLI_BIN)
-	@set -e; for t in $(TEST_BINS); do echo "== $$t =="; $$t; done
+	+@$(MAKE) --no-print-directory --output-sync=target $(PURE_TEST_RUNS)
+	@set -e; for t in $(IMPURE_TEST_BINS); do echo "== $$t =="; $$t; done
 
 # The routine edit-test loop: runs deterministic unit tests only, but still
 # builds $(CLI_BIN). Without that dependency this target passes while
@@ -164,7 +177,7 @@ test: $(TEST_BINS) $(CLI_BIN)
 # longer compile, since no pure test links them -- a fast tier that cannot
 # notice a broken build is worse than no fast tier.
 quick: $(PURE_TEST_BINS) $(CLI_BIN)
-	@set -e; for t in $(PURE_TEST_BINS); do echo "== $$t =="; $$t; done
+	+@$(MAKE) --no-print-directory --output-sync=target $(PURE_TEST_RUNS)
 
 # Fails if PURE_TESTS + IMPURE_TESTS stops accounting for every test binary,
 # so a newly added test cannot quietly belong to no tier and go unrun by
@@ -252,7 +265,9 @@ test-integration: $(INTEGRATION_BINS)
 # rather than `test` alone, so instrumentation covers the integration
 # tests too -- they are where the reactor, the socket paths, and the
 # tool subprocesses actually run together.
-check: tier-audit test test-integration
+check: tier-audit
+	+@$(MAKE) --no-print-directory test
+	+@$(MAKE) --no-print-directory test-integration
 
 # The pre-merge and release gate: everything `check` covers, under both
 # compilers and every instrumentation the project has, plus the ABI export
