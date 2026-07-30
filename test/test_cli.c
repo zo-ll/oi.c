@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pty.h>
 #include <signal.h>
 #include <stdint.h>
@@ -187,23 +188,214 @@ static pid_t start_mock_server(const char *response, size_t response_len,
 struct slow_mock_turn {
     const char *response;
     size_t response_len;
-    int delay_seconds;
+    /*
+     * When set, the server accepts and drains the request, announces that on
+     * the control channel, and then holds the response until the test
+     * explicitly releases it. Tests that need a request to still be in flight
+     * -- every cancellation and queueing test here -- use this instead of
+     * guessing how long "in flight" lasts.
+     */
+    int hold;
 };
 
 /*
- * A standalone mock server (not the shared start_mock_server_turns_capture
- * used everywhere else) that sleeps for each turn's delay_seconds after
- * accepting its connection and reading its request, before writing that
- * turn's response -- needed to make a Ctrl+C-during-a-turn test reliably
- * reach the CLI while a request is genuinely still in flight, rather than
- * racing a same-host loopback round trip that would otherwise complete
- * before the test could ever send the signal. Later turns typically use
- * delay_seconds=0 to verify the REPL is still usable after a cancel.
+ * Two pipes joining a test to its mock server, replacing what used to be a
+ * per-turn sleep.
+ *
+ * `accepted` carries one byte per held request the server has accepted and
+ * fully read, so a test can know that request is genuinely in flight rather
+ * than assuming it is by then. `release` carries one byte per held turn,
+ * letting the test decide exactly when the response is allowed to go out.
+ *
+ * Together these make the previously timing-dependent moment -- "the CLI is
+ * mid-request" -- an observed fact on both sides.
  */
-static pid_t start_slow_mock_server_with_notify(
-    const struct slow_mock_turn *turns, size_t turn_count,
-    unsigned short *out_port, int accepted_notify_fd) {
+struct slow_mock_control {
+    int accepted; /* read end */
+    int release;  /* write end */
+    /*
+     * Held requests observed via slow_mock_wait_accepted that have not yet
+     * been paired with a slow_mock_release call. Unheld requests never enter
+     * this count, so every credit corresponds to exactly one response blocked
+     * on the release pipe.
+     */
+    size_t accepted_unreleased;
+};
+
+/*
+ * Blocks until the server reports `count` more accepted requests.
+ *
+ * This is the barrier that makes a held turn mean anything. Terminal output
+ * such as the "\r\n" a submission echoes only proves the CLI rendered
+ * something; it says nothing about whether the HTTP request has reached the
+ * server. Releasing before that point is a silent no-op -- the byte waits in
+ * the pipe and the server consumes it the moment it accepts, holding
+ * nothing -- so every held turn must be waited for here first.
+ *
+ * Bounded, and fails the test rather than hanging the suite if the request
+ * never arrives.
+ */
+static void slow_mock_wait_accepted(struct slow_mock_control *control,
+                                    size_t count) {
+    size_t received = 0;
+
+    while (received < count) {
+        struct pollfd descriptor;
+        char byte;
+        ssize_t n;
+
+        descriptor.fd = control->accepted;
+        descriptor.events = POLLIN;
+        descriptor.revents = 0;
+        if (poll(&descriptor, 1, 20000) <= 0) {
+            fprintf(stderr,
+                    "[slow_mock] timed out waiting for accepted request "
+                    "%zu of %zu\n",
+                    received + 1, count);
+            fflush(stderr);
+            CHECK(0);
+            return;
+        }
+        n = read(control->accepted, &byte, 1);
+        if (n != 1) {
+            fprintf(stderr,
+                    "[slow_mock] accepted channel %s after %zu of %zu\n",
+                    n == 0 ? "hit EOF (server gone)" : "failed", received,
+                    count);
+            fflush(stderr);
+            CHECK(0);
+            return;
+        }
+        received++;
+        control->accepted_unreleased++;
+    }
+}
+
+/*
+ * Lets one held turn send its response.
+ *
+ * Requires a prior slow_mock_wait_accepted to have observed the request this
+ * release is meant to unblock. Without that ordering the release byte would
+ * simply sit in the pipe and be consumed the instant the server accepts,
+ * holding nothing -- so this asserts the credit exists instead of allowing
+ * that silent no-op.
+ */
+static void slow_mock_release(struct slow_mock_control *control) {
+    ssize_t n;
+
+    if (control->accepted_unreleased == 0) {
+        CHECK(control->accepted_unreleased > 0);
+        return;
+    }
+    n = write(control->release, "r", 1);
+    CHECK(n == 1);
+    if (n == 1) {
+        control->accepted_unreleased--;
+    }
+}
+
+static void slow_mock_control_free(struct slow_mock_control *control) {
+    if (control->accepted >= 0) {
+        close(control->accepted);
+        control->accepted = -1;
+    }
+    if (control->release >= 0) {
+        close(control->release);
+        control->release = -1;
+    }
+}
+
+/*
+ * A standalone mock server (not the shared start_mock_server_turns_capture
+ * used everywhere else) that can hold a turn's response open indefinitely,
+ * so a Ctrl+C-during-a-turn test reaches the CLI while a request is genuinely
+ * still in flight rather than racing a same-host loopback round trip.
+ *
+ * This used to sleep for a fixed number of seconds per turn, which was both a
+ * guess and expensive -- 28 s of the 34 s this file took to run. The response
+ * is now held until the test releases it, which is exact rather than
+ * approximate: the window cannot close early on a slow machine, and costs
+ * nothing on a fast one. Turns with `hold` unset respond immediately, which
+ * is how the "REPL still works after a cancel" half of these tests runs.
+ *
+ * The wait is bounded so a test that forgets to release fails on the usual
+ * 20 s test timeout instead of hanging the suite forever.
+ */
+/* Distinct exit codes so a control-channel failure inside the forked server
+ * reaches the test as a real failure rather than a warning nobody reads. */
+#define SLOW_MOCK_EXIT_OK 0
+#define SLOW_MOCK_EXIT_NO_CONNECTION 2
+#define SLOW_MOCK_EXIT_CONTROL 3
+
+/*
+ * Waits for exactly one release byte. Fails closed: a timeout, an EOF (the
+ * parent closed its end, usually because the test died), a read error, or a
+ * short read all mean "do not send this response". Sending it anyway would
+ * turn a broken control channel into a passing test.
+ */
+static int slow_mock_await_release(int release_fd, size_t turn) {
+    fd_set release_set;
+    struct timeval timeout = {20, 0};
+    char token;
+    ssize_t got;
+    int ready;
+
+    FD_ZERO(&release_set);
+    FD_SET(release_fd, &release_set);
+    ready = select(release_fd + 1, &release_set, NULL, NULL, &timeout);
+    if (ready <= 0) {
+        fprintf(stderr,
+                "[mock_server] turn %zu was never released (select rc=%d)\n",
+                turn, ready);
+        fflush(stderr);
+        return 0;
+    }
+    got = read(release_fd, &token, 1);
+    if (got != 1) {
+        fprintf(stderr,
+                "[mock_server] turn %zu release channel %s (read rc=%zd)\n",
+                turn, got == 0 ? "hit EOF" : "failed", got);
+        fflush(stderr);
+        return 0;
+    }
+    return 1;
+}
+
+/*
+ * A standalone mock server (not the shared start_mock_server_turns_capture
+ * used everywhere else) that can hold a turn's response open indefinitely, so
+ * a Ctrl+C-during-a-turn test reaches the CLI while a request is genuinely
+ * still in flight rather than racing a same-host loopback round trip.
+ *
+ * This used to sleep a fixed number of seconds per turn, which was both a
+ * guess and expensive -- 28 s of the 34 s this file took to run. Two pipes
+ * replace it:
+ *
+ *   accepted -- one byte per held request the server has accepted and fully
+ *               read, so a test can wait until that request really is in
+ *               flight;
+ *   release  -- one byte per held turn, letting the test say when the
+ *               response may go out.
+ *
+ * Both are needed. Releasing without first waiting on `accepted` is a silent
+ * no-op: the byte simply sits in the pipe, and the server consumes it the
+ * instant it accepts, holding nothing. slow_mock_wait_accepted exists so that
+ * ordering is explicit at every call site.
+ *
+ * The parent keeps accepted[0] and release[1]; the child keeps accepted[1]
+ * and release[0]. Each side closes the two ends it does not own, so a dead
+ * peer shows up as EOF instead of a descriptor kept alive by the other
+ * process.
+ */
+static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
+                                    size_t turn_count,
+                                    unsigned short *out_port,
+                                    struct slow_mock_control *out_control) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int accepted_pipe[2];
+    int release_pipe[2];
+    pid_t pid;
+
     CHECK(listen_fd >= 0);
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
@@ -220,9 +412,20 @@ static pid_t start_slow_mock_server_with_notify(
     CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
     *out_port = ntohs(addr.sin_port);
 
-    pid_t pid = fork();
+    CHECK_EQ(pipe(accepted_pipe), 0);
+    CHECK_EQ(pipe(release_pipe), 0);
+
+    pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
+        int exit_code = SLOW_MOCK_EXIT_OK;
+
+        /* Ends the child does not own. Without this the child would keep the
+         * release *writer* alive, so the parent closing its end would never
+         * produce EOF. */
+        close(accepted_pipe[0]);
+        close(release_pipe[1]);
+
         signal(SIGPIPE, SIG_IGN);
         for (size_t i = 0; i < turn_count; i++) {
             fd_set rfds;
@@ -235,17 +438,29 @@ static pid_t start_slow_mock_server_with_notify(
                       ? accept(listen_fd, NULL, NULL)
                       : -1;
             if (cfd < 0) {
+                fprintf(stderr,
+                        "[mock_server] gave up waiting for a connection on "
+                        "turn %zu\n",
+                        i);
+                fflush(stderr);
+                exit_code = SLOW_MOCK_EXIT_NO_CONNECTION;
                 break;
             }
             drain_request(cfd, -1);
-            if (accepted_notify_fd >= 0) {
+            if (turns[i].hold) {
                 char notification = 'A';
-                ssize_t unused =
-                    write(accepted_notify_fd, &notification, 1);
-                (void)unused;
-            }
-            if (turns[i].delay_seconds > 0) {
-                sleep((unsigned)turns[i].delay_seconds);
+                ssize_t sent = write(accepted_pipe[1], &notification, 1);
+
+                if (sent != 1) {
+                    exit_code = SLOW_MOCK_EXIT_CONTROL;
+                    close(cfd);
+                    break;
+                }
+                if (!slow_mock_await_release(release_pipe[0], i)) {
+                    exit_code = SLOW_MOCK_EXIT_CONTROL;
+                    close(cfd);
+                    break;
+                }
             }
             size_t off = 0;
             while (off < turns[i].response_len) {
@@ -258,20 +473,53 @@ static pid_t start_slow_mock_server_with_notify(
             }
             close(cfd);
         }
-        if (accepted_notify_fd >= 0) {
-            close(accepted_notify_fd);
-        }
+        close(accepted_pipe[1]);
+        close(release_pipe[0]);
         close(listen_fd);
-        _exit(0);
+        _exit(exit_code);
     }
+
+    /* Ends the parent does not own, for the same reason. */
+    close(accepted_pipe[1]);
+    close(release_pipe[0]);
     close(listen_fd);
+    out_control->accepted = accepted_pipe[0];
+    out_control->release = release_pipe[1];
     return pid;
 }
 
-static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
-                                    size_t turn_count,
-                                    unsigned short *out_port) {
-    return start_slow_mock_server_with_notify(turns, turn_count, out_port, -1);
+/*
+ * Reaps a server that should have served every turn and exited on its own.
+ * A control-channel failure inside the child surfaces here.
+ */
+static void slow_mock_server_expect_clean_exit(pid_t server) {
+    int status = 0;
+
+    CHECK_EQ(waitpid(server, &status, 0), server);
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), SLOW_MOCK_EXIT_OK);
+}
+
+/*
+ * Reaps a server the test deliberately terminates during cleanup, typically
+ * because turns were left unserved. Dying by our own SIGTERM is expected and
+ * fine; a clean exit is only fine if it reports SLOW_MOCK_EXIT_OK. Any other
+ * outcome -- exiting with a failure code, or dying from a different signal
+ * such as SIGSEGV or SIGABRT because the child had already crashed -- is a
+ * real failure and must not be waved through just because the process is
+ * gone.
+ */
+static void slow_mock_server_terminate(pid_t server) {
+    int status = 0;
+
+    CHECK_EQ(kill(server, SIGTERM), 0);
+    CHECK_EQ(waitpid(server, &status, 0), server);
+    if (WIFEXITED(status)) {
+        CHECK_EQ(WEXITSTATUS(status), SLOW_MOCK_EXIT_OK);
+    } else {
+        CHECK(WIFSIGNALED(status));
+        CHECK_EQ(WTERMSIG(status), SIGTERM);
+    }
 }
 
 /*
@@ -438,19 +686,6 @@ static int write_interactive(int fd, const char *data, size_t len) {
             return 0;
         }
         written += (size_t)result;
-    }
-    return 1;
-}
-
-static int read_exact(int fd, char *data, size_t len) {
-    size_t received = 0;
-
-    while (received < len) {
-        ssize_t result = read(fd, data + received, len - received);
-        if (result <= 0) {
-            return 0;
-        }
-        received += (size_t)result;
     }
     return 1;
 }
@@ -1345,6 +1580,7 @@ TEST(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt) {
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
@@ -1352,11 +1588,11 @@ TEST(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt) {
 
     turns[0].response = reply;
     turns[0].response_len = reply_len;
-    turns[0].delay_seconds = 3;
+    turns[0].hold = 1;
     turns[1].response = reply;
     turns[1].response_len = reply_len;
-    turns[1].delay_seconds = 0;
-    server = start_slow_mock_server(turns, 2, &port);
+    turns[1].hold = 0;
+    server = start_slow_mock_server(turns, 2, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     snprintf(session_root, sizeof session_root, "/tmp/oi-cli-sigint-req-%d",
@@ -1378,8 +1614,17 @@ TEST(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt) {
      * race and no further discard risk -- the mock server's 3s delay only
      * needs to outlast the turn's own setup, not this wait. */
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK_EQ(kill(cli, SIGINT), 0);
     CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
+    /* Released only now. Writing the keystroke or signal above does not
+     * mean the CLI has acted on it -- releasing then lets the response
+     * win the race and the turn completes instead of cancelling. The
+     * observed effect is the barrier. */
+    slow_mock_release(&control);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -1391,8 +1636,8 @@ TEST(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt) {
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    kill(server, SIGTERM);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_terminate(server);
     free(reply);
 
     {
@@ -1633,27 +1878,70 @@ TEST(ctrl_d_during_a_turn_has_no_effect) {
      * SUBMIT) is a deliberate no-op while busy: there is no queue or
      * "exit at the next safe boundary" logic wired up yet to act on it.
      * The turn completes normally and the REPL is left exactly as if
-     * Ctrl+D had never been sent. */
-    const char *reply_sse =
+     * Ctrl+D had never been sent.
+     *
+     * Writing Ctrl+D to the PTY only proves the byte reached the kernel,
+     * not that the CLI's busy input loop actually processed it -- a
+     * response released immediately afterward could still win that race
+     * and pass without exercising the intended behavior. Worse, a second
+     * write issued too soon after Ctrl+D can land in the same read() burst
+     * as the Ctrl+D byte itself: oi_cli_composer_feed decodes one decisive
+     * action per read() and stops there, so if Ctrl+D and a follow-up both
+     * arrive before the CLI's next read(), the follow-up's bytes are left
+     * sitting in the composer's buffer, unprocessed, until unrelated
+     * further input happens to arrive -- silently testing nothing.
+     *
+     * handle_turn_input sets context->dirty = 1 unconditionally, before
+     * looking at what it decoded, and the turn-stepping loop erases and
+     * redraws the composer whenever a step touched it -- so even Ctrl+D's
+     * no-op still produces a fresh "\x1b[J" erase on screen. While this
+     * turn is held, no other reactor-registered source can fire (no new
+     * HTTP bytes, no pending resize), so a new erase can only mean the
+     * pty input was just read. Waiting for one more erase than had already
+     * appeared before the Ctrl+D write, before sending anything else, is
+     * what proves the CLI's own read() already consumed the Ctrl+D byte --
+     * making it impossible for the follow-up to land in the same read().
+     *
+     * With that established, submitting a visible follow-up ("world")
+     * while the turn is still held and waiting for "oi: queued" proves the
+     * busy input loop kept running afterward rather than exiting or
+     * otherwise breaking out of it. Releasing then lets both the current
+     * turn and the queued one complete normally, matching
+     * queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids's
+     * two-turn shape. */
+    const char *first_reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
         "\"recovered\"}}]}\n\n"
         "data: [DONE]\n\n";
-    size_t reply_len;
-    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
-                                         "HTTP/1.1 200 OK", &reply_len);
-    struct slow_mock_turn turns[1];
+    const char *second_reply_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"secondreply\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t first_len;
+    size_t second_len;
+    char *first_reply = build_chunked_response(
+        first_reply_sse, strlen(first_reply_sse), "HTTP/1.1 200 OK",
+        &first_len);
+    char *second_reply = build_chunked_response(
+        second_reply_sse, strlen(second_reply_sse), "HTTP/1.1 200 OK",
+        &second_len);
+    struct slow_mock_turn turns[2];
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
     char session_root[128];
 
-    turns[0].response = reply;
-    turns[0].response_len = reply_len;
-    turns[0].delay_seconds = 2;
-    server = start_slow_mock_server(turns, 1, &port);
+    turns[0].response = first_reply;
+    turns[0].response_len = first_len;
+    turns[0].hold = 1;
+    turns[1].response = second_reply;
+    turns[1].response_len = second_len;
+    turns[1].hold = 0;
+    server = start_slow_mock_server(turns, 2, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     snprintf(session_root, sizeof session_root, "/tmp/oi-cli-ctrl-d-turn-%d",
@@ -1667,8 +1955,29 @@ TEST(ctrl_d_during_a_turn_has_no_effect) {
      * returns) proves the turn has actually started before sending Ctrl+D
      * mid-turn, matching the same reasoning used for SIGINT above. */
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    CHECK(write_interactive(master_fd, "\x04", 1));
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
+    {
+        size_t erases_before_ctrl_d = count_text(result.output, "\x1b[J");
+
+        CHECK(write_interactive(master_fd, "\x04", 1));
+        CHECK(interactive_wait_for(master_fd, &result, "\x1b[J",
+                                   erases_before_ctrl_d + 1));
+    }
+    /* If Ctrl+D had exited or otherwise broken the busy input loop, this
+     * submission would never be observed and the wait below would time
+     * out -- that is the observable consequence proving Ctrl+D was
+     * processed mid-turn rather than merely written. */
+    CHECK(write_interactive(master_fd, "world\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+    slow_mock_release(&control);
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
+    /* The queued message runs immediately once the first turn finishes,
+     * with no further input from us -- confirming normal completion and
+     * queued-turn behavior, not just that the queue slot was reached. */
+    CHECK(interactive_wait_for(master_fd, &result, "secondreply", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
     {
@@ -1678,9 +1987,10 @@ TEST(ctrl_d_during_a_turn_has_no_effect) {
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    kill(server, SIGTERM);
-    waitpid(server, NULL, 0);
-    free(reply);
+    slow_mock_control_free(&control);
+    slow_mock_server_expect_clean_exit(server);
+    free(first_reply);
+    free(second_reply);
 
     {
         DIR *directory = opendir(session_root);
@@ -1836,6 +2146,7 @@ TEST(typed_ctrl_c_during_a_turn_cancels_it) {
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
@@ -1843,11 +2154,11 @@ TEST(typed_ctrl_c_during_a_turn_cancels_it) {
 
     turns[0].response = reply;
     turns[0].response_len = reply_len;
-    turns[0].delay_seconds = 3;
+    turns[0].hold = 1;
     turns[1].response = reply;
     turns[1].response_len = reply_len;
-    turns[1].delay_seconds = 0;
-    server = start_slow_mock_server(turns, 2, &port);
+    turns[1].hold = 0;
+    server = start_slow_mock_server(turns, 2, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     snprintf(session_root, sizeof session_root, "/tmp/oi-cli-typed-ctrl-c-%d",
@@ -1858,8 +2169,17 @@ TEST(typed_ctrl_c_during_a_turn_cancels_it) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
+    /* Released only now. Writing the keystroke or signal above does not
+     * mean the CLI has acted on it -- releasing then lets the response
+     * win the race and the turn completes instead of cancelling. The
+     * observed effect is the barrier. */
+    slow_mock_release(&control);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -1871,8 +2191,8 @@ TEST(typed_ctrl_c_during_a_turn_cancels_it) {
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    kill(server, SIGTERM);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_terminate(server);
     free(reply);
 
     {
@@ -1922,6 +2242,7 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
@@ -1929,8 +2250,8 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
 
     turns[0].response = reply;
     turns[0].response_len = reply_len;
-    turns[0].delay_seconds = 2;
-    server = start_slow_mock_server(turns, 1, &port);
+    turns[0].hold = 1;
+    server = start_slow_mock_server(turns, 1, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     snprintf(session_root, sizeof session_root, "/tmp/oi-cli-queue-slot-%d",
@@ -1943,6 +2264,10 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
 
     /* First submission while busy: accepted into the one pending slot. */
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
 
@@ -1961,6 +2286,8 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
     CHECK(write_interactive(master_fd, "another\r", 8));
     CHECK(interactive_wait_for(
         master_fd, &result, "oi: a message is already queued", 1));
+        /* Everything that needed the slot occupied has now been observed. */
+        slow_mock_release(&control);
 
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
     /* "another" is still sitting in the draft (the refusal above left it
@@ -1979,7 +2306,8 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_expect_clean_exit(server);
     free(reply);
 
     {
@@ -2210,6 +2538,7 @@ TEST(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids) {
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
@@ -2221,11 +2550,11 @@ TEST(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids) {
      * once the first reaches its safe boundary. */
     turns[0].response = first_reply;
     turns[0].response_len = first_len;
-    turns[0].delay_seconds = 2;
+    turns[0].hold = 1;
     turns[1].response = second_reply;
     turns[1].response_len = second_len;
-    turns[1].delay_seconds = 0;
-    server = start_slow_mock_server(turns, 2, &port);
+    turns[1].hold = 0;
+    server = start_slow_mock_server(turns, 2, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     snprintf(session_root, sizeof session_root, "/tmp/oi-cli-queue-resume-%d",
@@ -2237,8 +2566,14 @@ TEST(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids) {
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
 
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+    /* Queued while busy; the turn may now complete and drain it. */
+    slow_mock_release(&control);
 
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
     /* The queued message runs immediately once the first turn finishes,
@@ -2254,7 +2589,8 @@ TEST(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids) {
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_expect_clean_exit(server);
     free(first_reply);
     free(second_reply);
 
@@ -2348,6 +2684,7 @@ TEST(queued_command_while_busy_resolves_discarded_and_dispatches_live) {
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
@@ -2355,8 +2692,8 @@ TEST(queued_command_while_busy_resolves_discarded_and_dispatches_live) {
 
     turns[0].response = reply;
     turns[0].response_len = reply_len;
-    turns[0].delay_seconds = 2;
-    server = start_slow_mock_server(turns, 1, &port);
+    turns[0].hold = 1;
+    server = start_slow_mock_server(turns, 1, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     snprintf(session_root, sizeof session_root, "/tmp/oi-cli-queue-cmd-%d",
@@ -2371,8 +2708,14 @@ TEST(queued_command_while_busy_resolves_discarded_and_dispatches_live) {
     /* /model is not read-only (unlike /help and /status): it queues like
      * any plain message while busy, per the schema-forced rule that a
      * queued command can only ever resolve DISCARDED, then dispatch live. */
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "/model gpt-test\r", 17));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+    /* Queued while busy; the turn may now complete and drain it. */
+    slow_mock_release(&control);
 
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
     /* Once the turn reaches its safe boundary, the queued command
@@ -2392,7 +2735,8 @@ TEST(queued_command_while_busy_resolves_discarded_and_dispatches_live) {
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_expect_clean_exit(server);
     free(reply);
 
     {
@@ -2460,6 +2804,7 @@ TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
@@ -2469,8 +2814,8 @@ TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
      * genuinely still in flight, not for the full delay to elapse. */
     turns[0].response = reply;
     turns[0].response_len = reply_len;
-    turns[0].delay_seconds = 3;
-    server = start_slow_mock_server(turns, 1, &port);
+    turns[0].hold = 1;
+    server = start_slow_mock_server(turns, 1, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     snprintf(session_root, sizeof session_root, "/tmp/oi-cli-queue-ctrlc-%d",
@@ -2488,6 +2833,10 @@ TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
      * actually echoed while being typed here (the whole "world\r" is
      * decoded and submitted within a single step). It only appears once
      * it's restored below. */
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
 
@@ -2498,6 +2847,11 @@ TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
     CHECK(interactive_wait_for(
         master_fd, &result, "oi: queued input discarded", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
+    /* Released only now. Writing the keystroke or signal above does not
+     * mean the CLI has acted on it -- releasing then lets the response
+     * win the race and the turn completes instead of cancelling. The
+     * observed effect is the barrier. */
+    slow_mock_release(&control);
     /* "world" is echoed here for the only time in this whole session, as
      * the restored draft is redrawn -- proving it came back rather than
      * being dropped. */
@@ -2516,8 +2870,8 @@ TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    kill(server, SIGTERM);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_terminate(server);
     free(reply);
 
     {
@@ -2594,6 +2948,7 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
@@ -2611,8 +2966,8 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
      * no graceful shutdown at all) while it's still sitting unresolved. */
     turns[0].response = reply;
     turns[0].response_len = reply_len;
-    turns[0].delay_seconds = 5;
-    server = start_slow_mock_server(turns, 1, &port);
+    turns[0].hold = 1;
+    server = start_slow_mock_server(turns, 1, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     cli = start_interactive_cli_with_session(port, slave_fd, session_dir,
@@ -2622,14 +2977,20 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
 
     CHECK_EQ(kill(cli, SIGKILL), 0);
+    /* The CLI is gone; release so the server loop can finish. */
+    slow_mock_release(&control);
     waitpid(cli, NULL, 0);
     close(master_fd);
-    kill(server, SIGTERM);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_terminate(server);
     free(reply);
 
     /* Second "life": same session, fresh process -- the crash-recovery
@@ -3408,6 +3769,7 @@ TEST(sigterm_during_a_turn_terminates_cleanly) {
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
@@ -3418,8 +3780,8 @@ TEST(sigterm_during_a_turn_terminates_cleanly) {
      * mock server is killed once the test is done with it regardless. */
     turns[0].response = reply;
     turns[0].response_len = reply_len;
-    turns[0].delay_seconds = 3;
-    server = start_slow_mock_server(turns, 1, &port);
+    turns[0].hold = 1;
+    server = start_slow_mock_server(turns, 1, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     snprintf(session_root, sizeof session_root,
@@ -3437,17 +3799,26 @@ TEST(sigterm_during_a_turn_terminates_cleanly) {
      * callback rather than raced against the idle-prompt's own signal
      * draining. */
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK_EQ(kill(cli, SIGTERM), 0);
 
     {
         int status = 0;
         CHECK_EQ(waitpid(cli, &status, 0), cli);
+        /* Released only now. Writing the keystroke or signal above does not
+         * mean the CLI has acted on it -- releasing then lets the response
+         * win the race and the turn completes instead of cancelling. The
+         * observed effect is the barrier. */
+        slow_mock_release(&control);
         result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    kill(server, SIGTERM);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_terminate(server);
     free(reply);
 
     {
@@ -3997,6 +4368,7 @@ TEST(compact_typed_while_a_turn_is_active_queues_and_runs_next) {
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
     struct interactive_result result;
@@ -4010,11 +4382,11 @@ TEST(compact_typed_while_a_turn_is_active_queues_and_runs_next) {
      * which relies on the same "first ever submission" property). */
     turns[0].response = first;
     turns[0].response_len = first_len;
-    turns[0].delay_seconds = 3;
+    turns[0].hold = 1;
     turns[1].response = summary;
     turns[1].response_len = summary_len;
-    turns[1].delay_seconds = 0;
-    server = start_slow_mock_server(turns, 2, &port);
+    turns[1].hold = 0;
+    server = start_slow_mock_server(turns, 2, &port, &control);
 
     snprintf(session_root, sizeof session_root, "/tmp/oi-cli-compact-queue-%d",
              (int)getpid());
@@ -4030,8 +4402,14 @@ TEST(compact_typed_while_a_turn_is_active_queues_and_runs_next) {
     /* Queues /compact while the only turn so far is still in flight --
      * once it completes there's exactly 1 turn, so /compact 0 (compact
      * everything) is what actually has something to do. */
+    /* The request is on the wire, not merely rendered: without this
+     * barrier the release below would be consumed the instant the
+     * server accepts, holding nothing. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "/compact 0\r", 11));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+    /* /compact queued while busy; the turn may now complete. */
+    slow_mock_release(&control);
 
     CHECK(interactive_wait_for(master_fd, &result, "first reply", 1));
     CHECK(interactive_wait_for(
@@ -4045,7 +4423,8 @@ TEST(compact_typed_while_a_turn_is_active_queues_and_runs_next) {
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_expect_clean_exit(server);
     free(first);
     free(summary);
 
@@ -4201,15 +4580,15 @@ TEST(typed_ctrl_c_cancels_compaction_and_returns_to_the_prompt) {
     struct slow_mock_turn turns[4] = {
         {first, first_len, 0},
         {second, second_len, 0},
-        {summary, summary_len, 3},
+        {summary, summary_len, 1},
         {third, third_len, 0},
     };
     unsigned short port;
     pid_t server;
     pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
     int master_fd = -1;
     int slave_fd = -1;
-    int accepted_pipe[2] = {-1, -1};
     struct interactive_result result;
     char session_dir[] = "/tmp";
     char session_name[64];
@@ -4221,11 +4600,7 @@ TEST(typed_ctrl_c_cancels_compaction_and_returns_to_the_prompt) {
              session_name);
     unlink(log_path);
 
-    CHECK_EQ(pipe(accepted_pipe), 0);
-    server = start_slow_mock_server_with_notify(turns, 4, &port,
-                                                accepted_pipe[1]);
-    close(accepted_pipe[1]);
-    accepted_pipe[1] = -1;
+    server = start_slow_mock_server(turns, 4, &port, &control);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     cli = start_interactive_cli_with_session(port, slave_fd, session_dir,
@@ -4239,14 +4614,17 @@ TEST(typed_ctrl_c_cancels_compaction_and_returns_to_the_prompt) {
     CHECK(interactive_wait_for(master_fd, &result, "second reply", 1));
 
     CHECK(write_interactive(master_fd, "/compact 1\r", 11));
-    {
-        char accepted[3];
-        CHECK(read_exact(accepted_pipe[0], accepted, sizeof accepted));
-    }
+    /* Only held requests produce acceptance credits. The two completed
+     * ordinary turns cannot accidentally authorize this release; this credit
+     * belongs specifically to the in-flight compaction request. */
+    slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(interactive_wait_for(master_fd, &result,
                                "oi: compaction cancelled", 1));
 
+    /* Cancelled, so its response is moot -- but the server serves turns in
+     * order and the next message needs the one after it. */
+    slow_mock_release(&control);
     CHECK(write_interactive(master_fd, "third message\r", 14));
     CHECK(interactive_wait_for(master_fd, &result, "third reply", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -4257,9 +4635,8 @@ TEST(typed_ctrl_c_cancels_compaction_and_returns_to_the_prompt) {
     }
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
-    close(accepted_pipe[0]);
-    kill(server, SIGTERM);
-    waitpid(server, NULL, 0);
+    slow_mock_control_free(&control);
+    slow_mock_server_terminate(server);
 
     {
         struct oilog_records records;
@@ -5217,6 +5594,197 @@ TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
     rmdir(session_root);
 }
 
+/* --- the mock server's own control channel --- */
+
+/* Opens a connection to the mock server and sends a minimal request, so a
+ * test can exercise the hold/release handshake without a CLI in the way. */
+static int slow_mock_client_request(unsigned short port) {
+    struct sockaddr_in addr;
+    static const char request[] = "POST /v1/chat/completions HTTP/1.1\r\n\r\n";
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    CHECK(fd >= 0);
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    CHECK_EQ(connect(fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(write(fd, request, sizeof request - 1),
+             (ssize_t)(sizeof request - 1));
+    return fd;
+}
+
+static int slow_mock_readable_within(int fd, int timeout_ms) {
+    struct pollfd descriptor;
+
+    descriptor.fd = fd;
+    descriptor.events = POLLIN;
+    descriptor.revents = 0;
+    return poll(&descriptor, 1, timeout_ms) > 0;
+}
+
+TEST(mock_control_holds_a_response_until_it_is_released) {
+    const char *body = "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(body, strlen(body),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[1];
+    struct slow_mock_control control = {-1, -1, 0};
+    unsigned short port;
+    pid_t server;
+    int client;
+
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].hold = 1;
+    server = start_slow_mock_server(turns, 1, &port, &control);
+    client = slow_mock_client_request(port);
+
+    /* Accepted and fully read, so the request really is in flight. */
+    slow_mock_wait_accepted(&control, 1);
+    /* ...and nothing comes back while the turn is held. This is the property
+     * the cancellation tests depend on. */
+    CHECK(!slow_mock_readable_within(client, 300));
+
+    slow_mock_release(&control);
+    CHECK(slow_mock_readable_within(client, 20000));
+
+    close(client);
+    slow_mock_control_free(&control);
+    slow_mock_server_expect_clean_exit(server);
+    free(reply);
+}
+
+TEST(mock_control_release_before_acceptance_is_rejected) {
+    const char *body = "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(body, strlen(body),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[2];
+    struct slow_mock_control control = {-1, -1, 0};
+    unsigned short port;
+    pid_t server;
+    pid_t checker;
+    int client;
+
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].hold = 0;
+    turns[1].response = reply;
+    turns[1].response_len = reply_len;
+    turns[1].hold = 1;
+    server = start_slow_mock_server(turns, 2, &port, &control);
+
+    /*
+     * Complete an unheld request first. It must not create a release credit:
+     * only requests whose responses are actually blocked can authorize a
+     * slow_mock_release call.
+     */
+    client = slow_mock_client_request(port);
+    CHECK(slow_mock_readable_within(client, 20000));
+    close(client);
+
+    /*
+     * Releasing before the server has reported a held acceptance used to be a
+     * silent no-op: the byte would simply wait in the pipe and be consumed the
+     * moment a held request arrived, holding nothing. slow_mock_release now
+     * refuses to write a release credit without a matching held notification,
+     * turning that silent no-op into a CHECK failure. The completed unheld
+     * request above must not satisfy that contract either.
+     *
+     * Triggering that CHECK directly in this process would corrupt this
+     * binary's own pass/fail signal, so the violation runs in a throwaway
+     * child instead: the child's local oi_test_failures counter (a copy
+     * made at fork) shows whether the CHECK fired, and its exit code
+     * reports that back to the parent without touching the real count.
+     */
+    checker = fork();
+    CHECK(checker >= 0);
+    if (checker < 0) {
+        slow_mock_control_free(&control);
+        slow_mock_server_terminate(server);
+        free(reply);
+        return;
+    }
+    if (checker == 0) {
+        int failures_before_release = oi_test_failures;
+        slow_mock_release(&control);
+        _exit(oi_test_failures != failures_before_release ? 42 : 0);
+    }
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(checker, &status, 0), checker);
+        CHECK(WIFEXITED(status));
+        CHECK_EQ(WEXITSTATUS(status), 42);
+    }
+
+    /*
+     * Prove the rejected call did not merely report a CHECK and then leak a
+     * release byte anyway: when a real request now arrives, its response must
+     * remain held until the parent observes acceptance and explicitly
+     * releases it.
+     */
+    client = slow_mock_client_request(port);
+    slow_mock_wait_accepted(&control, 1);
+    CHECK(!slow_mock_readable_within(client, 300));
+    slow_mock_release(&control);
+    CHECK(slow_mock_readable_within(client, 20000));
+
+    close(client);
+    slow_mock_control_free(&control);
+    slow_mock_server_expect_clean_exit(server);
+    free(reply);
+}
+
+TEST(mock_control_closing_the_release_end_fails_the_server_promptly) {
+    const char *body = "data: [DONE]\n\n";
+    size_t reply_len;
+    char *reply = build_chunked_response(body, strlen(body),
+                                         "HTTP/1.1 200 OK", &reply_len);
+    struct slow_mock_turn turns[1];
+    struct slow_mock_control control = {-1, -1, 0};
+    unsigned short port;
+    pid_t server;
+    int client;
+    int status = 0;
+    time_t started;
+
+    turns[0].response = reply;
+    turns[0].response_len = reply_len;
+    turns[0].hold = 1;
+    server = start_slow_mock_server(turns, 1, &port, &control);
+    client = slow_mock_client_request(port);
+    slow_mock_wait_accepted(&control, 1);
+
+    /*
+     * A vanished parent must be noticed, not waited out. Closing the release
+     * end gives the server EOF rather than silence, so it fails closed
+     * immediately instead of burning the full 20 s timeout and then sending
+     * the response anyway.
+     */
+    started = time(NULL);
+    slow_mock_control_free(&control);
+    CHECK_EQ(waitpid(server, &status, 0), server);
+    CHECK(time(NULL) - started < 10);
+    CHECK(WIFEXITED(status));
+    CHECK_EQ(WEXITSTATUS(status), SLOW_MOCK_EXIT_CONTROL);
+    /*
+     * Fail closed: the held response was never sent. The socket does become
+     * readable, because the server closed it -- so the check is that reading
+     * yields EOF rather than response bytes.
+     */
+    {
+        char leftover[64];
+        ssize_t got;
+        CHECK(slow_mock_readable_within(client, 2000));
+        got = read(client, leftover, sizeof leftover);
+        CHECK_EQ(got, (ssize_t)0);
+    }
+
+    close(client);
+    free(reply);
+}
+
 int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(help_exits_zero);
@@ -5278,5 +5846,8 @@ int main(void) {
     RUN(interactive_session_switch_reports_a_missing_target_and_keeps_working);
     RUN(interactive_session_trash_restore_and_confirmed_delete);
     RUN(interactive_session_import_requires_confirmation_and_keeps_the_source);
+    RUN(mock_control_holds_a_response_until_it_is_released);
+    RUN(mock_control_release_before_acceptance_is_rejected);
+    RUN(mock_control_closing_the_release_end_fails_the_server_promptly);
     return oi_test_report();
 }

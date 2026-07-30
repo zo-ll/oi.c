@@ -19,14 +19,22 @@ make
 make check
 ```
 
-Useful additional checks are:
+Use `make quick` for the routine edit-test loop. It still builds the real CLI,
+but runs only deterministic pure unit tests. `make check` runs every ordinary
+unit and integration test, while `make verify` is the comprehensive pre-merge
+and release gate:
 
 ```sh
-make asan
-make ubsan
-make valgrind
-make fuzz-run
+make quick
+make check
+make verify
 ```
+
+`make -j24 quick` and `make -j24 check` parallelize compilation and only the
+audited pure test binaries; PTY, socket, fork, signal, and integration tests
+remain serialized. `make timings` reports clean compilation, each tier, and
+every test binary. See [docs/TESTING.md](docs/TESTING.md) for the workflow,
+concurrency boundaries, and measured issue-#32 results.
 
 Clang can be selected for the ordinary build with `make CC=clang check`.
 Artifacts are written under `build/`: `oi`, `liboi.a`, and `liboi.so`.
