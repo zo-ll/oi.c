@@ -158,17 +158,16 @@ occupy the single pending slot and wait until idle.
   terminal styling, and clear/redraw coordination, including resizing: a
   pending `SIGWINCH` re-reads `TIOCGWINSZ` and redraws the current editor/menu
   frame in place, preserving the edit buffer, cursor, and command-menu
-  selection (nothing else needs to be touched, since editor-frame rendering
-  and assistant/tool-output streaming are strictly sequential today — the
-  editor's raw ANSI frame is never on screen while a turn's output streams
-  through the separate buffered-`FILE*` path in `cli_present`/
-  `cli_render_stream`, so there is nothing for a resize to interleave with).
-  When the still-unimplemented "single pending item / concurrent
-  composition" milestone below lands, resize handling will need to move
-  from `cli_prompt`'s private `poll()` loop into the shared reactor,
-  mirroring the existing `timerfd`/`pidfd` `native_watch` pattern in
-  `reactor_epoll.c`, since the editor could then need to redraw while a
-  turn's reactor loop runs concurrently.
+  selection. Now that concurrent composition has landed, the editor frame and
+  a turn's streamed output do share the screen, so redraw is bracketed rather
+  than merely sequential: `cli_repl`'s turn loop erases the composer frame
+  before every reactor step and redraws it only on a step that actually
+  touched the composer (decoded input, or a pending resize), which is what
+  keeps the editor's raw ANSI frame out of the middle of a multi-chunk reply
+  streaming through `cli_present`/`cli_render_stream`. Resize therefore
+  arrives from two polling contexts that both read the same `signalfd`: the
+  idle prompt's private `poll()` in `cli_composer`, and — for the duration of
+  a turn — a plain `oi_reactor_add` registration in `cli_repl`.
 - `cli_conversation`: owns active messages, model/tool step sequencing,
   safe-boundary steering, cancellation, and recoverable turn failures. Any
   turn that ends before a normal, fully-resolved completion (cancellation,

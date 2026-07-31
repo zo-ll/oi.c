@@ -8,6 +8,7 @@
 #include "test.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -912,6 +913,70 @@ static void run_cli(char *const argv[], struct run_result *out) {
     out->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+/*
+ * Same as run_cli, but with `input` piped in as stdin -- the shape every
+ * documented `... | oi` example has, and the only way to exercise the
+ * read-all-of-stdin prompt path.
+ */
+static void run_cli_with_stdin(char *const argv[], const char *input,
+                               struct run_result *out) {
+    size_t input_len = strlen(input);
+    int in_pipe[2];
+    int out_pipe[2];
+
+    memset(out, 0, sizeof *out);
+    CHECK_EQ(pipe(in_pipe), 0);
+    CHECK_EQ(pipe(out_pipe), 0);
+
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(out_pipe[1], STDERR_FILENO);
+        close(in_pipe[0]);
+        close(out_pipe[1]);
+        execv(OI_BIN, argv);
+        _exit(127);
+    }
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+
+    /* SIGPIPE is possible if the child never reads stdin (a prompt argument
+     * was given); ignoring the write result is deliberate, the child's own
+     * behavior is what the assertions are about. */
+    {
+        void (*previous)(int) = signal(SIGPIPE, SIG_IGN);
+        size_t written = 0;
+
+        while (written < input_len) {
+            ssize_t n = write(in_pipe[1], input + written,
+                              input_len - written);
+
+            if (n <= 0) {
+                break;
+            }
+            written += (size_t)n;
+        }
+        signal(SIGPIPE, previous);
+    }
+    close(in_pipe[1]);
+
+    ssize_t n;
+    while (out->output_len < sizeof out->output - 1 &&
+           (n = read(out_pipe[0], out->output + out->output_len,
+                     sizeof out->output - 1 - out->output_len)) > 0) {
+        out->output_len += (size_t)n;
+    }
+    close(out_pipe[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+    out->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 /* --- tests requiring no network --- */
 
 TEST(help_exits_zero) {
@@ -920,6 +985,125 @@ TEST(help_exits_zero) {
     run_cli(argv, &r);
     CHECK_EQ(r.exit_code, 0);
     CHECK(strstr(r.output, "usage:") != NULL);
+}
+
+/*
+ * Documentation drift guard for the flag list, the counterpart to
+ * test_cli_docs' registry check: every long flag `oi --help` prints must
+ * appear in docs/CLI.md, so adding a flag fails the suite until the guide
+ * lists it. Lives here rather than in test_cli_docs because the usage text
+ * belongs to cli.c, which is deliberately not linked into the private-module
+ * test archive -- running the real binary is the only way to read it.
+ *
+ * The path is repository-relative, like OI_BIN itself.
+ */
+TEST(help_flags_are_documented_in_the_guide) {
+    static const char guide_path[] = "docs/CLI.md";
+    char *argv[] = {(char *)OI_BIN, (char *)"--help", NULL};
+    struct run_result r;
+    char *guide = NULL;
+    size_t guide_len = 0;
+    size_t guide_cap = 0;
+    FILE *file = fopen(guide_path, "r");
+    const char *cursor;
+    int flags_seen = 0;
+
+    CHECK(file != NULL);
+    if (file == NULL) {
+        return;
+    }
+    /*
+     * Read to real EOF rather than into a fixed buffer: a silently truncated
+     * guide would make every strstr() below pass for the wrong reason, and a
+     * "did it fit" check after the fact cannot tell a file that ended from
+     * one that filled the buffer.
+     */
+    for (;;) {
+        size_t n;
+
+        if (guide_len + 1 >= guide_cap) {
+            size_t next_cap = guide_cap == 0 ? 65536 : guide_cap * 2;
+            char *grown = realloc(guide, next_cap);
+
+            CHECK(grown != NULL);
+            if (grown == NULL) {
+                free(guide);
+                fclose(file);
+                return;
+            }
+            guide = grown;
+            guide_cap = next_cap;
+        }
+        n = fread(guide + guide_len, 1, guide_cap - 1 - guide_len, file);
+        guide_len += n;
+        if (n == 0) {
+            break;
+        }
+    }
+    guide[guide_len] = '\0';
+    /* Distinguish "the whole file is here" from "the read gave up early". */
+    CHECK(ferror(file) == 0);
+    CHECK(feof(file) != 0);
+    CHECK(guide_len > 0);
+    fclose(file);
+
+    run_cli(argv, &r);
+    CHECK_EQ(r.exit_code, 0);
+    for (cursor = strstr(r.output, "--"); cursor != NULL;
+         cursor = strstr(cursor + 2, "--")) {
+        char flag[64];
+        size_t len = 0;
+
+        while (len + 2 < sizeof flag &&
+               (isalnum((unsigned char)cursor[2 + len]) ||
+                cursor[2 + len] == '-')) {
+            len++;
+        }
+        if (len == 0) {
+            continue;
+        }
+        memcpy(flag, cursor, len + 2);
+        flag[len + 2] = '\0';
+        flags_seen++;
+        if (strstr(guide, flag) == NULL) {
+            fprintf(stderr, "FAIL %s: %s does not document \"%s\"\n",
+                    oi_test_current, guide_path, flag);
+            CHECK(0);
+        }
+    }
+    /* Guards against the loop silently matching nothing at all. */
+    CHECK(flags_seen >= 10);
+    free(guide);
+}
+
+/*
+ * Guards the documented piped-input shape, which is easy to get subtly
+ * wrong: a prompt argument wins over stdin outright, so
+ * `git diff | oi "Review this diff"` sends only the argument and silently
+ * drops the diff. README.md and docs/CLI.md therefore show
+ * `{ printf 'Review this diff:\n'; git diff; } | oi` instead, and this test
+ * asserts both halves of why -- the piped form carries the whole stream into
+ * the request, and the argument form does not read stdin at all.
+ */
+TEST(piped_prompt_carries_stdin_into_the_request) {
+    static const char piped_input[] =
+        "Review this diff:\n"
+        "+oi-stdin-sentinel-line\n";
+    char *piped_argv[] = {(char *)OI_BIN, (char *)"--dry-run", NULL};
+    char *argument_argv[] = {(char *)OI_BIN, (char *)"--dry-run",
+                             (char *)"Review this diff", NULL};
+    struct run_result r;
+
+    run_cli_with_stdin(piped_argv, piped_input, &r);
+    CHECK_EQ(r.exit_code, 0);
+    CHECK(strstr(r.output, "Review this diff:") != NULL);
+    CHECK(strstr(r.output, "oi-stdin-sentinel-line") != NULL);
+
+    /* The mistake the documented example avoids. */
+    run_cli_with_stdin(argument_argv, piped_input, &r);
+    CHECK_EQ(r.exit_code, 0);
+    CHECK(strstr(r.output, "Review this diff") != NULL);
+    CHECK(strstr(r.output, "oi-stdin-sentinel-line") == NULL);
 }
 
 TEST(missing_api_key_fails) {
@@ -6199,6 +6383,8 @@ TEST(mock_control_closing_the_release_end_fails_the_server_promptly) {
 int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(help_exits_zero);
+    RUN(help_flags_are_documented_in_the_guide);
+    RUN(piped_prompt_carries_stdin_into_the_request);
     RUN(missing_api_key_fails);
     RUN(unrecognized_flag_fails);
     RUN(flag_missing_value_fails);

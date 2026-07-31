@@ -33,6 +33,15 @@ make build/test_cli_composer
 build/test_cli_composer
 ```
 
+Two tests guard the user-facing documentation against drift rather than
+proving behavior. `test_cli_docs` requires every command name, usage string,
+and description in `cli_commands.c`, plus every `Ctrl+key` binding `/help`
+prints, to appear in [CLI.md](CLI.md). `test_cli`'s
+`help_flags_are_documented_in_the_guide` does the same for every long flag
+`oi --help` prints; it lives there because the usage text belongs to `cli.c`,
+which is deliberately not in the private test archive. Adding or renaming a
+command or flag therefore fails the suite until the guide is updated.
+
 `make timings` performs a clean serial build, times the pure and complete
 runtime tiers, and reports every binary separately. A build or test failure
 makes the command fail rather than producing a successful-looking partial

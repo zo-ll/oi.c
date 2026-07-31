@@ -54,7 +54,8 @@ CLI_TEST_SRCS = $(filter-out src/cli.c src/cli_loop.c src/cli_repl.c,$(CLI_SRCS)
 CLI_TEST_OBJS = $(CLI_TEST_SRCS:src/%.c=$(CLI_OBJ_BUILD)/%.o)
 CLI_TEST_LIB = $(BUILD)/liboi_cli_test.a
 
-.PHONY: all lib so cli install test quick check verify verify-compilers \
+.PHONY: all lib so cli install uninstall test quick check verify \
+	verify-compilers \
 	compiler-stamp tier-audit timings abi-check asan ubsan tsan valgrind \
 	fuzz fuzz-run test-integration clean
 
@@ -76,6 +77,20 @@ install: all
 	ln -sfn "$(notdir $(LIB_SO_SONAME))" \
 		"$(DESTDIR)$(LIBDIR)/$(notdir $(LIB_SO))"
 	install -m 644 include/oi/*.h "$(DESTDIR)$(INCLUDEDIR)/oi/"
+
+# Removes exactly what `install` creates, and nothing else: the header
+# directory is removed with rmdir rather than `rm -r`, so an INCLUDEDIR/oi
+# holding anything this project did not install is left alone instead of
+# being deleted along with it. Session data is never touched -- see
+# docs/CLI.md for where it lives and how to remove it deliberately.
+uninstall:
+	rm -f "$(DESTDIR)$(BINDIR)/oi"
+	rm -f "$(DESTDIR)$(LIBDIR)/$(notdir $(LIB))" \
+		"$(DESTDIR)$(LIBDIR)/$(notdir $(LIB_SO_REAL))" \
+		"$(DESTDIR)$(LIBDIR)/$(notdir $(LIB_SO_SONAME))" \
+		"$(DESTDIR)$(LIBDIR)/$(notdir $(LIB_SO))"
+	rm -f $(patsubst include/oi/%,"$(DESTDIR)$(INCLUDEDIR)/oi/%",$(wildcard include/oi/*.h))
+	-rmdir "$(DESTDIR)$(INCLUDEDIR)/oi"
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -134,7 +149,8 @@ $(BUILD)/test_cli_terminal $(BUILD)/test_cli_composer: LDLIBS += $(PTY_LIBS)
 # fails the build if this list plus IMPURE_TESTS stops covering every binary.
 PURE_TESTS = \
 	test_arena test_cli_bytebuf test_cli_command_dispatch test_cli_commands \
-	test_cli_compact test_cli_editor test_cli_history test_cli_history_codec \
+	test_cli_compact test_cli_docs test_cli_editor test_cli_history \
+	test_cli_history_codec \
 	test_cli_history_repair test_cli_history_replay test_cli_history_store \
 	test_cli_input test_cli_input_history test_cli_markdown \
 	test_cli_markdown_block test_cli_markdown_inline test_cli_message \

@@ -37,8 +37,21 @@ static oi_status print_help(FILE *out) {
             return OI_ERR_IO;
         }
     }
-    if (fputs("\nKeys: Enter submit, Ctrl+J newline, Ctrl+C clear, "
-              "Ctrl+D exit\n",
+    /* Deliberately the whole binding set, not a sample: /help is the only
+     * in-terminal reference, and docs/CLI.md's key table is checked against
+     * this list by test_cli_docs so the two cannot drift apart. */
+    if (fputs("\nKeys:\n"
+              "  Enter        submit (or complete the selected command)\n"
+              "  Ctrl+J       newline\n"
+              "  Left/Right   move; Home/End line start/end\n"
+              "  Backspace    delete back; Delete deletes forward\n"
+              "  Up/Down      input history, or the command menu\n"
+              "  Tab          complete the selected command\n"
+              "  Ctrl+C       clear the draft, or cancel the current turn\n"
+              "  Ctrl+D       exit from an empty prompt\n"
+              "\n"
+              "/ opens the command menu; //text sends a literal leading "
+              "slash.\n",
               out) == EOF ||
         fflush(out) != 0) {
         return OI_ERR_IO;

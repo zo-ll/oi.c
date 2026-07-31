@@ -32,10 +32,14 @@ static void print_usage(void) {
         "Runs an interactive chat on a terminal, or one model turn when given\n"
         "a prompt argument or redirected stdin.\n"
         "\n"
+        "A terminal session is durable; a one-shot run is ephemeral unless\n"
+        "--session is given.\n"
+        "\n"
         "flags:\n"
-        "  --config PATH        config file to load\n"
-        "  --session ID         durable named session (omitted: ephemeral)\n"
-        "  --session-dir DIR    directory for session logs (default: \".\")\n"
+        "  --config PATH        config file to load (may not hold the key)\n"
+        "  --session ID         durable session log <session-dir>/<ID>.oilog\n"
+        "  --session-dir DIR    session storage root (default: \".\" with\n"
+        "                       --session, else $XDG_STATE_HOME/oi/sessions)\n"
         "  --host HOST          API host (default: api.openai.com)\n"
         "  --port PORT          API port (default: 443)\n"
         "  --path PATH          API path (default: /v1/chat/completions)\n"
@@ -46,9 +50,17 @@ static void print_usage(void) {
         "  --max-turns N        maximum model turns (default: 8)\n"
         "  --allow-tools        run requested tools without prompting\n"
         "  --deny-tools         reject every requested tool\n"
+        "                       (default: ask on a terminal, refuse otherwise)\n"
         "  --tls / --no-tls     use TLS (default: on)\n"
         "  --dry-run            resolve config and print the request, don't send it\n"
-        "  -h, --help           show this help\n");
+        "  -h, --help           show this help\n"
+        "\n"
+        /* A URL, not the repository-relative docs/CLI.md: `make install`
+         * installs the binary, the libraries, and the headers, so an
+         * installed `oi` has no docs directory to point anyone at. */
+        "Interactive commands and key bindings: /help.\n"
+        "Full guide, including session storage:\n"
+        "https://github.com/zo-ll/oi.c/blob/main/docs/CLI.md\n");
 }
 
 static const char *config_flag_key(const char *arg) {
