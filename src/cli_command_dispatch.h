@@ -5,6 +5,7 @@
 
 #include "cli_commands.h"
 #include "cli_sessions.h"
+#include "cli_status.h"
 #include "cli_tools.h"
 #include "oi/status.h"
 
@@ -26,6 +27,26 @@ typedef oi_status (*oi_cli_command_set_model_cb)(void *user_data,
 typedef oi_status (*oi_cli_command_set_cwd_cb)(void *user_data,
                                                const char *path,
                                                size_t path_len);
+
+/*
+ * Fills in the /status snapshot. Assembled on demand rather than handed in
+ * pre-built, for two reasons: /status must be able to report a turn that is
+ * active *right now*, and the snapshot's borrowed strings (a working
+ * directory in particular) would otherwise have to stay valid across every
+ * other command's dispatch too.
+ *
+ * Every pointer written into `*out_snapshot` is borrowed from the callee and
+ * valid only until the next call through the same callback -- the same
+ * contract as oi_cli_command_session_ops::current. Dispatch runs
+ * oi_cli_status_snapshot_init before calling, so any field the callee leaves
+ * alone renders as explicitly unknown rather than as a stale value or a
+ * plausible-looking default.
+ *
+ * Returning non-OK means no snapshot could be assembled; dispatch reports
+ * that and stays in the REPL.
+ */
+typedef oi_status (*oi_cli_command_status_cb)(
+    void *user_data, struct oi_cli_status_snapshot *out_snapshot);
 
 /*
  * What /session current reports. Both strings are borrowed and valid only
@@ -80,6 +101,8 @@ struct oi_cli_command_context {
     void *set_model_user_data;
     oi_cli_command_set_cwd_cb set_cwd; /* NULL if unavailable */
     void *set_cwd_user_data;
+    oi_cli_command_status_cb status; /* NULL if unavailable */
+    void *status_user_data;
     struct oi_cli_command_session_ops session; /* all-NULL if unavailable */
 };
 

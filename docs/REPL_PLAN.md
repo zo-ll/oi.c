@@ -87,8 +87,45 @@ without learning terminal UI or conversation-record semantics.
 - `/model`: edit the durable session model.
 - `/permissions`: inspect or change the process-scoped `ask`, `allow`, or `deny`
   policy; elevation to `allow` requires confirmation.
-- `/status`: show session ID, model, endpoint, permission policy, timeout,
-  working directory, queue state, and checkpoint state without secrets.
+- `/status`: report the whole runtime in one deterministic, secret-free
+  block: durable session state (not created, ephemeral, active id, or
+  durable-storage failure), the active model and where it came from
+  (startup default, `--model` override, replayed history, metadata cache,
+  or `/model`), the endpoint as host/port/path plus TLS on/off, the
+  permission policy, the request and tool timeouts, the effective working
+  directory, what the conversation is doing (idle, model streaming,
+  awaiting tool permission, tool running, cancelling, working, or failed
+  with its cause), the pending queue as a kind and a byte count, and the
+  latest durable checkpoint's source range plus whether active context is
+  compacted.
+
+  Assembled as one typed borrowed snapshot (`cli_status`) rather than read
+  field by field: the facts belong to four different owners, and a report
+  stitched from several sources can contradict itself with no way to tell
+  which half was right. `cli_command_dispatch` renders that snapshot and
+  reaches into no private conversation or history struct to do it. Every
+  string in the snapshot is borrowed and valid only for the one dispatch
+  that reads it. Secrets are structurally absent — there is no field for an
+  API key, an authorization header, a CA file, or a request body, so no
+  assembler can pass one in.
+
+  Every field has an explicit unknown, established by
+  `oi_cli_status_snapshot_init` rather than by zeroing: zero would otherwise
+  claim a pile of real states (no session, `ask`, disabled deadlines, idle,
+  empty queue) that no assembler ever asserted. A callback that fills in
+  nothing therefore produces a report that claims nothing.
+
+  The borrowed strings are untrusted — a model name can come from a
+  tampered log, a working directory can hold any byte a filesystem accepts,
+  a host or session id is whatever the command line said — so the renderer
+  repairs each one to well-formed UTF-8, runs it through the shared
+  `cli_render_sanitize` escape/control stripper, and then flattens the two
+  control bytes that pass deliberately preserves (`\n` and `\t`) into
+  U+FFFD. That last step is what makes "one line per field" structural: no
+  value can forge an extra status line, shift itself into another column, or
+  emit CSI/OSC (including OSC 52 clipboard writes). Ordinary UTF-8 survives
+  unchanged, and each field is bounded so no single value can produce an
+  unbounded line.
 - `/compact [N]`: summarize the completed turns older than the most recent `N`
   (default 8) into one durable checkpoint. Only runs at an idle safe boundary
   (the same one queued commands drain into); the summarization request is a
@@ -155,6 +192,14 @@ occupy the single pending slot and wait until idle.
 - `cli_tools`: continues to own built-in tool definitions and permission
   decisions, using REPL-owned presentation callbacks instead of direct
   `/dev/tty` reads.
+- `cli_status`: owns the `/status` snapshot type, its unknown-establishing
+  initializer, and its renderer, and nothing else. It reads no live state
+  itself — each owning module fills in its own fields — which is what keeps
+  the report a pure function of the snapshot and so identical on a TTY and
+  in a redirected stream. It composes `cli_utf8_stream` and
+  `cli_render_sanitize` for untrusted values rather than carrying an
+  escaping scheme of its own; the only thing it adds is line flattening,
+  which those two deliberately do not do.
 
 No module other than `cli_editor` and `cli_render` emits terminal-control
 sequences. No terminal module interprets conversation records or drives model

@@ -1881,6 +1881,11 @@ TEST(fresh_session_records_initial_model_and_cwd) {
              OI_OK);
     CHECK_STREQ(restore.model.data, "gpt-default");
     CHECK_STREQ(restore.cwd.data, target_dir);
+    /* Nothing to restore from and no override: the fallback branch won, and
+     * says so. /status reports this provenance verbatim, so the resolution
+     * branch itself is what has to be asserted -- the resolved name alone
+     * cannot distinguish a default from an override of the same value. */
+    CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_DEFAULT);
     CHECK(!restore.metadata_missing_or_corrupt);
     CHECK(!restore.cwd_fallback_applied);
     CHECK_EQ(fresh.store.typed_history.len, 3); /* transition + model + cwd */
@@ -1934,6 +1939,10 @@ TEST(unchanged_resume_writes_no_new_records_but_refreshes_metadata) {
     CHECK_EQ(fresh.store.typed_history.len, history_len_after_first);
     CHECK_STREQ(restore.model.data, "gpt-default");
     CHECK_STREQ(restore.cwd.data, target_dir);
+    /* The same name as the default, but reached through the replayed setting
+     * record the first call wrote -- which is a different provenance, and the
+     * one a resume must report. */
+    CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_HISTORY);
 
     oi_cli_session_restore_free(&restore);
     unlink(fresh.metadata_path);
@@ -1972,6 +1981,9 @@ TEST(apply_setting_writes_a_record_and_persists_through_restore) {
                  0, NULL, "gpt-default", target_dir, NULL, &restore),
              OI_OK);
     CHECK_STREQ(restore.model.data, "gpt-changed");
+    /* A /model change lands in history first, so a later resume attributes it
+     * to history rather than to the cache it also refreshed. */
+    CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_HISTORY);
 
     oi_cli_session_restore_free(&restore);
     unlink(fresh.metadata_path);
@@ -2141,6 +2153,9 @@ TEST(explicit_model_override_wins_and_persists) {
                  &restore),
              OI_OK);
     CHECK_STREQ(restore.model.data, "gpt-override");
+    /* The override outranks the setting record the first call wrote, and the
+     * reported provenance follows the branch that actually won. */
+    CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_EXPLICIT);
     CHECK_STREQ(fresh.state.last_model.data, "gpt-override");
     {
         struct oi_cli_session_metadata metadata;
@@ -2350,6 +2365,9 @@ TEST(the_metadata_cache_still_supplies_settings_history_never_recorded) {
                  0, NULL, "gpt-default", target_dir, NULL, &restore),
              OI_OK);
     CHECK_STREQ(restore.model.data, "gpt-from-cache");
+    /* History recorded nothing, so the cache branch won -- reported as the
+     * cache, not as history, since a rebuilt cache is a weaker claim. */
+    CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_METADATA);
     oi_cli_session_restore_free(&restore);
 
     unlink(fresh.metadata_path);

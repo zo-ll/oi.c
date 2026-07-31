@@ -42,6 +42,21 @@ struct oi_cli_history_replay_state {
      * session_setting records. Empty (data == NULL) if never set. */
     struct oi_cli_string last_model;
     struct oi_cli_string last_cwd;
+
+    /*
+     * The range collapsed by the most recent checkpoint applied while
+     * rebuilding `context`, so a reporting caller (/status) can name what
+     * replaced the active context's prefix without re-reading the log or
+     * reaching into the store's record array. Taken from the checkpoint
+     * record itself rather than derived from `context` -- once a second
+     * checkpoint has subsumed the first, only the record still states what
+     * it covered. Both are 0 until a checkpoint is applied, and
+     * `has_checkpoint` being set is exactly what makes context[0] a summary
+     * rather than the session's oldest real message.
+     */
+    uint64_t checkpoint_source_first_record_id;
+    uint64_t checkpoint_source_last_record_id;
+    int has_checkpoint;
 };
 
 void oi_cli_history_replay_state_init(

@@ -18,6 +18,7 @@ void oi_cli_session_switch_result_init(
     oi_cli_message_list_init(&result->initial_context);
     memset(&result->model, 0, sizeof result->model);
     memset(&result->cwd, 0, sizeof result->cwd);
+    result->model_origin = OI_CLI_SESSION_MODEL_UNKNOWN;
     result->path = NULL;
     result->metadata_path = NULL;
 }
@@ -239,6 +240,7 @@ oi_status oi_cli_session_switch(
         status = oi_cli_string_set(&result.cwd, restore.cwd.data,
                                    restore.cwd.len);
     }
+    result.model_origin = restore.model_origin;
     oi_cli_session_restore_free(&restore);
     if (status != OI_OK) {
         /*

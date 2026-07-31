@@ -54,6 +54,15 @@ struct repl_setting_context {
     const struct oi_cli_repl_config *config;
     struct oi_cli_string *current_model;
     oi_cli_conversation **conversation;
+    /*
+     * Live provenance of *current_model, seeded from config->model_origin
+     * and updated by whichever thing replaces the model: /model here, and a
+     * /session switch adopting the target's own restored value. Kept beside
+     * the model rather than in the status snapshot's own state, so the value
+     * and the story about where it came from can never be updated
+     * separately.
+     */
+    enum oi_cli_session_model_origin model_origin;
 };
 
 /*
@@ -87,6 +96,136 @@ static void repl_pending_free(struct oi_cli_repl_pending *pending) {
     pending->text_len = 0;
     pending->kind = OI_CLI_REPL_PENDING_NONE;
     pending->record_id = 0;
+}
+
+/*
+ * What the /status snapshot is assembled from. Holds no state of its own
+ * beyond `cwd` scratch space and one run-local counter, because everything
+ * else is already owned somewhere: borrowing keeps a single copy of each
+ * fact rather than a second one that can drift out of step with it.
+ *
+ * Every member is borrowed and outlives any single dispatch, which is what
+ * makes it safe for repl_status_snapshot to hand dispatch pointers straight
+ * out of here.
+ */
+struct repl_status_context {
+    const struct oi_cli_repl_config *config;
+    struct repl_setting_context *setting;
+    /* Points at oi_cli_repl_run's own conversation slot, not at a
+     * conversation: it is NULL before the first message and is replaced by a
+     * /session switch, and /status must report whichever one is live now. */
+    oi_cli_conversation **conversation;
+    const struct oi_cli_repl_pending *pending;
+    /* Checkpoints /compact spliced into active context this run. Reset by a
+     * /session switch, which replaces that context wholesale. */
+    unsigned int checkpoints_applied;
+    /*
+     * Scratch for the snapshot's borrowed `cwd`. Owned here rather than
+     * heap-allocated per call so assembling a snapshot cannot fail for want
+     * of memory, and so the borrowed pointer's lifetime is plainly this
+     * context's.
+     */
+    char cwd[PATH_MAX];
+};
+
+/*
+ * Which durable session, if any, this run has. Derived rather than stored: a
+ * /session switch can turn a run with no session into one with an active
+ * session, and only the live callbacks know that. `id` is the already-
+ * resolved current id, passed in rather than fetched again so the state and
+ * the id in the same report can never come from two different reads.
+ */
+static enum oi_cli_status_session_state repl_session_state(
+    const struct oi_cli_repl_config *config, const char *id) {
+    if (id != NULL) {
+        return config->is_durably_failed != NULL &&
+                       config->is_durably_failed(
+                           config->is_durably_failed_user_data)
+                   ? OI_CLI_STATUS_SESSION_FAILED
+                   : OI_CLI_STATUS_SESSION_ACTIVE;
+    }
+    /* No id and no lazy-creation hook means no session will ever exist this
+     * run -- distinct from an automatic session that simply has not been
+     * created yet, and worth saying so, since nothing is being persisted. */
+    return config->prepare == NULL ? OI_CLI_STATUS_SESSION_EPHEMERAL
+                                   : OI_CLI_STATUS_SESSION_NOT_CREATED;
+}
+
+/* The REPL always knows its own slot, so there is no unknown to report
+ * here: an unoccupied slot is genuinely empty. */
+static enum oi_cli_status_queue_state repl_queue_state(
+    const struct oi_cli_repl_pending *pending) {
+    switch (pending->kind) {
+    case OI_CLI_REPL_PENDING_NONE:
+        return OI_CLI_STATUS_QUEUE_EMPTY;
+    case OI_CLI_REPL_PENDING_MESSAGE:
+        return OI_CLI_STATUS_QUEUE_MESSAGE;
+    case OI_CLI_REPL_PENDING_COMMAND:
+        return OI_CLI_STATUS_QUEUE_COMMAND;
+    }
+    return OI_CLI_STATUS_QUEUE_EMPTY;
+}
+
+/*
+ * Assembles the /status snapshot. Registered as the dispatch context's
+ * status callback at both call sites -- the idle prompt and the mid-turn
+ * read-only path -- because /status must answer for a turn that is running
+ * right now, and everything read here is either an accessor or a borrowed
+ * pointer, so nothing about doing it mid-turn is unsafe.
+ *
+ * Never fails: an unresolvable working directory is reported as unknown
+ * rather than turning /status into an error, since the rest of the report is
+ * still accurate and useful.
+ *
+ * Every field is assigned, so nothing is left at the unknown the caller's
+ * oi_cli_status_snapshot_init established -- the REPL genuinely knows all of
+ * this. The one exception is the checkpoint's durable half, which belongs to
+ * a nullable callback.
+ */
+static oi_status repl_status_snapshot(
+    void *user_data, struct oi_cli_status_snapshot *out_snapshot) {
+    struct repl_status_context *context = user_data;
+    const struct oi_cli_repl_config *config = context->config;
+    const oi_cli_conversation *conversation = *context->conversation;
+
+    out_snapshot->session_id =
+        config->session_id == NULL
+            ? NULL
+            : config->session_id(config->session_id_user_data);
+    out_snapshot->session_state =
+        repl_session_state(config, out_snapshot->session_id);
+    out_snapshot->model = context->setting->current_model->data;
+    out_snapshot->model_origin = context->setting->model_origin;
+    out_snapshot->endpoint = config->endpoint;
+    out_snapshot->permission =
+        oi_cli_status_permission_from_policy(config->permission->policy);
+    out_snapshot->request_timeout_ms = config->request_timeout_ms;
+    out_snapshot->tool_timeout_ms = config->tool_timeout_ms;
+    out_snapshot->cwd = getcwd(context->cwd, sizeof context->cwd);
+    out_snapshot->conversation = oi_cli_conversation_activity(conversation);
+    out_snapshot->conversation_status =
+        conversation == NULL ? OI_OK
+                             : oi_cli_conversation_last_status(conversation);
+    out_snapshot->steering = oi_cli_conversation_is_steering(conversation);
+    out_snapshot->queue = repl_queue_state(context->pending);
+    out_snapshot->queue_bytes = context->pending->text_len;
+    if (config->status_checkpoint != NULL) {
+        config->status_checkpoint(config->status_checkpoint_user_data,
+                                  &out_snapshot->checkpoint);
+    }
+    out_snapshot->checkpoint.applied_this_run =
+        context->checkpoints_applied > 0;
+    /* Active context begins with a checkpoint summary if either a durable
+     * checkpoint was replayed into it or /compact spliced one in this run.
+     * The second case is the only one an ephemeral session can have. */
+    out_snapshot->checkpoint.context_compacted =
+        out_snapshot->checkpoint.has_durable_checkpoint ||
+        out_snapshot->checkpoint.applied_this_run;
+    /* Reported last, and unconditionally: whether or not a durable-checkpoint
+     * callback was wired, the REPL has now answered both halves of the
+     * question, so "nobody looked" is no longer true. */
+    out_snapshot->checkpoint.known = 1;
+    return OI_OK;
 }
 
 struct repl_turn_signal_context {
@@ -145,6 +284,9 @@ struct repl_turn_input_context {
     const struct oi_cli_repl_config *config;
     struct oi_cli_string *current_model;
     struct repl_setting_context *setting_context;
+    /* Shared with the idle path: /status must report the same snapshot
+     * whether it was typed at the prompt or during a turn. */
+    struct repl_status_context *status_context;
     struct oi_cli_repl_pending *pending;
     /* Owned by this context: cancelled unconditionally when the turn ends
      * (whichever way), since a still-pending timer firing after this
@@ -558,6 +700,8 @@ static void handle_busy_submit(struct repl_turn_input_context *context) {
                 .set_model_user_data = context->setting_context,
                 .set_cwd = dispatch_set_cwd,
                 .set_cwd_user_data = context->setting_context,
+                .status = repl_status_snapshot,
+                .status_user_data = context->status_context,
             };
             enum oi_cli_command_result command_result;
 
@@ -730,7 +874,14 @@ static oi_status dispatch_set_model(void *user_data, const char *name,
         }
     }
     status = oi_cli_string_set(context->current_model, name, name_len);
-    if (status == OI_OK && *context->conversation != NULL) {
+    if (status != OI_OK) {
+        return status;
+    }
+    /* Set with the value, not after the whole change lands: the name is
+     * already the active one at this point, so leaving the provenance behind
+     * would make /status describe a model that is no longer there. */
+    context->model_origin = OI_CLI_SESSION_MODEL_COMMAND;
+    if (*context->conversation != NULL) {
         status = oi_cli_conversation_set_model(*context->conversation, name,
                                                name_len);
     }
@@ -829,6 +980,11 @@ static int repl_token_equals(const char *token, size_t token_len,
 
 struct repl_session_switch_outcome {
     int terminate; /* a terminating signal arrived during a selector */
+    /* Set only once the switch has committed: the caller's run-local
+     * reporting state describes the session that was just replaced, so it
+     * has to be told, and only the committed path knows the difference. */
+    int switched;
+    enum oi_cli_session_model_origin model_origin;
 };
 
 /*
@@ -1009,6 +1165,8 @@ static oi_status repl_handle_session_switch(
     oi_status status;
 
     out_outcome->terminate = 0;
+    out_outcome->switched = 0;
+    out_outcome->model_origin = OI_CLI_SESSION_MODEL_UNKNOWN;
     repl_split_first_token(rest, rest_len, &id, &id_len, &extra, &extra_len);
     if (id_len == 0 || extra_len != 0) {
         return fputs("oi: usage: /session switch ID\n", config->err) == EOF ||
@@ -1096,6 +1254,8 @@ static oi_status repl_handle_session_switch(
     status = oi_cli_string_set(current_model, result.model.data,
                                result.model.len);
     if (status == OI_OK) {
+        out_outcome->switched = 1;
+        out_outcome->model_origin = result.model_origin;
         oi_cli_message_list_free(switched_context);
         *switched_context = result.initial_context;
         result.initial_context = (struct oi_cli_message_list){0};
@@ -1308,6 +1468,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     struct oi_cli_string current_model_storage = {0};
     struct oi_cli_string *current_model;
     struct repl_setting_context setting_context;
+    struct repl_status_context status_context = {0};
     struct repl_event_context repl_event_context;
     struct oi_cli_repl_pending pending = {0};
     int signal_fd = -1;
@@ -1386,6 +1547,11 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     setting_context.config = config;
     setting_context.current_model = current_model;
     setting_context.conversation = &conversation;
+    setting_context.model_origin = config->model_origin;
+    status_context.config = config;
+    status_context.setting = &setting_context;
+    status_context.conversation = &conversation;
+    status_context.pending = &pending;
 
     /* conversation_config.model is set fresh just before each
      * oi_cli_conversation_create call below (not here): a /model command
@@ -1671,6 +1837,12 @@ have_parsed_command:
                     free(prompt);
                     break;
                 }
+                /* Counted only after the live splice succeeded, so /status
+                 * cannot claim a compacted context that was never spliced.
+                 * This is what lets a session with no durable storage report
+                 * its compaction at all -- there is no record to read it
+                 * back from. */
+                status_context.checkpoints_applied++;
                 if (fprintf(config->out,
                            "oi: compacted %zu turn%s into a checkpoint "
                            "(kept last %zu)\n",
@@ -1713,6 +1885,13 @@ have_parsed_command:
                         &conversation_config, current_model, &input_history,
                         rest, rest_len, &conversation, &active_arena,
                         &switched_context, &has_switched_context, &outcome);
+                    if (status == OI_OK && outcome.switched) {
+                        /* The adopted session's context is whatever its own
+                         * history replayed into, so this run's own compaction
+                         * count no longer describes anything. */
+                        status_context.checkpoints_applied = 0;
+                        setting_context.model_origin = outcome.model_origin;
+                    }
                     if (status == OI_OK && outcome.terminate) {
                         free(prompt);
                         break;
@@ -1815,6 +1994,8 @@ have_parsed_command:
                 .set_cwd = dispatch_set_cwd,
                 .set_cwd_user_data = &setting_context,
                 .session = config->session_ops,
+                .status = repl_status_snapshot,
+                .status_user_data = &status_context,
             };
             enum oi_cli_command_result command_result;
 
@@ -1874,6 +2055,7 @@ have_message:
                 .config = config,
                 .current_model = current_model,
                 .setting_context = &setting_context,
+                .status_context = &status_context,
                 .pending = &pending,
             };
             int signal_registered;

@@ -706,6 +706,33 @@ static oi_status seed_pending_draft_from_replay(
     return st;
 }
 
+/*
+ * Reports the durable checkpoint /status names. Read live off the replay
+ * state rather than remembered from startup: oi_cli_history_store_append
+ * republishes that state after every append, so a checkpoint written by a
+ * /compact this run is visible here without any separate bookkeeping, and a
+ * /session switch's adopted state is too.
+ *
+ * `applied_this_run` and `context_compacted` are deliberately left alone --
+ * they are the REPL's to fill in, since only it knows what it spliced into a
+ * live conversation that may have no durable storage behind it at all.
+ */
+static void status_checkpoint(void *user_data,
+                              struct oi_cli_status_checkpoint *out_checkpoint) {
+    const struct persistence_context *persistence = user_data;
+    const struct oi_cli_history_replay_state *state = persistence->state;
+
+    if (persistence->store == NULL || state == NULL ||
+        !state->has_checkpoint) {
+        return;
+    }
+    out_checkpoint->has_durable_checkpoint = 1;
+    out_checkpoint->source_first_record_id =
+        state->checkpoint_source_first_record_id;
+    out_checkpoint->source_last_record_id =
+        state->checkpoint_source_last_record_id;
+}
+
 /* Wired unconditionally into oi_cli_repl_config, even for an ephemeral
  * session with no durable persistence at all: persist_conversation_event
  * (the only writer of persistence->last_error) is then never registered as
@@ -977,10 +1004,15 @@ int main(int argc, char **argv) {
     struct oi_cli_string pending_model = {0};
     char *explicit_metadata_path = NULL;
     int model_flag_explicit = 0;
+    /* Refined below for an explicit --session, whose replayed history or
+     * metadata cache can outrank a plain default. */
+    enum oi_cli_session_model_origin model_origin =
+        OI_CLI_SESSION_MODEL_DEFAULT;
 
     for (size_t i = 0; i < n_overrides; i++) {
         if (strcmp(overrides[i].key, "model") == 0) {
             model_flag_explicit = 1;
+            model_origin = OI_CLI_SESSION_MODEL_EXPLICIT;
             break;
         }
     }
@@ -1092,6 +1124,9 @@ int main(int argc, char **argv) {
                 st = oi_cli_string_set(&persistence.model, restore.model.data,
                                        restore.model.len);
             }
+            if (st == OI_OK) {
+                model_origin = restore.model_origin;
+            }
             oi_cli_session_restore_free(&restore);
         }
         if (st != OI_OK) {
@@ -1173,6 +1208,19 @@ int main(int argc, char **argv) {
             .model = cfg.model,
             .max_turns = max_turns,
             .tool_timeout_ms = cfg.timeout_ms,
+            /* The same resolved values the client above was built from, so
+             * /status reports the endpoint requests actually go to. Only the
+             * non-secret fields are passed on: the API key and CA file stay
+             * in llm_cfg. */
+            .endpoint =
+                {
+                    .host = cfg.host,
+                    .path = cfg.path,
+                    .port = (unsigned short)cfg.port,
+                    .use_tls = cfg.use_tls,
+                },
+            .request_timeout_ms = cfg.timeout_ms,
+            .model_origin = model_origin,
             .permission = &permission,
             .input_fd = STDIN_FILENO,
             .output_fd = STDOUT_FILENO,
@@ -1206,6 +1254,8 @@ int main(int argc, char **argv) {
             .persist_queue_resolved_user_data = &persistence,
             .persist_checkpoint = persist_checkpoint,
             .persist_checkpoint_user_data = &persistence,
+            .status_checkpoint = status_checkpoint,
+            .status_checkpoint_user_data = &persistence,
             .initial_draft = initial_draft.data,
             .initial_draft_len = initial_draft.len,
             .session_ops =

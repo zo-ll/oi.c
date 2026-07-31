@@ -690,8 +690,16 @@ static int write_interactive(int fd, const char *data, size_t len) {
     return 1;
 }
 
-static pid_t start_interactive_cli(unsigned short port, int slave_fd,
-                                   const char *session_root) {
+/*
+ * Starts a tool-denying interactive CLI against a caller-chosen API key.
+ * Parameterized because the /status tests need a distinctive sentinel key to
+ * assert its absence from the terminal; the shared "test-key" below is too
+ * plausible a substring to prove anything.
+ */
+static pid_t start_interactive_cli_with_api_key(unsigned short port,
+                                                int slave_fd,
+                                                const char *session_root,
+                                                const char *api_key) {
     pid_t pid = fork();
 
     CHECK(pid >= 0);
@@ -722,7 +730,7 @@ static pid_t start_interactive_cli(unsigned short port, int slave_fd,
         argv[4] = port_text;
         argv[5] = (char *)"--no-tls";
         argv[6] = (char *)"--api-key";
-        argv[7] = (char *)"test-key";
+        argv[7] = (char *)api_key;
         argv[8] = (char *)"--deny-tools";
         argv[9] = (char *)"--session-dir";
         argv[10] = (char *)session_root;
@@ -731,6 +739,12 @@ static pid_t start_interactive_cli(unsigned short port, int slave_fd,
         _exit(127);
     }
     return pid;
+}
+
+static pid_t start_interactive_cli(unsigned short port, int slave_fd,
+                                   const char *session_root) {
+    return start_interactive_cli_with_api_key(port, slave_fd, session_root,
+                                              "test-key");
 }
 
 /* Same as start_interactive_cli, but allows tools to run without prompting
@@ -3933,6 +3947,383 @@ TEST(interactive_cwd_command_changes_the_process_directory) {
     rmdir(target_dir);
 }
 
+/*
+ * A distinctive sentinel, so "the key never reached the terminal" is a real
+ * assertion rather than a coincidence about a plausible substring.
+ */
+static const char status_sentinel_api_key[] =
+    "sk-oi-status-sentinel-MUST-NOT-BE-PRINTED";
+
+/* Removes whichever sessions a /status test left behind, without the test
+ * needing to learn the generated id. */
+static void remove_sessions_under(const char *root) {
+    DIR *directory = opendir(root);
+    struct dirent *entry;
+
+    while (directory != NULL && (entry = readdir(directory)) != NULL) {
+        char path[640];
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        snprintf(path, sizeof path, "%s/%s/history.oilog", root,
+                 entry->d_name);
+        unlink(path);
+        snprintf(path, sizeof path, "%s/%s/metadata.json", root,
+                 entry->d_name);
+        unlink(path);
+        snprintf(path, sizeof path, "%s/%s/metadata.json.lock", root,
+                 entry->d_name);
+        unlink(path);
+        snprintf(path, sizeof path, "%s/%s", root, entry->d_name);
+        rmdir(path);
+    }
+    if (directory != NULL) {
+        closedir(directory);
+    }
+    rmdir(root);
+}
+
+/*
+ * The pre-session report: every contracted field is present, the endpoint is
+ * the one actually configured, and the API key is nowhere in the output.
+ */
+TEST(status_reports_every_field_before_a_session_exists) {
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+    char expected_endpoint[64];
+
+    /* Never queried: /status submits no model message. */
+    server = start_mock_server("data: [DONE]\n\n", 14, &port);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-status-fresh-%d", (int)getpid());
+    cli = start_interactive_cli_with_api_key(port, slave_fd, session_root,
+                                             status_sentinel_api_key);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "Context: not compacted",
+                               1));
+    /* A process-scoped permission change is reflected immediately: the
+     * snapshot reads the live policy rather than one captured at startup.
+     * "ask" needs no confirmation, unlike an elevation to "allow". Waiting
+     * for the second report's last line drains it completely, so the count
+     * below sees both /permissions' own echo and the report's line. */
+    CHECK(write_interactive(master_fd, "/permissions ask\r", 17));
+    CHECK(interactive_wait_for(master_fd, &result, "Permissions: ask", 1));
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "Context: not compacted",
+                               2));
+    CHECK(count_text(result.output, "Permissions: ask") >= 2);
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+
+    /* An automatic session is created lazily on the first message, so
+     * nothing durable exists yet and /status must say exactly that. */
+    CHECK(strstr(result.output, "Session: (not created)") != NULL);
+    CHECK(strstr(result.output, "Model: ") != NULL);
+    snprintf(expected_endpoint, sizeof expected_endpoint,
+             "Endpoint: 127.0.0.1:%u/v1/chat/completions (TLS off)",
+             (unsigned)port);
+    CHECK(strstr(result.output, expected_endpoint) != NULL);
+    CHECK(strstr(result.output, "Permissions: deny") != NULL);
+    CHECK(strstr(result.output, "Request timeout: ") != NULL);
+    CHECK(strstr(result.output, "Tool timeout: ") != NULL);
+    CHECK(strstr(result.output, "CWD: /") != NULL);
+    CHECK(strstr(result.output, "Conversation: idle") != NULL);
+    CHECK(strstr(result.output, "Queue: empty") != NULL);
+    CHECK(strstr(result.output, "Checkpoint: none") != NULL);
+    CHECK(strstr(result.output, "Context: not compacted") != NULL);
+
+    /* No secret, and none of the header shapes one would arrive in. */
+    CHECK(strstr(result.output, status_sentinel_api_key) == NULL);
+    CHECK(strstr(result.output, "sk-oi-status-sentinel") == NULL);
+    CHECK(strstr(result.output, "Authorization") == NULL);
+    CHECK(strstr(result.output, "Bearer") == NULL);
+
+    remove_sessions_under(session_root);
+}
+
+/*
+ * The mid-turn report, which is the whole point of /status being read-only:
+ * it must answer while the model is streaming, must see a queued message,
+ * and must not itself take the single pending slot.
+ */
+TEST(status_reports_streaming_and_queue_state_during_a_turn) {
+    const char *first_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"first reply\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *second_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"second reply\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t first_len;
+    size_t second_len;
+    char *first = build_chunked_response(first_sse, strlen(first_sse),
+                                        "HTTP/1.1 200 OK", &first_len);
+    char *second = build_chunked_response(second_sse, strlen(second_sse),
+                                          "HTTP/1.1 200 OK", &second_len);
+    struct slow_mock_turn turns[2];
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    struct slow_mock_control control = {-1, -1, 0};
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    turns[0].response = first;
+    turns[0].response_len = first_len;
+    turns[0].hold = 1;
+    turns[1].response = second;
+    turns[1].response_len = second_len;
+    turns[1].hold = 0;
+    server = start_slow_mock_server(turns, 2, &port, &control);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-status-stream-%d", (int)getpid());
+    cli = start_interactive_cli_with_api_key(port, slave_fd, session_root,
+                                             status_sentinel_api_key);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    /* The request is genuinely on the wire, not merely rendered, so the
+     * conversation really is streaming when /status answers below. */
+    slow_mock_wait_accepted(&control, 1);
+
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    /*
+     * Waits for the report's *last* line before inspecting earlier ones. A
+     * needle in the middle only proves the bytes up to it arrived, so
+     * asserting on a later field right after it is a race that a slower
+     * build (a sanitizer run, a loaded machine) genuinely loses.
+     */
+    CHECK(interactive_wait_for(master_fd, &result, "Context: not compacted",
+                               1));
+    CHECK(strstr(result.output, "Conversation: model streaming") != NULL);
+    CHECK(strstr(result.output, "Queue: empty") != NULL);
+    /* The session now exists: it was created by the submission above, and
+     * the report tracked that change. */
+    CHECK(strstr(result.output, "Session: (not created)") == NULL);
+
+    /* Queue a message, then ask again: the queue line changes, the slot is
+     * still held by "world" rather than by /status, and the turn reports
+     * that it is steering to a safe boundary. Waited for as one whole line,
+     * for the same reason. */
+    CHECK(write_interactive(master_fd, "world\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "Queue: 1 message queued (5 bytes) (steering "
+                               "to a safe boundary)",
+                               1));
+
+    /* Still refused, which proves /status never occupied the slot. */
+    CHECK(write_interactive(master_fd, "another\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "oi: a message is already queued", 1));
+    slow_mock_release(&control);
+
+    CHECK(interactive_wait_for(master_fd, &result, "first reply", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "second reply", 1));
+    /* "another" was refused, so its text is still an uncommitted draft;
+     * clear it before Ctrl+D, which would otherwise delete forward. */
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    slow_mock_control_free(&control);
+    slow_mock_server_expect_clean_exit(server);
+    free(first);
+    free(second);
+
+    /* Neither queued message's text was echoed by a queue line. The queue
+     * report is a kind and a byte count by design. */
+    CHECK(strstr(result.output, "queued (5 bytes)") != NULL);
+    CHECK(strstr(result.output, "queued: world") == NULL);
+    CHECK(strstr(result.output, status_sentinel_api_key) == NULL);
+
+    remove_sessions_under(session_root);
+}
+
+/*
+ * A tool is a distinct in-flight kind, and the report has to name it rather
+ * than collapse it into "streaming". Cancelling it then returns the report to
+ * idle: a user cancel is a fully-recovered outcome, so calling the prompt
+ * "failed" afterwards -- which the cancel's own OI_ERR_CLOSED would suggest
+ * -- would describe a working REPL as broken.
+ */
+TEST(status_reports_a_running_tool_then_returns_to_idle_after_a_cancel) {
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_status\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\\\"printf started; sleep 3\\\"}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"done here\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t tool_len;
+    size_t answer_len;
+    char *tool_resp = build_chunked_response(tool_sse, strlen(tool_sse),
+                                             "HTTP/1.1 200 OK", &tool_len);
+    char *answer_resp = build_chunked_response(
+        answer_sse, strlen(answer_sse), "HTTP/1.1 200 OK", &answer_len);
+    const char *responses[] = {tool_resp, answer_resp};
+    size_t lengths[] = {tool_len, answer_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server_turns(responses, lengths, 2, &port);
+    free(tool_resp);
+    free(answer_resp);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-status-tool-%d",
+             (int)getpid());
+    cli = start_interactive_cli_allowing_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    /*
+     * "running tool shell" is written from the synchronous TOOL_STARTING
+     * callback, and the REPL installs conversation->tool the moment that
+     * callback returns -- both inside one reactor step, before any terminal
+     * input can be read again. So seeing that line is already the barrier:
+     * no sleep is needed to know the tool is installed by the time /status
+     * below is processed.
+     */
+    CHECK(interactive_wait_for(master_fd, &result, "running tool shell", 1));
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "Conversation: tool "
+                                                  "running",
+                               1));
+
+    /* Cancel the running tool, then ask again. The report above already
+     * proved the tool is installed, so this cancel needs no timing window
+     * of its own either. */
+    CHECK_EQ(kill(cli, SIGINT), 0);
+    CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "Conversation: idle", 1));
+    CHECK(strstr(result.output, "Conversation: failed") == NULL);
+
+    /* Consume the second prepared response so the mock server exits having
+     * served every turn it was given. */
+    CHECK(write_interactive(master_fd, "and again\r", 10));
+    CHECK(interactive_wait_for(master_fd, &result, "done here", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+    remove_sessions_under(session_root);
+}
+
+/*
+ * A failed turn stays visible in the report after the prompt comes back, and
+ * a /model change is reflected in both the name and its provenance.
+ */
+TEST(status_reports_a_failed_turn_and_a_model_change) {
+    /* --deny-tools refuses this call: a real turn failure (OI_ERR_DENIED)
+     * that still returns to a working prompt. */
+    const char *denied_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_denied\",\"type\":\"function\","
+        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\\\"echo hi\\\"}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t denied_len;
+    char *denied = build_chunked_response(denied_sse, strlen(denied_sse),
+                                          "HTTP/1.1 200 OK", &denied_len);
+    const char *responses[] = {denied};
+    size_t lengths[] = {denied_len};
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    server = start_mock_server_turns(responses, lengths, 1, &port);
+    free(denied);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-status-failed-%d", (int)getpid());
+    cli = start_interactive_cli_with_api_key(port, slave_fd, session_root,
+                                             status_sentinel_api_key);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed", 1));
+
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "Conversation: failed", 1));
+
+    /* /model changes both the active name and where /status says it came
+     * from -- a restored or default value must not keep being claimed. */
+    CHECK(write_interactive(master_fd, "/model status-model\r", 20));
+    CHECK(interactive_wait_for(master_fd, &result, "Model: status-model", 1));
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(
+        master_fd, &result, "Model: status-model (changed with /model)", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+    CHECK(strstr(result.output, status_sentinel_api_key) == NULL);
+    remove_sessions_under(session_root);
+}
+
 TEST(model_override_persists_across_a_restart) {
     char session_dir[] = "/tmp";
     char session_name[64];
@@ -4209,6 +4600,13 @@ TEST(compact_replaces_older_turns_with_a_checkpoint) {
     CHECK(interactive_wait_for(
         master_fd, &result, "oi: compacted 1 turn into a checkpoint", 1));
 
+    /* The report tracks the compaction: a durable checkpoint with its own
+     * source range, and an active context that now starts from a summary.
+     * The exact range is cross-checked against the log below. */
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "Context: compacted", 1));
+    CHECK(strstr(result.output, "Checkpoint: records ") != NULL);
+
     CHECK(write_interactive(master_fd, "third message\r", 14));
     CHECK(interactive_wait_for(master_fd, &result, "third reply", 1));
 
@@ -4260,6 +4658,19 @@ TEST(compact_replaces_older_turns_with_a_checkpoint) {
                                         "source_last_record_id"),
                  oilog_record_u64_field(records.items[assistant1_index],
                                         "record_id"));
+        /* /status reported that same range, read back off the replay state
+         * rather than recomputed -- so the report and the durable record
+         * cannot disagree. */
+        {
+            char expected[64];
+            snprintf(expected, sizeof expected,
+                     "Checkpoint: records %llu-%llu",
+                     (unsigned long long)oilog_record_u64_field(
+                         records.items[user1_index], "record_id"),
+                     (unsigned long long)oilog_record_u64_field(
+                         records.items[assistant1_index], "record_id"));
+            CHECK(strstr(result.output, expected) != NULL);
+        }
         oilog_records_free(&records);
     }
 
@@ -5831,6 +6242,10 @@ int main(void) {
     RUN(tool_panel_survives_malicious_escape_bytes_in_output);
     RUN(tool_panel_coexists_with_resize_and_queued_input);
     RUN(interactive_cwd_command_changes_the_process_directory);
+    RUN(status_reports_every_field_before_a_session_exists);
+    RUN(status_reports_streaming_and_queue_state_during_a_turn);
+    RUN(status_reports_a_running_tool_then_returns_to_idle_after_a_cancel);
+    RUN(status_reports_a_failed_turn_and_a_model_change);
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);
     RUN(interactive_exit_before_submission_creates_no_session);

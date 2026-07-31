@@ -73,6 +73,16 @@ struct oi_cli_conversation {
      * three, or none, is non-NULL at any moment while busy.
      */
     oi_tool_call *pending_permission_tool;
+    /*
+     * Set for the duration of oi_cli_conversation_cancel's own unwind --
+     * from before the partial-response event it emits until finish_turn
+     * clears it. Purely for reporting: the events emitted during that
+     * window (PARTIAL_ASSISTANT, then each repair MESSAGE) run callbacks
+     * that can ask what the conversation is doing, and "streaming" or
+     * "running a tool" would both be wrong answers by then, since cancel
+     * has already detached whatever was in flight.
+     */
+    int cancelling;
 };
 
 static oi_status buffer_append(struct buffer *buffer, const void *data,
@@ -140,6 +150,7 @@ static void finish_turn(oi_cli_conversation *conversation, oi_status status) {
         return;
     }
     conversation->busy = 0;
+    conversation->cancelling = 0;
     conversation->last_status = status;
     struct oi_cli_conversation_event event = {
         .type = OI_CLI_CONVERSATION_EVENT_TURN_DONE,
@@ -1108,6 +1119,7 @@ oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
     conversation->http_status = 0;
     conversation->model_steps = 0;
     conversation->cancelled = 0;
+    conversation->cancelling = 0;
     conversation->steering = 0;
     conversation->busy = 1;
 
@@ -1213,6 +1225,9 @@ void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
     if (conversation == NULL || !conversation->busy) {
         return;
     }
+    /* Before the first event this unwind emits, so no callback can see a
+     * conversation that still claims to be streaming or running a tool. */
+    conversation->cancelling = 1;
     if (conversation->request != NULL) {
         oi_llm_request *request = conversation->request;
         conversation->request = NULL;
@@ -1251,6 +1266,40 @@ void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
 int oi_cli_conversation_is_busy(
     const oi_cli_conversation *conversation) {
     return conversation != NULL && conversation->busy;
+}
+
+enum oi_cli_conversation_activity oi_cli_conversation_activity(
+    const oi_cli_conversation *conversation) {
+    if (conversation == NULL) {
+        return OI_CLI_CONVERSATION_ACTIVITY_IDLE;
+    }
+    if (!conversation->busy) {
+        /* A completed cancel is idle, not failed, even though it leaves a
+         * non-OK last_status behind (OI_ERR_CLOSED): the same reasoning
+         * cli_repl.c applies when it treats a cancelled turn as always
+         * recoverable. Reporting the status the cancel happened to carry
+         * would describe a working prompt as broken. */
+        return conversation->last_status == OI_OK || conversation->cancelled
+                   ? OI_CLI_CONVERSATION_ACTIVITY_IDLE
+                   : OI_CLI_CONVERSATION_ACTIVITY_FAILED;
+    }
+    /* Checked before the three in-flight kinds: cancel detaches whichever
+     * one was set before emitting anything, so by the time a callback can
+     * observe this they are all NULL anyway -- ordering it first states the
+     * intent rather than relying on that. */
+    if (conversation->cancelling) {
+        return OI_CLI_CONVERSATION_ACTIVITY_CANCELLING;
+    }
+    if (conversation->request != NULL) {
+        return OI_CLI_CONVERSATION_ACTIVITY_STREAMING;
+    }
+    if (conversation->pending_permission_tool != NULL) {
+        return OI_CLI_CONVERSATION_ACTIVITY_AWAITING_PERMISSION;
+    }
+    if (conversation->tool != NULL) {
+        return OI_CLI_CONVERSATION_ACTIVITY_TOOL_RUNNING;
+    }
+    return OI_CLI_CONVERSATION_ACTIVITY_WORKING;
 }
 
 int oi_cli_conversation_was_cancelled(

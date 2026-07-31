@@ -49,6 +49,10 @@ struct oi_cli_session_switch_result {
     struct oi_cli_message_list initial_context;
     struct oi_cli_string model;
     struct oi_cli_string cwd;
+    /* Where `model` came from, for a caller that reports provenance. Never
+     * OI_CLI_SESSION_MODEL_EXPLICIT: a switch restores the target's own
+     * settings and deliberately passes no override. */
+    enum oi_cli_session_model_origin model_origin;
     char *path;          /* owned private session directory */
     char *metadata_path; /* owned selector-cache path */
 };

@@ -311,9 +311,33 @@ oi_status oi_cli_session_import(const char *root_override,
                                 size_t source_path_len, char **out_new_id,
                                 char **out_error_detail);
 
+/*
+ * Where an effective model name came from.
+ *
+ * Only oi_cli_session_restore_settings can attribute the four open-time
+ * branches: the resolved name alone cannot be attributed after the fact,
+ * since a restored model and an explicit override can be the same string.
+ * COMMAND is the one value this module never produces -- it belongs to a
+ * later /model, whose caller replaces both the name and this alongside it.
+ * The vocabulary lives here anyway, so provenance has one type rather than
+ * one per consumer.
+ *
+ * UNKNOWN is the zero value on purpose: a zeroed or partially-filled struct
+ * then claims nothing rather than claiming "default".
+ */
+enum oi_cli_session_model_origin {
+    OI_CLI_SESSION_MODEL_UNKNOWN = 0,
+    OI_CLI_SESSION_MODEL_DEFAULT,  /* built-in default or config file */
+    OI_CLI_SESSION_MODEL_EXPLICIT, /* an explicit override, e.g. --model */
+    OI_CLI_SESSION_MODEL_HISTORY,  /* replayed session history */
+    OI_CLI_SESSION_MODEL_METADATA, /* the selector metadata cache */
+    OI_CLI_SESSION_MODEL_COMMAND   /* changed with /model this run */
+};
+
 struct oi_cli_session_restore {
     struct oi_cli_string model;
     struct oi_cli_string cwd;
+    enum oi_cli_session_model_origin model_origin;
     int metadata_missing_or_corrupt; /* diagnostic already printed if so */
     int cwd_fallback_applied;        /* diagnostic already printed if so */
 };

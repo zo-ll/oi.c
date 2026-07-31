@@ -1795,15 +1795,19 @@ oi_status oi_cli_session_restore_settings(
     if (explicit_model != NULL) {
         resolved_model = explicit_model;
         resolved_model_len = strlen(explicit_model);
+        out_restore->model_origin = OI_CLI_SESSION_MODEL_EXPLICIT;
     } else if (state->last_model.data != NULL) {
         resolved_model = state->last_model.data;
         resolved_model_len = state->last_model.len;
+        out_restore->model_origin = OI_CLI_SESSION_MODEL_HISTORY;
     } else if (metadata_valid && meta.model.len > 0) {
         resolved_model = meta.model.data;
         resolved_model_len = meta.model.len;
+        out_restore->model_origin = OI_CLI_SESSION_MODEL_METADATA;
     } else {
         resolved_model = default_model;
         resolved_model_len = strlen(default_model);
+        out_restore->model_origin = OI_CLI_SESSION_MODEL_DEFAULT;
     }
 
     if (state->last_cwd.data != NULL) {

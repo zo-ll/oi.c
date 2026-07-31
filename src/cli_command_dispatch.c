@@ -46,24 +46,36 @@ static oi_status print_help(FILE *out) {
     return OI_OK;
 }
 
+/*
+ * Every field comes from the one snapshot the owning modules assembled --
+ * dispatch deliberately does not mix in `context->model`, `->session_id`, or
+ * a getcwd() of its own, even though it has all three to hand. A report
+ * stitched from two sources can disagree with itself (a /model change
+ * applied to the conversation but not yet to this context, say), and there
+ * would be no way to tell which half was right.
+ */
 static oi_status print_status(struct oi_cli_command_context *context) {
-    char *cwd = getcwd(NULL, 0);
-    oi_status status = OI_OK;
+    struct oi_cli_status_snapshot snapshot;
+    oi_status status;
 
-    if (cwd == NULL) {
-        return OI_ERR_IO;
+    if (context->status == NULL) {
+        return fputs("oi: /status is not available in this context\n",
+                     context->err) == EOF
+                   ? OI_ERR_IO
+                   : OI_OK;
     }
-    if (fprintf(context->out,
-                "Session: %s\nModel: %s\nPermissions: %s\nCWD: %s\n",
-                context->session_id == NULL ? "(not created)"
-                                            : context->session_id,
-                context->model,
-                permission_name(context->permission->policy), cwd) < 0 ||
-        fflush(context->out) != 0) {
-        status = OI_ERR_IO;
+    /* The semantic initializer, not a memset: a zeroed snapshot would claim
+     * a pile of real states (no session, ask, disabled deadlines, idle,
+     * empty queue) that the callee never asserted. */
+    oi_cli_status_snapshot_init(&snapshot);
+    status = context->status(context->status_user_data, &snapshot);
+    if (status != OI_OK) {
+        return fputs("oi: could not read the current status\n",
+                     context->err) == EOF
+                   ? OI_ERR_IO
+                   : OI_OK;
     }
-    free(cwd);
-    return status;
+    return oi_cli_status_write(&snapshot, context->out);
 }
 
 static int argument_equals(const struct oi_cli_command_parse *command,

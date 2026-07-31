@@ -8,6 +8,7 @@
 #include "cli_conversation.h"
 #include "cli_message.h"
 #include "cli_session_switch.h"
+#include "cli_status.h"
 #include "cli_tools.h"
 #include "oi/arena.h"
 #include "oi/llm.h"
@@ -115,10 +116,36 @@ typedef oi_status (*oi_cli_repl_persist_checkpoint_cb)(
     void *user_data, size_t prefix_message_count, const char *summary,
     size_t summary_len, const char *model, size_t model_len);
 
+/*
+ * Reports the durable checkpoint state behind /status. cli.c owns the
+ * replay state this reads, and re-reads it on every call rather than
+ * caching: a live /compact, and a /session switch, both replace it.
+ * Nullable -- a session with no durable storage has no durable checkpoint,
+ * and the REPL then reports only what it applied itself this run.
+ *
+ * `*out_checkpoint` arrives zeroed. Fill in only the durable fields; the
+ * REPL owns `applied_this_run` and `context_compacted`, since only it knows
+ * what it spliced into a live conversation.
+ */
+typedef void (*oi_cli_repl_status_checkpoint_cb)(
+    void *user_data, struct oi_cli_status_checkpoint *out_checkpoint);
+
 struct oi_cli_repl_config {
     const char *model;
     int max_turns;
     int tool_timeout_ms;
+    /*
+     * The resolved LLM endpoint and request deadline, for /status only --
+     * the REPL never opens a connection itself, and the client it is handed
+     * deliberately does not publish what it was configured with. `endpoint`
+     * is borrowed and must outlive the run; it carries host/port/path and
+     * the TLS flag, and structurally cannot carry a credential.
+     */
+    struct oi_cli_status_endpoint endpoint;
+    int request_timeout_ms;
+    /* Where `model` came from at startup. The REPL updates its own copy of
+     * this as /model and /session switch change the active model. */
+    enum oi_cli_session_model_origin model_origin;
     struct oi_cli_permission *permission;
     int input_fd;
     int output_fd;
@@ -149,6 +176,8 @@ struct oi_cli_repl_config {
     void *persist_queue_resolved_user_data;
     oi_cli_repl_persist_checkpoint_cb persist_checkpoint;
     void *persist_checkpoint_user_data;
+    oi_cli_repl_status_checkpoint_cb status_checkpoint;
+    void *status_checkpoint_user_data;
     /* Crash-recovery text found by the caller's own replay (an interrupted
      * queue consumption) to seed as the composer's initial draft -- never
      * auto-run, just handed back as an editable line. NULL/0 (the default)

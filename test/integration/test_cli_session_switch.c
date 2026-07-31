@@ -175,6 +175,15 @@ TEST(switch_opens_replays_and_restores_the_target) {
     /* The target's durable settings win over the process defaults. */
     CHECK_STREQ(result.model.data, "gpt-target");
     CHECK_STREQ(result.cwd.data, target_cwd);
+    /*
+     * And the provenance restore_settings decided is propagated out, not
+     * recomputed or dropped: the seeded target carries a model setting
+     * record, so history is what won. A switch passes no override at all, so
+     * this can never be OI_CLI_SESSION_MODEL_EXPLICIT -- that is structural,
+     * not incidental, and the REPL adopts whatever arrives here as the
+     * newly-active model's story.
+     */
+    CHECK_EQ(result.model_origin, OI_CLI_SESSION_MODEL_HISTORY);
     /* ...and the working directory really moved. */
     {
         char now[256];

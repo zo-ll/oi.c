@@ -39,8 +39,8 @@ TEST(help_lists_commands_and_exit_requests_exit) {
     FILE *err = tmpfile();
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
-        out, err, "test-model", &permission, NULL, NULL, NULL, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "test-model",
+        .permission = &permission,
     };
     enum oi_cli_command_result result;
     char *output;
@@ -64,9 +64,8 @@ TEST(permissions_are_process_scoped_and_validated) {
     FILE *err = tmpfile();
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
-        out, err, "test-model", &permission, "session-1", NULL, NULL, NULL,
-        NULL,
-        {0},
+        .out = out, .err = err, .model = "test-model",
+        .permission = &permission, .session_id = "session-1",
     };
     enum oi_cli_command_result result;
     char *errors;
@@ -82,24 +81,182 @@ TEST(permissions_are_process_scoped_and_validated) {
     fclose(err);
 }
 
-TEST(status_reports_runtime_without_secrets) {
+struct status_cb_call {
+    int call_count;
+    oi_status result;
+};
+
+/*
+ * Stands in for cli_repl's assembler. The strings handed back are static, so
+ * the borrowed-pointer contract ("valid until the next call through the same
+ * callback") holds trivially -- which is the point: dispatch must not need to
+ * copy anything.
+ */
+static oi_status fake_status(void *user_data,
+                             struct oi_cli_status_snapshot *out_snapshot) {
+    struct status_cb_call *call = user_data;
+
+    call->call_count++;
+    if (call->result != OI_OK) {
+        return call->result;
+    }
+    out_snapshot->session_state = OI_CLI_STATUS_SESSION_ACTIVE;
+    out_snapshot->session_id = "snapshot-session";
+    out_snapshot->model = "snapshot-model";
+    out_snapshot->model_origin = OI_CLI_SESSION_MODEL_DEFAULT;
+    out_snapshot->endpoint.host = "endpoint.invalid";
+    out_snapshot->endpoint.path = "/v1/chat/completions";
+    out_snapshot->endpoint.port = 8443;
+    out_snapshot->endpoint.use_tls = 1;
+    out_snapshot->permission = OI_CLI_STATUS_PERMISSION_DENY;
+    out_snapshot->request_timeout_ms = 1500;
+    out_snapshot->tool_timeout_ms = 2500;
+    out_snapshot->cwd = "/snapshot/cwd";
+    out_snapshot->conversation = OI_CLI_CONVERSATION_ACTIVITY_TOOL_RUNNING;
+    out_snapshot->queue = OI_CLI_STATUS_QUEUE_MESSAGE;
+    out_snapshot->queue_bytes = 11;
+    out_snapshot->checkpoint.known = 1;
+    return OI_OK;
+}
+
+/* Fills in nothing at all, to prove what dispatch hands a callback. */
+static oi_status silent_status(void *user_data,
+                              struct oi_cli_status_snapshot *out_snapshot) {
+    struct status_cb_call *call = user_data;
+
+    (void)out_snapshot;
+    call->call_count++;
+    return OI_OK;
+}
+
+TEST(status_reports_the_assembled_snapshot) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_DENY};
+    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct status_cb_call call = {0, OI_OK};
+    /*
+     * `model`, `session_id`, and `permission` are deliberately set to values
+     * the snapshot contradicts: /status must report the snapshot and nothing
+     * else, so a stale context field cannot leak into the report.
+     */
     struct oi_cli_command_context context = {
-        out, err, "test-model", &permission, NULL, NULL, NULL, NULL, NULL,
-        {0},
+        .out = out,
+        .err = err,
+        .model = "context-model",
+        .permission = &permission,
+        .session_id = "context-session",
+        .status = fake_status,
+        .status_user_data = &call,
     };
     enum oi_cli_command_result result;
     char *output;
 
     CHECK_EQ(dispatch("/status", &context, &result), OI_OK);
+    CHECK_EQ(call.call_count, 1);
     output = read_stream(out);
-    CHECK(strstr(output, "Session: (not created)") != NULL);
-    CHECK(strstr(output, "Model: test-model") != NULL);
+    CHECK(strstr(output, "Session: snapshot-session") != NULL);
+    CHECK(strstr(output, "Model: snapshot-model (startup default)") != NULL);
+    CHECK(strstr(output, "Endpoint: endpoint.invalid:8443"
+                         "/v1/chat/completions (TLS on)") != NULL);
     CHECK(strstr(output, "Permissions: deny") != NULL);
-    CHECK(strstr(output, "CWD:") != NULL);
+    CHECK(strstr(output, "Request timeout: 1500 ms") != NULL);
+    CHECK(strstr(output, "Tool timeout: 2500 ms") != NULL);
+    CHECK(strstr(output, "CWD: /snapshot/cwd") != NULL);
+    CHECK(strstr(output, "Conversation: tool running") != NULL);
+    CHECK(strstr(output, "Queue: 1 message queued (11 bytes)") != NULL);
+    CHECK(strstr(output, "Checkpoint: none") != NULL);
+    CHECK(strstr(output, "Context: not compacted") != NULL);
+    /* Neither the contradicted context values nor any queued text. */
+    CHECK(strstr(output, "context-model") == NULL);
+    CHECK(strstr(output, "context-session") == NULL);
     free(output);
+    fclose(out);
+    fclose(err);
+}
+
+/*
+ * Dispatch must hand the callback an honestly-unknown snapshot, not a zeroed
+ * one: a callback that reports nothing must produce a report that claims
+ * nothing. Asserted here, at the boundary that owns the initialization, and
+ * not only in the renderer's own tests.
+ */
+TEST(status_reports_unknown_for_everything_a_callback_leaves_alone) {
+    FILE *out = tmpfile();
+    FILE *err = tmpfile();
+    struct oi_cli_permission permission = {OI_CLI_TOOLS_ALLOW};
+    struct status_cb_call call = {0, OI_OK};
+    struct oi_cli_command_context context = {
+        .out = out,
+        .err = err,
+        .model = "context-model",
+        .permission = &permission,
+        .session_id = "context-session",
+        .status = silent_status,
+        .status_user_data = &call,
+    };
+    enum oi_cli_command_result result;
+    char *output;
+
+    CHECK_EQ(dispatch("/status", &context, &result), OI_OK);
+    CHECK_EQ(call.call_count, 1);
+    output = read_stream(out);
+    CHECK_STREQ(output,
+                "Session: (unknown)\n"
+                "Model: (unknown)\n"
+                "Endpoint: (unknown)\n"
+                "Permissions: (unknown)\n"
+                "Request timeout: (unknown)\n"
+                "Tool timeout: (unknown)\n"
+                "CWD: (unknown)\n"
+                "Conversation: (unknown)\n"
+                "Queue: (unknown)\n"
+                "Checkpoint: (unknown)\n"
+                "Context: (unknown)\n");
+    free(output);
+    fclose(out);
+    fclose(err);
+}
+
+TEST(status_rejects_arguments_and_survives_an_unavailable_snapshot) {
+    FILE *out = tmpfile();
+    FILE *err = tmpfile();
+    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct status_cb_call call = {0, OI_ERR_IO};
+    struct oi_cli_command_context context = {
+        .out = out,
+        .err = err,
+        .model = "context-model",
+        .permission = &permission,
+        .status = fake_status,
+        .status_user_data = &call,
+    };
+    enum oi_cli_command_result result;
+    char *errors;
+
+    /* An assembler failure is reported and stays in the REPL, like every
+     * other recoverable command failure. */
+    CHECK_EQ(dispatch("/status", &context, &result), OI_OK);
+    CHECK_EQ(result, OI_CLI_COMMAND_CONTINUE);
+    CHECK_EQ(call.call_count, 1);
+
+    /* No callback at all: say so rather than reporting a made-up snapshot. */
+    context.status = NULL;
+    CHECK_EQ(dispatch("/status", &context, &result), OI_OK);
+
+    /* Arguments are a usage error, and must not reach the assembler. */
+    CHECK_EQ(dispatch("/status extra", &context, &result), OI_OK);
+    CHECK_EQ(call.call_count, 1);
+
+    errors = read_stream(err);
+    CHECK(strstr(errors, "could not read the current status") != NULL);
+    CHECK(strstr(errors, "/status is not available in this context") != NULL);
+    CHECK(strstr(errors, "usage: /status") != NULL);
+    free(errors);
+    {
+        char *output = read_stream(out);
+        CHECK_STREQ(output, "");
+        free(output);
+    }
     fclose(out);
     fclose(err);
 }
@@ -127,8 +284,8 @@ TEST(model_with_no_argument_prints_the_active_model) {
     FILE *err = tmpfile();
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
-        out, err, "current-model", &permission, NULL, NULL, NULL, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission,
     };
     enum oi_cli_command_result result;
     char *output;
@@ -146,8 +303,8 @@ TEST(model_with_no_callback_reports_unavailable) {
     FILE *err = tmpfile();
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
-        out, err, "current-model", &permission, NULL, NULL, NULL, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission,
     };
     enum oi_cli_command_result result;
     char *errors;
@@ -166,9 +323,9 @@ TEST(model_with_argument_invokes_the_callback_with_exact_bytes) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct model_cb_call call = {.result = OI_OK};
     struct oi_cli_command_context context = {
-        out,  err, "current-model", &permission, NULL,
-        record_set_model, &call, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission, .set_model = record_set_model,
+        .set_model_user_data = &call,
     };
     enum oi_cli_command_result result;
     char *output;
@@ -189,9 +346,9 @@ TEST(model_callback_failure_is_reported_and_stays_in_the_repl) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct model_cb_call call = {.result = OI_ERR_INVAL};
     struct oi_cli_command_context context = {
-        out,  err, "current-model", &permission, NULL,
-        record_set_model, &call, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission, .set_model = record_set_model,
+        .set_model_user_data = &call,
     };
     enum oi_cli_command_result result;
     char *errors;
@@ -211,9 +368,9 @@ TEST(model_callback_structural_failure_propagates) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct model_cb_call call = {.result = OI_ERR_IO};
     struct oi_cli_command_context context = {
-        out,  err, "current-model", &permission, NULL,
-        record_set_model, &call, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission, .set_model = record_set_model,
+        .set_model_user_data = &call,
     };
     enum oi_cli_command_result result;
 
@@ -228,9 +385,9 @@ TEST(model_rejects_an_oversized_name_without_calling_back) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct model_cb_call call = {.result = OI_OK};
     struct oi_cli_command_context context = {
-        out,  err, "current-model", &permission, NULL,
-        record_set_model, &call, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission, .set_model = record_set_model,
+        .set_model_user_data = &call,
     };
     enum oi_cli_command_result result;
     char oversized[300] = "/model ";
@@ -274,8 +431,8 @@ TEST(cwd_with_no_argument_prints_the_process_cwd) {
     FILE *err = tmpfile();
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
-        out, err, "current-model", &permission, NULL, NULL, NULL, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission,
     };
     enum oi_cli_command_result result;
     char *output;
@@ -293,8 +450,8 @@ TEST(cwd_with_no_callback_reports_unavailable) {
     FILE *err = tmpfile();
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
-        out, err, "current-model", &permission, NULL, NULL, NULL, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission,
     };
     enum oi_cli_command_result result;
     char *errors;
@@ -313,9 +470,9 @@ TEST(cwd_with_argument_invokes_the_callback_with_exact_bytes) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct cwd_cb_call call = {.result = OI_OK};
     struct oi_cli_command_context context = {
-        out, err, "current-model", &permission, NULL, NULL, NULL,
-        record_set_cwd, &call,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission, .set_cwd = record_set_cwd,
+        .set_cwd_user_data = &call,
     };
     enum oi_cli_command_result result;
     char *output;
@@ -336,9 +493,9 @@ TEST(cwd_callback_failure_is_reported_and_stays_in_the_repl) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct cwd_cb_call call = {.result = OI_ERR_INVAL};
     struct oi_cli_command_context context = {
-        out, err, "current-model", &permission, NULL, NULL, NULL,
-        record_set_cwd, &call,
-        {0},
+        .out = out, .err = err, .model = "current-model",
+        .permission = &permission, .set_cwd = record_set_cwd,
+        .set_cwd_user_data = &call,
     };
     enum oi_cli_command_result result;
     char *errors;
@@ -480,7 +637,8 @@ TEST(session_list_renders_every_entry_state) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
-        out, err, "m", &permission, "sess-0", NULL, NULL, NULL, NULL, {0},
+        .out = out, .err = err, .model = "m", .permission = &permission,
+        .session_id = "sess-0",
     };
     enum oi_cli_command_result result;
     char *output;
@@ -527,7 +685,7 @@ TEST(session_list_reports_an_empty_directory_and_a_read_failure) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
-        out, err, "m", &permission, NULL, NULL, NULL, NULL, NULL, {0},
+        .out = out, .err = err, .model = "m", .permission = &permission,
     };
     enum oi_cli_command_result result;
     char *text;
@@ -559,8 +717,8 @@ TEST(session_current_reports_health_live) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
-        out, err, "m", &permission, "sess-current", NULL, NULL, NULL, NULL,
-        {0},
+        .out = out, .err = err, .model = "m", .permission = &permission,
+        .session_id = "sess-current",
     };
     enum oi_cli_command_result result;
     char *text;
@@ -595,7 +753,7 @@ TEST(session_rename_passes_exact_bytes_and_reports_details) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
-        out, err, "m", &permission, NULL, NULL, NULL, NULL, NULL, {0},
+        .out = out, .err = err, .model = "m", .permission = &permission,
     };
     enum oi_cli_command_result result;
     char *text;
@@ -644,7 +802,7 @@ TEST(session_trash_and_restore_take_exactly_one_id) {
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
-        out, err, "m", &permission, NULL, NULL, NULL, NULL, NULL, {0},
+        .out = out, .err = err, .model = "m", .permission = &permission,
     };
     enum oi_cli_command_result result;
     char *text;
@@ -691,7 +849,7 @@ TEST(session_reports_unavailable_operations_and_bad_subcommands) {
     FILE *err = tmpfile();
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
-        out, err, "m", &permission, NULL, NULL, NULL, NULL, NULL, {0},
+        .out = out, .err = err, .model = "m", .permission = &permission,
     };
     enum oi_cli_command_result result;
     char *text;
@@ -744,7 +902,9 @@ TEST(session_reports_unavailable_operations_and_bad_subcommands) {
 int main(void) {
     RUN(help_lists_commands_and_exit_requests_exit);
     RUN(permissions_are_process_scoped_and_validated);
-    RUN(status_reports_runtime_without_secrets);
+    RUN(status_reports_the_assembled_snapshot);
+    RUN(status_reports_unknown_for_everything_a_callback_leaves_alone);
+    RUN(status_rejects_arguments_and_survives_an_unavailable_snapshot);
     RUN(model_with_no_argument_prints_the_active_model);
     RUN(model_with_no_callback_reports_unavailable);
     RUN(model_with_argument_invokes_the_callback_with_exact_bytes);

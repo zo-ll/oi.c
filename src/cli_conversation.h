@@ -26,6 +26,36 @@ enum oi_cli_conversation_tool_outcome {
     OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED
 };
 
+/*
+ * Where a turn currently is, as one value rather than a handful of
+ * booleans a reader has to combine correctly. Exactly one of the three
+ * in-flight kinds applies at a time (see the request/tool/
+ * pending_permission_tool invariant in cli_conversation.c), so this is a
+ * faithful enumeration, not a lossy summary.
+ */
+enum oi_cli_conversation_activity {
+    /*
+     * Nobody asked. Never returned by oi_cli_conversation_activity -- it
+     * exists so a reporting struct that carries this enum can distinguish
+     * "not filled in" from IDLE, which is a real and common answer. The
+     * zero value for exactly that reason.
+     */
+    OI_CLI_CONVERSATION_ACTIVITY_UNKNOWN = 0,
+    /* No turn is active and the last one, if any, completed normally. */
+    OI_CLI_CONVERSATION_ACTIVITY_IDLE,
+    OI_CLI_CONVERSATION_ACTIVITY_STREAMING,
+    OI_CLI_CONVERSATION_ACTIVITY_AWAITING_PERMISSION,
+    OI_CLI_CONVERSATION_ACTIVITY_TOOL_RUNNING,
+    /* A cancel is unwinding the turn. Observable from an event callback
+     * during the cancel's own partial-response and repair events. */
+    OI_CLI_CONVERSATION_ACTIVITY_CANCELLING,
+    /* Busy, but nothing is in flight: between a model round and the tool
+     * loop, or committing a message. */
+    OI_CLI_CONVERSATION_ACTIVITY_WORKING,
+    /* No turn is active and the last one ended with a non-OK status. */
+    OI_CLI_CONVERSATION_ACTIVITY_FAILED
+};
+
 enum oi_cli_conversation_event_type {
     OI_CLI_CONVERSATION_EVENT_ASSISTANT_DELTA,
     OI_CLI_CONVERSATION_EVENT_MESSAGE,
@@ -159,6 +189,15 @@ oi_status oi_cli_conversation_resolve_permission(
     oi_cli_conversation *conversation, int allow);
 
 int oi_cli_conversation_is_busy(const oi_cli_conversation *conversation);
+
+/*
+ * The current activity, for reporting (/status) rather than control flow --
+ * the existing is_busy/is_steering/last_status predicates remain the ones
+ * the REPL steers on. A NULL conversation reads as IDLE, which is what a
+ * REPL that has not lazily created one yet genuinely is.
+ */
+enum oi_cli_conversation_activity oi_cli_conversation_activity(
+    const oi_cli_conversation *conversation);
 /*
  * True only when the most recent finished turn ended via
  * oi_cli_conversation_cancel with its repair (if any) fully succeeding --
