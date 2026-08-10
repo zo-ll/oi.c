@@ -47,6 +47,12 @@ runtime tiers, and reports every binary separately. A build or test failure
 makes the command fail rather than producing a successful-looking partial
 report.
 
+`docs/VERIFICATION_MATRIX.md` maps every REPL-plan verification gate to the
+concrete test cases and CI jobs that prove it, and records the release
+checklist with environment-only limitations (macOS kqueue on the
+`macos-support` branch, the TSan ASLR workaround). Keep it in sync when a
+gate gains or loses coverage.
+
 ## Build architecture
 
 CLI sources compile once into `build/cli/*.o`. The production `build/oi`
