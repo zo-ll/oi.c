@@ -2,6 +2,13 @@ CC ?= cc
 CSTD = -std=c11 -D_POSIX_C_SOURCE=200809L
 WARN = -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Werror
 CFLAGS ?= -g -O0
+# -MMD writes a <object>.d dependency file next to each object, so a header
+# edit rebuilds every compile that includes it instead of silently linking
+# stale objects against a new declaration (an ABI drift that the suite then
+# fails with a hard-to-place crash). -MP adds phony per-header targets so a
+# deleted header does not error the next run. The .d files are read back in
+# at the bottom of this file via -include.
+DEPFLAGS = -MMD -MP
 OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null)
 OPENSSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
 INCLUDES = -Iinclude -Isrc $(OPENSSL_CFLAGS)
@@ -102,13 +109,13 @@ $(CLI_OBJ_BUILD):
 	mkdir -p $(CLI_OBJ_BUILD)
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
 
 $(CLI_OBJ_BUILD)/%.o: src/%.c | $(CLI_OBJ_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
 
 $(PIC_BUILD)/%.o: src/%.c | $(PIC_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) -fPIC $(INCLUDES) -c $< -o $@
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) -fPIC $(INCLUDES) $(DEPFLAGS) -c $< -o $@
 
 $(LIB): $(LIB_OBJS)
 	ar rcs $@ $^
@@ -130,13 +137,13 @@ $(CLI_BIN): $(CLI_OBJS) $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $(CLI_OBJS) $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/test_%: test/test_%.c $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/test_cli: test/test_cli.c $(LIB) $(CLI_BIN) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS) $(PTY_LIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS) $(PTY_LIBS)
 
 $(BUILD)/test_cli_%: test/test_cli_%.c $(CLI_TEST_LIB) $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/test_cli_terminal $(BUILD)/test_cli_composer: LDLIBS += $(PTY_LIBS)
 
@@ -260,16 +267,16 @@ $(INTEGRATION_BUILD):
 	mkdir -p $(INTEGRATION_BUILD)
 
 $(INTEGRATION_BUILD)/%: test/integration/%.c $(LIB) | $(INTEGRATION_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(LIB) -o $@ $(LDLIBS)
 
 $(INTEGRATION_BUILD)/test_cli_conversation: test/integration/test_cli_conversation.c $(CLI_TEST_LIB) $(LIB) | $(INTEGRATION_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
 
 $(INTEGRATION_BUILD)/test_cli_compact: test/integration/test_cli_compact.c $(CLI_TEST_LIB) $(LIB) | $(INTEGRATION_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
 
 $(INTEGRATION_BUILD)/test_cli_session_switch: test/integration/test_cli_session_switch.c $(CLI_TEST_LIB) $(LIB) | $(INTEGRATION_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
 
 test-integration: $(INTEGRATION_BINS)
 	@if [ -z "$(INTEGRATION_BINS)" ]; then \
@@ -491,7 +498,7 @@ $(FUZZ_BUILD):
 $(FUZZ_BUILD)/%: test/fuzz/%.c $(LIB_SRCS) | $(FUZZ_BUILD)
 	$(FUZZ_CC) $(CSTD) $(WARN) -g -O1 \
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
-		$(INCLUDES) $< $(LIB_SRCS) -o $@ $(LDLIBS)
+		$(INCLUDES) $(DEPFLAGS) $< $(LIB_SRCS) -o $@ $(LDLIBS)
 
 # The CLI-private render/Markdown pipeline doesn't touch the public
 # library, so this harness links only its own dependency chain (the
@@ -504,7 +511,7 @@ CLI_RENDER_STREAM_SRCS = src/cli_render_stream.c src/cli_render_style.c \
 $(FUZZ_BUILD)/fuzz_cli_render_stream: test/fuzz/fuzz_cli_render_stream.c $(CLI_RENDER_STREAM_SRCS) | $(FUZZ_BUILD)
 	$(FUZZ_CC) $(CSTD) $(WARN) -g -O1 \
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
-		$(INCLUDES) $< $(CLI_RENDER_STREAM_SRCS) -o $@ $(LDLIBS)
+		$(INCLUDES) $(DEPFLAGS) $< $(CLI_RENDER_STREAM_SRCS) -o $@ $(LDLIBS)
 
 # Also CLI-private, plus the JSON parser/writer $(LIB_SRCS) itself needs
 # for record encode/decode (oi_cli_history_record_encode is compiled in
@@ -517,7 +524,7 @@ CLI_HISTORY_REPLAY_FUZZ_SRCS = src/cli_history.c src/cli_history_codec.c \
 $(FUZZ_BUILD)/fuzz_cli_history_replay: test/fuzz/fuzz_cli_history_replay.c $(CLI_HISTORY_REPLAY_FUZZ_SRCS) | $(FUZZ_BUILD)
 	$(FUZZ_CC) $(CSTD) $(WARN) -g -O1 \
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
-		$(INCLUDES) $< $(CLI_HISTORY_REPLAY_FUZZ_SRCS) -o $@ $(LDLIBS)
+		$(INCLUDES) $(DEPFLAGS) $< $(CLI_HISTORY_REPLAY_FUZZ_SRCS) -o $@ $(LDLIBS)
 
 fuzz: $(FUZZ_BINS)
 	@if [ -z "$(FUZZ_BINS)" ]; then \
@@ -536,6 +543,12 @@ fuzz-run: $(FUZZ_BINS)
 		$$b -runs=$(FUZZ_RUNS) -artifact_prefix=$(FUZZ_BUILD)/ \
 			$$found $$([ -d $$seeds ] && echo $$seeds); \
 	done
+
+# Dependency files, read back in so header edits rebuild dependents. All
+# build trees are defined above this point; a wildcard that matches nothing
+# (a tree not built yet, or a tree wiped by `clean`) silently includes nothing.
+-include $(wildcard $(BUILD)/*.d $(CLI_OBJ_BUILD)/*.d $(PIC_BUILD)/*.d \
+	$(INTEGRATION_BUILD)/*.d $(FUZZ_BUILD)/*.d)
 
 clean:
 	rm -rf $(BUILD) build-gcc build-clang build-asan build-ubsan \
