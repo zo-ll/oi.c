@@ -442,7 +442,7 @@ timings:
 abi-check: $(LIB_SO_REAL)
 	@nm -D --defined-only --format=posix $(LIB_SO_REAL) | \
 		awk '$$1 ~ /^oi_/ { sub(/@.*/, "", $$1); print $$1 }' | \
-		sort -u | diff -u test/abi_exports.txt -
+		LC_ALL=C sort -u | diff -u <(LC_ALL=C sort -u test/abi_exports.txt) -
 
 # Sanitizer variants each recurse into a separate BUILD dir with
 # overridden CFLAGS, reusing every rule above unchanged rather than
