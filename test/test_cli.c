@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -5445,6 +5446,133 @@ TEST(interactive_exit_before_submission_creates_no_session) {
     close(master_fd);
 }
 
+/*
+ * The REPL puts the pty into raw mode and enables bracketed paste when it
+ * starts; every exit path must undo both before the process goes away, or a
+ * shell resuming on that terminal is left with echo and line editing off.
+ * test_cli_terminal.c proves the terminal module restores a single struct;
+ * this proves the real process reaches that restore on each exit path and
+ * emits the matching bracketed-paste disable, by keeping the parent's own
+ * slave descriptor open and inspecting the shared tty state after the child
+ * has gone. Raw mode clears ICANON|ECHO|ISIG (cli_terminal.c), so their
+ * presence after exit is the cooked-mode signal.
+ */
+static int termios_is_cooked(int fd) {
+    struct termios attributes;
+
+    if (tcgetattr(fd, &attributes) != 0) {
+        return 0;
+    }
+    return (attributes.c_lflag & ICANON) != 0 &&
+           (attributes.c_lflag & ECHO) != 0 &&
+           (attributes.c_lflag & ISIG) != 0;
+}
+
+static int exit_path_restores_terminal(int master_fd, int slave_fd,
+                                       const char *session_root,
+                                       void (*trigger)(int, pid_t)) {
+    struct interactive_result result;
+    int status = 0;
+    pid_t cli;
+
+    memset(&result, 0, sizeof result);
+    cli = start_interactive_cli(9, slave_fd, session_root);
+    if (!interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1)) {
+        return 0;
+    }
+    trigger(master_fd, cli);
+    if (waitpid(cli, &status, 0) != cli || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "[restore] exit path did not terminate cleanly\n");
+        fflush(stderr);
+        return 0;
+    }
+    if (!termios_is_cooked(slave_fd)) {
+        fprintf(stderr, "[restore] terminal left in raw mode after exit\n");
+        fflush(stderr);
+        return 0;
+    }
+    /* Drain what the child flushed before exiting: the disable sequence was
+     * written before the process ended, so it is already in the master's
+     * buffer. The parent's open slave descriptor means the master never
+     * reaches EOF, so read nonblocking until EAGAIN rather than block. */
+    {
+        int flags = fcntl(master_fd, F_GETFL, 0);
+        char buffer[256];
+        ssize_t len;
+
+        fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
+        while ((len = read(master_fd, buffer, sizeof buffer)) > 0) {
+            size_t room = sizeof result.output - 1 - result.output_len;
+            if (result.output_len < sizeof result.output - 1) {
+                if ((size_t)len > room) {
+                    len = (ssize_t)room;
+                }
+                memcpy(result.output + result.output_len, buffer, (size_t)len);
+                result.output_len += (size_t)len;
+                result.output[result.output_len] = '\0';
+            }
+        }
+        fcntl(master_fd, F_SETFL, flags);
+    }
+    if (count_text(result.output, "\x1b[?2004l") < 1) {
+        fprintf(stderr,
+                "[restore] bracketed paste was not disabled on exit\n");
+        fflush(stderr);
+        return 0;
+    }
+    if (access(session_root, F_OK) == 0) {
+        fprintf(stderr, "[restore] exit path created a session directory\n");
+        fflush(stderr);
+        return 0;
+    }
+    return 1;
+}
+
+static void trigger_exit_command(int master_fd, pid_t cli) {
+    (void)cli;
+    CHECK(write_interactive(master_fd, "/exit\r", 6));
+}
+
+static void trigger_ctrl_d(int master_fd, pid_t cli) {
+    (void)cli;
+    CHECK(write_interactive(master_fd, "\x04", 1));
+}
+
+static void trigger_sigterm(int master_fd, pid_t cli) {
+    (void)master_fd;
+    CHECK_EQ(kill(cli, SIGTERM), 0);
+}
+
+TEST(repl_restores_terminal_state_on_every_exit_path) {
+    static const struct {
+        const char *name;
+        void (*trigger)(int, pid_t);
+    } paths[] = {
+        {"the /exit command", trigger_exit_command},
+        {"Ctrl+D", trigger_ctrl_d},
+        {"SIGTERM", trigger_sigterm},
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        int master_fd = -1;
+        int slave_fd = -1;
+        char session_root[128];
+
+        snprintf(session_root, sizeof session_root,
+                 "/tmp/oi-cli-restore-%d-%zu", (int)getpid(), i);
+        CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+        /* Keep slave_fd: it is the parent's window onto the tty state once
+         * the child's descriptor is gone, and holds the pty alive so the
+         * drain above sees buffered output instead of EOF. */
+        CHECK(exit_path_restores_terminal(master_fd, slave_fd, session_root,
+                                          paths[i].trigger));
+        close(master_fd);
+        close(slave_fd);
+    }
+}
+
 TEST(interactive_help_and_exit_are_dispatched_without_a_session) {
     int master_fd = -1;
     int slave_fd = -1;
@@ -6435,6 +6563,7 @@ int main(void) {
     RUN(model_override_persists_across_a_restart);
     RUN(resize_redraws_the_live_prompt_at_the_new_width);
     RUN(interactive_exit_before_submission_creates_no_session);
+    RUN(repl_restores_terminal_state_on_every_exit_path);
     RUN(interactive_help_and_exit_are_dispatched_without_a_session);
     RUN(compact_replaces_older_turns_with_a_checkpoint);
     RUN(compact_reports_usage_error_and_nothing_to_compact);
