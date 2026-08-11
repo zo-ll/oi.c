@@ -1621,6 +1621,8 @@ TEST(checkpoint_is_rejected_while_busy) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     RUN(start_is_event_driven_and_preserves_context);
     RUN(tool_start_boundary_precedes_process_output);
     RUN(ask_defers_and_resolve_permission_allow_lets_the_tool_run);

@@ -853,6 +853,8 @@ TEST(auto_reaped_child_reports_status_unavailable) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     RUN(run_echo_captures_output_and_normal_exit);
     RUN(nonzero_exit_code_reported);
     RUN(missing_binary_reports_exec_failed);

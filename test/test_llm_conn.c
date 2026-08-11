@@ -413,6 +413,8 @@ TEST(connection_preserves_sigpipe_disposition) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     signal(SIGCHLD, SIG_DFL);
     RUN(connect_write_echo_and_reentrant_close);
     RUN(connection_refused_reports_error);

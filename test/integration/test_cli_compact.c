@@ -383,6 +383,8 @@ TEST(compact_run_rejects_invalid_arguments) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     RUN(compact_run_produces_a_summary_on_success);
     RUN(compact_run_reports_failed_on_http_error);
     RUN(compact_run_reports_failed_on_malformed_body);

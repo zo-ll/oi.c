@@ -6509,6 +6509,8 @@ TEST(mock_control_closing_the_release_end_fails_the_server_promptly) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     signal(SIGCHLD, SIG_DFL);
     RUN(help_exits_zero);
     RUN(help_flags_are_documented_in_the_guide);

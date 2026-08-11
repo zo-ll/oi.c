@@ -16,7 +16,9 @@ gates"). Each row below names the artifact that proves it.
   its pass so a stale tree cannot certify the wrong compiler, then checks the
   `compiler.txt` stamps (`verify-compilers`).
 - CI: `.github/workflows/ci.yml` `test (gcc)` and `test (clang)` jobs run
-  `make check` and `make abi-check` per compiler.
+  `make check` and `make abi-check` per compiler. Every job has
+  `timeout-minutes: 60` so a hung child fails the job instead of running the
+  platform's 6-hour default.
 - Every compile uses `-Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes
   -Werror`.
 
@@ -65,6 +67,16 @@ read against a live descriptor uses `select`/`poll` with a timeout
 (`interactive_wait_for` and `slow_mock_*`). A stalled child therefore fails
 with a diagnostic instead of hanging CI.
 
+Process-level watchdog: every impure and integration binary arms
+oi_test_set_deadline(900) (test.h), a SIGALRM deadline that prints the name
+of the test that was executing and exits 124 if the whole binary runs longer
+than 15 minutes. This closes the one unbounded vector — a CLI child that
+regresses into a silent hang — which per-read timeouts cannot catch. Mock
+servers additionally bound each accept with a 20 s select and exit without a
+client (a failed exec or missing connection fails in seconds, not forever).
+Pure tests never arm the deadline; it is generous so valgrind/tsan runs do
+not false-positive.
+
 ## Gate 4 — Mock-server integration
 
 | Coverage | Tests |
@@ -94,8 +106,8 @@ with a diagnostic instead of hanging CI.
 | ASan + UBSan | `make asan` (`-fsanitize=address,undefined`, `build-asan`) | `sanitizers (asan)` |
 | UBSan alone | `make ubsan` (`build-ubsan`) | `sanitizers (ubsan)` |
 | TSan | `make tsan` (`build-tsan`) | `sanitizers (tsan)` |
-| Valgrind | `make valgrind` (leak-check full, `--trace-children=no`, plain build) | `valgrind` |
-| Fuzz regression | `make fuzz-run` (clang libFuzzer, ASan+UBSan) | `fuzz` (`FUZZ_RUNS=200000`, crash artifacts uploaded on failure) |
+| Valgrind | `make valgrind` (leak-check full, `--trace-children=no`, plain build) | `valgrind` (60 min) |
+| Fuzz regression | `make fuzz-run` (clang libFuzzer, ASan+UBSan) | `fuzz` (`FUZZ_RUNS=200000`, crash artifacts uploaded on failure) (60 min) |
 
 ## Release checklist
 

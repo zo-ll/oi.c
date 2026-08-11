@@ -628,6 +628,8 @@ TEST(mock_cleanup_stops_unused_server) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     RUN(full_tool_use_loop);
     RUN(denied_tool_never_executes);
     RUN(deferred_permission_resolves);

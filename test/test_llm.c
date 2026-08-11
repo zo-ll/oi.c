@@ -699,6 +699,8 @@ TEST(client_rejects_unsafe_http_fields) {
 TEST(cancel_null_safe) { oi_llm_request_cancel(NULL); }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     signal(SIGCHLD, SIG_DFL);
     RUN(streaming_success_delivers_deltas);
     RUN(structured_tool_call_fragments_are_ordered);

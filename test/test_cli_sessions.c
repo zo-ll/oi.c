@@ -2404,6 +2404,8 @@ TEST(restore_settings_rejects_bad_arguments) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     RUN(default_root_uses_xdg_state_home);
     RUN(create_makes_private_timestamped_session);
     RUN(two_creations_are_unique);

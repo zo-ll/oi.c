@@ -1225,6 +1225,8 @@ TEST(select_terminate_signal_is_reported) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     RUN(cursor_editing_submits_expected_text_and_restores_terminal);
     RUN(bracketed_multiline_paste_is_one_submission);
     RUN(ctrl_c_clears_and_ctrl_d_exits);

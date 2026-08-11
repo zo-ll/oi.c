@@ -2,3 +2,4 @@
 # Sanitizer and fuzzer build dirs (make asan/ubsan/tsan/fuzz), plus the
 # corpus entries and crash artifacts a fuzz run leaves under build-fuzz/.
 /build-*/
+COORDINATION.md

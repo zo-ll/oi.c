@@ -113,6 +113,8 @@ TEST(isig_can_be_toggled_without_leaving_raw_mode) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     RUN(enable_sets_raw_mode_and_restore_reinstates_it);
     RUN(non_terminal_descriptors_are_refused);
     RUN(isig_can_be_toggled_without_leaving_raw_mode);

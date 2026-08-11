@@ -671,6 +671,8 @@ TEST(switch_repairs_an_interrupted_turn_in_the_target) {
 }
 
 int main(void) {
+    /* A regression that hangs a child must fail this binary, not CI. */
+    oi_test_set_deadline(900);
     RUN(switch_opens_replays_and_restores_the_target);
     RUN(switch_to_the_same_session_is_a_no_op);
     RUN(switch_rejects_unsafe_ids_and_missing_sessions);
