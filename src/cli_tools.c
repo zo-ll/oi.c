@@ -62,10 +62,9 @@ oi_tool_decision oi_cli_tool_permission(const char *tool_name,
     case OI_CLI_TOOLS_DENY:
         return OI_TOOL_DENY;
     case OI_CLI_TOOLS_ASK:
-        /* Deferred to the embedder: cli_tools has no terminal I/O of its
-         * own anymore (issue #26) -- an interactive caller (cli_repl.c)
-         * resolves this asynchronously via
-         * oi_cli_conversation_resolve_permission once a real decision
+        /* Deferred to the embedder: cli_tools has no terminal I/O. An
+         * interactive caller (cli_repl.c) resolves this asynchronously
+         * via oi_cli_conversation_resolve_permission once a decision
          * arrives through its own UI. */
         return OI_TOOL_ASK;
     }

@@ -8,7 +8,7 @@
  * non-secret settings, the environment for secrets, and a generic
  * setter any override source (a config file line, a CLI flag) can call
  * through. Deliberately doesn't parse argv itself -- flag *syntax* is
- * the CLI binary's concern (issue #9); this module only owns turning a
+ * the CLI binary's concern; this module only owns turning a
  * resolved (key, value) pair into the right struct field, so both the
  * file parser here and the CLI's flag loop there share one place that
  * knows the field set and how to validate/convert each one.

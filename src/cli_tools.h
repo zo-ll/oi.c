@@ -20,9 +20,9 @@ oi_status oi_cli_tools_register(oi_tool_registry *registry);
 /*
  * Permission callback used by the interactive REPL: OI_CLI_TOOLS_ASK maps
  * to OI_TOOL_ASK, deferring the actual decision to the embedder (resolved
- * later via oi_cli_conversation_resolve_permission). No terminal I/O of
- * its own -- cli_tools defines policy only, per issue #26's own
- * module-boundary rule; requesting a decision is the REPL's job.
+ * later via oi_cli_conversation_resolve_permission). cli_tools defines
+ * policy only and has no terminal I/O; requesting a decision is the
+ * REPL's job.
  */
 oi_tool_decision oi_cli_tool_permission(const char *tool_name,
                                          const oi_json_value *args,

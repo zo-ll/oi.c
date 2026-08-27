@@ -66,13 +66,11 @@ struct repl_setting_context {
 };
 
 /*
- * The one-slot pending item, owned entirely by cli_repl.c per this
- * issue's own module-boundary rule (cli_conversation only ever gets a
- * bare "steer" signal, no content; cli_history only encodes/replays the
- * durable record shape, it never decides what's queued). Reset to NONE at
- * the top of oi_cli_repl_run's turn loop each time it's actually consumed
- * or discarded (added in a later commit) -- this commit only ever
- * populates it, nothing yet drains it.
+ * The one-slot pending item, owned entirely by cli_repl.c. cli_conversation
+ * only ever receives a bare "steer" signal, never queued content, and
+ * cli_history only encodes/replays the durable record shape; deciding what
+ * is queued belongs to the REPL. Reset to NONE at the top of
+ * oi_cli_repl_run's turn loop each time it is consumed or discarded.
  */
 enum oi_cli_repl_pending_kind {
     OI_CLI_REPL_PENDING_NONE = 0,
@@ -626,14 +624,12 @@ static void report_busy_io_error(struct repl_turn_input_context *context,
 /*
  * Handles Enter pressed while a turn is active. /help and /status (the
  * only OI_CLI_COMMAND_READ_ONLY commands) dispatch immediately regardless
- * of the pending slot, matching the issue's own carve-out; everything
- * else -- a plain message, or any other command (including /exit) --
- * goes through the one-slot rule: refused non-destructively if the slot
- * is already occupied (the draft is only ever committed/cleared once the
- * submission is actually accepted, one way or the other), else committed,
- * durably persisted as QUEUED_INPUT, and held here until a later commit
- * wires up steering/consumption to actually run it at the next safe
- * boundary.
+ * of the pending slot; everything else -- a plain message, or any other
+ * command (including /exit) -- goes through the one-slot rule: refused
+ * non-destructively if the slot is already occupied (the draft is only
+ * ever committed/cleared once the submission is accepted, one way or the
+ * other), else committed and durably persisted as QUEUED_INPUT, to be
+ * steered into the turn at the next safe boundary.
  */
 static void handle_busy_submit(struct repl_turn_input_context *context) {
     struct oi_cli_command_parse peek;
@@ -1922,14 +1918,15 @@ have_parsed_command:
             }
             /*
              * /permissions allow must not silently elevate the process-
-             * wide tool policy: gated here (not in cli_command_dispatch.c,
-             * which has no composer/terminal access by design and
-             * shouldn't gain any) rather than in dispatch_permissions
-             * itself, so this one insertion covers both a freshly-typed
-             * command and a dequeued pending one (issue #25's one-slot
-             * queue also funnels through this same have_parsed_command:
-             * label). /permissions ask/deny, and a redundant allow when
-             * already allowed, skip this gate and dispatch directly.
+             * wide tool policy. Gated here rather than in
+             * cli_command_dispatch.c (which has no composer/terminal
+             * access by design and should not gain any) or in
+             * dispatch_permissions itself, so this one insertion covers
+             * both a freshly-typed command and a dequeued pending one --
+             * the one-slot queue funnels through this same
+             * have_parsed_command label. /permissions ask/deny, and a
+             * redundant allow when already allowed, skip this gate and
+             * dispatch directly.
              */
             if (parsed.command->id == OI_CLI_COMMAND_PERMISSIONS &&
                 parsed.arguments_len == 5 &&
