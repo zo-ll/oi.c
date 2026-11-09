@@ -7,6 +7,7 @@ TEST(registry_contains_the_agreed_commands) {
     static const char *expected[] = {
         "/help",        "/exit",   "/session", "/model",
         "/permissions", "/status", "/compact", "/cwd",
+        "/login",
     };
     size_t i;
 
@@ -23,10 +24,10 @@ TEST(registry_contains_the_agreed_commands) {
 }
 
 TEST(filter_matches_prefixes_only_in_the_first_token) {
-    size_t matches[8];
+    size_t matches[16];
     size_t count;
 
-    count = oi_cli_command_filter("/", 1, matches, 8);
+    count = oi_cli_command_filter("/", 1, matches, 16);
     CHECK_EQ(count, oi_cli_command_count());
     count = oi_cli_command_filter("/s", 2, matches, 8);
     CHECK_EQ(count, 2);

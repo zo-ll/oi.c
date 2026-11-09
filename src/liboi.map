@@ -39,7 +39,10 @@ OI_0.1 {
         oi_json_writer_data;
         oi_json_writer_destroy;
         oi_llm_client_create;
+        oi_llm_client_create_responses;
         oi_llm_client_destroy;
+        oi_llm_client_reconfigure;
+        oi_llm_client_set_before_request;
         oi_llm_request_cancel;
         oi_llm_request_start;
         oi_llm_request_start_events;

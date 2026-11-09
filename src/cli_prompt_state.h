@@ -24,7 +24,7 @@ struct oi_cli_prompt_state {
     struct oi_cli_editor editor;
     struct oi_cli_input_history *history;
     int pasting;
-    size_t command_matches[8];
+    size_t command_matches[16];
     size_t command_match_count;
     size_t command_selection;
 };

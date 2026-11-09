@@ -93,7 +93,39 @@ struct oi_llm_config {
  * injection is rejected at this boundary). The returned client must
  * outlive every request started against it. */
 oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg);
+
+/*
+ * Creates a client for the OpenAI Responses API wire format; `cfg->path`
+ * names that route, e.g. "/v1/responses". Callers still pass Chat
+ * Completions bodies: "model", "messages", and function "tools" are
+ * translated before sending and every other member is dropped. A body
+ * that cannot be translated fails the request start with OI_ERR_PARSE.
+ * Streams surface through the same callbacks. A terminal failure event
+ * reports OI_ERR_IO with that event's JSON as the error body.
+ */
+oi_llm_client *oi_llm_client_create_responses(const struct oi_llm_config *cfg);
 void oi_llm_client_destroy(oi_llm_client *client);
+
+/*
+ * Replaces a client's endpoint, key, and wire format in place, so that a
+ * caller holding the pointer sees the new settings on its next request. No
+ * request may be in flight. Returns OI_ERR_INVAL for a configuration
+ * oi_llm_client_create would refuse, and then leaves the client unchanged.
+ */
+oi_status oi_llm_client_reconfigure(oi_llm_client *client,
+                                    const struct oi_llm_config *cfg,
+                                    int responses_api);
+
+/*
+ * Runs `hook` at the start of every request, before anything is sent, so
+ * that a caller can renew a short-lived credential through
+ * oi_llm_client_reconfigure. A non-OK return fails that request start with
+ * the same status. The hook survives a reconfigure; NULL removes it.
+ */
+typedef oi_status (*oi_llm_before_request_cb)(void *user_data);
+void oi_llm_client_set_before_request(oi_llm_client *client,
+                                      oi_llm_before_request_cb hook,
+                                      void *user_data);
 
 /*
  * Starts one streaming chat-completion request. `body` is a complete

@@ -13,7 +13,8 @@ enum oi_cli_command_id {
     OI_CLI_COMMAND_PERMISSIONS,
     OI_CLI_COMMAND_STATUS,
     OI_CLI_COMMAND_COMPACT,
-    OI_CLI_COMMAND_CWD
+    OI_CLI_COMMAND_CWD,
+    OI_CLI_COMMAND_LOGIN
 };
 
 enum oi_cli_command_scope {

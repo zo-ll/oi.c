@@ -6,6 +6,7 @@
 
 #include "cli_command_dispatch.h"
 #include "cli_conversation.h"
+#include "cli_login.h"
 #include "cli_message.h"
 #include "cli_session_switch.h"
 #include "cli_status.h"
@@ -139,9 +140,12 @@ struct oi_cli_repl_config {
      * the REPL never opens a connection itself, and the client it is handed
      * deliberately does not publish what it was configured with. `endpoint`
      * is borrowed and must outlive the run; it carries host/port/path and
-     * the TLS flag, and structurally cannot carry a credential.
+     * the TLS flag, and structurally cannot carry a credential. /login
+     * updates it in place.
      */
-    struct oi_cli_status_endpoint endpoint;
+    struct oi_cli_status_endpoint *endpoint;
+    /* Borrowed; runs /login against the same client and endpoint. */
+    struct oi_cli_login *login;
     int request_timeout_ms;
     /* Where `model` came from at startup. The REPL updates its own copy of
      * this as /model and /session switch change the active model. */

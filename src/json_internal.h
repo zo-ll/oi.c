@@ -5,8 +5,9 @@
 
 /*
  * Value-tree representation shared between json_value.c (accessors and
- * arena-backed constructors) and json_parse.c (builds the tree while
- * parsing). json_write.c is deliberately excluded: it serializes text
+ * arena-backed constructors), json_parse.c (builds the tree while
+ * parsing), and llm_responses.c (copies parsed tool schemas verbatim).
+ * json_write.c is deliberately excluded: it serializes text
  * directly from caller calls and never touches this representation, so
  * it doesn't need to know the tree layout.
  */

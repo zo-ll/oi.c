@@ -194,7 +194,7 @@ static oi_status repl_status_snapshot(
         repl_session_state(config, out_snapshot->session_id);
     out_snapshot->model = context->setting->current_model->data;
     out_snapshot->model_origin = context->setting->model_origin;
-    out_snapshot->endpoint = config->endpoint;
+    out_snapshot->endpoint = *config->endpoint;
     out_snapshot->permission =
         oi_cli_status_permission_from_policy(config->permission->policy);
     out_snapshot->request_timeout_ms = config->request_timeout_ms;
@@ -1653,6 +1653,27 @@ have_parsed_command:
             continue;
         }
         if (parsed.kind == OI_CLI_COMMAND_PARSE_COMMAND) {
+            if (parsed.command->id == OI_CLI_COMMAND_LOGIN) {
+                int login_terminate_signal = 0;
+
+                status = oi_cli_login_run(config->login, &composer, signal_fd,
+                                          &login_terminate_signal);
+                free(prompt);
+                if (status != OI_OK || login_terminate_signal != 0) {
+                    break;
+                }
+                if (config->login->selected_model != NULL) {
+                    status = dispatch_set_model(
+                        &setting_context, config->login->selected_model,
+                        strlen(config->login->selected_model));
+                    free(config->login->selected_model);
+                    config->login->selected_model = NULL;
+                    if (status != OI_OK) {
+                        break;
+                    }
+                }
+                continue;
+            }
             /*
              * /compact never reaches cli_command_dispatch.c: dispatch has
              * no access to the conversation, durable history store, or LLM

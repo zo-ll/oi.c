@@ -205,4 +205,30 @@ oi_status oi_cli_composer_select(
     size_t default_selected, size_t *out_selected, int *out_cancelled,
     int *out_terminate_signal);
 
+/*
+ * Blocking one-line text entry for the idle case, bypassing the editor and
+ * input history so that a secret never reaches either. With `masked`, only
+ * a character count is displayed. A newline inside a paste does not submit,
+ * so a pasted key's trailing newline cannot end the entry early.
+ *
+ * On a normal Enter, *out_text is a heap copy the caller owns. On a cancel
+ * (Escape or Ctrl+C) or a terminate signal it stays NULL. Leaves the frame
+ * drawn on return, exactly like oi_cli_composer_select.
+ */
+oi_status oi_cli_composer_read_line(
+    struct oi_cli_composer *composer, int signal_fd,
+    const struct oi_cli_render_line *header_lines, size_t header_count,
+    const char *prompt, int masked, char **out_text, size_t *out_len,
+    int *out_cancelled, int *out_terminate_signal);
+
+/*
+ * Blocks with one status line drawn until `fd` is readable (*out_ready),
+ * the user presses Escape or Ctrl+C (*out_cancelled), a terminate signal
+ * arrives, or `timeout_ms` passes (none of the three set).
+ */
+oi_status oi_cli_composer_wait_fd(
+    struct oi_cli_composer *composer, int signal_fd,
+    const struct oi_cli_render_line *status_line, int fd, int timeout_ms,
+    int *out_ready, int *out_cancelled, int *out_terminate_signal);
+
 #endif
