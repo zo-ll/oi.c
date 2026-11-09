@@ -8,6 +8,7 @@
 #include "compat.h"
 #include "llm_conn.h"
 #include "llm_http.h"
+#include "llm_responses.h"
 #include "llm_sse.h"
 #include "oi/json.h"
 
@@ -21,6 +22,9 @@ struct oi_llm_client {
     char *api_key;
     char *path;
     int timeout_ms;
+    int responses_api;
+    oi_llm_before_request_cb before_request;
+    void *before_request_user_data;
 };
 
 struct oi_llm_tool_state {
@@ -115,7 +119,8 @@ static int valid_http_field_value(const char *value) {
     return 1;
 }
 
-oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg) {
+static oi_llm_client *client_create(const struct oi_llm_config *cfg,
+                                    int responses_api) {
     if (cfg == NULL || cfg->host == NULL || cfg->path == NULL ||
         cfg->port == 0 || cfg->timeout_ms < 0 ||
         !valid_http_host(cfg->host) || !valid_http_path(cfg->path) ||
@@ -135,6 +140,7 @@ oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg) {
     c->ca_file = cfg->ca_file ? strdup(cfg->ca_file) : NULL;
     c->api_key = cfg->api_key ? strdup(cfg->api_key) : NULL;
     c->timeout_ms = cfg->timeout_ms;
+    c->responses_api = responses_api;
 
     if (c->host == NULL || c->path == NULL ||
         (cfg->ca_file != NULL && c->ca_file == NULL) ||
@@ -143,6 +149,14 @@ oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg) {
         return NULL;
     }
     return c;
+}
+
+oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg) {
+    return client_create(cfg, 0);
+}
+
+oi_llm_client *oi_llm_client_create_responses(const struct oi_llm_config *cfg) {
+    return client_create(cfg, 1);
 }
 
 void oi_llm_client_destroy(oi_llm_client *c) {
@@ -154,6 +168,30 @@ void oi_llm_client_destroy(oi_llm_client *c) {
     free(c->api_key);
     free(c->path);
     free(c);
+}
+
+oi_status oi_llm_client_reconfigure(oi_llm_client *client,
+                                    const struct oi_llm_config *cfg,
+                                    int responses_api) {
+    oi_llm_client *fresh = client_create(cfg, responses_api);
+    if (client == NULL || fresh == NULL) {
+        oi_llm_client_destroy(fresh);
+        return OI_ERR_INVAL;
+    }
+    fresh->before_request = client->before_request;
+    fresh->before_request_user_data = client->before_request_user_data;
+    struct oi_llm_client previous = *client;
+    *client = *fresh;
+    *fresh = previous;
+    oi_llm_client_destroy(fresh);
+    return OI_OK;
+}
+
+void oi_llm_client_set_before_request(oi_llm_client *client,
+                                      oi_llm_before_request_cb hook,
+                                      void *user_data) {
+    client->before_request = hook;
+    client->before_request_user_data = user_data;
 }
 
 /* ================= request lifecycle ================= */
@@ -318,6 +356,57 @@ static int emit_event(oi_llm_request *req, const oi_llm_event *event) {
     return destroyed != NULL && *destroyed;
 }
 
+/* Returns nonzero when a callback cancelled (and freed) `req`. */
+static int emit_text(oi_llm_request *req, const char *text, size_t len) {
+    oi_llm_event event = {
+        .type = OI_LLM_EVENT_TEXT,
+        .as.text = {text, len},
+    };
+    if (emit_event(req, &event)) {
+        return 1;
+    }
+    if (req->on_delta == NULL) {
+        return 0;
+    }
+    int *destroyed = req->destroyed_flag;
+    req->on_delta(text, len, req->user_data);
+    return destroyed != NULL && *destroyed;
+}
+
+/* A NULL field was absent from this fragment. Returns OI_ERR_CLOSED when
+ * the event callback cancelled (and freed) `req`. */
+static oi_status record_tool_fragment(oi_llm_request *req, size_t index,
+                                      const char *id, size_t id_len,
+                                      const char *name, size_t name_len,
+                                      const char *arguments,
+                                      size_t arguments_len) {
+    struct oi_llm_tool_state *state = tool_state(req, index);
+    if (state == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    oi_status st = OI_OK;
+    if (id != NULL) {
+        st = append_fragment(&state->id, &state->id_len, id, id_len);
+    }
+    if (st == OI_OK && name != NULL) {
+        st = append_fragment(&state->name, &state->name_len, name, name_len);
+    }
+    if (st == OI_OK && arguments != NULL) {
+        st = append_fragment(&state->arguments, &state->arguments_len,
+                             arguments, arguments_len);
+    }
+    if (st != OI_OK) {
+        return st;
+    }
+
+    oi_llm_event event = {
+        .type = OI_LLM_EVENT_TOOL_CALL,
+        .as.tool_call = {index, id, id_len, name, name_len, arguments,
+                         arguments_len},
+    };
+    return emit_event(req, &event) ? OI_ERR_CLOSED : OI_OK;
+}
+
 static oi_status handle_tool_calls(oi_llm_request *req,
                                     const oi_json_value *tool_calls) {
     if (tool_calls == NULL) {
@@ -359,33 +448,10 @@ static oi_status handle_tool_calls(oi_llm_request *req,
             return OI_ERR_PARSE;
         }
 
-        struct oi_llm_tool_state *state = tool_state(req, index);
-        if (state == NULL) {
-            return OI_ERR_NOMEM;
-        }
-        oi_status st = OI_OK;
-        if (id != NULL) {
-            st = append_fragment(&state->id, &state->id_len, id, id_len);
-        }
-        if (st == OI_OK && name != NULL) {
-            st = append_fragment(&state->name, &state->name_len, name,
-                                 name_len);
-        }
-        if (st == OI_OK && arguments != NULL) {
-            st = append_fragment(&state->arguments, &state->arguments_len,
-                                 arguments, arguments_len);
-        }
+        oi_status st = record_tool_fragment(req, index, id, id_len, name,
+                                            name_len, arguments, arguments_len);
         if (st != OI_OK) {
             return st;
-        }
-
-        oi_llm_event event = {
-            .type = OI_LLM_EVENT_TOOL_CALL,
-            .as.tool_call = {index, id, id_len, name, name_len, arguments,
-                             arguments_len},
-        };
-        if (emit_event(req, &event)) {
-            return OI_ERR_CLOSED;
         }
     }
     return OI_OK;
@@ -413,12 +479,128 @@ static oi_status validate_tool_calls(oi_llm_request *req) {
     return OI_OK;
 }
 
+static void fail_stream(oi_llm_request *req, oi_status status) {
+    req->body_cb_failed = 1;
+    req->body_cb_status = status;
+}
+
+static int event_type_is(const char *type, size_t type_len,
+                         const char *expected) {
+    return type_len == strlen(expected) &&
+           memcmp(type, expected, type_len) == 0;
+}
+
+static oi_status handle_responses_item_added(oi_llm_request *req,
+                                             const oi_json_value *root) {
+    oi_json_value *item = oi_json_object_get(root, "item");
+    const char *type = NULL;
+    size_t type_len = 0;
+    if (optional_string(item, "type", &type, &type_len) != OI_OK) {
+        return OI_ERR_PARSE;
+    }
+    if (type == NULL || !event_type_is(type, type_len, "function_call")) {
+        return OI_OK;
+    }
+
+    size_t index;
+    const char *call_id = NULL;
+    const char *name = NULL;
+    size_t call_id_len = 0;
+    size_t name_len = 0;
+    if (json_size_index(oi_json_object_get(root, "output_index"), &index) !=
+            OI_OK ||
+        optional_string(item, "call_id", &call_id, &call_id_len) != OI_OK ||
+        optional_string(item, "name", &name, &name_len) != OI_OK ||
+        call_id == NULL || name == NULL) {
+        return OI_ERR_PARSE;
+    }
+    return record_tool_fragment(req, index, call_id, call_id_len, name,
+                                name_len, NULL, 0);
+}
+
+/* `key` names the member holding the text: fragments arrive under "delta",
+ * and the closing event repeats the whole value under "arguments". */
+static oi_status handle_responses_arguments(oi_llm_request *req,
+                                            const oi_json_value *root,
+                                            const char *key, int only_if_empty) {
+    size_t index;
+    const char *arguments = NULL;
+    size_t arguments_len = 0;
+    if (json_size_index(oi_json_object_get(root, "output_index"), &index) !=
+            OI_OK ||
+        optional_string(root, key, &arguments, &arguments_len) != OI_OK ||
+        arguments == NULL) {
+        return OI_ERR_PARSE;
+    }
+    if (only_if_empty) {
+        struct oi_llm_tool_state *state = tool_state(req, index);
+        if (state == NULL) {
+            return OI_ERR_NOMEM;
+        }
+        if (state->arguments_len > 0) {
+            return OI_OK;
+        }
+    }
+    return record_tool_fragment(req, index, NULL, 0, NULL, 0, arguments,
+                                arguments_len);
+}
+
+static void handle_responses_event(oi_llm_request *req, const char *data,
+                                   size_t len, const oi_json_value *root) {
+    const char *type = NULL;
+    size_t type_len = 0;
+    if (optional_string(root, "type", &type, &type_len) != OI_OK ||
+        type == NULL) {
+        fail_stream(req, OI_ERR_PARSE);
+        return;
+    }
+
+    oi_status st = OI_OK;
+    if (event_type_is(type, type_len, "response.output_text.delta")) {
+        const char *text = NULL;
+        size_t text_len = 0;
+        if (optional_string(root, "delta", &text, &text_len) != OI_OK ||
+            text == NULL) {
+            fail_stream(req, OI_ERR_PARSE);
+            return;
+        }
+        if (emit_text(req, text, text_len)) {
+            return;
+        }
+    } else if (event_type_is(type, type_len, "response.output_item.added")) {
+        st = handle_responses_item_added(req, root);
+    } else if (event_type_is(type, type_len,
+                             "response.function_call_arguments.delta")) {
+        st = handle_responses_arguments(req, root, "delta", 0);
+    } else if (event_type_is(type, type_len,
+                             "response.function_call_arguments.done")) {
+        st = handle_responses_arguments(req, root, "arguments", 1);
+    } else if (event_type_is(type, type_len, "response.completed")) {
+        st = validate_tool_calls(req);
+        if (st == OI_OK) {
+            req->saw_done = 1;
+        }
+    } else if (event_type_is(type, type_len, "response.failed") ||
+               event_type_is(type, type_len, "response.incomplete") ||
+               event_type_is(type, type_len, "error")) {
+        st = error_buf_append(req, data, len);
+        if (st == OI_OK) {
+            st = OI_ERR_IO;
+        }
+    }
+
+    if (st != OI_OK && st != OI_ERR_CLOSED) {
+        fail_stream(req, st);
+    }
+}
+
 static void handle_sse_event(const char *data, size_t len, void *ud) {
     oi_llm_request *req = ud;
     if (req->body_cb_failed) {
         return;
     }
-    if (len == 6 && memcmp(data, "[DONE]", 6) == 0) {
+    if (!req->client->responses_api && len == 6 &&
+        memcmp(data, "[DONE]", 6) == 0) {
         if (req->saw_done) {
             req->body_cb_failed = 1;
             req->body_cb_status = OI_ERR_PARSE;
@@ -451,6 +633,11 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
     }
 
     oi_json_value *root = oi_json_parser_root(req->json);
+    if (req->client->responses_api) {
+        handle_responses_event(req, data, len, root);
+        return;
+    }
+
     oi_json_value *choices = oi_json_object_get(root, "choices");
     oi_json_value *choice0 = oi_json_array_get(choices, 0);
     oi_json_value *delta = oi_json_object_get(choice0, "delta");
@@ -459,17 +646,9 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
 
     const char *text;
     size_t text_len;
-    if (oi_json_get_string(content, &text, &text_len) == OI_OK) {
-        oi_llm_event event = {
-            .type = OI_LLM_EVENT_TEXT,
-            .as.text = {text, text_len},
-        };
-        if (emit_event(req, &event)) {
-            return;
-        }
-        if (req->on_delta) {
-            req->on_delta(text, text_len, req->user_data);
-        }
+    if (oi_json_get_string(content, &text, &text_len) == OI_OK &&
+        emit_text(req, text, text_len)) {
+        return;
     }
     oi_status tool_st = handle_tool_calls(req, tool_calls);
     if (tool_st == OI_ERR_CLOSED) {
@@ -521,7 +700,8 @@ static void req_on_body(const void *data, size_t len, void *ud) {
 
 static void req_on_connected(oi_llm_conn *c, void *ud) {
     oi_llm_request *req = ud;
-    char header[1024];
+    /* OAuth access tokens are JWTs, which run to several kilobytes. */
+    char header[16 * 1024];
     int n;
 
     if (req->client->api_key) {
@@ -601,7 +781,7 @@ OI_DIAG_POP
                            ? st
                            : (req->body_cb_failed ? req->body_cb_status
                                                   : OI_ERR_PARSE),
-                       req->http_status, NULL, 0);
+                       req->http_status, req->error_buf, req->error_len);
                 return;
             }
             finish(req, OI_OK, req->http_status, NULL, 0);
@@ -633,6 +813,13 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
         out_request == NULL) {
         return OI_ERR_INVAL;
     }
+    if (client->before_request != NULL) {
+        oi_status hook_st =
+            client->before_request(client->before_request_user_data);
+        if (hook_st != OI_OK) {
+            return hook_st;
+        }
+    }
 
     oi_llm_request *req = calloc(1, sizeof *req);
     if (req == NULL) {
@@ -645,8 +832,20 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
     req->on_done = on_done;
     req->user_data = user_data;
 
+    oi_json_writer *translated = NULL;
+    if (client->responses_api) {
+        oi_status translate_st = oi_llm_responses_translate_body(
+            arena, body, body_len, &translated);
+        if (translate_st != OI_OK) {
+            free(req);
+            return translate_st;
+        }
+        body = oi_json_writer_data(translated, &body_len);
+    }
+
     req->body = malloc(body_len > 0 ? body_len : 1);
     if (req->body == NULL) {
+        oi_json_writer_destroy(translated);
         free(req);
         return OI_ERR_NOMEM;
     }
@@ -654,6 +853,7 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
         memcpy(req->body, body, body_len);
     }
     req->body_len = body_len;
+    oi_json_writer_destroy(translated);
 
     req->http = oi_llm_http_parser_create(req_on_headers_done, req_on_body,
                                            req);

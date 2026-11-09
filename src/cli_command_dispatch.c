@@ -597,6 +597,10 @@ oi_status oi_cli_command_dispatch(
          * oi_cli_command_context has access to by design. Only reachable
          * here via oi_cli_command_dispatch's own unit tests. */
         return print_deferred(command->command, context->err);
+    case OI_CLI_COMMAND_LOGIN:
+        /* cli_repl.c intercepts /login: it needs the composer and the LLM
+         * client, which oi_cli_command_context does not carry. */
+        return print_deferred(command->command, context->err);
     }
     return OI_ERR_INVAL;
 }

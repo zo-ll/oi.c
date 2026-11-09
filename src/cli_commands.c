@@ -22,6 +22,8 @@ static const struct oi_cli_command_definition commands[] = {
     {OI_CLI_COMMAND_CWD, "/cwd", "/cwd [path]",
      "Show or change the session working directory",
      OI_CLI_COMMAND_SESSION_SCOPED},
+    {OI_CLI_COMMAND_LOGIN, "/login", "/login",
+     "Choose a provider and log in", OI_CLI_COMMAND_PROCESS_SCOPED},
 };
 
 static int is_space(char value) {

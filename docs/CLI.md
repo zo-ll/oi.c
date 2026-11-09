@@ -132,7 +132,7 @@ Settings are resolved in this order, each layer overriding the one before:
 
 ### The API key
 
-The key can only come from the environment or the command line. A config
+A key can come from the environment, the command line, or `/login`. A config
 file containing `api_key` is **refused** — the whole file fails to load with
 `denied` — so a secret cannot be committed to a config file by accident.
 
@@ -160,10 +160,40 @@ has no field for a key, a CA file, or a request body.
 Without a key, anything that would make a request fails immediately:
 
 ```
-oi: no API key set (use OI_API_KEY or --api-key)
+oi: no API key set (use OI_API_KEY, --api-key, or /login in interactive mode)
 ```
 
+An interactive run without a key still starts, so that you can use `/login`.
 `--dry-run` needs no key.
+
+### Saved logins
+
+`/login` opens a menu. Choose a provider, and then choose a method:
+
+| Provider | API key | OAuth |
+| --- | --- | --- |
+| OpenAI | yes | yes, with your ChatGPT plan |
+| Custom OpenAI-compatible endpoint | yes | not available |
+
+A custom provider also asks for a URL. `https://host/api/v1` becomes
+`https://host/api/v1/chat/completions`. The key entry shows only a character
+count, and the key never reaches the input history or a session file.
+
+A login takes effect immediately and is saved in
+`$XDG_CONFIG_HOME/oi/credentials.json`, or `~/.config/oi/credentials.json`.
+The file has mode `0600` in a `0700` directory and is **not encrypted**. `oi`
+ignores the file, with a warning, if other users can read it.
+
+OAuth opens a browser for "Sign in with ChatGPT", and also prints the URL. The
+browser must reach `127.0.0.1:1455`. After the sign-in, choose a model from
+the list for your account. Requests then go to `/v1/responses`, and `oi` renews
+the access token before it expires. Manage usage at
+<https://chatgpt.com/settings/usage>.
+
+`OI_API_KEY` and `--api-key` take priority over a saved key at startup. A
+saved login applies only to the default endpoint: if `--host`, `--port`,
+`--path`, `--no-tls`, or a config file changes the endpoint, `oi` does not
+send a saved key.
 
 ### Config file
 
@@ -376,6 +406,7 @@ and descriptions `/help` prints, checked against it by `test_cli_docs`:
 - `/status` — Show current runtime and session status
 - `/compact [turns]` — Compact older model context
 - `/cwd [path]` — Show or change the session working directory
+- `/login` — Choose a provider and log in
 
 An unrecognized command prints `oi: unknown command: /whatever` and is never
 sent to the model. Commands are only available in interactive mode; one-shot
@@ -788,7 +819,7 @@ Semantics:
 
 ## Troubleshooting
 
-**`oi: no API key set (use OI_API_KEY or --api-key)`** — export
+**`oi: no API key set (use OI_API_KEY, --api-key, or /login in interactive mode)`** — export
 `OI_API_KEY`, or pass `--api-key`. Remember a config file cannot hold the
 key. `oi --dry-run "hi"` verifies everything else without a key.
 

@@ -8,6 +8,7 @@
 #include "cli_sessions.h"
 #include "cli_history_repair.h"
 #include "cli_history_store.h"
+#include "cli_credentials.h"
 #include "cli_session_metadata.h"
 #include "cli_session_metadata_store.h"
 #include "cli_tools.h"
@@ -902,9 +903,20 @@ int main(int argc, char **argv) {
         cfg.use_tls = cli_use_tls;
     }
 
-    if (!dry_run && (cfg.api_key == NULL || cfg.api_key[0] == '\0')) {
-        fprintf(stderr,
-                "oi: no API key set (use OI_API_KEY or --api-key)\n");
+    struct oi_cli_login login = {0};
+    login.key_from_environment = cfg.api_key != NULL && cfg.api_key[0] != '\0';
+    char *saved_credentials = NULL;
+    oi_status saved_status =
+        oi_cli_credentials_default_path(&saved_credentials);
+    if (saved_status == OI_OK) {
+        saved_status = oi_cli_login_apply_saved(&cfg, saved_credentials, stderr,
+                                                &login.oauth_active,
+                                                &login.expires_at);
+    }
+    free(saved_credentials);
+    if (saved_status != OI_OK && saved_status != OI_ERR_NOTFOUND) {
+        fprintf(stderr, "oi: failed to load saved credentials: %s\n",
+                oi_status_str(saved_status));
         oi_config_free(&cfg);
         return 1;
     }
@@ -912,6 +924,15 @@ int main(int argc, char **argv) {
     int interactive =
         prompt == NULL && !dry_run && isatty(STDIN_FILENO) &&
         isatty(STDOUT_FILENO);
+    if (!dry_run && (cfg.api_key == NULL || cfg.api_key[0] == '\0')) {
+        if (!interactive) {
+            fprintf(stderr, "oi: no API key set (use OI_API_KEY, --api-key, "
+                            "or /login in interactive mode)\n");
+            oi_config_free(&cfg);
+            return 1;
+        }
+        fprintf(stderr, "oi: not logged in: use /login or set OI_API_KEY\n");
+    }
     int automatic_session = interactive && session_id == NULL;
     int owns_prompt = 0;
     if (prompt == NULL && !interactive) {
@@ -1193,7 +1214,8 @@ int main(int argc, char **argv) {
         cfg.ca_file, cfg.api_key,           cfg.path,
         cfg.timeout_ms,
     };
-    client = oi_llm_client_create(&llm_cfg);
+    client = login.oauth_active ? oi_llm_client_create_responses(&llm_cfg)
+                                : oi_llm_client_create(&llm_cfg);
     if (client == NULL) {
         fprintf(stderr, "oi: out of memory\n");
         exit_code = 1;
@@ -1215,6 +1237,29 @@ int main(int argc, char **argv) {
         .event_user_data =
             session_id != NULL ? &persistence : NULL,
     };
+    struct oi_cli_status_endpoint status_endpoint = {
+        .host = cfg.host,
+        .path = cfg.path,
+        .port = (unsigned short)cfg.port,
+        .use_tls = cfg.use_tls,
+    };
+    if (oi_cli_credentials_default_path(&login.credentials_path) ==
+        OI_ERR_NOMEM) {
+        fprintf(stderr, "oi: out of memory\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+    login.client = client;
+    oi_llm_client_set_before_request(client, oi_cli_login_before_request,
+                                     &login);
+    if (interactive && login.oauth_active) {
+        fprintf(stderr, "oi: Using ChatGPT plan. Manage usage: "
+                        "https://chatgpt.com/settings/usage\n");
+    }
+    login.endpoint = &status_endpoint;
+    login.ca_file = cfg.ca_file;
+    login.timeout_ms = cfg.timeout_ms;
+    login.err = stderr;
     if (interactive) {
         struct oi_cli_repl_config repl_config = {
             .model = cfg.model,
@@ -1224,13 +1269,8 @@ int main(int argc, char **argv) {
              * /status reports the endpoint requests actually go to. Only the
              * non-secret fields are passed on: the API key and CA file stay
              * in llm_cfg. */
-            .endpoint =
-                {
-                    .host = cfg.host,
-                    .path = cfg.path,
-                    .port = (unsigned short)cfg.port,
-                    .use_tls = cfg.use_tls,
-                },
+            .endpoint = &status_endpoint,
+            .login = &login,
             .request_timeout_ms = cfg.timeout_ms,
             .model_origin = model_origin,
             .permission = &permission,
@@ -1302,6 +1342,7 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
+    oi_cli_login_free(&login);
     free(loop_result.assistant_text);
     oi_cli_string_free(&initial_draft);
     oi_cli_message_list_free(&initial_context);

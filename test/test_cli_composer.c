@@ -1224,9 +1224,132 @@ TEST(select_terminate_signal_is_reported) {
     close(master_fd);
 }
 
+struct read_line_result {
+    oi_status status;
+    int cancelled;
+    int has_text;
+    size_t len;
+    size_t editor_len;
+    char text[64];
+};
+
+static void run_read_line(const char *input, size_t input_len, int masked,
+                          struct read_line_result *result, char *screen,
+                          size_t screen_size) {
+    int result_pipe[2] = {-1, -1};
+    int master_fd = -1;
+    int slave_fd = -1;
+
+    memset(result, 0, sizeof *result);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    CHECK_EQ(pipe(result_pipe), 0);
+
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        struct oi_cli_input_history history;
+        struct oi_cli_composer composer;
+        char *text = NULL;
+        int terminate_signal = 0;
+
+        close(master_fd);
+        close(result_pipe[0]);
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
+            result->status = OI_ERR_IO;
+            (void)write_all(result_pipe[1], result, sizeof *result);
+            _exit(1);
+        }
+        oi_cli_input_history_init(&history);
+        result->status =
+            oi_cli_composer_init(&composer, slave_fd, slave_fd, &history);
+        if (result->status == OI_OK) {
+            result->status = oi_cli_composer_read_line(
+                &composer, -1, NULL, 0, "Key: ", masked, &text, &result->len,
+                &result->cancelled, &terminate_signal);
+            result->editor_len = oi_cli_editor_length(&composer.state.editor);
+            oi_cli_composer_free(&composer);
+        }
+        if (text != NULL && result->len < sizeof result->text) {
+            result->has_text = 1;
+            memcpy(result->text, text, result->len + 1);
+        }
+        (void)write_all(result_pipe[1], result, sizeof *result);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+
+    /* Keeps the first frame too: the checks below read the whole screen. */
+    size_t used = 0;
+    struct pollfd descriptor = {.fd = master_fd, .events = POLLIN};
+    CHECK(poll(&descriptor, 1, 2000) > 0);
+    ssize_t first = read(master_fd, screen, screen_size - 1);
+    CHECK(first > 0);
+    used = (size_t)first;
+
+    CHECK(write_all(master_fd, input, input_len));
+    CHECK(read_all(result_pipe[0], result, sizeof *result));
+
+    while (used < screen_size - 1 && poll(&descriptor, 1, 100) > 0) {
+        ssize_t got = read(master_fd, screen + used, screen_size - 1 - used);
+        if (got <= 0) {
+            break;
+        }
+        used += (size_t)got;
+    }
+    screen[used] = '\0';
+
+    int child_status = 0;
+    CHECK_EQ(waitpid(child, &child_status, 0), child);
+    CHECK(WIFEXITED(child_status));
+    close(result_pipe[0]);
+    close(slave_fd);
+    close(master_fd);
+}
+
+TEST(read_line_masks_a_paste_and_drops_its_trailing_newline) {
+    static const char input[] = "\x1b[200~sk-secret\n\x1b[201~\r";
+    struct read_line_result result;
+    char screen[4096];
+
+    run_read_line(input, sizeof input - 1, 1, &result, screen, sizeof screen);
+    CHECK_EQ(result.status, OI_OK);
+    CHECK(!result.cancelled);
+    CHECK(result.has_text);
+    CHECK_STREQ(result.text, "sk-secret");
+    CHECK_EQ(result.editor_len, 0);
+    CHECK(strstr(screen, "sk-secret") == NULL);
+    CHECK(strstr(screen, "0 characters entered") != NULL);
+}
+
+TEST(read_line_backspace_removes_a_whole_utf8_character) {
+    static const char input[] = "a\xc3\xa9\x7f\r";
+    struct read_line_result result;
+    char screen[4096];
+
+    run_read_line(input, sizeof input - 1, 0, &result, screen, sizeof screen);
+    CHECK_EQ(result.status, OI_OK);
+    CHECK_STREQ(result.text, "a");
+    CHECK_EQ(result.len, 1);
+}
+
+TEST(read_line_ctrl_c_cancels_without_text) {
+    static const char input[] = "abc\x03";
+    struct read_line_result result;
+    char screen[4096];
+
+    run_read_line(input, sizeof input - 1, 1, &result, screen, sizeof screen);
+    CHECK_EQ(result.status, OI_OK);
+    CHECK(result.cancelled);
+    CHECK(!result.has_text);
+}
+
 int main(void) {
     /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
+    RUN(read_line_masks_a_paste_and_drops_its_trailing_newline);
+    RUN(read_line_backspace_removes_a_whole_utf8_character);
+    RUN(read_line_ctrl_c_cancels_without_text);
     RUN(cursor_editing_submits_expected_text_and_restores_terminal);
     RUN(bracketed_multiline_paste_is_one_submission);
     RUN(ctrl_c_clears_and_ctrl_d_exits);

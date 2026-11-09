@@ -696,6 +696,274 @@ TEST(client_rejects_unsafe_http_fields) {
     CHECK(oi_llm_client_create(&cfg) == NULL);
 }
 
+TEST(long_bearer_token_fits_request_header) {
+    const char *sse_body = "data: [DONE]\n\n";
+    size_t total;
+    char *response = build_chunked_response(sse_body, strlen(sse_body),
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    char token[4097];
+    memset(token, 'a', sizeof token - 1);
+    token[sizeof token - 1] = '\0';
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, token,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    CHECK(client != NULL);
+    struct stream_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.done_status, OI_OK);
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+static char responses_error[512];
+
+static void responses_done(oi_status status, int http_status,
+                           const char *error_body, size_t error_body_len,
+                           void *ud) {
+    (void)http_status;
+    struct tool_event_ctx *ctx = ud;
+    ctx->status = status;
+    ctx->done = 1;
+    size_t kept = error_body_len < sizeof responses_error - 1
+                      ? error_body_len
+                      : sizeof responses_error - 1;
+    if (kept > 0) {
+        memcpy(responses_error, error_body, kept);
+    }
+    responses_error[kept] = '\0';
+}
+
+static void run_responses_stream(const char *sse_body,
+                                 struct tool_event_ctx *ctx) {
+    size_t total;
+    char *response = build_chunked_response(sse_body, strlen(sse_body),
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/responses", 0};
+    oi_llm_client *client = oi_llm_client_create_responses(&cfg);
+    CHECK(client != NULL);
+    const char *body = "{\"model\":\"m\",\"messages\":[]}";
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, body, strlen(body),
+                                          on_event, responses_done, ctx, &req),
+              OI_OK);
+    run_until(r, &ctx->done, 100);
+    CHECK(ctx->done);
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+TEST(responses_stream_delivers_text) {
+    struct tool_event_ctx ctx = {0};
+    run_responses_stream(
+        "event: response.created\n"
+        "data: {\"type\":\"response.created\",\"response\":{}}\n\n"
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n"
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_STREQ(ctx.text, "Hello");
+}
+
+TEST(responses_stream_assembles_function_calls) {
+    struct tool_event_ctx ctx = {0};
+    run_responses_stream(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,"
+        "\"item\":{\"type\":\"message\",\"id\":\"m1\"}}\n\n"
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,"
+        "\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":"
+        "\"call_1\",\"name\":\"shell\",\"arguments\":\"\"}}\n\n"
+        "data: {\"type\":\"response.function_call_arguments.delta\","
+        "\"item_id\":\"fc_1\",\"output_index\":1,\"delta\":"
+        "\"{\\\"command\\\":\"}\n\n"
+        "data: {\"type\":\"response.function_call_arguments.delta\","
+        "\"item_id\":\"fc_1\",\"output_index\":1,\"delta\":\"\\\"ls\\\"}\"}\n\n"
+        "data: {\"type\":\"response.function_call_arguments.done\","
+        "\"item_id\":\"fc_1\",\"output_index\":1,\"arguments\":"
+        "\"{\\\"command\\\":\\\"ls\\\"}\"}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_STREQ(ctx.text, "ok");
+    CHECK_STREQ(ctx.id[1], "call_1");
+    CHECK_STREQ(ctx.name[1], "shell");
+    CHECK_STREQ(ctx.arguments[1], "{\"command\":\"ls\"}");
+    CHECK_EQ(ctx.tool_events, 3);
+}
+
+TEST(responses_arguments_can_arrive_only_in_the_done_event) {
+    struct tool_event_ctx ctx = {0};
+    run_responses_stream(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,"
+        "\"item\":{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":"
+        "\"shell\",\"arguments\":\"\"}}\n\n"
+        "data: {\"type\":\"response.function_call_arguments.done\","
+        "\"output_index\":0,\"arguments\":\"{}\"}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_STREQ(ctx.arguments[0], "{}");
+}
+
+TEST(responses_stream_requires_completed_event) {
+    struct tool_event_ctx ctx = {0};
+    run_responses_stream(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_ERR_PARSE);
+}
+
+TEST(responses_incomplete_function_call_rejects_stream) {
+    struct tool_event_ctx ctx = {0};
+    run_responses_stream(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,"
+        "\"item\":{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":"
+        "\"shell\",\"arguments\":\"\"}}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_ERR_PARSE);
+}
+
+TEST(responses_terminal_failures_report_the_event) {
+    const char *failures[] = {
+        ("{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":"
+         "\"subscription_sharing_usage_limit_exceeded\"}}}"),
+        "{\"type\":\"response.incomplete\",\"response\":{}}",
+        "{\"type\":\"error\",\"message\":\"boom\"}",
+    };
+    for (size_t i = 0; i < sizeof failures / sizeof failures[0]; i++) {
+        char sse_body[256];
+        snprintf(sse_body, sizeof sse_body, "data: %s\n\n", failures[i]);
+        struct tool_event_ctx ctx = {0};
+        run_responses_stream(sse_body, &ctx);
+        CHECK_EQ(ctx.status, OI_ERR_IO);
+        CHECK_STREQ(responses_error, failures[i]);
+    }
+}
+
+TEST(responses_client_rejects_a_body_it_cannot_translate) {
+    struct oi_llm_config cfg = {"127.0.0.1", 9, 0, NULL, NULL, "/v1/responses",
+                                 0};
+    oi_llm_client *client = oi_llm_client_create_responses(&cfg);
+    CHECK(client != NULL);
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct tool_event_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, "{}", 2, on_event,
+                                          responses_done, &ctx, &req),
+              OI_ERR_PARSE);
+    CHECK(req == NULL);
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+}
+
+TEST(reconfigure_redirects_later_requests) {
+    const char *sse_body = "data: [DONE]\n\n";
+    size_t total;
+    char *response = build_chunked_response(sse_body, strlen(sse_body),
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    struct oi_llm_config stale = {"127.0.0.1", 9, 0, NULL, "old",
+                                   "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&stale);
+    CHECK(client != NULL);
+    struct oi_llm_config fresh = {"127.0.0.1", port, 0, NULL, "new",
+                                   "/v1/chat/completions", 0};
+    CHECK_EQ(oi_llm_client_reconfigure(client, &fresh, 0), OI_OK);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct stream_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.done_status, OI_OK);
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+TEST(reconfigure_refuses_bad_settings_and_keeps_the_client) {
+    struct oi_llm_config good = {"127.0.0.1", 9, 0, NULL, "k", "/p", 0};
+    oi_llm_client *client = oi_llm_client_create(&good);
+    CHECK(client != NULL);
+    struct oi_llm_config bad = good;
+    bad.api_key = "k\r\nX-Evil: y";
+    CHECK_EQ(oi_llm_client_reconfigure(client, &bad, 0), OI_ERR_INVAL);
+    oi_llm_client_destroy(client);
+}
+
+struct before_request_ctx {
+    int calls;
+    oi_status result;
+};
+
+static oi_status count_before_request(void *user_data) {
+    struct before_request_ctx *ctx = user_data;
+    ctx->calls++;
+    return ctx->result;
+}
+
+TEST(before_request_hook_can_refuse_and_survives_reconfigure) {
+    struct oi_llm_config cfg = {"127.0.0.1", 9, 0, NULL, "k", "/p", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    CHECK(client != NULL);
+    struct before_request_ctx hook = {0, OI_ERR_DENIED};
+    oi_llm_client_set_before_request(client, count_before_request, &hook);
+    CHECK_EQ(oi_llm_client_reconfigure(client, &cfg, 0), OI_OK);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct stream_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &ctx, &req),
+              OI_ERR_DENIED);
+    CHECK(req == NULL);
+    CHECK_EQ(hook.calls, 1);
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+}
+
 TEST(cancel_null_safe) { oi_llm_request_cancel(NULL); }
 
 int main(void) {
@@ -713,6 +981,17 @@ int main(void) {
     RUN(cancel_from_within_on_delta);
     RUN(start_rejects_bad_args);
     RUN(client_rejects_unsafe_http_fields);
+    RUN(long_bearer_token_fits_request_header);
+    RUN(responses_stream_delivers_text);
+    RUN(responses_stream_assembles_function_calls);
+    RUN(responses_arguments_can_arrive_only_in_the_done_event);
+    RUN(responses_stream_requires_completed_event);
+    RUN(responses_incomplete_function_call_rejects_stream);
+    RUN(responses_terminal_failures_report_the_event);
+    RUN(responses_client_rejects_a_body_it_cannot_translate);
+    RUN(reconfigure_redirects_later_requests);
+    RUN(reconfigure_refuses_bad_settings_and_keeps_the_client);
+    RUN(before_request_hook_can_refuse_and_survives_reconfigure);
     RUN(cancel_null_safe);
     return oi_test_report();
 }

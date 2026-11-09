@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -761,5 +762,260 @@ oi_status oi_cli_composer_select(
 
 cleanup:
     *out_selected = selected;
+    return status;
+}
+
+struct line_entry {
+    char text[OI_CLI_COMPOSER_INPUT_CAP];
+    size_t len;
+    int done;
+    int cancelled;
+    int dirty;
+};
+
+static int line_entry_event(const struct oi_cli_input_event *event,
+                            void *user_data) {
+    struct line_entry *entry = user_data;
+
+    switch (event->type) {
+    case OI_CLI_INPUT_ENTER:
+        if (event->pasted) {
+            return 0;
+        }
+        entry->done = 1;
+        return 1;
+    case OI_CLI_INPUT_ESCAPE:
+    case OI_CLI_INPUT_CTRL_C:
+        entry->cancelled = 1;
+        entry->done = 1;
+        return 1;
+    case OI_CLI_INPUT_BACKSPACE:
+        /* Removes one whole UTF-8 sequence. */
+        while (entry->len > 0 &&
+               ((unsigned char)entry->text[entry->len - 1] & 0xC0) == 0x80) {
+            entry->len--;
+        }
+        if (entry->len > 0) {
+            entry->len--;
+            entry->dirty = 1;
+        }
+        return 0;
+    case OI_CLI_INPUT_TEXT:
+        /* A paste delivers its newlines as text. */
+        if (event->text[0] < 0x20 || event->text[0] == 0x7f) {
+            return 0;
+        }
+        if (event->text_len <= sizeof entry->text - 1 - entry->len) {
+            memcpy(entry->text + entry->len, event->text, event->text_len);
+            entry->len += event->text_len;
+            entry->dirty = 1;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static oi_status draw_line_entry(struct oi_cli_composer *composer,
+                                 const struct oi_cli_render_line *header_lines,
+                                 size_t header_count, const char *prompt,
+                                 int masked, const struct line_entry *entry) {
+    char display[OI_CLI_COMPOSER_INPUT_CAP + 128];
+    int used = masked ? snprintf(display, sizeof display,
+                                 "%s%zu characters entered", prompt, entry->len)
+                      : snprintf(display, sizeof display, "%s%.*s", prompt,
+                                 (int)entry->len, entry->text);
+    if (used < 0) {
+        return OI_ERR_IO;
+    }
+    struct oi_cli_render_line option = {
+        display, (size_t)used < sizeof display ? (size_t)used
+                                               : sizeof display - 1};
+    return oi_cli_render_draw_selector(&composer->render, header_lines,
+                                       header_count, &option, 1, 0);
+}
+
+static void wipe_line_entry(struct line_entry *entry) {
+    /* Volatile so the compiler cannot drop a store to a dying object. */
+    volatile char *text = entry->text;
+    for (size_t i = 0; i < sizeof entry->text; i++) {
+        text[i] = '\0';
+    }
+}
+
+static oi_status run_line_entry(struct oi_cli_composer *composer,
+                                int signal_fd,
+                                const struct oi_cli_render_line *header_lines,
+                                size_t header_count, const char *prompt,
+                                int masked, struct line_entry *entry,
+                                int *out_terminate_signal) {
+    oi_status status = draw_line_entry(composer, header_lines, header_count,
+                                       prompt, masked, entry);
+    while (status == OI_OK && !entry->done) {
+        struct pollfd descriptors[2];
+        nfds_t ndescriptors = signal_fd >= 0 ? 2 : 1;
+        int timeout = oi_cli_composer_escape_pending(composer)
+                          ? OI_CLI_COMPOSER_ESCAPE_TIMEOUT_MS
+                          : -1;
+        int ready;
+
+        descriptors[0].fd = composer->input_fd;
+        descriptors[0].events = POLLIN;
+        descriptors[0].revents = 0;
+        descriptors[1].fd = signal_fd;
+        descriptors[1].events = POLLIN;
+        descriptors[1].revents = 0;
+        do {
+            ready = poll(descriptors, ndescriptors, timeout);
+        } while (ready < 0 && errno == EINTR);
+        if (ready < 0) {
+            return OI_ERR_IO;
+        }
+
+        if (ready == 0) {
+            status = oi_cli_composer_resolve_escape_raw(
+                composer, line_entry_event, entry);
+        } else if (ndescriptors == 2 &&
+                   (descriptors[1].revents & POLLIN) != 0) {
+            struct oi_cli_composer_signals signals;
+
+            drain_signals(signal_fd, &signals);
+            if (signals.terminate_signal != 0) {
+                *out_terminate_signal = signals.terminate_signal;
+                return OI_OK;
+            }
+            if (signals.resize) {
+                oi_cli_render_set_columns(
+                    &composer->render, terminal_columns(composer->output_fd));
+                entry->dirty = 1;
+            }
+        } else {
+            status = oi_cli_composer_feed_raw(composer, line_entry_event,
+                                              entry);
+        }
+        if (status == OI_OK && entry->dirty && !entry->done) {
+            entry->dirty = 0;
+            status = draw_line_entry(composer, header_lines, header_count,
+                                     prompt, masked, entry);
+        }
+    }
+    return status;
+}
+
+oi_status oi_cli_composer_read_line(
+    struct oi_cli_composer *composer, int signal_fd,
+    const struct oi_cli_render_line *header_lines, size_t header_count,
+    const char *prompt, int masked, char **out_text, size_t *out_len,
+    int *out_cancelled, int *out_terminate_signal) {
+    struct line_entry entry;
+
+    if (composer == NULL || prompt == NULL || out_text == NULL ||
+        out_len == NULL || out_cancelled == NULL ||
+        out_terminate_signal == NULL) {
+        return OI_ERR_INVAL;
+    }
+    memset(&entry, 0, sizeof entry);
+    *out_text = NULL;
+    *out_len = 0;
+    *out_cancelled = 0;
+    *out_terminate_signal = 0;
+
+    oi_status status =
+        run_line_entry(composer, signal_fd, header_lines, header_count, prompt,
+                       masked, &entry, out_terminate_signal);
+    if (status == OI_OK && *out_terminate_signal == 0) {
+        if (entry.cancelled) {
+            *out_cancelled = 1;
+        } else {
+            char *text = malloc(entry.len + 1);
+            if (text == NULL) {
+                status = OI_ERR_NOMEM;
+            } else {
+                memcpy(text, entry.text, entry.len);
+                text[entry.len] = '\0';
+                *out_text = text;
+                *out_len = entry.len;
+            }
+        }
+    }
+    wipe_line_entry(&entry);
+    return status;
+}
+
+static int wait_fd_event(const struct oi_cli_input_event *event,
+                         void *user_data) {
+    int *cancelled = user_data;
+
+    if (event->type == OI_CLI_INPUT_ESCAPE ||
+        event->type == OI_CLI_INPUT_CTRL_C) {
+        *cancelled = 1;
+        return 1;
+    }
+    return 0;
+}
+
+oi_status oi_cli_composer_wait_fd(
+    struct oi_cli_composer *composer, int signal_fd,
+    const struct oi_cli_render_line *status_line, int fd, int timeout_ms,
+    int *out_ready, int *out_cancelled, int *out_terminate_signal) {
+    *out_ready = 0;
+    *out_cancelled = 0;
+    *out_terminate_signal = 0;
+    oi_status status = oi_cli_render_draw_selector(&composer->render, NULL, 0,
+                                                   status_line, 1, 0);
+    while (status == OI_OK && !*out_cancelled) {
+        struct pollfd descriptors[3];
+        nfds_t ndescriptors = signal_fd >= 0 ? 3 : 2;
+        int pending = oi_cli_composer_escape_pending(composer);
+        int ready;
+
+        descriptors[0].fd = fd;
+        descriptors[0].events = POLLIN;
+        descriptors[0].revents = 0;
+        descriptors[1].fd = composer->input_fd;
+        descriptors[1].events = POLLIN;
+        descriptors[1].revents = 0;
+        descriptors[2].fd = signal_fd;
+        descriptors[2].events = POLLIN;
+        descriptors[2].revents = 0;
+        do {
+            ready = poll(descriptors, ndescriptors,
+                         pending ? OI_CLI_COMPOSER_ESCAPE_TIMEOUT_MS
+                                 : timeout_ms);
+        } while (ready < 0 && errno == EINTR);
+        if (ready < 0) {
+            return OI_ERR_IO;
+        }
+        if (ready == 0) {
+            if (!pending) {
+                return OI_OK;
+            }
+            status = oi_cli_composer_resolve_escape_raw(
+                composer, wait_fd_event, out_cancelled);
+            continue;
+        }
+        if ((descriptors[0].revents & POLLIN) != 0) {
+            *out_ready = 1;
+            return OI_OK;
+        }
+        if (ndescriptors == 3 && (descriptors[2].revents & POLLIN) != 0) {
+            struct oi_cli_composer_signals signals;
+
+            drain_signals(signal_fd, &signals);
+            if (signals.terminate_signal != 0) {
+                *out_terminate_signal = signals.terminate_signal;
+                return OI_OK;
+            }
+            if (signals.resize) {
+                oi_cli_render_set_columns(
+                    &composer->render, terminal_columns(composer->output_fd));
+                status = oi_cli_render_draw_selector(
+                    &composer->render, NULL, 0, status_line, 1, 0);
+            }
+            continue;
+        }
+        status = oi_cli_composer_feed_raw(composer, wait_fd_event,
+                                          out_cancelled);
+    }
     return status;
 }
