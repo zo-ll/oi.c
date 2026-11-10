@@ -12,6 +12,20 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+/* The Makefile links this binary with --wrap=kill. */
+int __real_kill(pid_t pid, int sig);
+int __wrap_kill(pid_t pid, int sig);
+
+static int record_kills;
+static size_t positive_kills;
+
+int __wrap_kill(pid_t pid, int sig) {
+    if (record_kills && pid > 0) {
+        positive_kills++;
+    }
+    return __real_kill(pid, sig);
+}
+
 static oi_json_value *parse_json(oi_arena *a, const char *text) {
     oi_json_parser *p = oi_json_parser_create(a);
     oi_status st = oi_json_parser_feed(p, text, strlen(text));
@@ -135,6 +149,25 @@ static oi_status tree_build_argv(const oi_json_value *args, oi_arena *arena,
     return OI_OK;
 }
 
+/* The shell exits at once; its background child moves to a new session,
+ * so the call's process group is empty while stdout stays open. */
+static oi_status orphan_build_argv(const oi_json_value *args,
+                                   oi_arena *arena, void *ud,
+                                   char ***out_argv) {
+    (void)args;
+    (void)ud;
+    char **argv = oi_arena_alloc(arena, 4 * sizeof(char *));
+    if (argv == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    argv[0] = (char *)"/bin/sh";
+    argv[1] = (char *)"-c";
+    argv[2] = (char *)"setsid sleep 30 & echo $$ $!";
+    argv[3] = NULL;
+    *out_argv = argv;
+    return OI_OK;
+}
+
 static oi_status missing_build_argv(const oi_json_value *args,
                                      oi_arena *arena, void *ud,
                                      char ***out_argv) {
@@ -167,6 +200,7 @@ static oi_tool_registry *make_registry(void) {
     oi_tool_registry_add(reg, "sleep", "{}", sleep_build_argv, NULL);
     oi_tool_registry_add(reg, "fdcheck", "{}", fdcheck_build_argv, NULL);
     oi_tool_registry_add(reg, "tree", "{}", tree_build_argv, NULL);
+    oi_tool_registry_add(reg, "orphan", "{}", orphan_build_argv, NULL);
     oi_tool_registry_add(reg, "missing", "{}", missing_build_argv, NULL);
     oi_tool_registry_add(reg, "badargv", "{}", build_argv_fails, NULL);
     return reg;
@@ -661,6 +695,68 @@ TEST(cancel_kills_descendant_processes) {
     oi_tool_registry_destroy(reg);
 }
 
+static void collect_output(const void *data, size_t len, void *ud) {
+    struct tree_cancel_ctx *ctx = ud;
+    size_t available = sizeof ctx->output - 1 - ctx->output_len;
+    size_t copy_len = len < available ? len : available;
+    memcpy(ctx->output + ctx->output_len, data, copy_len);
+    ctx->output_len += copy_len;
+    ctx->output[ctx->output_len] = '\0';
+}
+
+static int process_exists(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%ld", (long)pid);
+    return access(path, F_OK) == 0;
+}
+
+TEST(cancel_after_the_child_is_collected_signals_only_the_group) {
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+
+    struct tree_cancel_ctx ctx = {0};
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "orphan", NULL, allow_cb, NULL,
+                                collect_output, NULL, &ctx, &ctx.call),
+             OI_OK);
+
+    pid_t shell = 0;
+    for (int i = 0; i < 100; i++) {
+        oi_status st;
+        oi_reactor_step(r, 20, &st);
+        if (shell == 0 && strchr(ctx.output, '\n') != NULL) {
+            long first = 0;
+            long second = 0;
+            if (sscanf(ctx.output, "%ld %ld", &first, &second) == 2) {
+                shell = (pid_t)first;
+                ctx.descendant = (pid_t)second;
+            }
+        }
+        /* The /proc entry goes away only after the collect. */
+        if (shell > 0 && !process_exists(shell) &&
+            getpgid(ctx.descendant) == ctx.descendant) {
+            break;
+        }
+    }
+    CHECK(shell > 0);
+    CHECK(ctx.descendant > 0);
+    CHECK(!process_exists(shell));
+    CHECK_EQ(getpgid(ctx.descendant), ctx.descendant);
+
+    record_kills = 1;
+    positive_kills = 0;
+    oi_tool_call_cancel(ctx.call);
+    record_kills = 0;
+    CHECK_EQ(positive_kills, 0);
+
+    if (ctx.descendant > 0) {
+        kill(ctx.descendant, SIGKILL);
+    }
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
 TEST(cancel_null_safe) { oi_tool_call_cancel(NULL); }
 
 /* --- concurrent calls don't cross-wire --- */
@@ -872,6 +968,7 @@ int main(void) {
     RUN(tool_deadline_reports_timeout);
     RUN(pending_tool_deadline_starts_after_permission);
     RUN(cancel_kills_descendant_processes);
+    RUN(cancel_after_the_child_is_collected_signals_only_the_group);
     RUN(cancel_null_safe);
     RUN(concurrent_calls_do_not_cross_wire);
     RUN(child_does_not_inherit_other_tool_descriptors);

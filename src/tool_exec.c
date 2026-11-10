@@ -219,9 +219,11 @@ static void kill_and_reap(pid_t pid) {
     }
 }
 
-static void terminate_process_group(pid_t pid) {
-    if (kill(-pid, SIGKILL) != 0) {
-        kill(pid, SIGKILL);
+/* After the collect, the PID is free and can name an unrelated process:
+ * only the group, which still holds any grandchildren, gets the signal. */
+static void terminate_process_group(const oi_tool_call *call) {
+    if (kill(-call->pid, SIGKILL) != 0 && !call->child_exited) {
+        kill(call->pid, SIGKILL);
     }
 }
 
@@ -230,7 +232,7 @@ static void on_call_timeout(oi_reactor *r, void *ud) {
     oi_tool_call *call = ud;
     call->timed_out = 1;
     call->on_output = NULL;
-    terminate_process_group(call->pid);
+    terminate_process_group(call);
     close_call_io(call);
     maybe_finish(call);
 }
@@ -665,8 +667,9 @@ void oi_tool_call_cancel(oi_tool_call *call) {
     if (call->pid > 0) {
         /* The child creates a fresh process group before exec, so a tool
          * cannot leave grandchildren running after its call is cancelled. */
-        terminate_process_group(call->pid);
-        while (waitpid(call->pid, NULL, 0) < 0 && errno == EINTR) {
+        terminate_process_group(call);
+        while (!call->child_exited && waitpid(call->pid, NULL, 0) < 0 &&
+               errno == EINTR) {
             /* SIGKILL has already made termination inevitable. */
         }
     }
