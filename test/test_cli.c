@@ -1225,6 +1225,30 @@ TEST(overlong_session_path_fails_cleanly) {
     free(long_dir);
 }
 
+TEST(unsafe_session_id_fails_without_creating_a_file) {
+    char root[] = "/tmp/oi-cli-unsafe-session-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char session_dir[96];
+    snprintf(session_dir, sizeof session_dir, "%s/sessions", root);
+    CHECK_EQ(mkdir(session_dir, 0700), 0);
+    char escaped_path[128];
+    snprintf(escaped_path, sizeof escaped_path, "%s/x.oilog", root);
+    char *argv[] = {(char *)OI_BIN,      (char *)"--api-key",
+                    (char *)"test-key",  (char *)"--port",
+                    (char *)"1",         (char *)"--no-tls",
+                    (char *)"--session-dir", session_dir,
+                    (char *)"--session", (char *)"../x",
+                    (char *)"hi",        NULL};
+    struct run_result r;
+    run_cli(argv, &r);
+    CHECK_EQ(r.exit_code, 1);
+    CHECK(strstr(r.output, "invalid session ID") != NULL);
+    CHECK(access(escaped_path, F_OK) != 0);
+    unlink(escaped_path);
+    rmdir(session_dir);
+    rmdir(root);
+}
+
 /* --- end-to-end streaming through a mock server --- */
 
 TEST(end_to_end_streaming_reply) {
@@ -6591,6 +6615,7 @@ int main(void) {
     RUN(cli_flag_overrides_config_file);
     RUN(missing_config_file_fails);
     RUN(overlong_session_path_fails_cleanly);
+    RUN(unsafe_session_id_fails_without_creating_a_file);
     RUN(end_to_end_streaming_reply);
     RUN(tool_loop_executes_and_returns_result);
     RUN(tool_denial_stops_loop);

@@ -652,7 +652,8 @@ to turn into paths.
 `--session ID` uses a flat layout instead: `DIR/ID.oilog` alongside
 `DIR/ID.metadata.json`, where `DIR` is `--session-dir` (default `.`). The
 directory must already exist; `oi` will not create it, and reports
-`failed to open session 'ID' at 'DIR/ID.oilog'` if it cannot.
+`failed to open session 'ID' at 'DIR/ID.oilog'` if it cannot. `ID` follows the
+same session id rule; `oi` rejects any other value before it touches a file.
 
 ### Authoritative history versus rebuildable cache
 
