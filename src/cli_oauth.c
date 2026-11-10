@@ -108,20 +108,33 @@ static oi_status server_from_url(const char *url,
     return st;
 }
 
+static int is_loopback_host(const char *host) {
+    return strcmp(host, "127.0.0.1") == 0 || strcmp(host, "localhost") == 0 ||
+           strcmp(host, "::1") == 0 || strcmp(host, "[::1]") == 0;
+}
+
 oi_status oi_cli_oauth_servers(struct oi_cli_oauth_server *out_auth,
                                struct oi_cli_oauth_server *out_api,
                                int *out_is_test) {
     const char *test_base = getenv("OI_CHATGPT_TEST_BASE");
-    oi_status st;
+    oi_status st = OI_OK;
     out_auth->host = NULL;
     out_api->host = NULL;
-    *out_is_test = test_base != NULL && test_base[0] != '\0';
-    if (*out_is_test) {
+    *out_is_test = 0;
+    if (test_base != NULL && test_base[0] != '\0') {
+        /* The refresh token goes to this origin, and any environment
+         * (an .envrc in a cloned repository) can set the variable: only a
+         * loopback origin replaces the production servers. */
         st = server_from_url(test_base, out_auth);
-        if (st == OI_OK) {
+        if (st == OI_OK && is_loopback_host(out_auth->host)) {
             st = server_from_url(test_base, out_api);
+            *out_is_test = st == OI_OK;
+        } else {
+            oi_cli_oauth_server_free(out_auth);
+            st = OI_OK;
         }
-    } else {
+    }
+    if (st == OI_OK && !*out_is_test) {
         st = server_named("auth.openai.com", out_auth);
         if (st == OI_OK) {
             st = server_named("api.openai.com", out_api);

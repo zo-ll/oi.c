@@ -21,7 +21,8 @@ struct oi_cli_oauth_server {
 
 /*
  * The production servers, unless OI_CHATGPT_TEST_BASE names one http(s)
- * origin that replaces both; that variable exists only for tests.
+ * loopback origin that replaces both; that variable exists only for tests,
+ * and any other host in it is ignored.
  * `out_is_test` reports the override, which also disables opening a browser.
  */
 oi_status oi_cli_oauth_servers(struct oi_cli_oauth_server *out_auth,
