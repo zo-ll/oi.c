@@ -347,6 +347,56 @@ TEST(empty_tool_call_arguments_arrive_as_an_empty_object) {
     waitpid(child, NULL, 0);
 }
 
+/* A response with no Content-Length and no chunking; the mock server
+ * closes the connection after the last byte. */
+static void run_until_close_stream(const char *sse_body,
+                                   struct tool_event_ctx *ctx) {
+    char response[512];
+    int len = snprintf(response, sizeof response,
+                       "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream"
+                       "\r\nConnection: close\r\n\r\n%s",
+                       sse_body);
+    unsigned short port;
+    pid_t child = start_mock_server(response, (size_t)len, &port);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, "{}", 2, on_event,
+                                          tool_event_done, ctx, &req),
+              OI_OK);
+    run_until(r, &ctx->done, 100);
+    CHECK(ctx->done);
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+TEST(body_that_ends_at_the_close_completes_the_stream) {
+    struct tool_event_ctx ctx = {0};
+    run_until_close_stream(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"until close\"}}]}\n\n"
+        "data: [DONE]\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_STREQ(ctx.text, "until close");
+}
+
+TEST(body_cut_short_by_the_close_fails_the_stream) {
+    struct tool_event_ctx ctx = {0};
+    run_until_close_stream(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"cut\"}}]}\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_ERR_PARSE);
+}
+
 TEST(incomplete_tool_call_rejects_stream) {
     const char *sse_body =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -1023,6 +1073,8 @@ int main(void) {
     RUN(streaming_success_delivers_deltas);
     RUN(structured_tool_call_fragments_are_ordered);
     RUN(empty_tool_call_arguments_arrive_as_an_empty_object);
+    RUN(body_that_ends_at_the_close_completes_the_stream);
+    RUN(body_cut_short_by_the_close_fails_the_stream);
     RUN(incomplete_tool_call_rejects_stream);
     RUN(non_2xx_status_reports_error_body);
     RUN(malformed_sse_json_is_reported_not_dropped);

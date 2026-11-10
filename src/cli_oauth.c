@@ -701,6 +701,10 @@ static void http_on_error(oi_llm_conn *conn, oi_status reason,
     (void)conn;
     struct http_call *call = user_data;
     call->conn = NULL; /* closes itself once this callback returns */
+    if (reason == OI_ERR_CLOSED &&
+        oi_llm_http_parser_close(call->parser) == OI_OK) {
+        reason = OI_OK; /* a body with no length ends at the close */
+    }
     http_finish(call, reason);
 }
 

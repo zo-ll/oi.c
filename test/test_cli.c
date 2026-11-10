@@ -1296,6 +1296,31 @@ TEST(end_to_end_streaming_reply) {
     rmdir(session_dir);
 }
 
+TEST(reply_whose_body_ends_at_the_close_is_printed) {
+    const char *response =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Connection: close\r\n\r\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"no length header\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    unsigned short port;
+    pid_t child = start_mock_server(response, strlen(response), &port);
+
+    char port_str[16];
+    snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
+    char *argv[] = {(char *)OI_BIN,      (char *)"--host",
+                    (char *)"127.0.0.1", (char *)"--port",
+                    port_str,            (char *)"--no-tls",
+                    (char *)"--api-key", (char *)"test-key",
+                    (char *)"go",        NULL};
+    struct run_result r;
+    run_cli(argv, &r);
+
+    CHECK_EQ(r.exit_code, 0);
+    CHECK(strstr(r.output, "no length header") != NULL);
+    waitpid(child, NULL, 0);
+}
+
 static void run_tool_cli(const char *first_sse, const char *second_sse,
                          const char *policy_flag, const char *max_turns,
                          const char *session_suffix,
@@ -6848,6 +6873,7 @@ int main(void) {
     RUN(overlong_session_path_fails_cleanly);
     RUN(unsafe_session_id_fails_without_creating_a_file);
     RUN(end_to_end_streaming_reply);
+    RUN(reply_whose_body_ends_at_the_close_is_printed);
     RUN(tool_loop_executes_and_returns_result);
     RUN(tool_denial_stops_loop);
     RUN(default_ask_policy_denies_safely_without_a_controlling_terminal);

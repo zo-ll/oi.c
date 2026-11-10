@@ -27,6 +27,7 @@ enum state {
     ST_CHUNK_DATA_CRLF,
     ST_FINAL_CRLF,
     ST_CONTENT_BODY,
+    ST_UNTIL_CLOSE_BODY,
     ST_DONE,
     ST_ERROR
 };
@@ -90,6 +91,14 @@ void oi_llm_http_parser_destroy(oi_llm_http_parser *p) {
     }
     free(p->line_buf);
     free(p);
+}
+
+oi_status oi_llm_http_parser_close(oi_llm_http_parser *p) {
+    if (p == NULL || p->state != ST_UNTIL_CLOSE_BODY) {
+        return OI_ERR_CLOSED;
+    }
+    p->state = ST_DONE;
+    return OI_OK;
 }
 
 int oi_llm_http_parser_body_done(const oi_llm_http_parser *p) {
@@ -162,11 +171,13 @@ static oi_status finish_headers(oi_llm_http_parser *p) {
             p->remaining = p->content_length;
             p->state = ST_CONTENT_BODY;
         }
+    } else if (p->status_code < 200 || p->status_code == 204 ||
+               p->status_code == 304) {
+        p->state = ST_DONE; /* these statuses never carry a body */
     } else {
-        /* Neither chunked nor Content-Length: treated as an empty body.
-         * Scoped simplification -- OpenAI-compatible APIs always set
-         * one or the other; a general client would read until close. */
-        p->state = ST_DONE;
+        /* Neither chunked nor Content-Length: the body ends when the
+         * peer closes the connection (oi_llm_http_parser_close). */
+        p->state = ST_UNTIL_CLOSE_BODY;
     }
     if (p->on_headers_done) {
         p->on_headers_done(p->status_code, p->user_data);
@@ -189,10 +200,17 @@ static oi_status handle_header_line(oi_llm_http_parser *p) {
     }
     size_t name_len = colon;
     size_t vi = colon + 1;
-    while (vi < p->line_len && p->line_buf[vi] == ' ') {
+    size_t value_end = p->line_len;
+    /* Optional white space around a field value is not part of it. */
+    while (vi < value_end &&
+           (p->line_buf[vi] == ' ' || p->line_buf[vi] == '\t')) {
         vi++;
     }
-    size_t value_len = p->line_len - vi;
+    while (value_end > vi && (p->line_buf[value_end - 1] == ' ' ||
+                              p->line_buf[value_end - 1] == '\t')) {
+        value_end--;
+    }
+    size_t value_len = value_end - vi;
 
     if (name_len == 17 &&
         strncasecmp(p->line_buf, "Transfer-Encoding", 17) == 0) {
@@ -209,7 +227,7 @@ static oi_status handle_header_line(oi_llm_http_parser *p) {
             return OI_ERR_PARSE;
         }
         long v = 0;
-        for (size_t k = vi; k < p->line_len; k++) {
+        for (size_t k = vi; k < value_end; k++) {
             if (!is_digit_c(p->line_buf[k])) {
                 p->state = ST_ERROR;
                 return OI_ERR_PARSE;
@@ -374,9 +392,18 @@ OI_DIAG_POP
             continue;
         }
 
-        /* ST_CHUNK_DATA / ST_CONTENT_BODY: consume a run of raw bytes at
-         * once rather than one byte at a time. */
+        /* ST_CHUNK_DATA / ST_CONTENT_BODY / ST_UNTIL_CLOSE_BODY: consume
+         * a run of raw bytes at once rather than one byte at a time. */
         size_t avail = len - i;
+        if (p->state == ST_UNTIL_CLOSE_BODY) {
+            if (p->on_body) {
+                p->on_body(buf + i, avail, p->user_data);
+                if (destroyed) {
+                    return OI_OK; /* `p` was freed by a reentrant destroy */
+                }
+            }
+            break;
+        }
         size_t take =
             (size_t)p->remaining < avail ? (size_t)p->remaining : avail;
         if (p->on_body) {

@@ -756,6 +756,33 @@ static void req_on_connected(oi_llm_conn *c, void *ud) {
     }
 }
 
+/* The HTTP body is complete: settles the request from what it held. */
+static void complete_body(oi_llm_request *req) {
+    if (!req->is_success_status) {
+        finish(req, OI_ERR_IO, req->http_status, req->error_buf,
+               req->error_len);
+        return;
+    }
+    int destroyed = 0;
+OI_DIAG_PUSH_IGNORE_DANGLING
+    req->destroyed_flag = &destroyed;
+OI_DIAG_POP
+    oi_status st = oi_llm_sse_parser_finish(req->sse);
+    if (destroyed) {
+        return;
+    }
+    req->destroyed_flag = NULL;
+    if (st != OI_OK || req->body_cb_failed || !req->saw_done) {
+        finish(req,
+               st != OI_OK ? st
+                           : (req->body_cb_failed ? req->body_cb_status
+                                                  : OI_ERR_PARSE),
+               req->http_status, req->error_buf, req->error_len);
+        return;
+    }
+    finish(req, OI_OK, req->http_status, NULL, 0);
+}
+
 static void req_on_data(oi_llm_conn *c, const void *data, size_t len,
                          void *ud) {
     (void)c;
@@ -781,36 +808,20 @@ OI_DIAG_POP
     }
 
     if (oi_llm_http_parser_body_done(req->http)) {
-        if (req->is_success_status) {
-            int finish_destroyed = 0;
-OI_DIAG_PUSH_IGNORE_DANGLING
-            req->destroyed_flag = &finish_destroyed;
-OI_DIAG_POP
-            st = oi_llm_sse_parser_finish(req->sse);
-            if (finish_destroyed) {
-                return;
-            }
-            req->destroyed_flag = NULL;
-            if (st != OI_OK || req->body_cb_failed || !req->saw_done) {
-                finish(req,
-                       st != OI_OK
-                           ? st
-                           : (req->body_cb_failed ? req->body_cb_status
-                                                  : OI_ERR_PARSE),
-                       req->http_status, req->error_buf, req->error_len);
-                return;
-            }
-            finish(req, OI_OK, req->http_status, NULL, 0);
-        } else {
-            finish(req, OI_ERR_IO, req->http_status, req->error_buf,
-                   req->error_len);
-        }
+        complete_body(req);
     }
 }
 
 static void req_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
     (void)c;
     oi_llm_request *req = ud;
+    /* A body with no length ends at the close. A close that cut the
+     * stream short still fails: complete_body requires the end marker. */
+    if (reason == OI_ERR_CLOSED &&
+        oi_llm_http_parser_close(req->http) == OI_OK) {
+        complete_body(req);
+        return;
+    }
     /* If already finished (body_done already drove completion in an
      * earlier on_data call), the connection closing now is just the
      * expected teardown, not a new failure. */
