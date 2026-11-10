@@ -311,6 +311,42 @@ TEST(structured_tool_call_fragments_are_ordered) {
     waitpid(child, NULL, 0);
 }
 
+TEST(empty_tool_call_arguments_arrive_as_an_empty_object) {
+    const char *sse_body =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":"
+        "{\"name\":\"now\",\"arguments\":\"\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t total;
+    char *response = build_chunked_response(sse_body, strlen(sse_body),
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct tool_event_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, "{}", 2, on_event,
+                                          tool_event_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_STREQ(ctx.id[0], "call_0");
+    CHECK_STREQ(ctx.name[0], "now");
+    CHECK_STREQ(ctx.arguments[0], "{}");
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
 TEST(incomplete_tool_call_rejects_stream) {
     const char *sse_body =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -832,6 +868,20 @@ TEST(responses_arguments_can_arrive_only_in_the_done_event) {
     CHECK_STREQ(ctx.arguments[0], "{}");
 }
 
+TEST(responses_empty_arguments_arrive_as_an_empty_object) {
+    struct tool_event_ctx ctx = {0};
+    run_responses_stream(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,"
+        "\"item\":{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":"
+        "\"now\",\"arguments\":\"\"}}\n\n"
+        "data: {\"type\":\"response.function_call_arguments.done\","
+        "\"output_index\":0,\"arguments\":\"\"}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_STREQ(ctx.arguments[0], "{}");
+}
+
 TEST(responses_stream_requires_completed_event) {
     struct tool_event_ctx ctx = {0};
     run_responses_stream(
@@ -972,6 +1022,7 @@ int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(streaming_success_delivers_deltas);
     RUN(structured_tool_call_fragments_are_ordered);
+    RUN(empty_tool_call_arguments_arrive_as_an_empty_object);
     RUN(incomplete_tool_call_rejects_stream);
     RUN(non_2xx_status_reports_error_body);
     RUN(malformed_sse_json_is_reported_not_dropped);
@@ -984,6 +1035,7 @@ int main(void) {
     RUN(long_bearer_token_fits_request_header);
     RUN(responses_stream_delivers_text);
     RUN(responses_stream_assembles_function_calls);
+    RUN(responses_empty_arguments_arrive_as_an_empty_object);
     RUN(responses_arguments_can_arrive_only_in_the_done_event);
     RUN(responses_stream_requires_completed_event);
     RUN(responses_incomplete_function_call_rejects_stream);

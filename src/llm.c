@@ -457,12 +457,25 @@ static oi_status handle_tool_calls(oi_llm_request *req,
     return OI_OK;
 }
 
+/* Returns OI_ERR_CLOSED when the event callback cancelled (and freed)
+ * `req`. */
 static oi_status validate_tool_calls(oi_llm_request *req) {
     for (size_t i = 0; i < req->tools_len; i++) {
         struct oi_llm_tool_state *tool = &req->tools[i];
         if (tool->id_len == 0 || tool->name_len == 0 ||
-            tool->arguments_len == 0) {
+            tool->arguments == NULL) {
             return OI_ERR_PARSE;
+        }
+        /* Some OpenAI-compatible servers send "" for a tool that takes no
+         * arguments. Consumers append fragments, so the empty object goes
+         * out as one more fragment. */
+        if (tool->arguments_len == 0) {
+            oi_status st = record_tool_fragment(req, tool->index, NULL, 0,
+                                                NULL, 0, "{}", 2);
+            if (st != OI_OK) {
+                return st;
+            }
+            tool = &req->tools[i];
         }
         oi_json_parser_reset(req->json);
         oi_status st =
@@ -607,6 +620,9 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
             return;
         }
         oi_status st = validate_tool_calls(req);
+        if (st == OI_ERR_CLOSED) {
+            return;
+        }
         if (st != OI_OK) {
             req->body_cb_failed = 1;
             req->body_cb_status = st;
