@@ -829,6 +829,15 @@ int main(int argc, char **argv) {
                 return 1;
             }
             session_id = argv[i];
+            /* The ID becomes a file name under the session directory, so a
+             * separator or a traversal component must never reach it. */
+            if (!oi_cli_session_id_is_safe(session_id, strlen(session_id))) {
+                fprintf(stderr,
+                        "oi: invalid session ID '%s' (use letters, digits, "
+                        "'_' and '-')\n",
+                        session_id);
+                return 1;
+            }
             continue;
         }
         if (strcmp(arg, "--session-dir") == 0) {
