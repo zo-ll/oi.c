@@ -807,7 +807,7 @@ static void request_tool_call(oi_cli_conversation *conversation,
         struct oi_cli_conversation_event event = {
             .type = OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION,
             .as.awaiting_permission = {&call->id, &call->name,
-                                      &call->arguments},
+                                      &call->arguments, arguments},
         };
         oi_status st;
 

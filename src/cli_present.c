@@ -61,6 +61,54 @@ static oi_status write_tool_start(FILE *stream,
     return OI_OK;
 }
 
+/*
+ * Writes what the user approves, in full and before the selector: the
+ * decoded `command` string when there is one, else the raw arguments. The
+ * terminal wraps it and keeps it in scrollback, so no length or JSON
+ * escape can hide a part of it.
+ */
+static oi_status write_permission_request(
+    FILE *stream, const struct oi_cli_conversation_event *event) {
+    static const char prefix[] = "oi: approve tool ";
+    const struct oi_cli_string *name = event->as.awaiting_permission.name;
+    const char *text = event->as.awaiting_permission.arguments->data;
+    size_t text_len = event->as.awaiting_permission.arguments->len;
+    const char *command = NULL;
+    size_t command_len = 0;
+    oi_status status;
+
+    if (oi_json_get_string(
+            oi_json_object_get(event->as.awaiting_permission.parsed_arguments,
+                               "command"),
+            &command, &command_len) == OI_OK) {
+        text = command;
+        text_len = command_len;
+    }
+    if (fwrite(prefix, 1, sizeof prefix - 1, stream) != sizeof prefix - 1) {
+        return OI_ERR_IO;
+    }
+    if (name->len > 0) {
+        status = oi_cli_render_sanitize_write(stream, name->data, name->len);
+        if (status != OI_OK) {
+            return status;
+        }
+    }
+    if (fputs(command != NULL ? ", command:\n" : ", arguments:\n", stream) ==
+        EOF) {
+        return OI_ERR_IO;
+    }
+    if (text_len > 0) {
+        status = oi_cli_render_sanitize_write(stream, text, text_len);
+        if (status != OI_OK) {
+            return status;
+        }
+    }
+    if (putc('\n', stream) == EOF || fflush(stream) != 0) {
+        return OI_ERR_IO;
+    }
+    return OI_OK;
+}
+
 static oi_status write_model_error(
     FILE *stream, const struct oi_cli_conversation_event *event) {
     char header[96];
@@ -190,8 +238,9 @@ oi_status oi_cli_present_event(
         present->done = 1;
         return finish_status;
     }
-    case OI_CLI_CONVERSATION_EVENT_MESSAGE:
     case OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION:
+        return write_permission_request(present->err, event);
+    case OI_CLI_CONVERSATION_EVENT_MESSAGE:
     case OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT:
     case OI_CLI_CONVERSATION_EVENT_PARTIAL_ASSISTANT:
         return OI_OK;

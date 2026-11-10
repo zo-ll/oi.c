@@ -5,6 +5,7 @@
 
 #include "cli_message.h"
 #include "oi/arena.h"
+#include "oi/json.h"
 #include "oi/llm.h"
 #include "oi/reactor.h"
 #include "oi/status.h"
@@ -108,6 +109,7 @@ struct oi_cli_conversation_event {
             const struct oi_cli_string *id;
             const struct oi_cli_string *name;
             const struct oi_cli_string *arguments;
+            const oi_json_value *parsed_arguments; /* a JSON object */
         } awaiting_permission;
         struct {
             int http_status;

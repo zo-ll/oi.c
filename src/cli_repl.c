@@ -337,31 +337,21 @@ struct repl_turn_input_context {
     struct oi_cli_tool_panel panel;
 };
 
-/*
- * Bounds the raw argument JSON before sanitizing it, so a pathologically
- * large tool call can't blow up the header display or the sanitize pass'
- * own bounded memory use -- the full arguments are still whatever the
- * model actually sent; only this pre-approval summary is truncated.
- */
-#define OI_CLI_REPL_PERMISSION_ARGS_SUMMARY_MAX 200u
+/* Index of "Deny" in the permission selector's options. */
+#define PERMISSION_OPTION_DENY 2u
 
 /*
- * Builds the "Tool: <name>" / "Args: <summary>" header lines shown above
- * the permission selector, sanitizing both through the same
- * control-byte/escape-sequence stripper write_tool_start already uses for
- * "oi: running tool <name>" -- untrusted model output must never be able
- * to inject terminal escapes into this display. Copied into
- * caller-owned buffers immediately: `name`/`arguments` are event-scoped
- * borrowed pointers, not guaranteed to outlive this call.
+ * Builds the "Tool: <name>" header line shown above the permission
+ * selector, sanitized like every other untrusted string on the terminal.
+ * The selector redraws these lines, so they stay one row each: the full
+ * request goes to scrollback once, through cli_present, before the first
+ * draw. Copied because `name` is event-scoped.
  */
 static oi_status build_permission_header(struct oi_cli_bytebuf *tool_line,
                                          struct oi_cli_bytebuf *args_line,
-                                         const struct oi_cli_string *name,
-                                         const struct oi_cli_string *arguments) {
+                                         const struct oi_cli_string *name) {
+    static const char review[] = "Review the request above before you allow it.";
     struct oi_cli_sanitize_state sanitize;
-    size_t bounded_args_len = arguments->len > OI_CLI_REPL_PERMISSION_ARGS_SUMMARY_MAX
-                                  ? OI_CLI_REPL_PERMISSION_ARGS_SUMMARY_MAX
-                                  : arguments->len;
     oi_status status;
 
     oi_cli_bytebuf_reset(tool_line);
@@ -377,19 +367,7 @@ static oi_status build_permission_header(struct oi_cli_bytebuf *tool_line,
         }
     }
     if (status == OI_OK) {
-        status = oi_cli_bytebuf_append(args_line, "Args: ", 6);
-    }
-    if (status == OI_OK) {
-        oi_cli_sanitize_init(&sanitize);
-        status = oi_cli_sanitize_feed(
-            &sanitize, (const unsigned char *)arguments->data,
-            bounded_args_len, args_line);
-        if (status == OI_OK) {
-            status = oi_cli_sanitize_finish(&sanitize);
-        }
-    }
-    if (status == OI_OK && arguments->len > bounded_args_len) {
-        status = oi_cli_bytebuf_append(args_line, "...", 3);
+        status = oi_cli_bytebuf_append(args_line, review, sizeof review - 1);
     }
     return status;
 }
@@ -435,8 +413,7 @@ static oi_status repl_conversation_event(
         oi_status status = build_permission_header(
             &turn_input->permission_tool_line,
             &turn_input->permission_args_line,
-            event->as.awaiting_permission.name,
-            event->as.awaiting_permission.arguments);
+            event->as.awaiting_permission.name);
         if (status != OI_OK) {
             return status;
         }
@@ -449,7 +426,8 @@ static oi_status repl_conversation_event(
             return status;
         }
         turn_input->awaiting_permission = 1;
-        turn_input->permission_selected = 0;
+        /* Enter on a fresh prompt must not run anything. */
+        turn_input->permission_selected = PERMISSION_OPTION_DENY;
         turn_input->dirty = 1;
         break;
     }
@@ -534,7 +512,8 @@ static int permission_selector_key(const struct oi_cli_input_event *event,
         return 0;
     case OI_CLI_SELECTOR_ACTION_CONFIRM:
         status = oi_cli_conversation_resolve_permission(
-            context->conversation, context->permission_selected != 2);
+            context->conversation,
+            context->permission_selected != PERMISSION_OPTION_DENY);
         if (status != OI_OK) {
             /* A signal callback earlier in the same reactor batch may
              * already have cancelled the pending call. Stale selector

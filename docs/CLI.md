@@ -392,6 +392,11 @@ move, Enter to choose, `1`-`9` to choose directly by position, and Escape or
 Ctrl+C to cancel. Cancelling always picks the safe option — the first one
 for confirmations, and *deny* for a tool permission prompt.
 
+A tool permission prompt starts on *Deny*, so Enter alone never runs a tool.
+Before the prompt, `oi` prints the full request above it: for `shell`, the
+decoded `command` string with nothing cut off. Read it there before you
+choose *Allow once* (`1`) or *Allow for process* (`2`).
+
 ## Slash commands
 
 The summary below is the command registry verbatim — the same usage strings
