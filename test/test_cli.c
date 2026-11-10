@@ -3362,6 +3362,8 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
     unlink(log_path);
 }
 
+static void remove_sessions_under(const char *root);
+
 static const char permission_tool_sse[] =
     "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
     "\"index\":0,\"id\":\"call_ask\",\"type\":\"function\",\"function\":{"
@@ -3407,8 +3409,8 @@ TEST(permission_ask_allow_once_lets_the_tool_run) {
     CHECK(interactive_wait_for(master_fd, &result, "Allow once", 1));
     CHECK(interactive_wait_for(master_fd, &result, "Deny", 1));
 
-    /* Confirms at the default selection (index 0, "Allow once"). */
-    CHECK(write_interactive(master_fd, "\r", 1));
+    /* Digit shortcut '1' -> "Allow once"; the default is Deny. */
+    CHECK(write_interactive(master_fd, "1", 1));
     CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
 
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -3450,6 +3452,71 @@ TEST(permission_ask_allow_once_lets_the_tool_run) {
             rmdir(session_path);
         }
     }
+    rmdir(session_root);
+}
+
+TEST(permission_ask_shows_the_full_decoded_command_and_enter_denies) {
+    char padding[1001];
+    char tool_sse[2048];
+    char expected[1100];
+    size_t tool_len;
+    unsigned short port;
+    pid_t server;
+    pid_t cli;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    char session_root[128];
+
+    memset(padding, 'x', sizeof padding - 1);
+    padding[sizeof padding - 1] = '\0';
+    /* Two JSON layers: the SSE string holds the arguments JSON, whose
+     * command holds the A escape. */
+    snprintf(tool_sse, sizeof tool_sse,
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+             "\"index\":0,\"id\":\"call_long\",\"type\":\"function\","
+             "\"function\":{\"name\":\"shell\",\"arguments\":"
+             "\"{\\\"command\\\":\\\"printf \\\\u0041BC; %s tail-marker\\\"}\""
+             "}}]}}]}\n\n"
+             "data: [DONE]\n\n",
+             padding);
+    snprintf(expected, sizeof expected, "printf ABC; %s tail-marker", padding);
+    {
+        char *tool_response = build_chunked_response(
+            tool_sse, strlen(tool_sse), "HTTP/1.1 200 OK", &tool_len);
+        server = start_mock_server(tool_response, tool_len, &port);
+        free(tool_response);
+    }
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    snprintf(session_root, sizeof session_root, "/tmp/oi-cli-ask-long-%d",
+             (int)getpid());
+    cli = start_interactive_cli_asking_tools(port, slave_fd, session_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "run it\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Deny", 1));
+    CHECK(strstr(result.output, expected) != NULL);
+    CHECK(strstr(result.output, "\\u0041") == NULL);
+
+    /* Enter on a fresh prompt confirms the default, which is Deny. */
+    CHECK(write_interactive(master_fd, "\r", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "shell: denied", 1));
+    /* Only the approval request shows it: the command never ran. */
+    CHECK_EQ(count_text(result.output, "ABC"), 1);
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    waitpid(server, NULL, 0);
+    remove_sessions_under(session_root);
     rmdir(session_root);
 }
 
@@ -3658,7 +3725,7 @@ TEST(permission_ask_resize_redraws_the_selector) {
     CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &resized), 0);
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[J", 1));
 
-    CHECK(write_interactive(master_fd, "\r", 1));
+    CHECK(write_interactive(master_fd, "1", 1));
     CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
 
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -3711,11 +3778,11 @@ TEST(permission_ask_typing_does_not_leak_into_the_draft) {
     /* Plain letters are not digit shortcuts -- they must have no visible
      * effect on the selector and must never reach the editor. */
     CHECK(write_interactive(master_fd, "xyz", 3));
-    /* Confirms at the default selection (index 0, "Allow once"): if any
-     * of "xyz" had leaked into the editor instead, this "\r" would submit
-     * garbage as a new message rather than confirming the selector. */
+    /* Confirms at the default selection ("Deny"): if any of "xyz" had
+     * leaked into the editor instead, this "\r" would submit garbage as a
+     * new message rather than confirming the selector. */
     CHECK(write_interactive(master_fd, "\r", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "shell: denied", 1));
 
     /* Back at an idle prompt: if "xyz" had leaked into the draft, Ctrl+D
      * would delete forward instead of exiting (same technique used
@@ -3770,8 +3837,6 @@ TEST(permissions_allow_requires_confirmation_and_can_be_cancelled) {
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
 }
-
-static void remove_sessions_under(const char *root);
 
 /* Sends one GET to the OAuth loopback listener; copies the reply. */
 static int send_oauth_callback(const char *query, char *reply,
@@ -6752,6 +6817,7 @@ int main(void) {
     RUN(crash_with_a_pending_item_restores_it_as_a_startup_draft);
     RUN(permission_ask_allow_once_lets_the_tool_run);
     RUN(permission_ask_deny_ends_the_turn);
+    RUN(permission_ask_shows_the_full_decoded_command_and_enter_denies);
     RUN(permission_ask_allow_for_process_elevates_policy);
     RUN(permission_ask_ctrl_c_while_awaiting_denies_without_hanging);
     RUN(permission_ask_resize_redraws_the_selector);
