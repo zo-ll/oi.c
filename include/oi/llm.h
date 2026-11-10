@@ -40,6 +40,7 @@ typedef enum {
  * a field with length zero was absent from this delta. Callers that need a
  * complete call append fragments by `index`; the stream is rejected unless
  * every call finishes with a non-empty id/name and JSON-object arguments.
+ * A call whose arguments are present but empty gets one final "{}" fragment.
  */
 typedef struct {
     oi_llm_event_type type;
