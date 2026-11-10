@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -35,6 +36,7 @@ static const char usage_url[] = "https://chatgpt.com/settings/usage";
 /* Renew this long before expiry, so that a long turn keeps a valid token. */
 #define REFRESH_MARGIN_SECONDS 300.0
 #define CALLBACK_TIMEOUT_MS (5 * 60 * 1000)
+#define HEAD_TIMEOUT_MS 3000
 
 static const struct oi_cli_render_line provider_header[] = {
     LINE("Log in: choose a provider"),
@@ -476,10 +478,21 @@ static void open_browser(const char *url) {
     (void)waitpid(child, NULL, 0);
 }
 
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* One deadline for the whole head: a client that sends one byte at a time
+ * cannot hold the listener (and Esc) for longer than HEAD_TIMEOUT_MS. */
 static void read_request_head(int fd, char *head, size_t size) {
     size_t used = 0;
     struct pollfd descriptor = {.fd = fd, .events = POLLIN};
-    while (used < size - 1 && poll(&descriptor, 1, 3000) > 0) {
+    int64_t deadline = monotonic_ms() + HEAD_TIMEOUT_MS;
+    int64_t left;
+    while (used < size - 1 && (left = deadline - monotonic_ms()) > 0 &&
+           poll(&descriptor, 1, (int)left) > 0) {
         ssize_t got = read(fd, head + used, size - 1 - used);
         if (got <= 0) {
             break;
@@ -511,21 +524,26 @@ struct chatgpt_wait {
     struct oi_cli_oauth_callback callback;
 };
 
+/* Any local process or web page can reach the listener, so only a
+ * callback that carries this attempt's `state` ends the wait. */
 static oi_status wait_for_callback(struct oi_cli_composer *composer,
                                    int signal_fd, int listen_fd,
+                                   const char *state,
                                    struct chatgpt_wait *wait,
                                    int *out_terminate_signal) {
     static const struct oi_cli_render_line status_line =
         LINE("Waiting for the browser sign-in (Esc cancels)");
-    int remaining = CALLBACK_TIMEOUT_MS;
+    int64_t deadline = monotonic_ms() + CALLBACK_TIMEOUT_MS;
     for (;;) {
-        struct timespec before;
-        struct timespec after;
         int ready = 0;
-        clock_gettime(CLOCK_MONOTONIC, &before);
+        int64_t remaining = deadline - monotonic_ms();
+        if (remaining <= 0) {
+            wait->timed_out = 1;
+            return OI_OK;
+        }
         oi_status st = oi_cli_composer_wait_fd(
-            composer, signal_fd, &status_line, listen_fd, remaining, &ready,
-            &wait->cancelled, out_terminate_signal);
+            composer, signal_fd, &status_line, listen_fd, (int)remaining,
+            &ready, &wait->cancelled, out_terminate_signal);
         if (st != OI_OK || wait->cancelled || *out_terminate_signal != 0) {
             return st;
         }
@@ -533,8 +551,6 @@ static oi_status wait_for_callback(struct oi_cli_composer *composer,
             wait->timed_out = 1;
             return OI_OK;
         }
-        clock_gettime(CLOCK_MONOTONIC, &after);
-        remaining -= (int)((after.tv_sec - before.tv_sec) * 1000);
 
         int client = accept(listen_fd, NULL, NULL);
         if (client < 0) {
@@ -549,6 +565,15 @@ static oi_status wait_for_callback(struct oi_cli_composer *composer,
         }
         if (st != OI_OK || !wait->callback.is_callback) {
             reply_to_browser(client, "404 Not Found", "Not found.\n");
+            close(client);
+            oi_cli_oauth_callback_free(&wait->callback);
+            continue;
+        }
+        if (wait->callback.state == NULL ||
+            strcmp(wait->callback.state, state) != 0) {
+            reply_to_browser(client, "400 Bad Request",
+                             "This sign-in response is not for the current "
+                             "attempt.\n");
             close(client);
             oi_cli_oauth_callback_free(&wait->callback);
             continue;
@@ -710,9 +735,7 @@ static int callback_is_acceptable(const struct chatgpt_flow *flow,
     const struct oi_cli_oauth_callback *callback = &flow->wait.callback;
     const char *known = flow->saved.openai_client_id;
     const char *reason = NULL;
-    if (callback->state == NULL || strcmp(callback->state, flow->state) != 0) {
-        reason = "the browser response did not match this attempt";
-    } else if (callback->error != NULL) {
+    if (callback->error != NULL) {
         reason = strcmp(callback->error, "access_denied") == 0
                      ? "access was denied in the browser"
                      : "the sign-in server returned an error";
@@ -918,8 +941,8 @@ static oi_status log_in_with_chatgpt(struct oi_cli_login *login,
         open_browser(flow.url);
     }
 
-    st = wait_for_callback(composer, signal_fd, listen_fd, &flow.wait,
-                           out_terminate_signal);
+    st = wait_for_callback(composer, signal_fd, listen_fd, flow.state,
+                           &flow.wait, out_terminate_signal);
     close(listen_fd);
     listen_fd = -1;
     if (st != OI_OK || *out_terminate_signal != 0 || flow.wait.cancelled) {
