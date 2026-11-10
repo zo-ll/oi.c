@@ -1432,6 +1432,73 @@ TEST(tool_failure_is_returned_to_model) {
     CHECK(strstr(result.output, "observed failure") != NULL);
 }
 
+TEST(tool_subprocess_does_not_inherit_the_api_key) {
+    const char *tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_env\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf "
+        "key=$OI_API_KEY.\\\"}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"env checked\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    size_t first_len;
+    size_t second_len;
+    char *first = build_chunked_response(tool_sse, strlen(tool_sse),
+                                         "HTTP/1.1 200 OK", &first_len);
+    char *second = build_chunked_response(answer_sse, strlen(answer_sse),
+                                          "HTTP/1.1 200 OK", &second_len);
+    const char *responses[] = {first, second};
+    size_t lengths[] = {first_len, second_len};
+    char capture_path[160];
+    unsigned short port;
+    snprintf(capture_path, sizeof capture_path,
+             "/tmp/oi-cli-env-key-request-%d", (int)getpid());
+    unlink(capture_path);
+    pid_t server = start_mock_server_turns_capture(responses, lengths, 2,
+                                                   &port, capture_path);
+    free(first);
+    free(second);
+
+    char port_str[16];
+    snprintf(port_str, sizeof port_str, "%u", (unsigned)port);
+    char *argv[] = {(char *)OI_BIN,     (char *)"--host",
+                    (char *)"127.0.0.1", (char *)"--port",
+                    port_str,           (char *)"--no-tls",
+                    (char *)"--allow-tools", (char *)"go",
+                    NULL};
+    struct run_result result;
+    CHECK_EQ(setenv("OI_API_KEY", "sk-env-secret", 1), 0);
+    run_cli(argv, &result);
+    unsetenv("OI_API_KEY");
+    waitpid(server, NULL, 0);
+
+    if (result.exit_code != 0) {
+        fprintf(stderr, "env key CLI output: %s\n", result.output);
+    }
+    CHECK_EQ(result.exit_code, 0);
+    {
+        FILE *capture = fopen(capture_path, "r");
+        char requests[16384];
+        size_t request_len =
+            capture == NULL
+                ? 0
+                : fread(requests, 1, sizeof requests - 1, capture);
+        CHECK(capture != NULL);
+        if (capture != NULL) {
+            fclose(capture);
+        }
+        requests[request_len] = '\0';
+        /* The key still authenticates the requests... */
+        CHECK(strstr(requests, "Bearer sk-env-secret") != NULL);
+        /* ...but the tool saw an empty variable. */
+        CHECK(strstr(requests, "key=.") != NULL);
+        CHECK(strstr(requests, "key=sk-env-secret") == NULL);
+    }
+    unlink(capture_path);
+}
+
 TEST(tool_turn_limit_is_enforced) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -6529,6 +6596,7 @@ int main(void) {
     RUN(tool_denial_stops_loop);
     RUN(default_ask_policy_denies_safely_without_a_controlling_terminal);
     RUN(tool_failure_is_returned_to_model);
+    RUN(tool_subprocess_does_not_inherit_the_api_key);
     RUN(tool_turn_limit_is_enforced);
     RUN(resume_replays_prior_exchange);
     RUN(interactive_repl_preserves_context_across_prompts);
