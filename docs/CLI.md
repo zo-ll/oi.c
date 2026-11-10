@@ -734,6 +734,11 @@ string and runs it as `sh -c <command>` in the session working directory,
 with the environment `oi` itself was started with, minus `OI_API_KEY`:
 `oi` removes that variable at startup, so a tool command cannot read the key.
 
+A command ends when its shell exits. A background process that still holds
+the output open gets 500 ms; then `oi` kills the command's process group and
+returns the output it has. A process that must stay alive must leave the
+group, for example with `setsid`.
+
 **That is arbitrary code execution, requested by a model.** Tool arguments
 are produced from model output, which can be influenced by anything in
 context — a web page a previous tool fetched, a file it read, a tool result.

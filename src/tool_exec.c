@@ -32,6 +32,7 @@ struct oi_tool_call {
     pid_t pid;
     oi_reactor_process *process;
     oi_reactor_timer *timer;
+    oi_reactor_timer *drain_timer; /* runs from the child's exit */
     int timeout_ms;
     int stdin_fd;  /* -1 once closed */
     int stdin_close_pending; /* close_stdin() called while a write was
@@ -141,6 +142,7 @@ static void close_call_io(oi_tool_call *call) {
 
 static void free_call(oi_tool_call *call) {
     oi_reactor_timer_cancel(call->timer);
+    oi_reactor_timer_cancel(call->drain_timer);
     oi_reactor_process_cancel(call->process);
     close_call_io(call);
     if (call->destroyed_flag) {
@@ -176,6 +178,51 @@ static void maybe_finish(oi_tool_call *call) {
     free_call(call);
 }
 
+/*
+ * How long stdout may stay open after the child exits. Only a background
+ * process that inherited the pipe keeps it open then, and the call must
+ * not wait for that process.
+ */
+#define OI_TOOL_DRAIN_MS 500
+/* Bounds the last read: a writer outside the process group survives the
+ * kill and can fill the pipe without end. */
+#define OI_TOOL_DRAIN_MAX_READS 64
+
+static void terminate_process_group(const oi_tool_call *call);
+
+static void on_drain_timeout(oi_reactor *r, void *ud) {
+    (void)r;
+    oi_tool_call *call = ud;
+
+    terminate_process_group(call);
+
+    int destroyed = 0;
+OI_DIAG_PUSH_IGNORE_DANGLING
+    call->destroyed_flag = &destroyed;
+OI_DIAG_POP
+    char buf[16384];
+    for (int reads = 0; reads < OI_TOOL_DRAIN_MAX_READS; reads++) {
+        ssize_t n = read(call->stdout_fd, buf, sizeof buf);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        if (call->on_output) {
+            call->on_output(buf, (size_t)n, call->user_data);
+            if (destroyed) {
+                return; /* `call` was freed by a reentrant cancel */
+            }
+        }
+    }
+    call->destroyed_flag = NULL;
+
+    close_call_io(call);
+    call->stdout_eof = 1;
+    maybe_finish(call);
+}
+
 static void on_process_event(oi_reactor *r, pid_t pid, void *ud) {
     (void)r;
     oi_tool_call *call = ud;
@@ -202,6 +249,13 @@ static void on_process_event(oi_reactor *r, pid_t pid, void *ud) {
     call->process = NULL;
     call->child_exited = 1;
     call->exit_status = status;
+    if (!call->stdout_eof && !call->timed_out) {
+        /* On a failed start the call waits for end-of-file, bounded by
+         * its timeout. */
+        (void)oi_reactor_timer_start(call->reactor, OI_TOOL_DRAIN_MS,
+                                     on_drain_timeout, call,
+                                     &call->drain_timer);
+    }
     maybe_finish(call);
 }
 

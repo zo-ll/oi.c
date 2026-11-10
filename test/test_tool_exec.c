@@ -10,6 +10,7 @@
 #include <string.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The Makefile links this binary with --wrap=kill. */
@@ -168,6 +169,24 @@ static oi_status orphan_build_argv(const oi_json_value *args,
     return OI_OK;
 }
 
+/* The shell exits at once; its background child holds stdout open. */
+static oi_status background_build_argv(const oi_json_value *args,
+                                       oi_arena *arena, void *ud,
+                                       char ***out_argv) {
+    (void)args;
+    (void)ud;
+    char **argv = oi_arena_alloc(arena, 4 * sizeof(char *));
+    if (argv == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    argv[0] = (char *)"/bin/sh";
+    argv[1] = (char *)"-c";
+    argv[2] = (char *)"sleep 20 & echo started $!";
+    argv[3] = NULL;
+    *out_argv = argv;
+    return OI_OK;
+}
+
 static oi_status missing_build_argv(const oi_json_value *args,
                                      oi_arena *arena, void *ud,
                                      char ***out_argv) {
@@ -201,6 +220,8 @@ static oi_tool_registry *make_registry(void) {
     oi_tool_registry_add(reg, "fdcheck", "{}", fdcheck_build_argv, NULL);
     oi_tool_registry_add(reg, "tree", "{}", tree_build_argv, NULL);
     oi_tool_registry_add(reg, "orphan", "{}", orphan_build_argv, NULL);
+    oi_tool_registry_add(reg, "background", "{}", background_build_argv,
+                         NULL);
     oi_tool_registry_add(reg, "missing", "{}", missing_build_argv, NULL);
     oi_tool_registry_add(reg, "badargv", "{}", build_argv_fails, NULL);
     return reg;
@@ -710,14 +731,25 @@ static int process_exists(pid_t pid) {
     return access(path, F_OK) == 0;
 }
 
+static void clear_call_on_done(oi_tool_exit_kind kind, int code, void *ud) {
+    (void)kind;
+    (void)code;
+    ((struct tree_cancel_ctx *)ud)->call = NULL;
+}
+
 TEST(cancel_after_the_child_is_collected_signals_only_the_group) {
     oi_tool_registry *reg = make_registry();
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
 
     struct tree_cancel_ctx ctx = {0};
+    /* Either the cancel below or the drain after the child's exit ends
+     * the call; neither may signal the collected PID. */
+    record_kills = 1;
+    positive_kills = 0;
     CHECK_EQ(oi_tool_call_start(reg, r, a, "orphan", NULL, allow_cb, NULL,
-                                collect_output, NULL, &ctx, &ctx.call),
+                                collect_output, clear_call_on_done, &ctx,
+                                &ctx.call),
              OI_OK);
 
     pid_t shell = 0;
@@ -743,8 +775,6 @@ TEST(cancel_after_the_child_is_collected_signals_only_the_group) {
     CHECK(!process_exists(shell));
     CHECK_EQ(getpgid(ctx.descendant), ctx.descendant);
 
-    record_kills = 1;
-    positive_kills = 0;
     oi_tool_call_cancel(ctx.call);
     record_kills = 0;
     CHECK_EQ(positive_kills, 0);
@@ -752,6 +782,44 @@ TEST(cancel_after_the_child_is_collected_signals_only_the_group) {
     if (ctx.descendant > 0) {
         kill(ctx.descendant, SIGKILL);
     }
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    oi_tool_registry_destroy(reg);
+}
+
+TEST(call_does_not_wait_for_a_background_process) {
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct timespec before;
+    struct timespec after;
+
+    struct out_ctx ctx = {0};
+    oi_tool_call *call = NULL;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    CHECK_EQ(oi_tool_call_start(reg, r, a, "background", NULL, allow_cb,
+                                NULL, capture_output, capture_done, &ctx,
+                                &call),
+             OI_OK);
+    run_until(r, &ctx.done, 100);
+    clock_gettime(CLOCK_MONOTONIC, &after);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.kind, OI_TOOL_EXIT_NORMAL);
+    CHECK_EQ(ctx.code, 0);
+    CHECK(strncmp(ctx.buf, "started ", 8) == 0);
+    CHECK(after.tv_sec - before.tv_sec < 2);
+    {
+        pid_t background = (pid_t)strtol(ctx.buf + 8, NULL, 10);
+        CHECK(background > 0);
+        /* The background process was in the call's group. */
+        for (int i = 0; i < 100 && process_is_running(background); i++) {
+            struct timespec pause = {0, 10000000};
+            nanosleep(&pause, NULL);
+        }
+        CHECK(!process_is_running(background));
+    }
+
     oi_arena_destroy(a);
     oi_reactor_destroy(r);
     oi_tool_registry_destroy(reg);
@@ -969,6 +1037,7 @@ int main(void) {
     RUN(pending_tool_deadline_starts_after_permission);
     RUN(cancel_kills_descendant_processes);
     RUN(cancel_after_the_child_is_collected_signals_only_the_group);
+    RUN(call_does_not_wait_for_a_background_process);
     RUN(cancel_null_safe);
     RUN(concurrent_calls_do_not_cross_wire);
     RUN(child_does_not_inherit_other_tool_descriptors);
