@@ -3771,6 +3771,118 @@ TEST(permissions_allow_requires_confirmation_and_can_be_cancelled) {
     close(master_fd);
 }
 
+static void remove_sessions_under(const char *root);
+
+/* Sends one GET to the OAuth loopback listener; copies the reply. */
+static int send_oauth_callback(const char *query, char *reply,
+                               size_t reply_size) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    char request[512];
+    size_t used = 0;
+    ssize_t got;
+
+    if (fd < 0) {
+        return 0;
+    }
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(1455);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return 0;
+    }
+    snprintf(request, sizeof request,
+             "GET /auth/callback?%s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+             query);
+    if (!write_interactive(fd, request, strlen(request))) {
+        close(fd);
+        return 0;
+    }
+    while (used < reply_size - 1 &&
+           (got = read(fd, reply + used, reply_size - 1 - used)) > 0) {
+        used += (size_t)got;
+    }
+    reply[used] = '\0';
+    close(fd);
+    return used > 0;
+}
+
+TEST(oauth_callback_with_a_wrong_state_does_not_end_the_login) {
+    int master_fd = -1;
+    int slave_fd = -1;
+    pid_t cli;
+    struct interactive_result result;
+    char session_root[128];
+    char config_root[] = "/tmp/oi-cli-oauth-state-XXXXXX";
+    char state[128] = {0};
+    char query[256];
+    char reply[1024];
+
+    CHECK(mkdtemp(config_root) != NULL);
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-oauth-state-sessions-%d", (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+    /* The loopback test base also stops oi from opening a browser. */
+    setenv("OI_CHATGPT_TEST_BASE", "http://127.0.0.1:9", 1);
+    setenv("XDG_CONFIG_HOME", config_root, 1);
+    cli = start_interactive_cli(9, slave_fd, session_root);
+    unsetenv("OI_CHATGPT_TEST_BASE");
+    unsetenv("XDG_CONFIG_HOME");
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "/login\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "choose a provider", 1));
+    CHECK(write_interactive(master_fd, "\r", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Choose a login method",
+                               1));
+    CHECK(write_interactive(master_fd, "\x1b[B\r", 4));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "Waiting for the browser sign-in", 1));
+    {
+        const char *start = strstr(result.output, "state=");
+        size_t len = 0;
+        CHECK(start != NULL);
+        if (start != NULL) {
+            start += strlen("state=");
+            while (start[len] != '\0' && start[len] != '&' &&
+                   !isspace((unsigned char)start[len]) &&
+                   len < sizeof state - 1) {
+                len++;
+            }
+            memcpy(state, start, len);
+        }
+        CHECK(len > 0);
+    }
+
+    CHECK(send_oauth_callback("code=x&state=wrong", reply, sizeof reply));
+    CHECK(strstr(reply, "400 Bad Request") != NULL);
+    CHECK(send_oauth_callback("code=x", reply, sizeof reply));
+    CHECK(strstr(reply, "400 Bad Request") != NULL);
+
+    snprintf(query, sizeof query, "error=access_denied&state=%s", state);
+    CHECK(send_oauth_callback(query, reply, sizeof reply));
+    CHECK(strstr(reply, "200 OK") != NULL);
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "access was denied in the browser", 1));
+    CHECK(strstr(result.output, "did not match") == NULL);
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    close(master_fd);
+    remove_sessions_under(session_root);
+    rmdir(session_root);
+    rmdir(config_root);
+}
+
 TEST(permissions_allow_confirmed_elevates_policy) {
     const char *answer_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -6647,6 +6759,7 @@ int main(void) {
     RUN(permissions_allow_requires_confirmation_and_can_be_cancelled);
     RUN(permissions_allow_confirmed_elevates_policy);
     RUN(permissions_allow_when_already_allowed_skips_confirmation);
+    RUN(oauth_callback_with_a_wrong_state_does_not_end_the_login);
     RUN(tool_panel_shows_live_output_and_failed_status);
     RUN(tool_panel_survives_malicious_escape_bytes_in_output);
     RUN(tool_panel_coexists_with_resize_and_queued_input);
