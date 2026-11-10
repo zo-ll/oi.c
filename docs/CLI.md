@@ -394,7 +394,9 @@ for confirmations, and *deny* for a tool permission prompt.
 
 A tool permission prompt starts on *Deny*, so Enter alone never runs a tool.
 Before the prompt, `oi` prints the full request above it: for `shell`, the
-decoded `command` string with nothing cut off. Read it there before you
+decoded `command` string with nothing cut off. A bidirectional control
+character shows as `<U+202E>` (with its own number), because it can make
+text show in a different order than the shell runs it. Read it there before you
 choose *Allow once* (`1`) or *Allow for process* (`2`).
 
 ## Slash commands
