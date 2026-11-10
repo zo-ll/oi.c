@@ -7,11 +7,12 @@
 
 /*
  * Incremental HTTP/1.1 response parser: status line, headers, and a
- * chunked- or Content-Length-delimited body, fed byte-by-byte-safe from
- * a non-blocking socket. Deliberately scoped to what an OpenAI-compatible
- * API actually sends -- no HTTP/1.0 "read until close" body mode, no
- * chunk trailers beyond a single terminating CRLF. Knows nothing about
- * SSE or JSON; it just hands raw body bytes to the caller.
+ * body delimited by chunks, by Content-Length, or (with neither header)
+ * by the close of the connection, fed byte-by-byte-safe from a
+ * non-blocking socket. Deliberately scoped to what an OpenAI-compatible
+ * API actually sends -- no chunk trailers beyond a single terminating
+ * CRLF. Knows nothing about SSE or JSON; it just hands raw body bytes to
+ * the caller.
  */
 
 typedef struct oi_llm_http_parser oi_llm_http_parser;
@@ -27,6 +28,15 @@ void oi_llm_http_parser_destroy(oi_llm_http_parser *p);
 
 oi_status oi_llm_http_parser_feed(oi_llm_http_parser *p, const void *bytes,
                                    size_t len);
+
+/*
+ * Tells the parser that the peer closed the connection. OI_OK when that
+ * close is what ends the body (no Content-Length and not chunked): the
+ * body is then done. OI_ERR_CLOSED in every other state, where the close
+ * cut the response short. The transport cannot tell a clean close from a
+ * truncated one here, so the caller must check the body's own end marker.
+ */
+oi_status oi_llm_http_parser_close(oi_llm_http_parser *p);
 
 int oi_llm_http_parser_body_done(const oi_llm_http_parser *p);
 int oi_llm_http_parser_failed(const oi_llm_http_parser *p);

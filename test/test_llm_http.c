@@ -100,6 +100,60 @@ TEST(no_body_indicated_completes_after_headers) {
     oi_llm_http_parser_destroy(p);
 }
 
+TEST(body_without_a_length_ends_at_the_close) {
+    struct capture c = {0};
+    oi_llm_http_parser *p =
+        oi_llm_http_parser_create(on_headers_done, on_body, &c);
+    const char *doc = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+                      "first part, ";
+    CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_OK);
+    CHECK(c.headers_done);
+    CHECK(!oi_llm_http_parser_body_done(p));
+    CHECK_EQ(oi_llm_http_parser_feed(p, "second part", 11), OI_OK);
+    CHECK(!oi_llm_http_parser_body_done(p));
+    CHECK_EQ(oi_llm_http_parser_close(p), OI_OK);
+    CHECK(oi_llm_http_parser_body_done(p));
+    CHECK_EQ(c.body_len, 23);
+    CHECK(memcmp(c.body, "first part, second part", 23) == 0);
+    oi_llm_http_parser_destroy(p);
+}
+
+TEST(close_inside_a_delimited_body_is_a_truncation) {
+    struct capture c = {0};
+    oi_llm_http_parser *p =
+        oi_llm_http_parser_create(on_headers_done, on_body, &c);
+    const char *doc = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort";
+    CHECK_EQ(oi_llm_http_parser_feed(p, doc, strlen(doc)), OI_OK);
+    CHECK_EQ(oi_llm_http_parser_close(p), OI_ERR_CLOSED);
+    CHECK(!oi_llm_http_parser_body_done(p));
+    oi_llm_http_parser_destroy(p);
+
+    p = oi_llm_http_parser_create(on_headers_done, on_body, &c);
+    CHECK_EQ(oi_llm_http_parser_feed(p, "HTTP/1.1 200", 12), OI_OK);
+    CHECK_EQ(oi_llm_http_parser_close(p), OI_ERR_CLOSED);
+    oi_llm_http_parser_destroy(p);
+}
+
+TEST(white_space_around_a_header_value_is_ignored) {
+    struct capture c = {0};
+    oi_llm_http_parser *p =
+        oi_llm_http_parser_create(on_headers_done, on_body, &c);
+    const char *doc = "HTTP/1.1 200 OK\r\n"
+                      "Transfer-Encoding:\tchunked \t\r\n\r\n"
+                      "2\r\nhi\r\n0\r\n\r\n";
+    CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_OK);
+    CHECK(oi_llm_http_parser_body_done(p));
+    CHECK_EQ(c.body_len, 2);
+    oi_llm_http_parser_destroy(p);
+
+    memset(&c, 0, sizeof c);
+    p = oi_llm_http_parser_create(on_headers_done, on_body, &c);
+    doc = "HTTP/1.1 200 OK\r\nContent-Length: 2 \r\n\r\nhi";
+    CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_OK);
+    CHECK(oi_llm_http_parser_body_done(p));
+    oi_llm_http_parser_destroy(p);
+}
+
 TEST(header_name_case_insensitive) {
     struct capture c = {0};
     oi_llm_http_parser *p =
@@ -339,6 +393,9 @@ int main(void) {
     RUN(content_length_response);
     RUN(zero_content_length_completes_immediately);
     RUN(no_body_indicated_completes_after_headers);
+    RUN(body_without_a_length_ends_at_the_close);
+    RUN(close_inside_a_delimited_body_is_a_truncation);
+    RUN(white_space_around_a_header_value_is_ignored);
     RUN(header_name_case_insensitive);
     RUN(bare_lf_line_endings_accepted);
     RUN(malformed_status_line_errors);
