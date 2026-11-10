@@ -552,17 +552,23 @@ TEST(accessors_reject_wrong_type_and_null) {
     oi_arena_destroy(a);
 }
 
-/* --- arena interaction: a value too big for a small block_size --- */
+/* --- arena interaction: a value larger than a small block_size --- */
 
-TEST(string_larger_than_arena_block_size_is_nomem) {
+TEST(string_larger_than_arena_block_size_parses) {
     oi_arena *a = oi_arena_create(64); /* deliberately tiny */
     oi_json_parser *p = oi_json_parser_create(a);
     char doc[200];
+    const char *text = NULL;
+    size_t text_len = 0;
     doc[0] = '"';
     memset(doc + 1, 'x', 190);
     doc[191] = '"';
-    oi_status st = oi_json_parser_feed(p, doc, 192);
-    CHECK_EQ(st, OI_ERR_NOMEM);
+    CHECK_EQ(oi_json_parser_feed(p, doc, 192), OI_OK);
+    CHECK_EQ(oi_json_parser_finish(p), OI_OK);
+    CHECK_EQ(oi_json_get_string(oi_json_parser_root(p), &text, &text_len),
+             OI_OK);
+    CHECK_EQ(text_len, 190u);
+    CHECK(text != NULL && memcmp(text, doc + 1, 190) == 0);
     oi_json_parser_destroy(p);
     oi_arena_destroy(a);
 }
@@ -815,7 +821,7 @@ int main(void) {
     RUN(create_rejects_null_arena);
     RUN(destroy_null_safe);
     RUN(accessors_reject_wrong_type_and_null);
-    RUN(string_larger_than_arena_block_size_is_nomem);
+    RUN(string_larger_than_arena_block_size_parses);
 
     RUN(write_scalars);
     RUN(write_rejects_nonfinite_number);

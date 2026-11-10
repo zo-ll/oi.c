@@ -397,6 +397,82 @@ TEST(body_cut_short_by_the_close_fails_the_stream) {
     CHECK_EQ(ctx.status, OI_ERR_PARSE);
 }
 
+struct large_event_ctx {
+    size_t text_len;
+    size_t arguments_len;
+    int done;
+    oi_status status;
+};
+
+static void count_event(const oi_llm_event *event, void *ud) {
+    struct large_event_ctx *ctx = ud;
+    if (event->type == OI_LLM_EVENT_TEXT) {
+        ctx->text_len += event->as.text.len;
+    } else {
+        ctx->arguments_len += event->as.tool_call.arguments_len;
+    }
+}
+
+static void large_event_done(oi_status status, int http_status,
+                             const char *error_body, size_t error_body_len,
+                             void *ud) {
+    (void)http_status;
+    (void)error_body;
+    (void)error_body_len;
+    struct large_event_ctx *ctx = ud;
+    ctx->status = status;
+    ctx->done = 1;
+}
+
+/* Each value is larger than the 64 KiB default arena block. */
+TEST(delta_and_tool_arguments_larger_than_an_arena_block_complete) {
+    enum { LARGE = 70000 };
+    char *filler = malloc(LARGE + 1);
+    char *sse_body = malloc(2 * LARGE + 1024);
+    CHECK(filler != NULL && sse_body != NULL);
+    memset(filler, 'x', LARGE);
+    filler[LARGE] = '\0';
+    int body_len = snprintf(
+        sse_body, 2 * LARGE + 1024,
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"}}]}"
+        "\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":"
+        "{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"%s\\\"}\"}}]"
+        "}}]}\n\n"
+        "data: [DONE]\n\n",
+        filler, filler);
+    size_t total;
+    char *response = build_chunked_response(sse_body, (size_t)body_len,
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+    free(sse_body);
+    free(filler);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct large_event_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, "{}", 2, count_event,
+                                          large_event_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_EQ(ctx.text_len, LARGE);
+    CHECK_EQ(ctx.arguments_len, LARGE + strlen("{\"command\":\"\"}"));
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
 TEST(incomplete_tool_call_rejects_stream) {
     const char *sse_body =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -1075,6 +1151,7 @@ int main(void) {
     RUN(empty_tool_call_arguments_arrive_as_an_empty_object);
     RUN(body_that_ends_at_the_close_completes_the_stream);
     RUN(body_cut_short_by_the_close_fails_the_stream);
+    RUN(delta_and_tool_arguments_larger_than_an_arena_block_complete);
     RUN(incomplete_tool_call_rejects_stream);
     RUN(non_2xx_status_reports_error_body);
     RUN(malformed_sse_json_is_reported_not_dropped);

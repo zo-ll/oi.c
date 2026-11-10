@@ -90,9 +90,27 @@ static struct oi_block *advance_block(oi_arena *a) {
     return nb;
 }
 
-void *oi_arena_alloc(oi_arena *a, size_t size) {
-    if (a == NULL || size == 0 || size > a->block_size) {
+/* A request larger than one block gets a block of its own, linked at the
+ * head: blocks before a->current are never bumped again, so the current
+ * block keeps its free space. Only these blocks have a capacity above
+ * block_size, which is how oi_arena_reset finds them. */
+static void *alloc_oversize(oi_arena *a, size_t size) {
+    struct oi_block *b = block_alloc(size);
+    if (b == NULL) {
         return NULL;
+    }
+    b->used = size;
+    b->next = a->head;
+    a->head = b;
+    return b->data;
+}
+
+void *oi_arena_alloc(oi_arena *a, size_t size) {
+    if (a == NULL || size == 0) {
+        return NULL;
+    }
+    if (size > a->block_size) {
+        return alloc_oversize(a, size);
     }
 
     struct oi_block *b = a->current;
@@ -114,6 +132,13 @@ void *oi_arena_alloc(oi_arena *a, size_t size) {
 void oi_arena_reset(oi_arena *a) {
     if (a == NULL) {
         return;
+    }
+    /* Oversize blocks go back to the system: one large allocation must
+     * not pin its memory for the life of the arena. */
+    while (a->head->capacity > a->block_size) {
+        struct oi_block *oversize = a->head;
+        a->head = oversize->next;
+        free(oversize);
     }
     for (struct oi_block *b = a->head; b != NULL; b = b->next) {
         b->used = 0;

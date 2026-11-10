@@ -896,7 +896,7 @@ oi_status oi_cli_history_record_decode(
         json_len > OI_CLI_HISTORY_MAX_RECORD || out_record == NULL) {
         return OI_ERR_INVAL;
     }
-    oi_arena *arena = oi_arena_create(OI_CLI_HISTORY_MAX_RECORD);
+    oi_arena *arena = oi_arena_create(0);
     if (arena == NULL) {
         return OI_ERR_NOMEM;
     }
