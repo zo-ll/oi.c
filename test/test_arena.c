@@ -20,7 +20,7 @@ TEST(alloc_rejects_bad_args) {
     oi_arena *a = oi_arena_create(64);
     CHECK(oi_arena_alloc(NULL, 8) == NULL);
     CHECK(oi_arena_alloc(a, 0) == NULL);
-    CHECK(oi_arena_alloc(a, 65) == NULL); /* exceeds block_size */
+    CHECK(oi_arena_alloc(a, SIZE_MAX) == NULL);
     oi_arena_destroy(a);
 }
 
@@ -91,6 +91,41 @@ TEST(alloc_exactly_block_size_fits) {
     void *q = oi_arena_alloc(a, 1);
     CHECK(q != NULL);
     CHECK(q != p);
+    oi_arena_destroy(a);
+}
+
+TEST(alloc_larger_than_a_block_gets_its_own_block) {
+    oi_arena *a = oi_arena_create(64);
+    char *small = oi_arena_alloc(a, 16);
+    char *big = oi_arena_alloc(a, 1000);
+    CHECK(small != NULL);
+    CHECK(big != NULL);
+    CHECK_EQ((uintptr_t)big % _Alignof(max_align_t), 0);
+    memset(small, 'a', 16);
+    memset(big, 'b', 1000);
+    /* The current block keeps its free space after the large request. */
+    char *next = oi_arena_alloc(a, 16);
+    CHECK(next == small + 16);
+    memset(next, 'c', 16);
+    CHECK_EQ(small[15], 'a');
+    CHECK_EQ(big[0], 'b');
+    CHECK_EQ(big[999], 'b');
+    CHECK_EQ(oi_arena_used(a), 1032);
+    oi_arena_destroy(a);
+}
+
+TEST(reset_releases_oversize_blocks_and_keeps_regular_ones) {
+    oi_arena *a = oi_arena_create(64);
+    char *first = oi_arena_alloc(a, 16);
+    CHECK(oi_arena_alloc(a, 1000) != NULL);
+    CHECK(oi_arena_alloc(a, 5000) != NULL);
+    oi_arena_reset(a);
+    CHECK_EQ(oi_arena_used(a), 0);
+    /* The regular block is reused from its start. */
+    CHECK(oi_arena_alloc(a, 16) == first);
+    char *big = oi_arena_alloc(a, 2000);
+    CHECK(big != NULL);
+    memset(big, 'd', 2000);
     oi_arena_destroy(a);
 }
 
@@ -167,6 +202,8 @@ int main(void) {
     RUN(allocations_do_not_overlap);
     RUN(alloc_spans_multiple_blocks);
     RUN(alloc_exactly_block_size_fits);
+    RUN(alloc_larger_than_a_block_gets_its_own_block);
+    RUN(reset_releases_oversize_blocks_and_keeps_regular_ones);
     RUN(reset_reclaims_space);
     RUN(reset_reuse_cycle_reuses_all_blocks);
     RUN(many_reset_cycles);

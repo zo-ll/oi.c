@@ -40,7 +40,7 @@ static oi_status validate_arguments(
     if (string_contains_nul(&call->id) || string_contains_nul(&call->name)) {
         return OI_ERR_PARSE;
     }
-    oi_arena *arena = oi_arena_create(OI_CLI_HISTORY_MAX_CONTENT + 1);
+    oi_arena *arena = oi_arena_create(0);
     if (arena == NULL) {
         return OI_ERR_NOMEM;
     }

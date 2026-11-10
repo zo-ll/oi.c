@@ -1548,6 +1548,38 @@ TEST(tool_subprocess_does_not_inherit_the_api_key) {
     unlink(capture_path);
 }
 
+/* The argument is larger than the 64 KiB default arena block. */
+TEST(tool_argument_larger_than_an_arena_block_runs) {
+    enum { LARGE = 70000 };
+    char *filler = malloc(LARGE + 1);
+    char *tool_sse = malloc(LARGE + 512);
+    const char *answer_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"large argument ran\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    struct run_result result;
+
+    CHECK(filler != NULL && tool_sse != NULL);
+    memset(filler, 'x', LARGE);
+    filler[LARGE] = '\0';
+    snprintf(tool_sse, LARGE + 512,
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+             "\"index\":0,\"id\":\"call_big\",\"type\":\"function\","
+             "\"function\":{\"name\":\"shell\",\"arguments\":"
+             "\"{\\\"command\\\":\\\"true # %s\\\"}\"}}]}}]}\n\n"
+             "data: [DONE]\n\n",
+             filler);
+    run_tool_cli(tool_sse, answer_sse, "--allow-tools", "4", "large",
+                 &result);
+    free(tool_sse);
+    free(filler);
+    if (result.exit_code != 0) {
+        fprintf(stderr, "large argument CLI output: %s\n", result.output);
+    }
+    CHECK_EQ(result.exit_code, 0);
+    CHECK(strstr(result.output, "large argument ran") != NULL);
+}
+
 TEST(tool_turn_limit_is_enforced) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -6878,6 +6910,7 @@ int main(void) {
     RUN(tool_denial_stops_loop);
     RUN(default_ask_policy_denies_safely_without_a_controlling_terminal);
     RUN(tool_failure_is_returned_to_model);
+    RUN(tool_argument_larger_than_an_arena_block_runs);
     RUN(tool_subprocess_does_not_inherit_the_api_key);
     RUN(tool_turn_limit_is_enforced);
     RUN(resume_replays_prior_exchange);
