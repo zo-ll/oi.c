@@ -3928,6 +3928,60 @@ TEST(oauth_callback_with_a_wrong_state_does_not_end_the_login) {
     CHECK(send_oauth_callback("code=x", reply, sizeof reply));
     CHECK(strstr(reply, "400 Bad Request") != NULL);
 
+    /* A client that sends nothing must not stop the keyboard: Esc during
+     * its read cancels the login. */
+    {
+        struct sockaddr_in addr;
+        int silent = socket(AF_INET, SOCK_STREAM, 0);
+        memset(&addr, 0, sizeof addr);
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(1455);
+        CHECK(silent >= 0);
+        CHECK_EQ(connect(silent, (struct sockaddr *)&addr, sizeof addr), 0);
+        CHECK(write_interactive(silent, "GET /auth", 9));
+        CHECK(write_interactive(master_fd, "\x1b", 1));
+        CHECK(interactive_wait_for(master_fd, &result, "oi: login cancelled",
+                                   1));
+        close(silent);
+    }
+    CHECK(strstr(result.output, "did not match") == NULL);
+
+    /* A second attempt gets a new state; the first one is now wrong. */
+    {
+        size_t waits =
+            count_text(result.output, "Waiting for the browser sign-in");
+        const char *start;
+        size_t len = 0;
+        CHECK(write_interactive(master_fd, "/login\r", 7));
+        CHECK(interactive_wait_for(master_fd, &result, "choose a provider",
+                                   2));
+        CHECK(write_interactive(master_fd, "\r", 1));
+        CHECK(interactive_wait_for(master_fd, &result,
+                                   "Choose a login method", 2));
+        CHECK(write_interactive(master_fd, "\x1b[B\r", 4));
+        CHECK(interactive_wait_for(master_fd, &result,
+                                   "Waiting for the browser sign-in",
+                                   waits + 1));
+        snprintf(query, sizeof query, "code=x&state=%s", state);
+        CHECK(send_oauth_callback(query, reply, sizeof reply));
+        CHECK(strstr(reply, "400 Bad Request") != NULL);
+        start = strstr(result.output, "state=");
+        start = start != NULL ? strstr(start + 1, "state=") : NULL;
+        CHECK(start != NULL);
+        if (start != NULL) {
+            start += strlen("state=");
+            while (start[len] != '\0' && start[len] != '&' &&
+                   !isspace((unsigned char)start[len]) &&
+                   len < sizeof state - 1) {
+                len++;
+            }
+            memcpy(state, start, len);
+            state[len] = '\0';
+        }
+        CHECK(len > 0);
+    }
+
     snprintf(query, sizeof query, "error=access_denied&state=%s", state);
     CHECK(send_oauth_callback(query, reply, sizeof reply));
     CHECK(strstr(reply, "200 OK") != NULL);
