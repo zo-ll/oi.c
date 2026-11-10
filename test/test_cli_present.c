@@ -192,6 +192,84 @@ TEST(tool_name_sanitization_leaves_trusted_prefix_untouched) {
     fclose(err);
 }
 
+TEST(permission_request_shows_the_decoded_command_and_bidi_controls) {
+    FILE *out = tmpfile();
+    FILE *err = tmpfile();
+    struct oi_cli_present present;
+    /* The command holds a JSON escape for the letter A, an escaped and a
+     * raw bidirectional control, and an escaped terminal sequence. */
+    static const char arguments[] =
+        "{\"command\":\"echo \\u0041 \\u202eevil \xe2\x81\xa6 "
+        "\\u001b[2Jend\\nline two\"}";
+    struct oi_cli_string name = {(char *)"shell", 5};
+    struct oi_cli_string raw = {(char *)arguments, sizeof arguments - 1};
+    struct oi_cli_conversation_event event;
+    oi_arena *arena = oi_arena_create(0);
+    oi_json_parser *parser = oi_json_parser_create(arena);
+    char *result;
+
+    CHECK_EQ(oi_json_parser_feed(parser, arguments, sizeof arguments - 1),
+             OI_OK);
+    CHECK_EQ(oi_json_parser_finish(parser), OI_OK);
+    memset(&event, 0, sizeof event);
+    event.type = OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION;
+    event.as.awaiting_permission.name = &name;
+    event.as.awaiting_permission.arguments = &raw;
+    event.as.awaiting_permission.parsed_arguments =
+        oi_json_parser_root(parser);
+
+    CHECK_EQ(oi_cli_present_init(&present, out, err, 0, 0, NULL, NULL),
+             OI_OK);
+    CHECK_EQ(oi_cli_present_event(&event, &present), OI_OK);
+    result = read_stream(err);
+    CHECK_STREQ(result, "oi: approve tool shell, command:\n"
+                        "echo A <U+202E>evil <U+2066> end\nline two\n");
+
+    free(result);
+    oi_cli_present_free(&present);
+    oi_json_parser_destroy(parser);
+    oi_arena_destroy(arena);
+    fclose(out);
+    fclose(err);
+}
+
+TEST(permission_request_without_a_command_shows_the_raw_arguments) {
+    FILE *out = tmpfile();
+    FILE *err = tmpfile();
+    struct oi_cli_present present;
+    static const char arguments[] = "{\"path\":\"a\xe2\x80\xae.txt\"}";
+    struct oi_cli_string name = {(char *)"read", 4};
+    struct oi_cli_string raw = {(char *)arguments, sizeof arguments - 1};
+    struct oi_cli_conversation_event event;
+    oi_arena *arena = oi_arena_create(0);
+    oi_json_parser *parser = oi_json_parser_create(arena);
+    char *result;
+
+    CHECK_EQ(oi_json_parser_feed(parser, arguments, sizeof arguments - 1),
+             OI_OK);
+    CHECK_EQ(oi_json_parser_finish(parser), OI_OK);
+    memset(&event, 0, sizeof event);
+    event.type = OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION;
+    event.as.awaiting_permission.name = &name;
+    event.as.awaiting_permission.arguments = &raw;
+    event.as.awaiting_permission.parsed_arguments =
+        oi_json_parser_root(parser);
+
+    CHECK_EQ(oi_cli_present_init(&present, out, err, 0, 0, NULL, NULL),
+             OI_OK);
+    CHECK_EQ(oi_cli_present_event(&event, &present), OI_OK);
+    result = read_stream(err);
+    CHECK_STREQ(result, "oi: approve tool read, arguments:\n"
+                        "{\"path\":\"a<U+202E>.txt\"}\n");
+
+    free(result);
+    oi_cli_present_free(&present);
+    oi_json_parser_destroy(parser);
+    oi_arena_destroy(arena);
+    fclose(out);
+    fclose(err);
+}
+
 TEST(model_error_body_sanitization_leaves_trusted_header_untouched) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
@@ -265,6 +343,8 @@ int main(void) {
     RUN(captured_assistant_text_is_raw_not_sanitized);
     RUN(styling_enabled_differs_from_disabled_for_the_same_input);
     RUN(tool_name_sanitization_leaves_trusted_prefix_untouched);
+    RUN(permission_request_shows_the_decoded_command_and_bidi_controls);
+    RUN(permission_request_without_a_command_shows_the_raw_arguments);
     RUN(model_error_body_sanitization_leaves_trusted_header_untouched);
     RUN(response_done_emits_trailing_reset_for_an_unclosed_bold_span);
     RUN(turn_done_without_response_done_still_flushes_render_state);

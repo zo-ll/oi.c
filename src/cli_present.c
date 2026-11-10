@@ -61,6 +61,61 @@ static oi_status write_tool_start(FILE *stream,
     return OI_OK;
 }
 
+/* The byte length of the bidirectional control character at `text`
+ * (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069), else 0. */
+static size_t bidi_control_at(const char *text, size_t len,
+                              unsigned *out_codepoint) {
+    const unsigned char *b = (const unsigned char *)text;
+    if (len >= 2 && b[0] == 0xD8 && b[1] == 0x9C) {
+        *out_codepoint = 0x061C;
+        return 2;
+    }
+    if (len >= 3 && b[0] == 0xE2 && (b[1] == 0x80 || b[1] == 0x81)) {
+        unsigned codepoint = 0x2000u + ((b[1] & 0x3Fu) << 6) + (b[2] & 0x3Fu);
+        if (codepoint == 0x200E || codepoint == 0x200F ||
+            (codepoint >= 0x202A && codepoint <= 0x202E) ||
+            (codepoint >= 0x2066 && codepoint <= 0x2069)) {
+            *out_codepoint = codepoint;
+            return 3;
+        }
+    }
+    return 0;
+}
+
+/* Sanitized like other untrusted text, and with each bidirectional control
+ * as a visible <U+XXXX>: such a character can make the terminal show a
+ * command in a different order than the shell runs it. */
+static oi_status write_request_text(FILE *stream, const char *text,
+                                    size_t len) {
+    size_t start = 0;
+    size_t i = 0;
+    while (i <= len) {
+        unsigned codepoint = 0;
+        size_t control =
+            i < len ? bidi_control_at(text + i, len - i, &codepoint) : 0;
+        if (i < len && control == 0) {
+            i++;
+            continue;
+        }
+        if (i > start) {
+            oi_status status =
+                oi_cli_render_sanitize_write(stream, text + start, i - start);
+            if (status != OI_OK) {
+                return status;
+            }
+        }
+        if (i == len) {
+            break;
+        }
+        if (fprintf(stream, "<U+%04X>", codepoint) < 0) {
+            return OI_ERR_IO;
+        }
+        i += control;
+        start = i;
+    }
+    return OI_OK;
+}
+
 /*
  * Writes what the user approves, in full and before the selector: the
  * decoded `command` string when there is one, else the raw arguments. The
@@ -97,11 +152,9 @@ static oi_status write_permission_request(
         EOF) {
         return OI_ERR_IO;
     }
-    if (text_len > 0) {
-        status = oi_cli_render_sanitize_write(stream, text, text_len);
-        if (status != OI_OK) {
-            return status;
-        }
+    status = write_request_text(stream, text, text_len);
+    if (status != OI_OK) {
+        return status;
     }
     if (putc('\n', stream) == EOF || fflush(stream) != 0) {
         return OI_ERR_IO;
