@@ -723,7 +723,8 @@ id.
 
 `oi` advertises one built-in tool, `shell`, which takes a single `command`
 string and runs it as `sh -c <command>` in the session working directory,
-with the environment `oi` itself was started with.
+with the environment `oi` itself was started with, minus `OI_API_KEY`:
+`oi` removes that variable at startup, so a tool command cannot read the key.
 
 **That is arbitrary code execution, requested by a model.** Tool arguments
 are produced from model output, which can be influenced by anything in

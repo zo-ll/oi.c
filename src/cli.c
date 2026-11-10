@@ -889,6 +889,9 @@ int main(int argc, char **argv) {
         oi_config_free(&cfg);
         return 1;
     }
+    /* Tool subprocesses inherit this environment; a key left here is one
+     * `echo` away from the model and the session log. */
+    unsetenv("OI_API_KEY");
 
     for (size_t i = 0; i < n_overrides; i++) {
         oi_status st = oi_config_set(&cfg, overrides[i].key, overrides[i].value);
