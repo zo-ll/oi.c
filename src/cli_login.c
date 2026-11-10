@@ -484,15 +484,32 @@ static int64_t monotonic_ms(void) {
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-/* One deadline for the whole head: a client that sends one byte at a time
- * cannot hold the listener (and Esc) for longer than HEAD_TIMEOUT_MS. */
-static void read_request_head(int fd, char *head, size_t size) {
+static const struct oi_cli_render_line callback_status_line =
+    LINE("Waiting for the browser sign-in (Esc cancels)");
+
+/* Reads through the composer wait, so Esc and signals work while a client
+ * is slow. One deadline covers the whole head: a client that sends one
+ * byte at a time cannot hold the listener for longer than
+ * HEAD_TIMEOUT_MS. */
+static oi_status read_request_head(struct oi_cli_composer *composer,
+                                   int signal_fd, int fd, char *head,
+                                   size_t size, int *out_cancelled,
+                                   int *out_terminate_signal) {
     size_t used = 0;
-    struct pollfd descriptor = {.fd = fd, .events = POLLIN};
     int64_t deadline = monotonic_ms() + HEAD_TIMEOUT_MS;
     int64_t left;
-    while (used < size - 1 && (left = deadline - monotonic_ms()) > 0 &&
-           poll(&descriptor, 1, (int)left) > 0) {
+    head[0] = '\0';
+    while (used < size - 1 && (left = deadline - monotonic_ms()) > 0) {
+        int ready = 0;
+        oi_status st = oi_cli_composer_wait_fd(
+            composer, signal_fd, &callback_status_line, fd, (int)left, &ready,
+            out_cancelled, out_terminate_signal);
+        if (st != OI_OK || *out_cancelled || *out_terminate_signal != 0) {
+            return st;
+        }
+        if (!ready) {
+            break;
+        }
         ssize_t got = read(fd, head + used, size - 1 - used);
         if (got <= 0) {
             break;
@@ -503,7 +520,7 @@ static void read_request_head(int fd, char *head, size_t size) {
             break;
         }
     }
-    head[used] = '\0';
+    return OI_OK;
 }
 
 static void reply_to_browser(int fd, const char *status, const char *text) {
@@ -531,8 +548,6 @@ static oi_status wait_for_callback(struct oi_cli_composer *composer,
                                    const char *state,
                                    struct chatgpt_wait *wait,
                                    int *out_terminate_signal) {
-    static const struct oi_cli_render_line status_line =
-        LINE("Waiting for the browser sign-in (Esc cancels)");
     int64_t deadline = monotonic_ms() + CALLBACK_TIMEOUT_MS;
     for (;;) {
         int ready = 0;
@@ -542,8 +557,8 @@ static oi_status wait_for_callback(struct oi_cli_composer *composer,
             return OI_OK;
         }
         oi_status st = oi_cli_composer_wait_fd(
-            composer, signal_fd, &status_line, listen_fd, (int)remaining,
-            &ready, &wait->cancelled, out_terminate_signal);
+            composer, signal_fd, &callback_status_line, listen_fd,
+            (int)remaining, &ready, &wait->cancelled, out_terminate_signal);
         if (st != OI_OK || wait->cancelled || *out_terminate_signal != 0) {
             return st;
         }
@@ -557,7 +572,12 @@ static oi_status wait_for_callback(struct oi_cli_composer *composer,
             continue;
         }
         char head[8192];
-        read_request_head(client, head, sizeof head);
+        st = read_request_head(composer, signal_fd, client, head, sizeof head,
+                               &wait->cancelled, out_terminate_signal);
+        if (st != OI_OK || wait->cancelled || *out_terminate_signal != 0) {
+            close(client);
+            return st;
+        }
         st = oi_cli_oauth_parse_callback(head, &wait->callback);
         if (st == OI_ERR_NOMEM) {
             close(client);
