@@ -473,6 +473,57 @@ TEST(delta_and_tool_arguments_larger_than_an_arena_block_complete) {
     waitpid(child, NULL, 0);
 }
 
+/* Runs a stream of `events` text deltas; returns the caller arena's use
+ * at the end of the stream. */
+static size_t arena_use_after_stream(size_t events) {
+    static const char event[] =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ab\"}}]}"
+        "\n\n";
+    static const char done[] = "data: [DONE]\n\n";
+    size_t body_len = events * (sizeof event - 1) + sizeof done - 1;
+    char *sse_body = malloc(body_len);
+    CHECK(sse_body != NULL);
+    for (size_t i = 0; i < events; i++) {
+        memcpy(sse_body + i * (sizeof event - 1), event, sizeof event - 1);
+    }
+    memcpy(sse_body + events * (sizeof event - 1), done, sizeof done - 1);
+    size_t total;
+    char *response = build_chunked_response(sse_body, body_len,
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+    free(sse_body);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct large_event_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, "{}", 2, count_event,
+                                          large_event_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 1000);
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_EQ(ctx.text_len, events * 2);
+
+    size_t used = oi_arena_used(a);
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+    return used;
+}
+
+TEST(arena_use_does_not_grow_with_the_event_count) {
+    size_t small = arena_use_after_stream(10);
+    size_t large = arena_use_after_stream(10000);
+    CHECK(large <= small);
+}
+
 TEST(incomplete_tool_call_rejects_stream) {
     const char *sse_body =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -1152,6 +1203,7 @@ int main(void) {
     RUN(body_that_ends_at_the_close_completes_the_stream);
     RUN(body_cut_short_by_the_close_fails_the_stream);
     RUN(delta_and_tool_arguments_larger_than_an_arena_block_complete);
+    RUN(arena_use_does_not_grow_with_the_event_count);
     RUN(incomplete_tool_call_rejects_stream);
     RUN(non_2xx_status_reports_error_body);
     RUN(malformed_sse_json_is_reported_not_dropped);

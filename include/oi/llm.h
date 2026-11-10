@@ -132,9 +132,9 @@ void oi_llm_client_set_before_request(oi_llm_client *client,
  * Starts one streaming chat-completion request. `body` is a complete
  * JSON request object (model/messages/tools/etc., with "stream":true
  * already set by the caller) -- it's copied, so it need not outlive this
- * call. `arena` is used for the small JSON values parsed out of each
- * streamed chunk; this module never resets it, that's the caller's
- * turn/session boundary to manage, and it must outlive the request.
+ * call. `arena` must be non-NULL but receives no allocations: the
+ * request parses each streamed event into a private arena that it resets
+ * before the next event, so a long stream does not grow memory.
  *
  * Returns the in-flight request via *out_request; `on_delta`/`on_done`
  * fire later, driven by `reactor`.

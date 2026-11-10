@@ -252,7 +252,9 @@ TEST(start_is_event_driven_and_preserves_context) {
     CHECK_EQ(sink.message_count, 2);
     CHECK_EQ(sink.response_done_count, 1);
     CHECK(!oi_cli_conversation_is_busy(conversation));
-    CHECK(sink.arena_used_at_done > 0);
+    /* The stream's JSON lives in the request's own scratch arena: a turn
+     * with no tool call puts nothing in the session arena. */
+    CHECK_EQ(sink.arena_used_at_done, 0);
 
     /* An arriving delta means the request is still open, so the reported
      * activity has to be "streaming" -- and once the turn completes cleanly
