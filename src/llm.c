@@ -39,7 +39,9 @@ struct oi_llm_tool_state {
 
 struct oi_llm_request {
     oi_llm_client *client; /* borrowed */
-    oi_arena *arena;       /* borrowed */
+    /* Holds the JSON tree of one SSE event; reset before the next parse,
+     * so a long stream does not grow memory with its event count. */
+    oi_arena *scratch;
 
     oi_llm_delta_cb on_delta;
     oi_llm_event_cb on_event;
@@ -204,6 +206,7 @@ static void request_teardown(oi_llm_request *req) {
     oi_llm_http_parser_destroy(req->http);
     oi_llm_sse_parser_destroy(req->sse);
     oi_json_parser_destroy(req->json);
+    oi_arena_destroy(req->scratch);
     free(req->error_buf);
     free(req->body);
     for (size_t i = 0; i < req->tools_len; i++) {
@@ -478,6 +481,7 @@ static oi_status validate_tool_calls(oi_llm_request *req) {
             tool = &req->tools[i];
         }
         oi_json_parser_reset(req->json);
+        oi_arena_reset(req->scratch);
         oi_status st =
             oi_json_parser_feed(req->json, tool->arguments, tool->arguments_len);
         if (st == OI_OK) {
@@ -638,6 +642,7 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
     }
 
     oi_json_parser_reset(req->json);
+    oi_arena_reset(req->scratch);
     oi_status st = oi_json_parser_feed(req->json, data, len);
     if (st == OI_OK) {
         st = oi_json_parser_finish(req->json);
@@ -853,7 +858,11 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
         return OI_ERR_NOMEM;
     }
     req->client = client;
-    req->arena = arena;
+    req->scratch = oi_arena_create(0);
+    if (req->scratch == NULL) {
+        free(req);
+        return OI_ERR_NOMEM;
+    }
     req->on_delta = on_delta;
     req->on_event = on_event;
     req->on_done = on_done;
@@ -862,8 +871,9 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
     oi_json_writer *translated = NULL;
     if (client->responses_api) {
         oi_status translate_st = oi_llm_responses_translate_body(
-            arena, body, body_len, &translated);
+            req->scratch, body, body_len, &translated);
         if (translate_st != OI_OK) {
+            oi_arena_destroy(req->scratch);
             free(req);
             return translate_st;
         }
@@ -873,6 +883,7 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
     req->body = malloc(body_len > 0 ? body_len : 1);
     if (req->body == NULL) {
         oi_json_writer_destroy(translated);
+        oi_arena_destroy(req->scratch);
         free(req);
         return OI_ERR_NOMEM;
     }
@@ -886,14 +897,16 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
                                            req);
     if (req->http == NULL) {
         free(req->body);
+        oi_arena_destroy(req->scratch);
         free(req);
         return OI_ERR_NOMEM;
     }
 
-    req->json = oi_json_parser_create(arena);
+    req->json = oi_json_parser_create(req->scratch);
     if (req->json == NULL) {
         oi_llm_http_parser_destroy(req->http);
         free(req->body);
+        oi_arena_destroy(req->scratch);
         free(req);
         return OI_ERR_NOMEM;
     }
@@ -907,6 +920,7 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
         oi_json_parser_destroy(req->json);
         oi_llm_http_parser_destroy(req->http);
         free(req->body);
+        oi_arena_destroy(req->scratch);
         free(req);
         return st;
     }
