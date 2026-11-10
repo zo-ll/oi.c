@@ -204,6 +204,22 @@ TEST(test_base_replaces_both_servers) {
     oi_cli_oauth_server_free(&b);
 }
 
+TEST(test_base_with_a_remote_host_keeps_the_production_servers) {
+    struct oi_cli_oauth_server a;
+    struct oi_cli_oauth_server b;
+    int is_test = 1;
+    setenv("OI_CHATGPT_TEST_BASE", "http://example.com", 1);
+    CHECK_EQ(oi_cli_oauth_servers(&a, &b, &is_test), OI_OK);
+    unsetenv("OI_CHATGPT_TEST_BASE");
+    CHECK(!is_test);
+    CHECK_STREQ(a.host, "auth.openai.com");
+    CHECK_STREQ(b.host, "api.openai.com");
+    CHECK_EQ(a.use_tls, 1);
+    CHECK_EQ(b.port, 443);
+    oi_cli_oauth_server_free(&a);
+    oi_cli_oauth_server_free(&b);
+}
+
 int main(void) {
     RUN(challenge_matches_the_rfc_7636_vector);
     RUN(random_tokens_are_url_safe_and_differ);
@@ -216,5 +232,6 @@ int main(void) {
     RUN(id_token_claims_are_checked);
     RUN(model_list_keeps_only_listed_models);
     RUN(test_base_replaces_both_servers);
+    RUN(test_base_with_a_remote_host_keeps_the_production_servers);
     return oi_test_report();
 }
