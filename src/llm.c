@@ -24,6 +24,7 @@ struct oi_llm_client {
     unsigned short port;
     int use_tls;
     char *ca_file;
+    oi_llm_tls *tls; /* NULL without TLS; shared by every request */
     char *api_key;
     char *path;
     int timeout_ms;
@@ -154,7 +155,8 @@ static oi_llm_client *client_create(const struct oi_llm_config *cfg,
 
     if (c->host == NULL || c->path == NULL ||
         (cfg->ca_file != NULL && c->ca_file == NULL) ||
-        (cfg->api_key != NULL && c->api_key == NULL)) {
+        (cfg->api_key != NULL && c->api_key == NULL) ||
+        (c->use_tls && oi_llm_tls_create(c->ca_file, &c->tls) != OI_OK)) {
         oi_llm_client_destroy(c);
         return NULL;
     }
@@ -174,6 +176,7 @@ void oi_llm_client_destroy(oi_llm_client *c) {
         return;
     }
     free(c->host);
+    oi_llm_tls_destroy(c->tls);
     free(c->ca_file);
     if (c->api_key != NULL) {
         oi_wipe(c->api_key, strlen(c->api_key));
@@ -196,6 +199,16 @@ oi_status oi_llm_client_reconfigure(oi_llm_client *client,
     struct oi_llm_client previous = *client;
     *client = *fresh;
     *fresh = previous;
+    /* Same trust store: keep the TLS context and its session, so a token
+     * renewal does not cost a CA load and a full handshake. */
+    if (client->tls != NULL && fresh->tls != NULL &&
+        (client->ca_file == NULL) == (fresh->ca_file == NULL) &&
+        (client->ca_file == NULL ||
+         strcmp(client->ca_file, fresh->ca_file) == 0)) {
+        oi_llm_tls *kept = fresh->tls;
+        fresh->tls = client->tls;
+        client->tls = kept;
+    }
     oi_llm_client_destroy(fresh);
     return OI_OK;
 }
@@ -950,8 +963,7 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
     struct oi_llm_conn_callbacks cbs = {req_on_connected, req_on_data,
                                          req_on_error};
     oi_status st = oi_llm_conn_connect(reactor, client->host, client->port,
-                                        client->use_tls, client->ca_file,
-                                        &cbs, req, &req->conn);
+                                        client->tls, &cbs, req, &req->conn);
     if (st != OI_OK) {
         oi_json_parser_destroy(req->json);
         oi_llm_http_parser_destroy(req->http);

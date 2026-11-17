@@ -147,7 +147,7 @@ TEST(connect_write_echo_and_reentrant_close) {
 
     /* A hostname exercises asynchronous resolution and address fallback
      * (localhost commonly returns IPv6 before this IPv4 listener). */
-    oi_status st = oi_llm_conn_connect(r, "localhost", port, 0, NULL, &cbs,
+    oi_status st = oi_llm_conn_connect(r, "localhost", port, NULL, &cbs,
                                         &ctx, &ctx.conn);
     CHECK_EQ(st, OI_OK);
 
@@ -204,7 +204,7 @@ TEST(connection_refused_reports_error) {
                                          err_on_error};
     oi_llm_conn *conn = NULL;
 
-    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, 0, NULL, &cbs,
+    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, &cbs,
                                         &ctx, &conn);
     CHECK_EQ(st, OI_OK);
 
@@ -227,7 +227,7 @@ TEST(resolver_failure_is_reported_asynchronously) {
     struct oi_llm_conn_callbacks cbs = {err_on_connected, err_on_data,
                                          err_on_error};
     oi_llm_conn *conn = NULL;
-    CHECK_EQ(oi_llm_conn_connect(r, "does-not-exist.invalid", 443, 0, NULL,
+    CHECK_EQ(oi_llm_conn_connect(r, "does-not-exist.invalid", 443, NULL,
                                   &cbs, &ctx, &conn),
               OI_OK);
     CHECK(!ctx.done); /* connect never blocks to resolve */
@@ -247,7 +247,7 @@ TEST(cancel_during_resolution_is_silent) {
     struct oi_llm_conn_callbacks cbs = {err_on_connected, err_on_data,
                                          err_on_error};
     oi_llm_conn *conn = NULL;
-    CHECK_EQ(oi_llm_conn_connect(r, "localhost", 443, 0, NULL, &cbs, &ctx,
+    CHECK_EQ(oi_llm_conn_connect(r, "localhost", 443, NULL, &cbs, &ctx,
                                   &conn),
               OI_OK);
     oi_llm_conn_close(conn);
@@ -343,7 +343,7 @@ TEST(peer_close_reports_closed) {
     struct oi_llm_conn_callbacks cbs = {half_on_connected, half_on_data,
                                          half_on_error};
     oi_llm_conn *conn = NULL;
-    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, 0, NULL, &cbs,
+    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, &cbs,
                                         &ctx, &conn);
     CHECK_EQ(st, OI_OK);
 
@@ -368,13 +368,13 @@ TEST(connect_rejects_bad_args) {
     oi_reactor *r = oi_reactor_create();
     struct oi_llm_conn_callbacks cbs = {NULL, NULL, NULL};
     oi_llm_conn *conn;
-    CHECK_EQ(oi_llm_conn_connect(NULL, "x", 1, 0, NULL, &cbs, NULL, &conn),
+    CHECK_EQ(oi_llm_conn_connect(NULL, "x", 1, NULL, &cbs, NULL, &conn),
               OI_ERR_INVAL);
-    CHECK_EQ(oi_llm_conn_connect(r, NULL, 1, 0, NULL, &cbs, NULL, &conn),
+    CHECK_EQ(oi_llm_conn_connect(r, NULL, 1, NULL, &cbs, NULL, &conn),
               OI_ERR_INVAL);
-    CHECK_EQ(oi_llm_conn_connect(r, "x", 1, 0, NULL, NULL, NULL, &conn),
+    CHECK_EQ(oi_llm_conn_connect(r, "x", 1, NULL, NULL, NULL, &conn),
               OI_ERR_INVAL);
-    CHECK_EQ(oi_llm_conn_connect(r, "x", 1, 0, NULL, &cbs, NULL, NULL),
+    CHECK_EQ(oi_llm_conn_connect(r, "x", 1, NULL, &cbs, NULL, NULL),
               OI_ERR_INVAL);
     oi_reactor_destroy(r);
 }
@@ -389,7 +389,7 @@ TEST(write_before_connected_rejected) {
     /* Use a no-op connected callback for this test by overriding: skip
      * writing in on_connected and instead try to write immediately,
      * before the reactor has had a chance to establish the connection. */
-    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, 0, NULL, &cbs,
+    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, &cbs,
                                         &ctx, &ctx.conn);
     CHECK_EQ(st, OI_OK);
     CHECK_EQ(oi_llm_conn_write(ctx.conn, "x", 1), OI_ERR_INVAL);
@@ -417,7 +417,7 @@ TEST(connection_preserves_sigpipe_disposition) {
     struct echo_ctx ctx = {0};
     struct oi_llm_conn_callbacks cbs = {echo_on_connected, echo_on_data,
                                          echo_on_error};
-    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, 0, NULL, &cbs, &ctx,
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, NULL, &cbs, &ctx,
                                   &ctx.conn),
               OI_OK);
     run_until(r, &ctx.done, 100);
@@ -513,7 +513,7 @@ TEST(dead_address_moves_to_the_next_address) {
     struct oi_llm_conn_callbacks cbs = {close_on_connected, echo_on_data,
                                          echo_on_error};
     oi_llm_conn *conn = NULL;
-    CHECK_EQ(oi_llm_conn_connect(r, DEAD_THEN_LIVE, 1, 0, NULL, &cbs, &ctx,
+    CHECK_EQ(oi_llm_conn_connect(r, DEAD_THEN_LIVE, 1, NULL, &cbs, &ctx,
                                   &conn),
               OI_OK);
     /* 6 s: more than the 3 s address timeout, much less than the
@@ -533,12 +533,16 @@ TEST(dead_address_moves_to_the_next_address) {
 
 /* --- an untrusted certificate names the verify result --- */
 
-/* Serves one TLS connection with a fresh self-signed certificate, which
- * the system trust store does not contain. With `ca_path`, it also writes
- * the certificate there as PEM, so a client can trust it, and echoes the
- * first read back before it closes the socket with no TLS close_notify. */
+/* Serves `connections` TLS connections, one after another, with a fresh
+ * self-signed certificate, which the system trust store does not contain.
+ * With `ca_path`, it also writes the certificate there as PEM, so a client
+ * can trust it, and answers the first read before it closes the socket
+ * with no TLS close_notify: with an echo, or with `report_reuse`, with
+ * "1" when the client resumed a session and "0" when it did not. */
 static pid_t start_self_signed_tls_server(unsigned short *out_port,
-                                          const char *ca_path) {
+                                          const char *ca_path,
+                                          int connections,
+                                          int report_reuse) {
     EVP_PKEY *key = EVP_EC_gen("P-256");
     X509 *cert = X509_new();
     CHECK(key != NULL && cert != NULL);
@@ -585,14 +589,19 @@ static pid_t start_self_signed_tls_server(unsigned short *out_port,
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
-        int cfd = accept(listen_fd, NULL, NULL);
-        if (cfd >= 0) {
+        for (int i = 0; i < connections; i++) {
+            int cfd = accept(listen_fd, NULL, NULL);
+            if (cfd < 0) {
+                break;
+            }
             SSL *ssl = SSL_new(ctx);
             SSL_set_fd(ssl, cfd);
             if (SSL_accept(ssl) == 1 && ca_path != NULL) {
                 char buf[64];
                 int n = SSL_read(ssl, buf, sizeof buf);
-                if (n > 0) {
+                if (n > 0 && report_reuse) {
+                    SSL_write(ssl, SSL_session_reused(ssl) ? "1" : "0", 1);
+                } else if (n > 0) {
                     SSL_write(ssl, buf, n);
                 }
             }
@@ -610,14 +619,16 @@ static pid_t start_self_signed_tls_server(unsigned short *out_port,
 
 TEST(untrusted_certificate_names_the_verify_result) {
     unsigned short port;
-    pid_t child = start_self_signed_tls_server(&port, NULL);
+    pid_t child = start_self_signed_tls_server(&port, NULL, 1, 0);
 
     oi_reactor *r = oi_reactor_create();
     struct error_ctx ctx = {0};
     struct oi_llm_conn_callbacks cbs = {err_on_connected, err_on_data,
                                          err_on_error};
     oi_llm_conn *conn = NULL;
-    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, 1, NULL, &cbs, &ctx,
+    oi_llm_tls *tls = NULL;
+    CHECK_EQ(oi_llm_tls_create(NULL, &tls), OI_OK);
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, &cbs, &ctx,
                                   &conn),
               OI_OK);
     run_until(r, &ctx.done, 100);
@@ -627,14 +638,24 @@ TEST(untrusted_certificate_names_the_verify_result) {
     CHECK_STREQ(ctx.cause, "TLS certificate of 127.0.0.1 is not trusted: "
                            "self-signed certificate");
     oi_reactor_destroy(r);
+    oi_llm_tls_destroy(tls);
     waitpid(child, NULL, 0);
 }
 
 /* --- a TLS round trip through the connection socket BIO --- */
 
-/* The test links with -Wl,--wrap=send. liboi's own sends come here;
- * libssl's built-in socket BIO uses write() and never does. */
+/* The test links with -Wl,--wrap=send and -Wl,--wrap=SSL_CTX_new. liboi's
+ * own sends come here; libssl's built-in socket BIO uses write() and never
+ * does. */
 static int sends_total;
+static int ssl_ctx_created;
+
+SSL_CTX *__real_SSL_CTX_new(const SSL_METHOD *method);
+
+SSL_CTX *__wrap_SSL_CTX_new(const SSL_METHOD *method) {
+    ssl_ctx_created++;
+    return __real_SSL_CTX_new(method);
+}
 static int sends_without_nosignal;
 
 ssize_t __real_send(int fd, const void *buf, size_t len, int flags);
@@ -681,15 +702,17 @@ TEST(tls_round_trip_sends_with_msg_nosignal) {
     char ca_path[64];
     snprintf(ca_path, sizeof ca_path, "/tmp/oi-test-ca-%d.pem", (int)getpid());
     unsigned short port;
-    pid_t child = start_self_signed_tls_server(&port, ca_path);
+    pid_t child = start_self_signed_tls_server(&port, ca_path, 1, 0);
     oi_reactor *r = oi_reactor_create();
     struct tls_echo_ctx ctx = {0};
     struct oi_llm_conn_callbacks cbs = {tls_on_connected, tls_on_data,
                                          tls_on_error};
     oi_llm_conn *conn = NULL;
+    oi_llm_tls *tls = NULL;
+    CHECK_EQ(oi_llm_tls_create(ca_path, &tls), OI_OK);
     sends_total = 0;
     sends_without_nosignal = 0;
-    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, 1, ca_path, &cbs, &ctx,
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, &cbs, &ctx,
                                   &conn),
               OI_OK);
     run_until(r, &ctx.done, 100);
@@ -701,6 +724,69 @@ TEST(tls_round_trip_sends_with_msg_nosignal) {
     CHECK(sends_total >= 2);
     CHECK_EQ(sends_without_nosignal, 0);
     oi_reactor_destroy(r);
+    oi_llm_tls_destroy(tls);
+    waitpid(child, NULL, 0);
+    unlink(ca_path);
+}
+
+/* --- connections that share TLS settings share one context --- */
+
+struct reuse_ctx {
+    char answer;
+    int done;
+};
+
+static void reuse_on_connected(oi_llm_conn *c, void *ud) {
+    (void)ud;
+    CHECK_EQ(oi_llm_conn_write(c, "?", 1), OI_OK);
+}
+
+static void reuse_on_data(oi_llm_conn *c, const void *data, size_t len,
+                          void *ud) {
+    struct reuse_ctx *ctx = ud;
+    CHECK_EQ(len, (size_t)1);
+    ctx->answer = *(const char *)data;
+    oi_llm_conn_close(c);
+    ctx->done = 1;
+}
+
+static void reuse_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
+    (void)c;
+    (void)reason;
+    struct reuse_ctx *ctx = ud;
+    ctx->done = 1;
+}
+
+TEST(second_connection_reuses_the_context_and_resumes_the_session) {
+    char ca_path[64];
+    snprintf(ca_path, sizeof ca_path, "/tmp/oi-test-ca-r-%d.pem",
+             (int)getpid());
+    unsigned short port;
+    pid_t child = start_self_signed_tls_server(&port, ca_path, 2, 1);
+    oi_reactor *r = oi_reactor_create();
+    oi_llm_tls *tls = NULL;
+    CHECK_EQ(oi_llm_tls_create(ca_path, &tls), OI_OK);
+    struct oi_llm_conn_callbacks cbs = {reuse_on_connected, reuse_on_data,
+                                         reuse_on_error};
+    ssl_ctx_created = 0;
+
+    struct reuse_ctx first = {0, 0};
+    oi_llm_conn *conn = NULL;
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, &cbs, &first,
+                                  &conn),
+              OI_OK);
+    run_until(r, &first.done, 100);
+    struct reuse_ctx second = {0, 0};
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, &cbs, &second,
+                                  &conn),
+              OI_OK);
+    run_until(r, &second.done, 100);
+
+    CHECK_EQ(first.answer, '0');
+    CHECK_EQ(second.answer, '1');
+    CHECK_EQ(ssl_ctx_created, 1);
+    oi_reactor_destroy(r);
+    oi_llm_tls_destroy(tls);
     waitpid(child, NULL, 0);
     unlink(ca_path);
 }
@@ -721,5 +807,6 @@ int main(void) {
     RUN(dead_address_moves_to_the_next_address);
     RUN(untrusted_certificate_names_the_verify_result);
     RUN(tls_round_trip_sends_with_msg_nosignal);
+    RUN(second_connection_reuses_the_context_and_resumes_the_session);
     return oi_test_report();
 }

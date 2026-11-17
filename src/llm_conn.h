@@ -18,6 +18,20 @@
 
 typedef struct oi_llm_conn oi_llm_conn;
 
+/*
+ * TLS settings that many connections share: the trust store, and the
+ * SSL_CTX made from it at the first handshake. Sharing it saves loading
+ * the CA bundle for each connection and lets a later connection to the
+ * same host and port resume the last TLS session. `ca_file` NULL uses the
+ * system default trust store. A CA file that cannot be loaded fails the
+ * handshake that needs it, with a cause, and the next handshake tries
+ * again. A connection borrows its oi_llm_tls, so the oi_llm_tls must stay
+ * alive until that connection is connected or closed.
+ */
+typedef struct oi_llm_tls oi_llm_tls;
+oi_status oi_llm_tls_create(const char *ca_file, oi_llm_tls **out_tls);
+void oi_llm_tls_destroy(oi_llm_tls *tls); /* NULL-safe */
+
 typedef void (*oi_llm_conn_connected_cb)(oi_llm_conn *c, void *user_data);
 typedef void (*oi_llm_conn_data_cb)(oi_llm_conn *c, const void *data,
                                      size_t len, void *user_data);
@@ -37,10 +51,9 @@ struct oi_llm_conn_callbacks {
 
 /*
  * Begins asynchronous resolution of `host`, then a non-blocking connect,
- * optionally wrapping the connection in TLS once the TCP handshake
- * completes. Certificate verification is always on (hostname + chain);
- * there is no way to disable it. `ca_file` overrides the trust store
- * (NULL uses the system default) -- ignored if `use_tls` is 0.
+ * wrapping the connection in TLS with `tls` once the TCP handshake
+ * completes; `tls` NULL means plain TCP. Certificate verification is
+ * always on (hostname + chain); there is no way to disable it.
  *
  * Returns the new connection via *out_conn immediately, before it's
  * connected; `cbs->on_connected` (or `cbs->on_error` on failure) fires
@@ -48,8 +61,7 @@ struct oi_llm_conn_callbacks {
  * not outlive this call.
  */
 oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
-                               unsigned short port, int use_tls,
-                               const char *ca_file,
+                               unsigned short port, oi_llm_tls *tls,
                                const struct oi_llm_conn_callbacks *cbs,
                                void *user_data, oi_llm_conn **out_conn);
 

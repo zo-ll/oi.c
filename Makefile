@@ -153,8 +153,9 @@ $(BUILD)/test_tool_exec: LDLIBS += -Wl,--wrap=kill
 # test_reactor counts the epoll_ctl calls that liboi makes.
 $(BUILD)/test_reactor: LDLIBS += -Wl,--wrap=epoll_ctl
 # test_llm_conn gives one host name a dead address and a live address,
-# and counts the send() calls that carry MSG_NOSIGNAL.
-$(BUILD)/test_llm_conn: LDLIBS += -Wl,--wrap=getaddrinfo -Wl,--wrap=send
+# counts the send() calls that carry MSG_NOSIGNAL, and counts SSL_CTX_new.
+$(BUILD)/test_llm_conn: LDLIBS += -Wl,--wrap=getaddrinfo -Wl,--wrap=send \
+	-Wl,--wrap=SSL_CTX_new
 
 $(BUILD)/test_cli: test/test_cli.c $(LIB) $(CLI_BIN) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS) $(PTY_LIBS)
