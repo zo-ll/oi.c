@@ -8,7 +8,6 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/syscall.h>
-#include <sys/timerfd.h>
 #include <unistd.h>
 
 struct native_watch {
@@ -100,29 +99,6 @@ static oi_status native_watch_remove(oi_reactor_backend *b,
     close(watch->fd);
     free(watch);
     return OI_OK;
-}
-
-oi_status oi_reactor_backend_timer_add(oi_reactor_backend *b, int timeout_ms,
-                                        uint64_t token,
-                                        uintptr_t *out_handle) {
-    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (fd < 0) {
-        return OI_ERR_IO;
-    }
-    struct itimerspec spec;
-    memset(&spec, 0, sizeof spec);
-    spec.it_value.tv_sec = timeout_ms / 1000;
-    spec.it_value.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
-    if (timerfd_settime(fd, 0, &spec, NULL) != 0) {
-        close(fd);
-        return OI_ERR_IO;
-    }
-    return native_watch_add(b, fd, token, out_handle);
-}
-
-oi_status oi_reactor_backend_timer_remove(oi_reactor_backend *b,
-                                           uintptr_t handle) {
-    return native_watch_remove(b, handle);
 }
 
 oi_status oi_reactor_backend_process_add(oi_reactor_backend *b, pid_t pid,

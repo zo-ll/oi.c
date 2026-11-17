@@ -450,6 +450,114 @@ TEST(cancelled_timer_does_not_fire) {
     oi_reactor_destroy(r);
 }
 
+struct order_ctx {
+    int fired[8];
+    int count;
+};
+
+struct order_entry {
+    struct order_ctx *ctx;
+    int id;
+};
+
+static void record_order(oi_reactor *r, void *ud) {
+    (void)r;
+    struct order_entry *entry = ud;
+    entry->ctx->fired[entry->ctx->count++] = entry->id;
+}
+
+TEST(timers_fire_in_deadline_order_and_cancel_from_the_middle) {
+    oi_reactor *r = oi_reactor_create();
+    struct order_ctx ctx = {{0}, 0};
+    static const int delays[5] = {50, 10, 40, 20, 30};
+    struct order_entry entries[5];
+    oi_reactor_timer *timers[5];
+    for (int i = 0; i < 5; i++) {
+        entries[i].ctx = &ctx;
+        entries[i].id = delays[i];
+        CHECK_EQ(oi_reactor_timer_start(r, delays[i], record_order,
+                                         &entries[i], &timers[i]),
+                 OI_OK);
+    }
+    oi_reactor_timer_cancel(timers[3]); /* the 20 ms timer */
+    timers[3] = NULL;
+
+    /* oi_reactor_run returns when no timer is left. */
+    CHECK_EQ(oi_reactor_run(r), OI_OK);
+    CHECK_EQ(ctx.count, 4);
+    CHECK_EQ(ctx.fired[0], 10);
+    CHECK_EQ(ctx.fired[1], 30);
+    CHECK_EQ(ctx.fired[2], 40);
+    CHECK_EQ(ctx.fired[3], 50);
+    for (int i = 0; i < 5; i++) {
+        oi_reactor_timer_cancel(timers[i]);
+    }
+    oi_reactor_destroy(r);
+}
+
+struct restart_ctx {
+    oi_reactor_timer *second;
+    int first_fired;
+    int second_fired;
+};
+
+static void second_fired(oi_reactor *r, void *ud) {
+    (void)r;
+    struct restart_ctx *ctx = ud;
+    ctx->second_fired++;
+}
+
+static void first_fired_starts_second(oi_reactor *r, void *ud) {
+    struct restart_ctx *ctx = ud;
+    ctx->first_fired++;
+    CHECK_EQ(oi_reactor_timer_start(r, 1, second_fired, ctx, &ctx->second),
+             OI_OK);
+}
+
+TEST(timer_started_in_a_timer_callback_fires_in_a_later_step) {
+    oi_reactor *r = oi_reactor_create();
+    struct restart_ctx ctx = {NULL, 0, 0};
+    oi_reactor_timer *first = NULL;
+    CHECK_EQ(oi_reactor_timer_start(r, 5, first_fired_starts_second, &ctx,
+                                     &first),
+             OI_OK);
+    oi_status st;
+    CHECK_EQ(oi_reactor_step(r, -1, &st), 1);
+    CHECK_EQ(ctx.first_fired, 1);
+    CHECK_EQ(ctx.second_fired, 0);
+    /* step(-1) must still return: the next deadline bounds the wait. */
+    CHECK_EQ(oi_reactor_step(r, -1, &st), 1);
+    CHECK_EQ(ctx.second_fired, 1);
+    oi_reactor_timer_cancel(first);
+    oi_reactor_timer_cancel(ctx.second);
+    oi_reactor_destroy(r);
+}
+
+TEST(timers_use_no_file_descriptor) {
+    oi_reactor *r = oi_reactor_create();
+    enum { N = 200 };
+    oi_reactor_timer *timers[N];
+    int count = 0;
+    int before = dup(0);
+    CHECK(before >= 0);
+    close(before);
+    for (int i = 0; i < N; i++) {
+        CHECK_EQ(oi_reactor_timer_start(r, 60000, timer_fired, &count,
+                                         &timers[i]),
+                 OI_OK);
+    }
+    int after = dup(0);
+    CHECK_EQ(after, before);
+    close(after);
+    for (int i = 0; i < N; i++) {
+        oi_reactor_timer_cancel(timers[i]);
+    }
+    oi_status st;
+    CHECK_EQ(oi_reactor_step(r, 0, &st), 0);
+    CHECK_EQ(count, 0);
+    oi_reactor_destroy(r);
+}
+
 /* --- many fds (exercises fd-table growth) --- */
 
 TEST(many_fds_grow_table) {
@@ -506,6 +614,9 @@ int main(void) {
     RUN(run_returns_immediately_with_no_fds);
     RUN(one_shot_timer_fires_once);
     RUN(cancelled_timer_does_not_fire);
+    RUN(timers_fire_in_deadline_order_and_cancel_from_the_middle);
+    RUN(timer_started_in_a_timer_callback_fires_in_a_later_step);
+    RUN(timers_use_no_file_descriptor);
     RUN(many_fds_grow_table);
     return oi_test_report();
 }
