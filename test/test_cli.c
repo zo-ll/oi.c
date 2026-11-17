@@ -3993,6 +3993,296 @@ static int send_oauth_callback(const char *query, char *reply,
     return used > 0;
 }
 
+/* --- a renewal on the reactor, with a turn that does not wait for it --- */
+
+/* Serves each connection in its own process: the token endpoint answers
+ * with a new token, and /v1/responses answers after 300 ms with "ok".
+ * Each request appends "<path> <Authorization value>" to `log_path`. */
+static pid_t start_renewal_mock(unsigned short *out_port,
+                                const char *log_path) {
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    int one = 1;
+    CHECK(listen_fd >= 0);
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, 8), 0);
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    *out_port = ntohs(addr.sin_port);
+
+    pid_t server = fork();
+    CHECK(server >= 0);
+    if (server != 0) {
+        close(listen_fd);
+        return server;
+    }
+    signal(SIGCHLD, SIG_IGN); /* handlers are reaped by the kernel */
+    for (;;) {
+        int cfd = accept(listen_fd, NULL, NULL);
+        if (cfd < 0) {
+            _exit(0);
+        }
+        if (fork() != 0) {
+            close(cfd);
+            continue;
+        }
+        char request[16384];
+        size_t len = 0;
+        char *body = NULL;
+        size_t content_length = 0;
+        while (len < sizeof request - 1) {
+            ssize_t n = read(cfd, request + len, sizeof request - 1 - len);
+            if (n <= 0) {
+                break;
+            }
+            len += (size_t)n;
+            request[len] = '\0';
+            body = strstr(request, "\r\n\r\n");
+            if (body != NULL) {
+                const char *cl = strstr(request, "Content-Length: ");
+                content_length = cl != NULL ? strtoul(cl + 16, NULL, 10) : 0;
+                if ((size_t)(request + len - (body + 4)) >= content_length) {
+                    break;
+                }
+            }
+        }
+        char path[128] = "";
+        char auth[128] = "-";
+        sscanf(request, "%*s %127s", path);
+        const char *bearer = strstr(request, "Authorization: Bearer ");
+        if (bearer != NULL) {
+            sscanf(bearer + 22, "%127[^\r]", auth);
+        }
+        char line[300];
+        int line_len = snprintf(line, sizeof line, "%s %s\n", path, auth);
+        int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (log_fd >= 0) {
+            (void)!write(log_fd, line, (size_t)line_len);
+            close(log_fd);
+        }
+        const char *reply_body;
+        if (strcmp(path, "/api/accounts/oauth/token") == 0) {
+            reply_body = "{\"access_token\":\"fresh\",\"refresh_token\":"
+                         "\"rotated\",\"expires_in\":3600}";
+        } else {
+            struct timespec pause = {0, 300 * 1000 * 1000};
+            nanosleep(&pause, NULL);
+            reply_body =
+                "data: {\"type\":\"response.output_text.delta\","
+                "\"delta\":\"ok\"}\n\n"
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+        }
+        char head[256];
+        int head_len = snprintf(head, sizeof head,
+                                "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n"
+                                "Connection: close\r\n\r\n",
+                                strlen(reply_body));
+        (void)!write(cfd, head, (size_t)head_len);
+        (void)!write(cfd, reply_body, strlen(reply_body));
+        close(cfd);
+        _exit(0);
+    }
+}
+
+TEST(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it) {
+    char config_root[] = "/tmp/oi-cli-renewed-XXXXXX";
+    char path[256];
+    char log_path[256];
+    char base[64];
+    char credentials[512];
+    unsigned short port;
+
+    CHECK(mkdtemp(config_root) != NULL);
+    snprintf(log_path, sizeof log_path, "%s/requests.log", config_root);
+    pid_t server = start_renewal_mock(&port, log_path);
+    snprintf(base, sizeof base, "http://127.0.0.1:%u", (unsigned)port);
+    /* Inside the 300 s renewal margin, but still usable for this turn. */
+    int credentials_len = snprintf(
+        credentials, sizeof credentials,
+        "{\"version\":1,\"active\":\"openai\",\"openai\":{"
+        "\"auth\":\"oauth\",\"client_id\":\"app_test\",\"host_id\":\"h\","
+        "\"access_token\":\"old\",\"refresh_token\":\"refresh\","
+        "\"expires_at\":%.0f,\"welcome_shown\":true}}",
+        (double)time(NULL) + 100);
+    snprintf(path, sizeof path, "%s/oi", config_root);
+    CHECK_EQ(mkdir(path, 0700), 0);
+    snprintf(path, sizeof path, "%s/oi/credentials.json", config_root);
+    {
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        CHECK(fd >= 0);
+        CHECK_EQ(write(fd, credentials, (size_t)credentials_len),
+                 (ssize_t)credentials_len);
+        close(fd);
+    }
+
+    setenv("OI_CHATGPT_TEST_BASE", base, 1);
+    setenv("XDG_CONFIG_HOME", config_root, 1);
+    char *argv[] = {(char *)OI_BIN, (char *)"--deny-tools", (char *)"one",
+                    NULL};
+    struct run_result first;
+    run_cli(argv, &first);
+    argv[2] = (char *)"two";
+    struct run_result second;
+    run_cli(argv, &second);
+    unsetenv("OI_CHATGPT_TEST_BASE");
+    unsetenv("XDG_CONFIG_HOME");
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+
+    CHECK_EQ(first.exit_code, 0);
+    CHECK(strstr(first.output, "ok") != NULL);
+    CHECK_EQ(second.exit_code, 0);
+    char log[1024] = "";
+    {
+        int fd = open(log_path, O_RDONLY);
+        CHECK(fd >= 0);
+        ssize_t n = read(fd, log, sizeof log - 1);
+        close(fd);
+        CHECK(n > 0);
+        log[n > 0 ? n : 0] = '\0';
+    }
+    /* Run 1 renewed beside its turn, which kept the old token; run 2 read
+     * the renewed token from the file and did not renew again. */
+    CHECK_EQ(count_text(log, "/api/accounts/oauth/token"), (size_t)1);
+    CHECK_EQ(count_text(log, "/v1/responses old\n"), (size_t)1);
+    CHECK_EQ(count_text(log, "/v1/responses fresh\n"), (size_t)1);
+    {
+        char saved[2048] = "";
+        int fd = open(path, O_RDONLY);
+        CHECK(fd >= 0);
+        ssize_t n = read(fd, saved, sizeof saved - 1);
+        close(fd);
+        saved[n > 0 ? n : 0] = '\0';
+        CHECK(strstr(saved, "\"access_token\":\"fresh\"") != NULL);
+        CHECK(strstr(saved, "\"refresh_token\":\"rotated\"") != NULL);
+    }
+    unlink(log_path);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/oi/credentials.json.lock", config_root);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/oi", config_root);
+    rmdir(path);
+    rmdir(config_root);
+}
+
+/* A token renewal waits for a server that accepts and never answers. The
+ * turn that needs the renewal must still cancel at once on Ctrl+C. */
+TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
+    char config_root[] = "/tmp/oi-cli-renewal-XXXXXX";
+    char session_root[128];
+    char path[256];
+    char base[64];
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+    static const char credentials[] =
+        "{\"version\":1,\"active\":\"openai\",\"openai\":{"
+        "\"auth\":\"oauth\",\"client_id\":\"app_test\",\"host_id\":\"h\","
+        "\"access_token\":\"expired\",\"refresh_token\":\"refresh\","
+        "\"expires_at\":1,\"welcome_shown\":true}}";
+
+    /* The listener never calls accept(): the kernel completes the TCP
+     * handshake from its backlog, and no byte ever comes back. */
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, 8), 0);
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    snprintf(base, sizeof base, "http://127.0.0.1:%u",
+             (unsigned)ntohs(addr.sin_port));
+
+    CHECK(mkdtemp(config_root) != NULL);
+    snprintf(path, sizeof path, "%s/oi", config_root);
+    CHECK_EQ(mkdir(path, 0700), 0);
+    snprintf(path, sizeof path, "%s/oi/credentials.json", config_root);
+    {
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        CHECK(fd >= 0);
+        CHECK_EQ(write(fd, credentials, sizeof credentials - 1),
+                 (ssize_t)(sizeof credentials - 1));
+        close(fd);
+    }
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-renewal-sessions-%d", (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+
+    pid_t cli = fork();
+    CHECK(cli >= 0);
+    if (cli == 0) {
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0 ||
+            dup2(slave_fd, STDIN_FILENO) < 0 ||
+            dup2(slave_fd, STDOUT_FILENO) < 0 ||
+            dup2(slave_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        setenv("OI_CHATGPT_TEST_BASE", base, 1);
+        setenv("XDG_CONFIG_HOME", config_root, 1);
+        unsetenv("OI_API_KEY");
+        /* No endpoint flag: saved credentials apply to the default one. */
+        char *argv[] = {(char *)OI_BIN, (char *)"--deny-tools",
+                        (char *)"--session-dir", session_root, NULL};
+        execv(OI_BIN, argv);
+        _exit(127);
+    }
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
+    /* Give the turn time to reach the renewal wait. */
+    struct timespec pause = {0, 300 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+
+    struct timespec before;
+    struct timespec after;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    double waited = (double)(after.tv_sec - before.tv_sec) +
+                    (double)(after.tv_nsec - before.tv_nsec) / 1e9;
+    /* The renewal itself can take 20 s to time out. */
+    CHECK(waited < 5.0);
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+
+    /* The unfinished renewal changed nothing on disk. */
+    {
+        char saved[1024];
+        int fd = open(path, O_RDONLY);
+        CHECK(fd >= 0);
+        ssize_t n = read(fd, saved, sizeof saved - 1);
+        close(fd);
+        CHECK_EQ(n, (ssize_t)(sizeof credentials - 1));
+        CHECK(memcmp(saved, credentials, sizeof credentials - 1) == 0);
+    }
+    close(master_fd);
+    close(listen_fd);
+    remove_sessions_under(session_root);
+    rmdir(session_root);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/oi/credentials.json.lock", config_root);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/oi", config_root);
+    rmdir(path);
+    rmdir(config_root);
+}
+
 TEST(oauth_callback_with_a_wrong_state_does_not_end_the_login) {
     int master_fd = -1;
     int slave_fd = -1;
@@ -7002,6 +7292,8 @@ int main(void) {
     RUN(permissions_allow_confirmed_elevates_policy);
     RUN(permissions_allow_when_already_allowed_skips_confirmation);
     RUN(oauth_callback_with_a_wrong_state_does_not_end_the_login);
+    RUN(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal);
+    RUN(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it);
     RUN(tool_panel_shows_live_output_and_failed_status);
     RUN(tool_panel_survives_malicious_escape_bytes_in_output);
     RUN(tool_panel_coexists_with_resize_and_queued_input);

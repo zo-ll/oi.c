@@ -1277,6 +1277,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     login.client = client;
+    login.reactor = reactor;
     oi_llm_client_set_before_request(client, oi_cli_login_before_request,
                                      &login);
     if (interactive && login.oauth_active) {

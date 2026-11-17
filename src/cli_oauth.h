@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 
+#include "oi/reactor.h"
 #include "oi/status.h"
 
 /*
@@ -131,6 +132,25 @@ oi_status oi_cli_oauth_refresh(const struct oi_cli_oauth_server *auth,
                                const char *ca_file, const char *client_id,
                                const char *refresh_token,
                                struct oi_cli_oauth_tokens *out);
+
+/*
+ * oi_cli_oauth_refresh without blocking: the exchange runs on `reactor`,
+ * and `done` fires once with the result. `done` owns `*tokens` (free them
+ * with oi_cli_oauth_tokens_free; all members are NULL unless the status is
+ * OI_OK), and the call handle is already freed when `done` runs. The
+ * exchange times out after 20 seconds. oi_cli_oauth_refresh_cancel stops
+ * it without calling `done`; NULL-safe.
+ */
+struct oi_cli_oauth_refresh_call;
+typedef void (*oi_cli_oauth_tokens_cb)(oi_status status,
+                                       struct oi_cli_oauth_tokens *tokens,
+                                       void *user_data);
+oi_status oi_cli_oauth_refresh_start(
+    oi_reactor *reactor, const struct oi_cli_oauth_server *auth,
+    const char *ca_file, const char *client_id, const char *refresh_token,
+    oi_cli_oauth_tokens_cb done, void *user_data,
+    struct oi_cli_oauth_refresh_call **out_call);
+void oi_cli_oauth_refresh_cancel(struct oi_cli_oauth_refresh_call *call);
 
 oi_status oi_cli_oauth_fetch_models(const struct oi_cli_oauth_server *api,
                                     const char *ca_file, const char *bearer,
