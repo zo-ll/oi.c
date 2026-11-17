@@ -2167,6 +2167,9 @@ have_message:
             oi_cli_bytebuf_free(&turn_input_context.permission_args_line);
             oi_cli_tool_panel_free(&turn_input_context.panel);
             repl_event_context.turn_input = NULL;
+            if (config->login != NULL) {
+                oi_cli_login_turn_ended(config->login);
+            }
             if (signal_registered) {
                 oi_reactor_remove(reactor, signal_fd);
             }

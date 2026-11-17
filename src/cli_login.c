@@ -518,6 +518,13 @@ static oi_status start_renewal(struct oi_cli_login *login, double now) {
     return st;
 }
 
+void oi_cli_login_turn_ended(struct oi_cli_login *login) {
+    if (login->renewal != NULL && !login->renewal->finished) {
+        renewal_free(login->renewal);
+        login->renewal = NULL;
+    }
+}
+
 oi_status oi_cli_login_before_request(void *user_data) {
     struct oi_cli_login *login = user_data;
     double now = (double)time(NULL);
@@ -1188,6 +1195,11 @@ oi_status oi_cli_login_run(struct oi_cli_login *login,
                            int *out_terminate_signal) {
     char message[768];
     *out_terminate_signal = 0;
+    /* A renewal belongs to the login it started under. Dropped here, it
+     * cannot write that login's credentials over the new ones, nor adopt
+     * its token after them, and it releases the credentials lock. */
+    renewal_free(login->renewal);
+    login->renewal = NULL;
     oi_status st = run_dialog(login, composer, signal_fd, out_terminate_signal,
                               message, sizeof message);
     if (st != OI_OK || *out_terminate_signal != 0) {
