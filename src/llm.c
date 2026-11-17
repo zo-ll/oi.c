@@ -175,6 +175,9 @@ void oi_llm_client_destroy(oi_llm_client *c) {
     }
     free(c->host);
     free(c->ca_file);
+    if (c->api_key != NULL) {
+        oi_wipe(c->api_key, strlen(c->api_key));
+    }
     free(c->api_key);
     free(c->path);
     free(c);
