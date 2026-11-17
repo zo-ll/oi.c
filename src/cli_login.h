@@ -31,8 +31,9 @@ struct oi_cli_login {
 
 /*
  * Finishes a sent token renewal on `login->reactor`, so its rotated tokens
- * are saved, then frees what `login` owns. The reactor must stay alive
- * until this call returns.
+ * are saved, then frees what `login` owns. It prints a line while it waits
+ * (at most 20 s), and Ctrl+C ends the wait with the credentials file
+ * unchanged. The reactor must stay alive until this call returns.
  */
 void oi_cli_login_free(struct oi_cli_login *login);
 
