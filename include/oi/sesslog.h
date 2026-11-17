@@ -35,7 +35,7 @@ typedef struct oi_sesslog oi_sesslog;
  * crash tail. Open then copies the whole file to "<path>.corrupt" first,
  * cuts the log before the damaged record, and reports the count of bytes
  * cut through oi_sesslog_damaged_bytes. If the copy fails, open fails
- * with OI_ERR_IO and changes nothing.
+ * with OI_ERR_IO (or OI_ERR_NOMEM) and changes nothing.
  *
  * Takes an exclusive advisory lock (flock) for the life of the handle,
  * so two processes can't both append to the same log concurrently;
