@@ -3,7 +3,9 @@
 #include "json_internal.h"
 #include "test.h"
 
+#include <locale.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -788,6 +790,38 @@ TEST(write_many_elements_grows_buffer_and_frames) {
     oi_json_writer_destroy(w);
 }
 
+/* A program that embeds liboi can set a locale with a comma radix. The
+ * test is a no-op on a host that has none of these locales. */
+TEST(numbers_ignore_the_locale_radix) {
+    static const char *const names[] = {"de_DE.UTF-8", "de_DE.utf8",
+                                        "fr_FR.UTF-8", "fr_FR.utf8"};
+    const char *found = NULL;
+    for (size_t i = 0; i < sizeof names / sizeof names[0] && !found; i++) {
+        found = setlocale(LC_NUMERIC, names[i]);
+    }
+    if (found == NULL) {
+        fprintf(stderr, "numbers_ignore_the_locale_radix: no comma locale, "
+                        "skipped\n");
+        return;
+    }
+
+    oi_arena *a = oi_arena_create(0);
+    oi_status st;
+    oi_json_value *v = parse_byte_by_byte(a, "[1.5]", 5, &st);
+    double number = 0;
+    CHECK_EQ(st, OI_OK);
+    CHECK_EQ(oi_json_get_number(oi_json_array_get(v, 0), &number), OI_OK);
+    CHECK(number == 1.5);
+    oi_arena_destroy(a);
+
+    oi_json_writer *w = oi_json_writer_create();
+    CHECK_EQ(oi_json_write_number(w, -1.25e-7), OI_OK);
+    CHECK_STREQ(oi_json_writer_data(w, NULL), "-1.2499999999999999e-07");
+    oi_json_writer_destroy(w);
+
+    setlocale(LC_NUMERIC, "C");
+}
+
 int main(void) {
     RUN(parse_null);
     RUN(parse_true_false);
@@ -825,6 +859,7 @@ int main(void) {
 
     RUN(write_scalars);
     RUN(write_rejects_nonfinite_number);
+    RUN(numbers_ignore_the_locale_radix);
     RUN(write_array);
     RUN(write_empty_array_and_object);
     RUN(write_object);
