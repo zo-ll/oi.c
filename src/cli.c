@@ -1105,6 +1105,13 @@ int main(int argc, char **argv) {
             exit_code = 1;
             goto cleanup;
         }
+        size_t damaged = oi_sesslog_damaged_bytes(oi_session_log(session));
+        if (damaged > 0) {
+            fprintf(stderr,
+                    "oi: session log '%s' was damaged: removed %zu bytes; "
+                    "the original file is kept as '%s.corrupt'\n",
+                    log_path, damaged, log_path);
+        }
         st = oi_cli_history_store_load(oi_session_log(session),
                                        &history_store, &replay_state);
         if (st != OI_OK) {

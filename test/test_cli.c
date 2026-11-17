@@ -2759,23 +2759,25 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
             fclose(history);
             /* oi_sesslog's own file format is a 12-byte binary header
              * ("OISESLOG" + a little-endian u32 version) followed by a
-             * sequence of [4-byte little-endian length][JSON bytes]
-             * records -- both the header and each record's own length
+             * sequence of [4-byte little-endian length][4-byte CRC-32]
+             * [JSON bytes] records -- both the header and each record's
+             * own head
              * prefix contain embedded NUL/non-ASCII bytes, so treating the
              * whole file as one C string (strstr from the start) stops
              * almost immediately. Walk the length-prefixed records
              * individually instead, each of which *is* a plain, NUL-free
              * JSON string safe to strstr on its own. */
             CHECK(len > 12);
+            CHECK_EQ(contents[8], 2);
             offset = 12;
-            while (offset + 4 <= len) {
+            while (offset + 8 <= len) {
                 uint32_t record_len = (uint32_t)(unsigned char)contents[offset] |
                     ((uint32_t)(unsigned char)contents[offset + 1] << 8) |
                     ((uint32_t)(unsigned char)contents[offset + 2] << 16) |
                     ((uint32_t)(unsigned char)contents[offset + 3] << 24);
                 char record[1024];
 
-                offset += 4;
+                offset += 8;
                 CHECK(offset + record_len <= len);
                 CHECK(record_len < sizeof record);
                 memcpy(record, contents + offset, record_len);
@@ -2834,15 +2836,16 @@ static void oilog_records_load(const char *path, struct oilog_records *out) {
     out->items = malloc(cap * sizeof(char *));
     CHECK(out->items != NULL);
     out->count = 0;
+    CHECK_EQ(contents[8], 2);
     offset = 12;
-    while (offset + 4 <= len) {
+    while (offset + 8 <= len) {
         uint32_t record_len = (uint32_t)contents[offset] |
             ((uint32_t)contents[offset + 1] << 8) |
             ((uint32_t)contents[offset + 2] << 16) |
             ((uint32_t)contents[offset + 3] << 24);
         char *record;
 
-        offset += 4;
+        offset += 8; /* length and CRC-32 */
         CHECK(offset + record_len <= len);
         record = malloc(record_len + 1);
         CHECK(record != NULL);
