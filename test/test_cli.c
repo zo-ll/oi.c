@@ -4315,6 +4315,112 @@ TEST(sent_renewal_survives_the_turn_end_and_finishes_while_idle) {
     rmdir(config_root);
 }
 
+/* At exit, a sent renewal against a slow token server makes oi wait. The
+ * wait says so at once, and Ctrl+C ends it without a change to the
+ * credentials file. */
+TEST(exit_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it) {
+    char config_root[] = "/tmp/oi-cli-renewal-exit-XXXXXX";
+    char session_root[128];
+    char path[256];
+    char lock_path[sizeof path + 8];
+    char log_path[256];
+    char base[64];
+    char credentials[512];
+    unsigned short port;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+
+    CHECK(mkdtemp(config_root) != NULL);
+    snprintf(log_path, sizeof log_path, "%s/requests.log", config_root);
+    pid_t server = start_renewal_mock(&port, log_path, 10000);
+    snprintf(base, sizeof base, "http://127.0.0.1:%u", (unsigned)port);
+    int credentials_len = snprintf(
+        credentials, sizeof credentials,
+        "{\"version\":1,\"active\":\"openai\",\"openai\":{"
+        "\"auth\":\"oauth\",\"client_id\":\"app_test\",\"host_id\":\"h\","
+        "\"access_token\":\"old\",\"refresh_token\":\"refresh\","
+        "\"expires_at\":%.0f,\"welcome_shown\":true}}",
+        (double)time(NULL) + 100);
+    snprintf(path, sizeof path, "%s/oi", config_root);
+    CHECK_EQ(mkdir(path, 0700), 0);
+    snprintf(path, sizeof path, "%s/oi/credentials.json", config_root);
+    snprintf(lock_path, sizeof lock_path, "%s.lock", path);
+    {
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        CHECK(fd >= 0);
+        CHECK_EQ(write(fd, credentials, (size_t)credentials_len),
+                 (ssize_t)credentials_len);
+        close(fd);
+    }
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-renewal-exit-sessions-%d", (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+
+    pid_t cli = fork();
+    CHECK(cli >= 0);
+    if (cli == 0) {
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0 ||
+            dup2(slave_fd, STDIN_FILENO) < 0 ||
+            dup2(slave_fd, STDOUT_FILENO) < 0 ||
+            dup2(slave_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        setenv("OI_CHATGPT_TEST_BASE", base, 1);
+        setenv("XDG_CONFIG_HOME", config_root, 1);
+        unsetenv("OI_API_KEY");
+        char *argv[] = {(char *)OI_BIN, (char *)"--deny-tools",
+                        (char *)"--session-dir", session_root, NULL};
+        execv(OI_BIN, argv);
+        _exit(127);
+    }
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    CHECK(interactive_wait_for(master_fd, &result, "ok\n\r\x1b[J> ", 1));
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "finishing the ChatGPT token renewal", 1));
+
+    struct timespec before;
+    struct timespec after;
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    CHECK(write_interactive(master_fd, "\x03", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    double waited = (double)(after.tv_sec - before.tv_sec) +
+                    (double)(after.tv_nsec - before.tv_nsec) / 1e9;
+    CHECK(waited < 1.0);
+    CHECK_EQ(result.exit_code, 0);
+    {
+        char saved[2048] = "";
+        int fd = open(path, O_RDONLY);
+        CHECK(fd >= 0);
+        ssize_t n = read(fd, saved, sizeof saved - 1);
+        close(fd);
+        CHECK_EQ(n, (ssize_t)credentials_len);
+        CHECK(memcmp(saved, credentials, (size_t)credentials_len) == 0);
+    }
+
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    close(master_fd);
+    remove_sessions_under(session_root);
+    rmdir(session_root);
+    unlink(log_path);
+    unlink(path);
+    unlink(lock_path);
+    snprintf(path, sizeof path, "%s/oi", config_root);
+    rmdir(path);
+    rmdir(config_root);
+}
+
 /* A token renewal waits for a server that accepts and never answers. The
  * turn that needs the renewal must still cancel at once on Ctrl+C. */
 TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
@@ -7441,6 +7547,7 @@ int main(void) {
     RUN(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal);
     RUN(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it);
     RUN(sent_renewal_survives_the_turn_end_and_finishes_while_idle);
+    RUN(exit_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it);
     RUN(tool_panel_shows_live_output_and_failed_status);
     RUN(tool_panel_survives_malicious_escape_bytes_in_output);
     RUN(tool_panel_coexists_with_resize_and_queued_input);

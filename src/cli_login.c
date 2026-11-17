@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -525,15 +526,55 @@ static int renewal_running_and_sent(const struct oi_cli_login *login) {
            oi_cli_oauth_refresh_sent(login->renewal->call);
 }
 
+static void interrupt_wait(oi_reactor *reactor, int fd, int revents,
+                           void *user_data) {
+    (void)reactor;
+    (void)revents;
+    struct signalfd_siginfo info;
+    while (read(fd, &info, sizeof info) == (ssize_t)sizeof info) {
+    }
+    *(int *)user_data = 1;
+}
+
 /* Steps the reactor until a sent renewal ends, so that its rotated tokens
  * reach the credentials file. The exchange's own 20 s timeout bounds the
- * wait. */
+ * wait. Ctrl+C ends the wait early and leaves the renewal for the caller
+ * to drop, so the file keeps the tokens it had: the REPL keeps SIGINT
+ * blocked for the life of the process, so the wait reads it from its own
+ * signalfd; where SIGINT is not blocked, it ends the process, and the
+ * file is replaced only by rename, so it stays whole. */
 static void finish_sent_renewal(struct oi_cli_login *login) {
-    while (renewal_running_and_sent(login)) {
+    if (!renewal_running_and_sent(login)) {
+        return;
+    }
+    fputs("oi: finishing the ChatGPT token renewal (Ctrl+C skips it)\n",
+          login->err);
+    fflush(login->err);
+    int interrupted = 0;
+    int sigint_fd = -1;
+    sigset_t current;
+    if (pthread_sigmask(SIG_BLOCK, NULL, &current) == 0 &&
+        sigismember(&current, SIGINT)) {
+        sigset_t only;
+        sigemptyset(&only);
+        sigaddset(&only, SIGINT);
+        sigint_fd = signalfd(-1, &only, SFD_NONBLOCK | SFD_CLOEXEC);
+        if (sigint_fd >= 0 &&
+            oi_reactor_add(login->reactor, sigint_fd, OI_EV_READ,
+                           interrupt_wait, &interrupted) != OI_OK) {
+            close(sigint_fd);
+            sigint_fd = -1;
+        }
+    }
+    while (!interrupted && renewal_running_and_sent(login)) {
         oi_status st = OI_OK;
         if (oi_reactor_step(login->reactor, 1000, &st) < 0) {
             break;
         }
+    }
+    if (sigint_fd >= 0) {
+        oi_reactor_remove(login->reactor, sigint_fd);
+        close(sigint_fd);
     }
 }
 
@@ -1211,10 +1252,7 @@ oi_status oi_cli_login_run(struct oi_cli_login *login,
      * first, so that its rotated tokens are saved; then it is dropped, so it
      * cannot write that login's credentials over the new ones, nor adopt
      * its token after them, and it releases the credentials lock. */
-    if (renewal_running_and_sent(login)) {
-        fputs("oi: finishing the ChatGPT token renewal first\n", login->err);
-        finish_sent_renewal(login);
-    }
+    finish_sent_renewal(login);
     renewal_free(login->renewal);
     login->renewal = NULL;
     oi_status st = run_dialog(login, composer, signal_fd, out_terminate_signal,
