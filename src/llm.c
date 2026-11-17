@@ -13,6 +13,9 @@
 #include "oi/json.h"
 
 #define OI_LLM_MAX_ERROR_BODY (64 * 1024)
+/* How often a request asks a before_request hook that returned
+ * OI_ERR_AGAIN again. */
+#define OI_LLM_HOOK_RETRY_MS 20
 /* Bounds on what one stream can make the client hold. A model that goes
  * past them gets OI_ERR_PARSE instead of unbounded memory. */
 #define OI_LLM_MAX_TOOL_CALLS 256
@@ -57,8 +60,10 @@ struct oi_llm_request {
     oi_llm_done_cb on_done;
     void *user_data;
 
+    oi_reactor *reactor; /* borrowed */
     oi_llm_conn *conn;
     oi_reactor_timer *timer;
+    oi_reactor_timer *hook_timer; /* set while a hook says OI_ERR_AGAIN */
     oi_llm_http_parser *http;
     oi_llm_sse_parser *sse; /* created lazily once we know status is 2xx */
     oi_json_parser *json;   /* reused (reset) across SSE events */
@@ -224,6 +229,7 @@ void oi_llm_client_set_before_request(oi_llm_client *client,
 
 static void request_teardown(oi_llm_request *req) {
     oi_reactor_timer_cancel(req->timer);
+    oi_reactor_timer_cancel(req->hook_timer);
     if (req->conn) {
         oi_llm_conn_close(req->conn);
     }
@@ -884,6 +890,64 @@ static void req_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
 
 /* ================= public entry point ================= */
 
+/* The part of a start that reads the client: the body in the client's
+ * wire format, the parsers, and the connection. It runs only after the
+ * before_request hook returned OI_OK, so a hook may reconfigure the
+ * client while its request waits. On failure, the caller tears `req`
+ * down. */
+static oi_status request_begin(oi_llm_request *req) {
+    oi_llm_client *client = req->client;
+    if (client->responses_api) {
+        oi_json_writer *translated = NULL;
+        oi_status st = oi_llm_responses_translate_body(
+            req->scratch, req->body, req->body_len, &translated);
+        if (st != OI_OK) {
+            return st;
+        }
+        size_t len;
+        const char *data = oi_json_writer_data(translated, &len);
+        char *copy = malloc(len > 0 ? len : 1);
+        if (copy == NULL) {
+            oi_json_writer_destroy(translated);
+            return OI_ERR_NOMEM;
+        }
+        memcpy(copy, data, len);
+        oi_json_writer_destroy(translated);
+        free(req->body);
+        req->body = copy;
+        req->body_len = len;
+    }
+
+    req->http = oi_llm_http_parser_create(req_on_headers_done, req_on_body,
+                                           req);
+    req->json = oi_json_parser_create(req->scratch);
+    if (req->http == NULL || req->json == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    struct oi_llm_conn_callbacks cbs = {req_on_connected, req_on_data,
+                                         req_on_error};
+    return oi_llm_conn_connect(req->reactor, client->host, client->port,
+                               client->tls, &cbs, req, &req->conn);
+}
+
+static void retry_before_request(oi_reactor *reactor, void *ud) {
+    oi_llm_request *req = ud;
+    oi_reactor_timer_cancel(req->hook_timer);
+    req->hook_timer = NULL;
+    oi_llm_client *client = req->client;
+    oi_status st = client->before_request(client->before_request_user_data);
+    if (st == OI_ERR_AGAIN) {
+        st = oi_reactor_timer_start(reactor, OI_LLM_HOOK_RETRY_MS,
+                                    retry_before_request, req,
+                                    &req->hook_timer);
+    } else if (st == OI_OK) {
+        st = request_begin(req);
+    }
+    if (st != OI_OK) {
+        finish(req, st, 0, NULL, 0);
+    }
+}
+
 static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
                                oi_arena *arena, const char *body,
                                size_t body_len, oi_llm_delta_cb on_delta,
@@ -894,10 +958,10 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
         out_request == NULL) {
         return OI_ERR_INVAL;
     }
+    oi_status hook_st = OI_OK;
     if (client->before_request != NULL) {
-        oi_status hook_st =
-            client->before_request(client->before_request_user_data);
-        if (hook_st != OI_OK) {
+        hook_st = client->before_request(client->before_request_user_data);
+        if (hook_st != OI_OK && hook_st != OI_ERR_AGAIN) {
             return hook_st;
         }
     }
@@ -907,81 +971,37 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
         return OI_ERR_NOMEM;
     }
     req->client = client;
+    req->reactor = reactor;
     req->scratch = oi_arena_create(0);
-    if (req->scratch == NULL) {
-        free(req);
+    req->body = malloc(body_len > 0 ? body_len : 1);
+    if (req->scratch == NULL || req->body == NULL) {
+        request_teardown(req);
         return OI_ERR_NOMEM;
     }
+    memcpy(req->body, body, body_len);
+    req->body_len = body_len;
     req->on_delta = on_delta;
     req->on_event = on_event;
     req->on_done = on_done;
     req->user_data = user_data;
 
-    oi_json_writer *translated = NULL;
-    if (client->responses_api) {
-        oi_status translate_st = oi_llm_responses_translate_body(
-            req->scratch, body, body_len, &translated);
-        if (translate_st != OI_OK) {
-            oi_arena_destroy(req->scratch);
-            free(req);
-            return translate_st;
-        }
-        body = oi_json_writer_data(translated, &body_len);
-    }
-
-    req->body = malloc(body_len > 0 ? body_len : 1);
-    if (req->body == NULL) {
-        oi_json_writer_destroy(translated);
-        oi_arena_destroy(req->scratch);
-        free(req);
-        return OI_ERR_NOMEM;
-    }
-    if (body_len > 0) {
-        memcpy(req->body, body, body_len);
-    }
-    req->body_len = body_len;
-    oi_json_writer_destroy(translated);
-
-    req->http = oi_llm_http_parser_create(req_on_headers_done, req_on_body,
-                                           req);
-    if (req->http == NULL) {
-        free(req->body);
-        oi_arena_destroy(req->scratch);
-        free(req);
-        return OI_ERR_NOMEM;
-    }
-
-    req->json = oi_json_parser_create(req->scratch);
-    if (req->json == NULL) {
-        oi_llm_http_parser_destroy(req->http);
-        free(req->body);
-        oi_arena_destroy(req->scratch);
-        free(req);
-        return OI_ERR_NOMEM;
-    }
-
-    struct oi_llm_conn_callbacks cbs = {req_on_connected, req_on_data,
-                                         req_on_error};
-    oi_status st = oi_llm_conn_connect(reactor, client->host, client->port,
-                                        client->tls, &cbs, req, &req->conn);
-    if (st != OI_OK) {
-        oi_json_parser_destroy(req->json);
-        oi_llm_http_parser_destroy(req->http);
-        free(req->body);
-        oi_arena_destroy(req->scratch);
-        free(req);
-        return st;
-    }
-
+    /* The deadline covers a wait for the hook as well. */
+    oi_status st = OI_OK;
     if (client->timeout_ms > 0) {
         st = oi_reactor_timer_start(reactor, client->timeout_ms,
-                                     request_timed_out, req, &req->timer);
-        if (st != OI_OK) {
-            request_teardown(req);
-            return st;
-        }
+                                    request_timed_out, req, &req->timer);
     }
-
+    if (st == OI_OK) {
+        st = hook_st == OI_ERR_AGAIN
+                 ? oi_reactor_timer_start(reactor, OI_LLM_HOOK_RETRY_MS,
+                                          retry_before_request, req,
+                                          &req->hook_timer)
+                 : request_begin(req);
+    }
+    if (st != OI_OK) {
+        request_teardown(req);
+        return st;
+    }
     *out_request = req;
     return OI_OK;
 }
