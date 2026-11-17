@@ -118,8 +118,9 @@ call, and a one-shot run refuses the call rather than prompting. Pass
 refuse everything. `oi` follows tool calls with their results until the model
 returns a final answer or `--max-turns` (default 8) is reached.
 
-Session files are append-only `.oilog` logs. They recover a torn trailing
-record after a process crash. They intentionally do not call `fsync`, so
+Session files are append-only `.oilog` logs with a CRC-32 for each record.
+They recover a torn trailing record after a process crash, and keep a
+`.corrupt` copy before they cut a damaged record. They intentionally do not call `fsync`, so
 they do not promise persistence across power loss, and they are not
 encrypted — tool output is stored verbatim.
 

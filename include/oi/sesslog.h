@@ -7,9 +7,9 @@
 
 /*
  * Durable append-only log for session state: one write() syscall per
- * record. A short/error write is rolled back before returning; a genuine
- * mid-write process crash is recovered by discarding the partial tail on
- * the next open.
+ * record. Each record carries a CRC-32 of its payload. A short/error
+ * write is rolled back before returning; a genuine mid-write process
+ * crash is recovered by discarding the partial tail on the next open.
  * No fsync by default: crash-safe against the *process* dying, not
  * against a power loss losing the page cache.
  *
@@ -30,6 +30,12 @@ typedef struct oi_sesslog oi_sesslog;
  * header -- OI_ERR_PARSE on a bad magic or an unrecognized version --
  * and recovers by truncating off a trailing record left incomplete by
  * a prior crash; everything before that point is preserved untouched.
+ *
+ * A record with a bad checksum or an impossible length is damage, not a
+ * crash tail. Open then copies the whole file to "<path>.corrupt" first,
+ * cuts the log before the damaged record, and reports the count of bytes
+ * cut through oi_sesslog_damaged_bytes. If the copy fails, open fails
+ * with OI_ERR_IO and changes nothing.
  *
  * Takes an exclusive advisory lock (flock) for the life of the handle,
  * so two processes can't both append to the same log concurrently;
@@ -52,5 +58,9 @@ typedef void (*oi_sesslog_record_cb)(const void *data, size_t len,
                                       void *user_data);
 oi_status oi_sesslog_replay(oi_sesslog *log, oi_sesslog_record_cb cb,
                              void *user_data);
+
+/* The count of bytes that oi_sesslog_open cut because of damage; 0 when
+ * the log was intact or lost only a crash tail. NULL-safe. */
+size_t oi_sesslog_damaged_bytes(const oi_sesslog *log);
 
 #endif /* OI_SESSLOG_H */

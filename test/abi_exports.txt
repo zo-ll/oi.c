@@ -66,6 +66,7 @@ oi_session_registry_destroy
 oi_session_state_of
 oi_sesslog_append
 oi_sesslog_close
+oi_sesslog_damaged_bytes
 oi_sesslog_open
 oi_sesslog_replay
 oi_tool_call_cancel

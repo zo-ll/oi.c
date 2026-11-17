@@ -714,8 +714,12 @@ Limits worth knowing before you rely on any of this:
 - **Ids are permanent.** `rename` changes the display name only.
 - **Deletion is permanent** and requires trashing first. There is no undo
   and no backup copy.
-- A history file that is corrupt beyond a torn trailing record cannot be
-  repaired by `oi`. Such a session is still listed and can still be trashed;
+- Each record carries a CRC-32 checksum. When a record in the middle of a
+  history file is damaged, `oi` copies the file to `<file>.corrupt`, removes
+  the damaged record and every record after it, and prints a warning with
+  the count of bytes removed. The records after the damage are still in the
+  `.corrupt` copy. A history file that `oi` cannot read at all, such as one
+  with a bad header, is still listed and can still be trashed;
   `/session switch` reports `session could not be loaded`.
 
 ### Trash
@@ -864,9 +868,11 @@ hand; a lingering report means the process is still alive.
 **`session could not be loaded` / `[metadata rebuilt]`.** A rebuilt cache is
 harmless and self-healing. A session that will not load has a damaged
 `history.oilog`; `oi` will not rewrite it. You can still list and trash it.
-The file is a 12-byte `OISESLOG` header followed by length-prefixed records
-whose payloads are JSON, so `strings history.oilog` recovers the text of a
-conversation even when the framing is too damaged to replay.
+The file is a 12-byte `OISESLOG` header followed by records, each a length,
+a CRC-32, and a JSON payload, so `strings history.oilog` recovers the text
+of a conversation even when the framing is too damaged to replay. After a
+damage warning, run `strings` on the `.corrupt` copy to get the records that
+were removed.
 
 **Terminal left in a strange state.** `oi` restores the original terminal
 modes and disables bracketed paste on exit, including on Ctrl+D, `/exit`,

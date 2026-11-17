@@ -2,7 +2,9 @@
 #include "test.h"
 
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -211,17 +213,173 @@ TEST(recovery_discards_implausible_length_prefix) {
      * corruption, not a legitimate in-progress write. */
     int fd = open(path, O_WRONLY | O_APPEND);
     CHECK(fd >= 0);
-    unsigned char prefix[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-    CHECK_EQ(write(fd, prefix, 4), 4);
+    unsigned char head[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0};
+    CHECK_EQ(write(fd, head, 8), 8);
     close(fd);
 
     CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
+    CHECK_EQ(oi_sesslog_damaged_bytes(log), (size_t)8);
     struct collected c = {0};
     CHECK_EQ(oi_sesslog_replay(log, collect_cb, &c), OI_OK);
     CHECK_EQ(c.count, 1);
     CHECK(memcmp(c.records[0], "good", 4) == 0);
 
     oi_sesslog_close(log);
+    char copy_path[300];
+    snprintf(copy_path, sizeof copy_path, "%s.corrupt", path);
+    CHECK_EQ(unlink(copy_path), 0);
+    unlink(path);
+}
+
+/* --- checksums and damage --- */
+
+static size_t read_file(const char *path, unsigned char *buf, size_t cap) {
+    int fd = open(path, O_RDONLY);
+    CHECK(fd >= 0);
+    ssize_t n = read(fd, buf, cap);
+    close(fd);
+    CHECK(n >= 0 && (size_t)n < cap);
+    return (size_t)n;
+}
+
+static uint32_t u32le(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+TEST(new_record_carries_its_crc32) {
+    const char *path = fresh_path();
+    oi_sesslog *log;
+    CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "123456789", 9), OI_OK);
+    oi_sesslog_close(log);
+
+    unsigned char bytes[64];
+    size_t n = read_file(path, bytes, sizeof bytes);
+    CHECK_EQ(n, (size_t)(12 + 8 + 9));
+    CHECK_EQ(u32le(bytes + 8), 2u);           /* log version */
+    CHECK_EQ(u32le(bytes + 12), 9u);          /* payload length */
+    CHECK_EQ(u32le(bytes + 16), 0xCBF43926u); /* CRC-32("123456789") */
+    CHECK(memcmp(bytes + 20, "123456789", 9) == 0);
+    unlink(path);
+}
+
+TEST(flipped_byte_cuts_the_log_and_keeps_a_copy) {
+    const char *path = fresh_path();
+    char copy_path[300];
+    snprintf(copy_path, sizeof copy_path, "%s.corrupt", path);
+    unlink(copy_path);
+    oi_sesslog *log;
+    CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "first", 5), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "second", 6), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "third", 5), OI_OK);
+    oi_sesslog_close(log);
+
+    unsigned char original[128];
+    size_t size = read_file(path, original, sizeof original);
+    /* One byte inside the payload of "second", in the middle of the log. */
+    off_t flip = 12 + 8 + 5 + 8 + 2;
+    unsigned char byte = original[flip] ^ 0x20;
+    int fd = open(path, O_WRONLY);
+    CHECK(fd >= 0);
+    CHECK_EQ(pwrite(fd, &byte, 1, flip), 1);
+    close(fd);
+    unsigned char damaged[128];
+    CHECK_EQ(read_file(path, damaged, sizeof damaged), size);
+
+    CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
+    CHECK_EQ(oi_sesslog_damaged_bytes(log), (size_t)(8 + 6 + 8 + 5));
+    struct collected c = {0};
+    CHECK_EQ(oi_sesslog_replay(log, collect_cb, &c), OI_OK);
+    CHECK_EQ(c.count, 1);
+    CHECK(memcmp(c.records[0], "first", 5) == 0);
+    oi_sesslog_close(log);
+
+    unsigned char copy[128];
+    CHECK_EQ(read_file(copy_path, copy, sizeof copy), size);
+    CHECK(memcmp(copy, damaged, size) == 0);
+    struct stat info;
+    CHECK_EQ(stat(copy_path, &info), 0);
+    CHECK_EQ(info.st_mode & 0777, 0600u);
+    unlink(copy_path);
+    unlink(path);
+}
+
+TEST(crash_tail_is_cut_without_a_copy) {
+    const char *path = fresh_path();
+    char copy_path[300];
+    snprintf(copy_path, sizeof copy_path, "%s.corrupt", path);
+    unlink(copy_path);
+    oi_sesslog *log;
+    CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "good", 4), OI_OK);
+    oi_sesslog_close(log);
+
+    /* A head that claims 100 bytes, then 3: a write a crash cut short. */
+    int fd = open(path, O_WRONLY | O_APPEND);
+    unsigned char head[8] = {100, 0, 0, 0, 1, 2, 3, 4};
+    CHECK_EQ(write(fd, head, 8), 8);
+    CHECK_EQ(write(fd, "abc", 3), 3);
+    close(fd);
+
+    CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
+    CHECK_EQ(oi_sesslog_damaged_bytes(log), (size_t)0);
+    oi_sesslog_close(log);
+    CHECK(access(copy_path, F_OK) != 0);
+    unlink(path);
+}
+
+TEST(failed_copy_keeps_the_log_unchanged) {
+    const char *path = fresh_path();
+    char copy_path[300];
+    snprintf(copy_path, sizeof copy_path, "%s.corrupt", path);
+    oi_sesslog *log;
+    CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "first", 5), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "second", 6), OI_OK);
+    oi_sesslog_close(log);
+
+    /* A bad checksum on "first", and a directory where the copy goes. */
+    unsigned char zero[4] = {0, 0, 0, 0};
+    int fd = open(path, O_WRONLY);
+    CHECK_EQ(pwrite(fd, zero, 4, 12 + 4), 4);
+    close(fd);
+    unsigned char before[128];
+    size_t size = read_file(path, before, sizeof before);
+    CHECK_EQ(mkdir(copy_path, 0700), 0);
+
+    CHECK_EQ(oi_sesslog_open(path, &log), OI_ERR_IO);
+    unsigned char after[128];
+    CHECK_EQ(read_file(path, after, sizeof after), size);
+    CHECK(memcmp(before, after, size) == 0);
+    rmdir(copy_path);
+    unlink(path);
+}
+
+TEST(version_1_log_keeps_its_record_format) {
+    const char *path = fresh_path();
+    unsigned char v1[12 + 4 + 3] = {'O', 'I', 'S', 'E', 'S', 'L', 'O', 'G',
+                                    1,   0,   0,   0,   3,   0,   0,   0,
+                                    'o', 'l', 'd'};
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    CHECK_EQ(write(fd, v1, sizeof v1), (ssize_t)sizeof v1);
+    close(fd);
+
+    oi_sesslog *log;
+    CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
+    CHECK_EQ(oi_sesslog_append(log, "new", 3), OI_OK);
+    struct collected c = {0};
+    CHECK_EQ(oi_sesslog_replay(log, collect_cb, &c), OI_OK);
+    CHECK_EQ(c.count, 2);
+    CHECK(memcmp(c.records[0], "old", 3) == 0);
+    CHECK(memcmp(c.records[1], "new", 3) == 0);
+    oi_sesslog_close(log);
+
+    unsigned char bytes[64];
+    CHECK_EQ(read_file(path, bytes, sizeof bytes), sizeof v1 + 4 + 3);
+    CHECK_EQ(u32le(bytes + sizeof v1), 3u);
+    CHECK(memcmp(bytes + sizeof v1 + 4, "new", 3) == 0);
     unlink(path);
 }
 
@@ -361,6 +519,11 @@ int main(void) {
     RUN(recovery_discards_implausible_length_prefix);
     RUN(bad_magic_rejected);
     RUN(bad_version_rejected);
+    RUN(new_record_carries_its_crc32);
+    RUN(flipped_byte_cuts_the_log_and_keeps_a_copy);
+    RUN(crash_tail_is_cut_without_a_copy);
+    RUN(failed_copy_keeps_the_log_unchanged);
+    RUN(version_1_log_keeps_its_record_format);
     RUN(file_shorter_than_header_rejected);
     RUN(second_open_of_same_path_is_locked_out);
     RUN(append_rejects_oversized_record);

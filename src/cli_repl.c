@@ -1225,6 +1225,15 @@ static oi_status repl_handle_session_switch(
     /* Committed. Adopt the new session's arena, model, context, and input
      * history, then build the conversation on top of them. */
     oi_cli_message_list_free(&rollback_context);
+    size_t damaged = oi_sesslog_damaged_bytes(oi_session_log(result.session));
+    if (damaged > 0) {
+        /* A warning that cannot be written does not undo the switch. */
+        (void)fprintf(config->err,
+                      "oi: %.*s: session log was damaged: removed %zu bytes; "
+                      "the original file is kept next to it with a .corrupt "
+                      "suffix\n",
+                      (int)id_len, id, damaged);
+    }
     *active_arena = oi_session_arena(result.session);
     status = oi_cli_string_set(current_model, result.model.data,
                                result.model.len);
