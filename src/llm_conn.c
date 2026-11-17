@@ -573,6 +573,11 @@ static void handle_tcp_connecting(oi_llm_conn *c) {
 }
 
 static void handle_established(oi_llm_conn *c, int revents) {
+    /* An error or hangup with no other bit leaves the descriptor ready.
+     * A read reports the error or the EOF and stops the connection. */
+    if (revents & (OI_EV_ERROR | OI_EV_HUP)) {
+        revents |= OI_EV_READ;
+    }
     if ((revents & OI_EV_READ) && c->write_needs_read &&
         c->out_off < c->out_len) {
         if (flush_write_queue(c) != OI_OK) {
