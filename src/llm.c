@@ -13,6 +13,11 @@
 #include "oi/json.h"
 
 #define OI_LLM_MAX_ERROR_BODY (64 * 1024)
+/* Bounds on what one stream can make the client hold. A model that goes
+ * past them gets OI_ERR_PARSE instead of unbounded memory. */
+#define OI_LLM_MAX_TOOL_CALLS 256
+#define OI_LLM_MAX_TOOL_FIELD (4 * 1024)          /* id or name */
+#define OI_LLM_MAX_TOOL_ARGUMENTS (16 * 1024 * 1024)
 
 struct oi_llm_client {
     char *host;
@@ -31,10 +36,13 @@ struct oi_llm_tool_state {
     size_t index;
     char *id;
     size_t id_len;
+    size_t id_cap;
     char *name;
     size_t name_len;
+    size_t name_cap;
     char *arguments;
     size_t arguments_len;
+    size_t arguments_cap;
 };
 
 struct oi_llm_request {
@@ -282,46 +290,58 @@ static oi_status error_buf_append(oi_llm_request *req, const void *data,
 
 /* ================= SSE event -> delta extraction ================= */
 
-static oi_status append_fragment(char **buf, size_t *used, const char *data,
-                                  size_t len) {
-    if (len > SIZE_MAX - *used - 1) {
-        return OI_ERR_NOMEM;
+/* Keeps `*buf` NUL-terminated. The capacity doubles, so a value that
+ * arrives in many small fragments costs a logarithmic count of reallocs. */
+static oi_status append_fragment(char **buf, size_t *used, size_t *cap,
+                                  size_t max, const char *data, size_t len) {
+    if (len > max - *used) {
+        return OI_ERR_PARSE;
     }
-    char *next = realloc(*buf, *used + len + 1);
-    if (next == NULL) {
-        return OI_ERR_NOMEM;
+    size_t needed = *used + len + 1;
+    if (needed > *cap) {
+        size_t new_cap = *cap == 0 ? 64 : *cap;
+        while (new_cap < needed) {
+            new_cap *= 2;
+        }
+        char *next = realloc(*buf, new_cap);
+        if (next == NULL) {
+            return OI_ERR_NOMEM;
+        }
+        *buf = next;
+        *cap = new_cap;
     }
     if (len > 0) {
-        memcpy(next + *used, data, len);
+        memcpy(*buf + *used, data, len);
     }
     *used += len;
-    next[*used] = '\0';
-    *buf = next;
+    (*buf)[*used] = '\0';
     return OI_OK;
 }
 
-static struct oi_llm_tool_state *tool_state(oi_llm_request *req,
-                                             size_t index) {
+static oi_status tool_state(oi_llm_request *req, size_t index,
+                            struct oi_llm_tool_state **out) {
     for (size_t i = 0; i < req->tools_len; i++) {
         if (req->tools[i].index == index) {
-            return &req->tools[i];
+            *out = &req->tools[i];
+            return OI_OK;
         }
     }
-    if (req->tools_len == SIZE_MAX / sizeof *req->tools) {
-        return NULL;
+    if (req->tools_len == OI_LLM_MAX_TOOL_CALLS) {
+        return OI_ERR_PARSE;
     }
     size_t count = req->tools_len + 1;
     struct oi_llm_tool_state *next =
         realloc(req->tools, count * sizeof *next);
     if (next == NULL) {
-        return NULL;
+        return OI_ERR_NOMEM;
     }
     req->tools = next;
     struct oi_llm_tool_state *state = &next[req->tools_len];
     memset(state, 0, sizeof *state);
     state->index = index;
     req->tools_len = count;
-    return state;
+    *out = state;
+    return OI_OK;
 }
 
 static oi_status json_size_index(const oi_json_value *value, size_t *out) {
@@ -383,19 +403,19 @@ static oi_status record_tool_fragment(oi_llm_request *req, size_t index,
                                       const char *name, size_t name_len,
                                       const char *arguments,
                                       size_t arguments_len) {
-    struct oi_llm_tool_state *state = tool_state(req, index);
-    if (state == NULL) {
-        return OI_ERR_NOMEM;
-    }
-    oi_status st = OI_OK;
-    if (id != NULL) {
-        st = append_fragment(&state->id, &state->id_len, id, id_len);
+    struct oi_llm_tool_state *state;
+    oi_status st = tool_state(req, index, &state);
+    if (st == OI_OK && id != NULL) {
+        st = append_fragment(&state->id, &state->id_len, &state->id_cap,
+                             OI_LLM_MAX_TOOL_FIELD, id, id_len);
     }
     if (st == OI_OK && name != NULL) {
-        st = append_fragment(&state->name, &state->name_len, name, name_len);
+        st = append_fragment(&state->name, &state->name_len, &state->name_cap,
+                             OI_LLM_MAX_TOOL_FIELD, name, name_len);
     }
     if (st == OI_OK && arguments != NULL) {
         st = append_fragment(&state->arguments, &state->arguments_len,
+                             &state->arguments_cap, OI_LLM_MAX_TOOL_ARGUMENTS,
                              arguments, arguments_len);
     }
     if (st != OI_OK) {
@@ -550,9 +570,10 @@ static oi_status handle_responses_arguments(oi_llm_request *req,
         return OI_ERR_PARSE;
     }
     if (only_if_empty) {
-        struct oi_llm_tool_state *state = tool_state(req, index);
-        if (state == NULL) {
-            return OI_ERR_NOMEM;
+        struct oi_llm_tool_state *state;
+        oi_status st = tool_state(req, index, &state);
+        if (st != OI_OK) {
+            return st;
         }
         if (state->arguments_len > 0) {
             return OI_OK;

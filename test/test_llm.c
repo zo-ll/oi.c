@@ -524,6 +524,94 @@ TEST(arena_use_does_not_grow_with_the_event_count) {
     CHECK(large <= small);
 }
 
+/* Runs one chat-completions stream and returns what the events carried. */
+static struct large_event_ctx run_stream(const char *sse_body,
+                                         size_t body_len) {
+    size_t total;
+    char *response = build_chunked_response(sse_body, body_len,
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct large_event_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, "{}", 2, count_event,
+                                          large_event_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 1000);
+    CHECK(ctx.done);
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+    return ctx;
+}
+
+static char *tool_calls_body(size_t calls, size_t *out_len) {
+    static const char done[] = "data: [DONE]\n\n";
+    size_t cap = calls * 256 + sizeof done;
+    char *body = malloc(cap);
+    CHECK(body != NULL);
+    size_t len = 0;
+    for (size_t i = 0; i < calls; i++) {
+        len += (size_t)snprintf(
+            body + len, cap - len,
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+            "\"index\":%zu,\"id\":\"call_%zu\",\"type\":\"function\","
+            "\"function\":{\"name\":\"echo\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            i, i);
+    }
+    memcpy(body + len, done, sizeof done - 1);
+    *out_len = len + sizeof done - 1;
+    return body;
+}
+
+TEST(tool_call_count_has_a_limit) {
+    size_t len;
+    char *body = tool_calls_body(256, &len);
+    CHECK_EQ(run_stream(body, len).status, OI_OK);
+    free(body);
+
+    body = tool_calls_body(257, &len);
+    CHECK_EQ(run_stream(body, len).status, OI_ERR_PARSE);
+    free(body);
+}
+
+TEST(tool_call_arguments_have_a_size_limit) {
+    /* 17 fragments of 1 MB each go past the 16 MiB limit. Each fragment
+     * stays below the 1 MiB SSE line limit. */
+    enum { FRAGMENTS = 17, FRAGMENT = 1000 * 1000 };
+    static const char head[] =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":"
+        "{\"name\":\"echo\",\"arguments\":\"";
+    static const char tail[] = "\"}}]}}]}\n\n";
+    static const char done[] = "data: [DONE]\n\n";
+    size_t event_len = sizeof head - 1 + FRAGMENT + sizeof tail - 1;
+    size_t body_len = FRAGMENTS * event_len + sizeof done - 1;
+    char *body = malloc(body_len);
+    CHECK(body != NULL);
+    for (size_t i = 0; i < FRAGMENTS; i++) {
+        char *event = body + i * event_len;
+        memcpy(event, head, sizeof head - 1);
+        memset(event + sizeof head - 1, 'x', FRAGMENT);
+        memcpy(event + sizeof head - 1 + FRAGMENT, tail, sizeof tail - 1);
+    }
+    memcpy(body + FRAGMENTS * event_len, done, sizeof done - 1);
+    struct large_event_ctx ctx = run_stream(body, body_len);
+    CHECK_EQ(ctx.status, OI_ERR_PARSE);
+    /* The stream stops at the fragment that goes past the limit, before
+     * the end, where the text that is not JSON would also fail it. */
+    CHECK_EQ(ctx.arguments_len, (size_t)16 * FRAGMENT);
+    free(body);
+}
+
 TEST(incomplete_tool_call_rejects_stream) {
     const char *sse_body =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -1205,6 +1293,8 @@ int main(void) {
     RUN(delta_and_tool_arguments_larger_than_an_arena_block_complete);
     RUN(arena_use_does_not_grow_with_the_event_count);
     RUN(incomplete_tool_call_rejects_stream);
+    RUN(tool_call_count_has_a_limit);
+    RUN(tool_call_arguments_have_a_size_limit);
     RUN(non_2xx_status_reports_error_body);
     RUN(malformed_sse_json_is_reported_not_dropped);
     RUN(success_response_requires_done_sentinel);
