@@ -3,8 +3,10 @@
 #include "test.h"
 
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -531,9 +533,12 @@ TEST(dead_address_moves_to_the_next_address) {
 
 /* --- an untrusted certificate names the verify result --- */
 
-/* Serves one TLS handshake with a fresh self-signed certificate, which
- * the system trust store does not contain. */
-static pid_t start_self_signed_tls_server(unsigned short *out_port) {
+/* Serves one TLS connection with a fresh self-signed certificate, which
+ * the system trust store does not contain. With `ca_path`, it also writes
+ * the certificate there as PEM, so a client can trust it, and echoes the
+ * first read back before it closes the socket with no TLS close_notify. */
+static pid_t start_self_signed_tls_server(unsigned short *out_port,
+                                          const char *ca_path) {
     EVP_PKEY *key = EVP_EC_gen("P-256");
     X509 *cert = X509_new();
     CHECK(key != NULL && cert != NULL);
@@ -546,11 +551,24 @@ static pid_t start_self_signed_tls_server(unsigned short *out_port) {
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
                                (const unsigned char *)"127.0.0.1", -1, -1, 0);
     X509_set_issuer_name(cert, name);
+    /* A client checks an IP host against the subjectAltName, not the CN. */
+    X509_EXTENSION *san = X509V3_EXT_conf_nid(NULL, NULL,
+                                              NID_subject_alt_name,
+                                              "IP:127.0.0.1");
+    CHECK(san != NULL);
+    CHECK_EQ(X509_add_ext(cert, san, -1), 1);
+    X509_EXTENSION_free(san);
     CHECK(X509_sign(cert, key, EVP_sha256()) > 0);
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     CHECK(ctx != NULL);
     CHECK_EQ(SSL_CTX_use_certificate(ctx, cert), 1);
     CHECK_EQ(SSL_CTX_use_PrivateKey(ctx, key), 1);
+    if (ca_path != NULL) {
+        FILE *pem = fopen(ca_path, "w");
+        CHECK(pem != NULL);
+        CHECK_EQ(PEM_write_X509(pem, cert), 1);
+        fclose(pem);
+    }
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(listen_fd >= 0);
@@ -571,7 +589,13 @@ static pid_t start_self_signed_tls_server(unsigned short *out_port) {
         if (cfd >= 0) {
             SSL *ssl = SSL_new(ctx);
             SSL_set_fd(ssl, cfd);
-            (void)SSL_accept(ssl); /* the client rejects the certificate */
+            if (SSL_accept(ssl) == 1 && ca_path != NULL) {
+                char buf[64];
+                int n = SSL_read(ssl, buf, sizeof buf);
+                if (n > 0) {
+                    SSL_write(ssl, buf, n);
+                }
+            }
             SSL_free(ssl);
             close(cfd);
         }
@@ -586,7 +610,7 @@ static pid_t start_self_signed_tls_server(unsigned short *out_port) {
 
 TEST(untrusted_certificate_names_the_verify_result) {
     unsigned short port;
-    pid_t child = start_self_signed_tls_server(&port);
+    pid_t child = start_self_signed_tls_server(&port, NULL);
 
     oi_reactor *r = oi_reactor_create();
     struct error_ctx ctx = {0};
@@ -606,6 +630,81 @@ TEST(untrusted_certificate_names_the_verify_result) {
     waitpid(child, NULL, 0);
 }
 
+/* --- a TLS round trip through the connection socket BIO --- */
+
+/* The test links with -Wl,--wrap=send. liboi's own sends come here;
+ * libssl's built-in socket BIO uses write() and never does. */
+static int sends_total;
+static int sends_without_nosignal;
+
+ssize_t __real_send(int fd, const void *buf, size_t len, int flags);
+
+ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
+    sends_total++;
+    if ((flags & MSG_NOSIGNAL) == 0) {
+        sends_without_nosignal++;
+    }
+    return __real_send(fd, buf, len, flags);
+}
+
+struct tls_echo_ctx {
+    char received[16];
+    size_t received_len;
+    int done;
+};
+
+static void tls_on_connected(oi_llm_conn *c, void *ud) {
+    (void)ud;
+    CHECK_EQ(oi_llm_conn_write(c, "hello", 5), OI_OK);
+}
+
+static void tls_on_data(oi_llm_conn *c, const void *data, size_t len,
+                        void *ud) {
+    struct tls_echo_ctx *ctx = ud;
+    CHECK(ctx->received_len + len <= sizeof ctx->received);
+    memcpy(ctx->received + ctx->received_len, data, len);
+    ctx->received_len += len;
+    if (ctx->received_len == 5) {
+        oi_llm_conn_close(c);
+        ctx->done = 1;
+    }
+}
+
+static void tls_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
+    (void)c;
+    (void)reason;
+    struct tls_echo_ctx *ctx = ud;
+    ctx->done = 1;
+}
+
+TEST(tls_round_trip_sends_with_msg_nosignal) {
+    char ca_path[64];
+    snprintf(ca_path, sizeof ca_path, "/tmp/oi-test-ca-%d.pem", (int)getpid());
+    unsigned short port;
+    pid_t child = start_self_signed_tls_server(&port, ca_path);
+    oi_reactor *r = oi_reactor_create();
+    struct tls_echo_ctx ctx = {0};
+    struct oi_llm_conn_callbacks cbs = {tls_on_connected, tls_on_data,
+                                         tls_on_error};
+    oi_llm_conn *conn = NULL;
+    sends_total = 0;
+    sends_without_nosignal = 0;
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, 1, ca_path, &cbs, &ctx,
+                                  &conn),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK_EQ(ctx.received_len, (size_t)5);
+    CHECK(memcmp(ctx.received, "hello", 5) == 0);
+    /* The handshake and the request: every TLS byte left through send()
+     * with MSG_NOSIGNAL, so no write can raise SIGPIPE. */
+    CHECK(sends_total >= 2);
+    CHECK_EQ(sends_without_nosignal, 0);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+    unlink(ca_path);
+}
+
 int main(void) {
     /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
@@ -621,5 +720,6 @@ int main(void) {
     RUN(connection_preserves_sigpipe_disposition);
     RUN(dead_address_moves_to_the_next_address);
     RUN(untrusted_certificate_names_the_verify_result);
+    RUN(tls_round_trip_sends_with_msg_nosignal);
     return oi_test_report();
 }
