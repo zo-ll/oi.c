@@ -207,7 +207,22 @@ oi_status oi_json_write_number(oi_json_writer *w, double value) {
     if (n < 0 || (size_t)n >= sizeof tmp) {
         return OI_ERR_INVAL;
     }
-    st = append_bytes(w, tmp, (size_t)n);
+    /* "%.17g" writes the radix of the current locale, which can be ',' or
+     * a multibyte sequence. Every other byte it writes is a digit, a sign,
+     * or 'e', so replace the one run of other bytes with '.'. */
+    size_t len = 0;
+    for (int i = 0; i < n; len++) {
+        unsigned char c = (unsigned char)tmp[i];
+        if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == 'e') {
+            tmp[len] = tmp[i++];
+            continue;
+        }
+        tmp[len] = '.';
+        while (i < n && !(tmp[i] >= '0' && tmp[i] <= '9')) {
+            i++;
+        }
+    }
+    st = append_bytes(w, tmp, len);
     if (st != OI_OK) {
         return st;
     }

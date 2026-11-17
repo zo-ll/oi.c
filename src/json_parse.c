@@ -1,5 +1,7 @@
 #include "json_internal.h"
 
+#include <locale.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -595,6 +597,16 @@ static int validate_json_number(const char *s, size_t len) {
     return i == len;
 }
 
+/* JSON numbers always use '.', but strtod reads the radix of the current
+ * locale. An embedding program can set a comma locale, so the parse runs
+ * under a thread-local "C" locale. */
+static locale_t c_numeric_locale;
+static pthread_once_t c_numeric_once = PTHREAD_ONCE_INIT;
+
+static void make_c_numeric_locale(void) {
+    c_numeric_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+}
+
 static oi_status finalize_number(oi_json_parser *p) {
     if (!validate_json_number(p->num_buf, p->num_len)) {
         p->state = PS_ERROR;
@@ -602,8 +614,15 @@ static oi_status finalize_number(oi_json_parser *p) {
     }
     p->num_buf[p->num_len] = '\0';
 
+    pthread_once(&c_numeric_once, make_c_numeric_locale);
+    if (c_numeric_locale == (locale_t)0) {
+        p->state = PS_ERROR;
+        return OI_ERR_NOMEM;
+    }
+    locale_t previous = uselocale(c_numeric_locale);
     char *end;
     double value = strtod(p->num_buf, &end);
+    uselocale(previous);
     if (end != p->num_buf + p->num_len) {
         p->state = PS_ERROR; /* defensive: validate_json_number should
                                * already guarantee this can't happen */
