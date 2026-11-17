@@ -2,6 +2,7 @@
 #include "test.h"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -558,6 +559,45 @@ TEST(timers_use_no_file_descriptor) {
     oi_reactor_destroy(r);
 }
 
+/* --- an outside poll() can wait for the reactor's work --- */
+
+TEST(reactor_fd_and_timeout_let_an_outside_poll_drive_the_reactor) {
+    oi_reactor *r = oi_reactor_create();
+    CHECK_EQ(oi_reactor_timeout_ms(r), -1);
+
+    int count = 0;
+    oi_reactor_timer *timer = NULL;
+    CHECK_EQ(oi_reactor_timer_start(r, 30, timer_fired, &count, &timer),
+             OI_OK);
+    int left = oi_reactor_timeout_ms(r);
+    CHECK(left > 0 && left <= 30);
+
+    /* Wait the way a caller with its own poll() does. */
+    struct pollfd pfd = {oi_reactor_fd(r), POLLIN, 0};
+    CHECK_EQ(poll(&pfd, 1, oi_reactor_timeout_ms(r)), 0);
+    CHECK_EQ(oi_reactor_timeout_ms(r), 0);
+    oi_status st;
+    CHECK_EQ(oi_reactor_step(r, 0, &st), 1);
+    CHECK_EQ(count, 1);
+    CHECK_EQ(oi_reactor_timeout_ms(r), -1);
+    oi_reactor_timer_cancel(timer);
+
+    /* A ready fd makes the reactor fd readable. */
+    int fds[2];
+    make_socketpair(fds);
+    struct capture cap = {0};
+    CHECK_EQ(oi_reactor_add(r, fds[0], OI_EV_READ, capture_cb, &cap), OI_OK);
+    CHECK_EQ(poll(&pfd, 1, 0), 0);
+    CHECK_EQ(write(fds[1], "x", 1), 1);
+    CHECK_EQ(poll(&pfd, 1, 1000), 1);
+    CHECK_EQ(oi_reactor_step(r, 0, &st), 1);
+    CHECK(cap.fired);
+
+    close(fds[0]);
+    close(fds[1]);
+    oi_reactor_destroy(r);
+}
+
 /* --- many fds (exercises fd-table growth) --- */
 
 TEST(many_fds_grow_table) {
@@ -617,6 +657,7 @@ int main(void) {
     RUN(timers_fire_in_deadline_order_and_cancel_from_the_middle);
     RUN(timer_started_in_a_timer_callback_fires_in_a_later_step);
     RUN(timers_use_no_file_descriptor);
+    RUN(reactor_fd_and_timeout_let_an_outside_poll_drive_the_reactor);
     RUN(many_fds_grow_table);
     return oi_test_report();
 }

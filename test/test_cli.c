@@ -4181,8 +4181,9 @@ TEST(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it) {
 /* The token server rotates the refresh token when it gets the request, and
  * answers only after the turn has ended. The renewal must survive the turn
  * end and save the rotated token, or the next renewal would send a refresh
- * token that the server has already used. */
-TEST(sent_renewal_survives_the_turn_end_and_saves_the_rotated_token) {
+ * token that the server has already used. It must also finish while the
+ * prompt is idle, and so release the credentials lock. */
+TEST(sent_renewal_survives_the_turn_end_and_finishes_while_idle) {
     char config_root[] = "/tmp/oi-cli-renewal-lock-XXXXXX";
     char session_root[128];
     char path[256];
@@ -4245,7 +4246,36 @@ TEST(sent_renewal_survives_the_turn_end_and_saves_the_rotated_token) {
     CHECK(write_interactive(master_fd, "hello\r", 6));
     /* The turn used the old token and ended; the prompt is back. */
     CHECK(interactive_wait_for(master_fd, &result, "ok\n\r\x1b[J> ", 1));
-    /* Exit while the token response is still on its way. */
+    /* The prompt stays idle. The idle wait runs the reactor, so the
+     * renewal finishes on its own: within 3 s after the server answers,
+     * the rotated token is saved and the lock is free. */
+    {
+        int saved_rotated = 0;
+        int lock_free = 0;
+        for (int i = 0; i < 45 && !(saved_rotated && lock_free); i++) {
+            struct timespec pause = {0, 100 * 1000 * 1000};
+            char saved[2048] = "";
+            nanosleep(&pause, NULL);
+            int fd = open(path, O_RDONLY);
+            CHECK(fd >= 0);
+            ssize_t n = read(fd, saved, sizeof saved - 1);
+            close(fd);
+            saved[n > 0 ? n : 0] = '\0';
+            saved_rotated =
+                strstr(saved, "\"refresh_token\":\"rotated\"") != NULL;
+            fd = open(lock_path, O_RDWR);
+            if (fd >= 0) {
+                struct flock lock;
+                memset(&lock, 0, sizeof lock);
+                lock.l_type = F_WRLCK;
+                lock.l_whence = SEEK_SET;
+                lock_free = fcntl(fd, F_SETLK, &lock) == 0;
+                close(fd);
+            }
+        }
+        CHECK(saved_rotated);
+        CHECK(lock_free);
+    }
     CHECK(write_interactive(master_fd, "\x04", 1));
     {
         int status = 0;
@@ -7410,7 +7440,7 @@ int main(void) {
     RUN(oauth_callback_with_a_wrong_state_does_not_end_the_login);
     RUN(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal);
     RUN(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it);
-    RUN(sent_renewal_survives_the_turn_end_and_saves_the_rotated_token);
+    RUN(sent_renewal_survives_the_turn_end_and_finishes_while_idle);
     RUN(tool_panel_shows_live_output_and_failed_status);
     RUN(tool_panel_survives_malicious_escape_bytes_in_output);
     RUN(tool_panel_coexists_with_resize_and_queued_input);

@@ -499,3 +499,11 @@ void oi_reactor_process_cancel(oi_reactor_process *process) {
     }
     free(process);
 }
+
+int oi_reactor_fd(const oi_reactor *r) {
+    return oi_reactor_backend_fd(r->backend);
+}
+
+int oi_reactor_timeout_ms(const oi_reactor *r) {
+    return wait_timeout(r, -1);
+}
