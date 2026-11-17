@@ -151,6 +151,8 @@ void oi_llm_conn_close(oi_llm_conn *c) {
     if (c->ssl_ctx) {
         SSL_CTX_free(c->ssl_ctx);
     }
+    /* The request head holds the Authorization header. */
+    oi_wipe(c->out_buf, c->out_cap);
     free(c->out_buf);
     freeaddrinfo(c->addresses);
     free(c->host);
@@ -807,9 +809,16 @@ oi_status oi_llm_conn_write(oi_llm_conn *c, const void *data, size_t len) {
             }
             new_cap *= 2;
         }
-        char *nb = realloc(c->out_buf, new_cap);
+        /* Not realloc: a moved block would keep a copy of the
+         * Authorization header in freed memory. */
+        char *nb = malloc(new_cap);
         if (nb == NULL) {
             return OI_ERR_NOMEM;
+        }
+        if (c->out_buf != NULL) {
+            memcpy(nb, c->out_buf, c->out_len);
+            oi_wipe(c->out_buf, c->out_cap);
+            free(c->out_buf);
         }
         c->out_buf = nb;
         c->out_cap = new_cap;

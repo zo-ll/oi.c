@@ -1,6 +1,8 @@
 #ifndef OI_COMPAT_H
 #define OI_COMPAT_H
 
+#include <stddef.h>
+
 /*
  * Compiler-specific diagnostic suppression, isolated here so the modules
  * that need it don't each carry a compiler conditional.
@@ -27,5 +29,13 @@
 #define OI_DIAG_PUSH_IGNORE_DANGLING
 #define OI_DIAG_POP
 #endif
+
+/* Zeroes memory that held a secret. The volatile store stops the compiler
+ * from dropping the writes to memory that is about to be freed. */
+static inline void oi_wipe(void *data, size_t len) {
+    for (volatile unsigned char *p = data; len > 0; len--) {
+        *p++ = 0;
+    }
+}
 
 #endif /* OI_COMPAT_H */
