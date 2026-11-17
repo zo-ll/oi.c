@@ -3,9 +3,11 @@
 #include "reactor_backend.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "reactor_process.h"
 
@@ -36,18 +38,22 @@ struct oi_reactor {
     size_t registered_count;
     int stop_requested;
     uint64_t next_native_id;
-    struct oi_reactor_timer *timers;
+    /* Active timers as a binary min-heap on deadline_ns. The heap, not a
+     * kernel timer, decides the epoll_wait timeout, so starting and
+     * cancelling a timer make no system call. */
+    struct oi_reactor_timer **timer_heap;
+    size_t timer_count;
+    size_t timer_cap;
     struct oi_reactor_process *processes;
 };
 
 struct oi_reactor_timer {
     oi_reactor *reactor;
-    uint64_t id;
-    uintptr_t backend_handle;
+    uint64_t deadline_ns; /* CLOCK_MONOTONIC */
+    size_t heap_index;
     oi_reactor_timer_cb cb;
     void *user_data;
     int active;
-    struct oi_reactor_timer *next;
 };
 
 struct oi_reactor_process {
@@ -63,8 +69,82 @@ struct oi_reactor_process {
 
 #define TOKEN_KIND_SHIFT 62
 #define TOKEN_PAYLOAD_MASK ((UINT64_C(1) << TOKEN_KIND_SHIFT) - 1)
-#define TOKEN_TIMER (UINT64_C(1) << TOKEN_KIND_SHIFT)
 #define TOKEN_PROCESS (UINT64_C(2) << TOKEN_KIND_SHIFT)
+
+static uint64_t monotonic_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)now.tv_nsec;
+}
+
+static void heap_place(oi_reactor *r, size_t index, oi_reactor_timer *t) {
+    r->timer_heap[index] = t;
+    t->heap_index = index;
+}
+
+static void heap_sift_up(oi_reactor *r, size_t index) {
+    oi_reactor_timer *t = r->timer_heap[index];
+    while (index > 0) {
+        size_t parent = (index - 1) / 2;
+        if (r->timer_heap[parent]->deadline_ns <= t->deadline_ns) {
+            break;
+        }
+        heap_place(r, index, r->timer_heap[parent]);
+        index = parent;
+    }
+    heap_place(r, index, t);
+}
+
+static void heap_sift_down(oi_reactor *r, size_t index) {
+    oi_reactor_timer *t = r->timer_heap[index];
+    for (;;) {
+        size_t child = 2 * index + 1;
+        if (child >= r->timer_count) {
+            break;
+        }
+        if (child + 1 < r->timer_count &&
+            r->timer_heap[child + 1]->deadline_ns <
+                r->timer_heap[child]->deadline_ns) {
+            child++;
+        }
+        if (t->deadline_ns <= r->timer_heap[child]->deadline_ns) {
+            break;
+        }
+        heap_place(r, index, r->timer_heap[child]);
+        index = child;
+    }
+    heap_place(r, index, t);
+}
+
+static void heap_remove(oi_reactor *r, oi_reactor_timer *t) {
+    size_t index = t->heap_index;
+    oi_reactor_timer *last = r->timer_heap[--r->timer_count];
+    if (last == t) {
+        return;
+    }
+    heap_place(r, index, last);
+    heap_sift_up(r, index);
+    heap_sift_down(r, last->heap_index);
+}
+
+/* The epoll_wait timeout: the caller's limit, cut to the time left to the
+ * next timer deadline, rounded up so a wake is never early. */
+static int wait_timeout(const oi_reactor *r, int timeout_ms) {
+    if (r->timer_count == 0) {
+        return timeout_ms;
+    }
+    uint64_t now = monotonic_ns();
+    uint64_t deadline = r->timer_heap[0]->deadline_ns;
+    uint64_t left_ms = deadline <= now ? 0 : (deadline - now + 999999) / 1000000;
+    if (left_ms > INT_MAX) {
+        left_ms = INT_MAX;
+    }
+    if (timeout_ms < 0 || (uint64_t)timeout_ms > left_ms) {
+        return (int)left_ms;
+    }
+    return timeout_ms;
+}
 
 oi_reactor *oi_reactor_create(void) {
     oi_reactor *r = malloc(sizeof *r);
@@ -83,7 +163,9 @@ oi_reactor *oi_reactor_create(void) {
     r->registered_count = 0;
     r->stop_requested = 0;
     r->next_native_id = 1;
-    r->timers = NULL;
+    r->timer_heap = NULL;
+    r->timer_count = 0;
+    r->timer_cap = 0;
     r->processes = NULL;
     return r;
 }
@@ -93,11 +175,10 @@ void oi_reactor_destroy(oi_reactor *r) {
         return;
     }
     oi_reactor_backend_destroy(r->backend);
-    while (r->timers != NULL) {
-        oi_reactor_timer *next = r->timers->next;
-        free(r->timers);
-        r->timers = next;
+    for (size_t i = 0; i < r->timer_count; i++) {
+        free(r->timer_heap[i]);
     }
+    free(r->timer_heap);
     while (r->processes != NULL) {
         oi_reactor_process *next = r->processes->next;
         free(r->processes);
@@ -239,9 +320,9 @@ int oi_reactor_step(oi_reactor *r, int timeout_ms, oi_status *out_status) {
     int revents[OI_REACTOR_MAX_EVENTS];
     int n = 0;
 
-    oi_status st = oi_reactor_backend_wait(r->backend, timeout_ms, tokens,
-                                            revents, OI_REACTOR_MAX_EVENTS,
-                                            &n);
+    oi_status st = oi_reactor_backend_wait(
+        r->backend, wait_timeout(r, timeout_ms), tokens, revents,
+        OI_REACTOR_MAX_EVENTS, &n);
     if (out_status) {
         *out_status = st;
     }
@@ -252,25 +333,6 @@ int oi_reactor_step(oi_reactor *r, int timeout_ms, oi_status *out_status) {
     int dispatched = 0;
     for (int i = 0; i < n; i++) {
         uint64_t kind = tokens[i] >> TOKEN_KIND_SHIFT;
-        if (kind == 1) {
-            uint64_t id = tokens[i] & TOKEN_PAYLOAD_MASK;
-            oi_reactor_timer **link = &r->timers;
-            while (*link != NULL && (*link)->id != id) {
-                link = &(*link)->next;
-            }
-            if (*link != NULL) {
-                oi_reactor_timer *timer = *link;
-                *link = timer->next;
-                oi_reactor_backend_timer_remove(r->backend,
-                                                 timer->backend_handle);
-                timer->active = 0;
-                timer->next = NULL;
-                r->registered_count--;
-                timer->cb(r, timer->user_data);
-                dispatched++;
-            }
-            continue;
-        }
         if (kind == 2) {
             uint64_t id = tokens[i] & TOKEN_PAYLOAD_MASK;
             oi_reactor_process **link = &r->processes;
@@ -299,6 +361,18 @@ int oi_reactor_step(oi_reactor *r, int timeout_ms, oi_status *out_status) {
             continue;
         }
         r->entries[fd].cb(r, fd, revents[i], r->entries[fd].user_data);
+        dispatched++;
+    }
+
+    /* `now` is read once, so a timer that a callback starts here waits
+     * for a later step, even with a deadline that has already passed. */
+    uint64_t now = monotonic_ns();
+    while (r->timer_count > 0 && r->timer_heap[0]->deadline_ns <= now) {
+        oi_reactor_timer *timer = r->timer_heap[0];
+        heap_remove(r, timer);
+        timer->active = 0;
+        r->registered_count--;
+        timer->cb(r, timer->user_data);
         dispatched++;
     }
     return dispatched;
@@ -334,29 +408,29 @@ oi_status oi_reactor_timer_start(oi_reactor *r, int timeout_ms,
     if (r == NULL || timeout_ms <= 0 || cb == NULL || out_timer == NULL) {
         return OI_ERR_INVAL;
     }
+    if (r->timer_count == r->timer_cap) {
+        size_t new_cap = r->timer_cap == 0 ? 8 : r->timer_cap * 2;
+        oi_reactor_timer **heap =
+            realloc(r->timer_heap, new_cap * sizeof *heap);
+        if (heap == NULL) {
+            return OI_ERR_NOMEM;
+        }
+        r->timer_heap = heap;
+        r->timer_cap = new_cap;
+    }
 
     oi_reactor_timer *timer = malloc(sizeof *timer);
     if (timer == NULL) {
         return OI_ERR_NOMEM;
     }
     timer->reactor = r;
-    timer->id = r->next_native_id++;
-    if (timer->id == 0 || timer->id > TOKEN_PAYLOAD_MASK) {
-        timer->id = 1;
-        r->next_native_id = 2;
-    }
+    timer->deadline_ns =
+        monotonic_ns() + (uint64_t)timeout_ms * UINT64_C(1000000);
     timer->cb = cb;
     timer->user_data = user_data;
     timer->active = 1;
-    timer->next = r->timers;
-    oi_status st = oi_reactor_backend_timer_add(
-        r->backend, timeout_ms, TOKEN_TIMER | timer->id,
-        &timer->backend_handle);
-    if (st != OI_OK) {
-        free(timer);
-        return st;
-    }
-    r->timers = timer;
+    heap_place(r, r->timer_count++, timer);
+    heap_sift_up(r, timer->heap_index);
     r->registered_count++;
     *out_timer = timer;
     return OI_OK;
@@ -367,15 +441,7 @@ void oi_reactor_timer_cancel(oi_reactor_timer *timer) {
         return;
     }
     if (timer->active) {
-        oi_reactor_timer **link = &timer->reactor->timers;
-        while (*link != NULL && *link != timer) {
-            link = &(*link)->next;
-        }
-        if (*link == timer) {
-            *link = timer->next;
-        }
-        oi_reactor_backend_timer_remove(timer->reactor->backend,
-                                         timer->backend_handle);
+        heap_remove(timer->reactor, timer);
         timer->reactor->registered_count--;
     }
     free(timer);
