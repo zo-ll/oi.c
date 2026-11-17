@@ -35,6 +35,9 @@ static const char usage_url[] = "https://chatgpt.com/settings/usage";
 
 /* Renew this long before expiry, so that a long turn keeps a valid token. */
 #define REFRESH_MARGIN_SECONDS 300.0
+/* A request does not start with a token that has less time than this left;
+ * it waits for the renewal instead. */
+#define USABLE_SECONDS 30.0
 #define CALLBACK_TIMEOUT_MS (5 * 60 * 1000)
 #define HEAD_TIMEOUT_MS 3000
 
@@ -59,7 +62,11 @@ static const struct oi_cli_render_line key_header[] = {
     LINE("Paste the API key and press Enter (Esc cancels)"),
 };
 
+static void renewal_free(struct login_renewal *renewal);
+
 void oi_cli_login_free(struct oi_cli_login *login) {
+    renewal_free(login->renewal);
+    login->renewal = NULL;
     free(login->credentials_path);
     free(login->host);
     free(login->path);
@@ -292,10 +299,13 @@ static oi_status adopt_access_token(struct oi_cli_login *login,
     return st;
 }
 
+/* Takes the credentials lock without waiting: -1 with EAGAIN or EACCES
+ * when another process holds it, which means that process is renewing. */
 static int lock_credentials(const char *path) {
     char lock_path[4096];
     if (snprintf(lock_path, sizeof lock_path, "%s.lock", path) >=
         (int)sizeof lock_path) {
+        errno = ENAMETOOLONG;
         return -1;
     }
     int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -308,10 +318,12 @@ static int lock_credentials(const char *path) {
     lock.l_whence = SEEK_SET;
     int rc;
     do {
-        rc = fcntl(fd, F_SETLKW, &lock);
+        rc = fcntl(fd, F_SETLK, &lock);
     } while (rc != 0 && errno == EINTR);
     if (rc != 0) {
+        int saved_errno = errno;
         close(fd);
+        errno = saved_errno;
         return -1;
     }
     return fd;
@@ -332,99 +344,204 @@ static oi_status session_ended(const struct oi_cli_login *login) {
     return OI_ERR_DENIED;
 }
 
-static oi_status refresh_with_saved(struct oi_cli_login *login,
-                                    struct oi_cli_credentials *saved,
-                                    double now) {
-    struct oi_cli_oauth_server auth;
-    struct oi_cli_oauth_server api;
-    struct oi_cli_oauth_tokens tokens;
-    int is_test = 0;
-    oi_status st = oi_cli_oauth_servers(&auth, &api, &is_test);
+/*
+ * One renewal on the main reactor. It holds the credentials lock from
+ * start to finish, because the server rotates the refresh token and a
+ * second process must not reuse the old one. Its result waits here until
+ * the next request start adopts it: oi_llm_client_reconfigure is not
+ * allowed while a request is in flight, and the before_request hook is
+ * the point where none is.
+ */
+struct login_renewal {
+    struct oi_cli_login *login;
+    struct oi_cli_oauth_refresh_call *call; /* NULL once finished */
+    int lock_fd;
+    struct oi_cli_credentials saved;
+    int finished;
+    oi_status status;   /* OI_ERR_NOMEM, or OI_OK */
+    int ended;          /* the server refused the refresh token for good */
+    char *access_token; /* the new token; NULL when the renewal failed */
+    double expires_at;
+    char reason[128];   /* why a renewal failed */
+};
+
+static void renewal_free(struct login_renewal *renewal) {
+    if (renewal == NULL) {
+        return;
+    }
+    oi_cli_oauth_refresh_cancel(renewal->call);
+    if (renewal->lock_fd >= 0) {
+        close(renewal->lock_fd);
+    }
+    oi_cli_credentials_free(&renewal->saved);
+    free_text_secret(&renewal->access_token);
+    free(renewal);
+}
+
+static int token_usable(const struct oi_cli_login *login, double now) {
+    return login->expires_at - now > USABLE_SECONDS;
+}
+
+/* Runs on the reactor, possibly while a request is in flight: it saves the
+ * outcome and leaves the client alone. */
+static void renewal_done(oi_status st, struct oi_cli_oauth_tokens *tokens,
+                         void *user_data) {
+    struct login_renewal *renewal = user_data;
+    struct oi_cli_credentials *saved = &renewal->saved;
+    const char *path = renewal->login->credentials_path;
+    renewal->call = NULL;
+    renewal->finished = 1;
+    renewal->status = st == OI_ERR_NOMEM ? OI_ERR_NOMEM : OI_OK;
     if (st != OI_OK) {
-        return st;
-    }
-    st = oi_cli_oauth_refresh(&auth, login->ca_file, saved->openai_client_id,
-                              saved->openai_refresh_token, &tokens);
-    oi_cli_oauth_server_free(&auth);
-    oi_cli_oauth_server_free(&api);
-    if (st == OI_ERR_NOMEM) {
-        return st;
-    }
-    if (st != OI_OK) {
-        return refresh_unavailable(login, now, oi_status_str(st));
-    }
-    if (tokens.access_token == NULL) {
-        if (oi_cli_oauth_error_is_terminal(tokens.error)) {
+        snprintf(renewal->reason, sizeof renewal->reason, "%s",
+                 oi_status_str(st));
+    } else if (tokens->access_token == NULL) {
+        if (oi_cli_oauth_error_is_terminal(tokens->error)) {
             (void)oi_cli_credentials_set(&saved->openai_access_token, NULL);
             (void)oi_cli_credentials_set(&saved->openai_refresh_token, NULL);
-            (void)oi_cli_credentials_write(login->credentials_path, saved);
-            oi_cli_oauth_tokens_free(&tokens);
-            return session_ended(login);
+            (void)oi_cli_credentials_write(path, saved);
+            renewal->ended = 1;
+        } else {
+            snprintf(renewal->reason, sizeof renewal->reason, "%s",
+                     tokens->error);
         }
-        st = refresh_unavailable(login, now, tokens.error);
-        oi_cli_oauth_tokens_free(&tokens);
-        return st;
+    } else {
+        double expires_at = (double)time(NULL) + tokens->expires_in;
+        oi_status save = oi_cli_credentials_set(&saved->openai_access_token,
+                                                tokens->access_token);
+        if (save == OI_OK && tokens->refresh_token != NULL) {
+            save = oi_cli_credentials_set(&saved->openai_refresh_token,
+                                          tokens->refresh_token);
+        }
+        if (save == OI_OK && tokens->id_token != NULL) {
+            save = oi_cli_credentials_set(&saved->openai_id_token,
+                                          tokens->id_token);
+        }
+        if (save == OI_OK) {
+            saved->openai_expires_at = expires_at;
+            if (oi_cli_credentials_write(path, saved) != OI_OK) {
+                fputs("oi: warning: could not save the renewed ChatGPT "
+                      "login\n",
+                      renewal->login->err);
+            }
+            save = oi_cli_credentials_set(&renewal->access_token,
+                                          tokens->access_token);
+        }
+        renewal->expires_at = expires_at;
+        if (save != OI_OK) {
+            renewal->status = save;
+        }
     }
+    oi_cli_oauth_tokens_free(tokens);
+    close(renewal->lock_fd);
+    renewal->lock_fd = -1;
+}
 
-    double expires_at = now + tokens.expires_in;
-    st = oi_cli_credentials_set(&saved->openai_access_token,
-                                tokens.access_token);
-    if (st == OI_OK && tokens.refresh_token != NULL) {
-        st = oi_cli_credentials_set(&saved->openai_refresh_token,
-                                    tokens.refresh_token);
+/* Applies a finished renewal: adopts its token, or reports why not. */
+static oi_status settle_renewal(struct oi_cli_login *login, double now) {
+    struct login_renewal *renewal = login->renewal;
+    login->renewal = NULL;
+    oi_status st;
+    if (renewal->status != OI_OK) {
+        st = renewal->status;
+    } else if (renewal->access_token != NULL) {
+        st = adopt_access_token(login, renewal->access_token,
+                                renewal->expires_at);
+    } else if (renewal->ended) {
+        st = session_ended(login);
+    } else {
+        st = refresh_unavailable(login, now, renewal->reason);
     }
-    if (st == OI_OK && tokens.id_token != NULL) {
-        st = oi_cli_credentials_set(&saved->openai_id_token, tokens.id_token);
+    renewal_free(renewal);
+    return st;
+}
+
+/* Starts a renewal, or settles at once when it cannot or need not run. */
+static oi_status start_renewal(struct oi_cli_login *login, double now) {
+    if (login->credentials_path == NULL) {
+        return refresh_unavailable(login, now, "no credentials file");
     }
-    if (st == OI_OK) {
-        saved->openai_expires_at = expires_at;
-        if (oi_cli_credentials_write(login->credentials_path, saved) != OI_OK) {
-            fputs("oi: warning: could not save the renewed ChatGPT login\n",
-                  login->err);
+    struct login_renewal *renewal = calloc(1, sizeof *renewal);
+    if (renewal == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    renewal->login = login;
+    renewal->lock_fd = lock_credentials(login->credentials_path);
+    if (renewal->lock_fd < 0) {
+        int busy = errno == EAGAIN || errno == EACCES;
+        free(renewal);
+        /* Another process is renewing: read its result at a later start. */
+        return busy ? OI_OK
+                    : refresh_unavailable(login, now,
+                                          "could not lock credentials");
+    }
+    oi_status st = oi_cli_credentials_read(login->credentials_path,
+                                           &renewal->saved);
+    if (st != OI_OK) {
+        close(renewal->lock_fd);
+        free(renewal);
+        return st == OI_ERR_NOMEM
+                   ? st
+                   : refresh_unavailable(login, now, oi_status_str(st));
+    }
+    struct oi_cli_credentials *saved = &renewal->saved;
+    if (!saved->openai_oauth || saved->openai_client_id == NULL ||
+        saved->openai_refresh_token == NULL ||
+        saved->openai_access_token == NULL) {
+        st = session_ended(login);
+    } else if (saved->openai_expires_at - now > REFRESH_MARGIN_SECONDS) {
+        /* Another process renewed the token before this one took the lock. */
+        st = adopt_access_token(login, saved->openai_access_token,
+                                saved->openai_expires_at);
+    } else {
+        struct oi_cli_oauth_server auth;
+        struct oi_cli_oauth_server api;
+        int is_test = 0;
+        st = oi_cli_oauth_servers(&auth, &api, &is_test);
+        if (st == OI_OK) {
+            st = oi_cli_oauth_refresh_start(
+                login->reactor, &auth, login->ca_file,
+                saved->openai_client_id, saved->openai_refresh_token,
+                renewal_done, renewal, &renewal->call);
+            oi_cli_oauth_server_free(&auth);
+            oi_cli_oauth_server_free(&api);
         }
-        st = adopt_access_token(login, tokens.access_token, expires_at);
+        if (st == OI_OK) {
+            login->renewal = renewal;
+            return OI_OK;
+        }
+        st = st == OI_ERR_NOMEM ? st
+                                : refresh_unavailable(login, now,
+                                                      oi_status_str(st));
     }
-    oi_cli_oauth_tokens_free(&tokens);
+    renewal_free(renewal);
     return st;
 }
 
 oi_status oi_cli_login_before_request(void *user_data) {
     struct oi_cli_login *login = user_data;
     double now = (double)time(NULL);
-    if (!login->oauth_active ||
-        login->expires_at - now > REFRESH_MARGIN_SECONDS) {
+    if (!login->oauth_active) {
         return OI_OK;
     }
-    if (login->credentials_path == NULL) {
-        return refresh_unavailable(login, now, "no credentials file");
+    if (login->renewal != NULL && login->renewal->finished) {
+        oi_status st = settle_renewal(login, now);
+        if (st != OI_OK) {
+            return st;
+        }
     }
-
-    int lock_fd = lock_credentials(login->credentials_path);
-    if (lock_fd < 0) {
-        return refresh_unavailable(login, now, "could not lock credentials");
+    if (login->expires_at - now > REFRESH_MARGIN_SECONDS) {
+        return OI_OK;
     }
-    struct oi_cli_credentials saved;
-    oi_status st = oi_cli_credentials_read(login->credentials_path, &saved);
-    if (st != OI_OK) {
-        close(lock_fd);
-        return st == OI_ERR_NOMEM
-                   ? st
-                   : refresh_unavailable(login, now, oi_status_str(st));
+    if (login->renewal == NULL) {
+        oi_status st = start_renewal(login, now);
+        if (st != OI_OK || login->expires_at - now > REFRESH_MARGIN_SECONDS) {
+            return st;
+        }
     }
-    if (!saved.openai_oauth || saved.openai_client_id == NULL ||
-        saved.openai_refresh_token == NULL ||
-        saved.openai_access_token == NULL) {
-        st = session_ended(login);
-    } else if (saved.openai_expires_at - now > REFRESH_MARGIN_SECONDS) {
-        /* Another process renewed the token while this one waited. */
-        st = adopt_access_token(login, saved.openai_access_token,
-                                saved.openai_expires_at);
-    } else {
-        st = refresh_with_saved(login, &saved, now);
-    }
-    oi_cli_credentials_free(&saved);
-    close(lock_fd);
-    return st;
+    /* A renewal runs, here or in another process: use the current token
+     * while it still has time left, else make the request wait. */
+    return token_usable(login, now) ? OI_OK : OI_ERR_AGAIN;
 }
 
 /* --- ChatGPT sign-in --- */

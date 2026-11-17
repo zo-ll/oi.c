@@ -7,7 +7,10 @@
 #include "cli_status.h"
 #include "oi/config.h"
 #include "oi/llm.h"
+#include "oi/reactor.h"
 #include "oi/status.h"
+
+struct login_renewal;
 
 struct oi_cli_login {
     char *credentials_path;                 /* owned; NULL when no home */
@@ -22,6 +25,8 @@ struct oi_cli_login {
     int oauth_active;       /* the client holds a short-lived access token */
     double expires_at;      /* when that token expires, epoch seconds */
     char *selected_model;   /* owned; set when a login chose a model */
+    oi_reactor *reactor;    /* borrowed; token renewal runs on it */
+    struct login_renewal *renewal; /* owned; a renewal and its result */
 };
 
 void oi_cli_login_free(struct oi_cli_login *login);
@@ -37,10 +42,15 @@ oi_status oi_cli_login_apply_saved(oi_config *cfg, const char *path,
                                    double *out_expires_at);
 
 /*
- * An oi_llm_before_request_cb. While an OAuth login is active, renews an
- * access token that is close to expiry. Holds a file lock across the
- * renewal, because the server rotates the refresh token and a second
- * process must not reuse the old one. Blocks the caller for the exchange.
+ * An oi_llm_before_request_cb. While an OAuth login is active and the
+ * access token is close to expiry, starts a renewal on `reactor` and
+ * returns at once; a later call adopts the new token. It returns
+ * OI_ERR_AGAIN, so the request waits on the reactor and stays
+ * cancellable, only when the token has less than 30 seconds left and a
+ * renewal is still running. The renewal holds a file lock, because the
+ * server rotates the refresh token and a second process must not reuse
+ * the old one; a lock that another process holds means that process is
+ * renewing.
  */
 oi_status oi_cli_login_before_request(void *user_data);
 

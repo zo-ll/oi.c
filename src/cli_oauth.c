@@ -642,7 +642,7 @@ oi_status oi_cli_oauth_parse_models(const char *body, size_t body_len,
     return st;
 }
 
-/* --- blocking HTTP --- */
+/* --- HTTP --- */
 
 struct http_call {
     oi_llm_http_parser *parser;
@@ -651,14 +651,23 @@ struct http_call {
     size_t request_len;
     int http_status;
     int done;
+    int oversize; /* the body went past OI_CLI_OAUTH_MAX_RESPONSE */
     oi_status status;
     struct text body;
+    /* Runs once, when the call ends. NULL for the blocking call, which
+     * reads `done` from its own loop. */
+    void (*finished)(struct http_call *call);
 };
 
+/* The connection callbacks never touch `call` after this, so `finished`
+ * may free it. */
 static void http_finish(struct http_call *call, oi_status status) {
     if (!call->done) {
         call->done = 1;
         call->status = status;
+        if (call->finished != NULL) {
+            call->finished(call);
+        }
     }
 }
 
@@ -669,8 +678,10 @@ static void http_on_headers(int status_code, void *user_data) {
 
 static void http_on_body(const void *data, size_t len, void *user_data) {
     struct http_call *call = user_data;
-    if (call->body.len + len > OI_CLI_OAUTH_MAX_RESPONSE) {
-        http_finish(call, OI_ERR_PARSE);
+    /* Runs inside the parser, which must outlive this call: http_on_data
+     * ends the call after the feed returns. */
+    if (call->oversize || call->body.len + len > OI_CLI_OAUTH_MAX_RESPONSE) {
+        call->oversize = 1;
         return;
     }
     text_append(&call->body, data, len);
@@ -689,6 +700,9 @@ static void http_on_data(oi_llm_conn *conn, const void *data, size_t len,
     (void)conn;
     struct http_call *call = user_data;
     oi_status st = oi_llm_http_parser_feed(call->parser, data, len);
+    if (st == OI_OK && call->oversize) {
+        st = OI_ERR_PARSE;
+    }
     if (st != OI_OK) {
         http_finish(call, st);
     } else if (oi_llm_http_parser_body_done(call->parser)) {
@@ -812,6 +826,19 @@ oi_status oi_cli_oauth_http(const struct oi_cli_oauth_server *server,
     return *out_body != NULL ? OI_OK : OI_ERR_NOMEM;
 }
 
+/* Turns a token endpoint response into `out`. */
+static oi_status tokens_from_response(int http_status, const char *body,
+                                      size_t body_len,
+                                      struct oi_cli_oauth_tokens *out) {
+    oi_status st = oi_cli_oauth_parse_tokens(body, body_len, out);
+    if (st == OI_OK && http_status >= 200 && http_status < 300 &&
+        out->access_token == NULL) {
+        oi_cli_oauth_tokens_free(out);
+        return OI_ERR_PARSE;
+    }
+    return st;
+}
+
 static oi_status post_token_form(const struct oi_cli_oauth_server *auth,
                                  const char *ca_file, struct text *form,
                                  struct oi_cli_oauth_tokens *out) {
@@ -831,14 +858,9 @@ static oi_status post_token_form(const struct oi_cli_oauth_server *auth,
     if (st != OI_OK) {
         return st;
     }
-    st = oi_cli_oauth_parse_tokens(body, body_len, out);
+    st = tokens_from_response(http_status, body, body_len, out);
     memset(body, 0, body_len);
     free(body);
-    if (st == OI_OK && http_status >= 200 && http_status < 300 &&
-        out->access_token == NULL) {
-        oi_cli_oauth_tokens_free(out);
-        return OI_ERR_PARSE;
-    }
     return st;
 }
 
@@ -857,16 +879,130 @@ oi_status oi_cli_oauth_exchange_code(const struct oi_cli_oauth_server *auth,
     return post_token_form(auth, ca_file, &form, out);
 }
 
+static void refresh_form(struct text *form, const char *client_id,
+                         const char *refresh_token) {
+    text_param(form, "grant_type", "refresh_token");
+    text_param(form, "client_id", client_id);
+    text_param(form, "refresh_token", refresh_token);
+    text_param(form, "resource", resource);
+}
+
 oi_status oi_cli_oauth_refresh(const struct oi_cli_oauth_server *auth,
                                const char *ca_file, const char *client_id,
                                const char *refresh_token,
                                struct oi_cli_oauth_tokens *out) {
     struct text form = {0};
-    text_param(&form, "grant_type", "refresh_token");
-    text_param(&form, "client_id", client_id);
-    text_param(&form, "refresh_token", refresh_token);
-    text_param(&form, "resource", resource);
+    refresh_form(&form, client_id, refresh_token);
     return post_token_form(auth, ca_file, &form, out);
+}
+
+/* --- token renewal on the caller's reactor --- */
+
+struct oi_cli_oauth_refresh_call {
+    struct http_call http; /* first: http_finish receives its address */
+    oi_llm_tls *tls;
+    char *request; /* holds the refresh token; wiped before free */
+    oi_reactor_timer *timer;
+    oi_cli_oauth_tokens_cb done;
+    void *user_data;
+};
+
+static void refresh_call_free(struct oi_cli_oauth_refresh_call *call) {
+    oi_reactor_timer_cancel(call->timer);
+    oi_llm_conn_close(call->http.conn); /* reentrant-safe; NULL-safe */
+    oi_llm_tls_destroy(call->tls);
+    oi_llm_http_parser_destroy(call->http.parser);
+    if (call->request != NULL) {
+        memset(call->request, 0, call->http.request_len);
+        free(call->request);
+    }
+    if (call->http.body.data != NULL) {
+        memset(call->http.body.data, 0, call->http.body.len);
+        free(call->http.body.data);
+    }
+    free(call);
+}
+
+static void refresh_finished(struct http_call *http) {
+    struct oi_cli_oauth_refresh_call *call =
+        (struct oi_cli_oauth_refresh_call *)http;
+    struct oi_cli_oauth_tokens tokens;
+    memset(&tokens, 0, sizeof tokens);
+    oi_status st = http->status;
+    if (st == OI_OK && http->body.failed) {
+        st = OI_ERR_NOMEM;
+    }
+    if (st == OI_OK) {
+        st = tokens_from_response(http->http_status, http->body.data,
+                                  http->body.len, &tokens);
+    }
+    oi_cli_oauth_tokens_cb done = call->done;
+    void *user_data = call->user_data;
+    refresh_call_free(call);
+    done(st, &tokens, user_data);
+}
+
+static void refresh_timed_out(oi_reactor *reactor, void *user_data) {
+    (void)reactor;
+    struct oi_cli_oauth_refresh_call *call = user_data;
+    http_finish(&call->http, OI_ERR_TIMEOUT);
+}
+
+oi_status oi_cli_oauth_refresh_start(
+    oi_reactor *reactor, const struct oi_cli_oauth_server *auth,
+    const char *ca_file, const char *client_id, const char *refresh_token,
+    oi_cli_oauth_tokens_cb done, void *user_data,
+    struct oi_cli_oauth_refresh_call **out_call) {
+    struct oi_cli_oauth_refresh_call *call = calloc(1, sizeof *call);
+    if (call == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    call->done = done;
+    call->user_data = user_data;
+    call->http.finished = refresh_finished;
+
+    struct text form = {0};
+    char *form_text = NULL;
+    refresh_form(&form, client_id, refresh_token);
+    oi_status st = text_finish(&form, &form_text);
+    if (st == OI_OK) {
+        st = build_request(auth, "POST", token_path, NULL, form_text,
+                           &call->request, &call->http.request_len);
+        memset(form_text, 0, strlen(form_text));
+        free(form_text);
+    }
+    call->http.request = call->request;
+    if (st == OI_OK) {
+        call->http.parser = oi_llm_http_parser_create(
+            http_on_headers, http_on_body, &call->http);
+        if (call->http.parser == NULL ||
+            (auth->use_tls && oi_llm_tls_create(ca_file, &call->tls) != OI_OK)) {
+            st = OI_ERR_NOMEM;
+        }
+    }
+    if (st == OI_OK) {
+        struct oi_llm_conn_callbacks callbacks = {
+            http_on_connected, http_on_data, http_on_error};
+        st = oi_llm_conn_connect(reactor, auth->host,
+                                 (unsigned short)auth->port, call->tls,
+                                 &callbacks, &call->http, &call->http.conn);
+    }
+    if (st == OI_OK) {
+        st = oi_reactor_timer_start(reactor, OI_CLI_OAUTH_HTTP_TIMEOUT_MS,
+                                    refresh_timed_out, call, &call->timer);
+    }
+    if (st != OI_OK) {
+        refresh_call_free(call);
+        return st;
+    }
+    *out_call = call;
+    return OI_OK;
+}
+
+void oi_cli_oauth_refresh_cancel(struct oi_cli_oauth_refresh_call *call) {
+    if (call != NULL) {
+        refresh_call_free(call);
+    }
 }
 
 oi_status oi_cli_oauth_fetch_models(const struct oi_cli_oauth_server *api,
