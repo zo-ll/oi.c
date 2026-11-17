@@ -210,3 +210,7 @@ oi_status oi_reactor_backend_wait(oi_reactor_backend *b, int timeout_ms,
     *out_n = n;
     return OI_OK;
 }
+
+int oi_reactor_backend_fd(const oi_reactor_backend *b) {
+    return b->epfd;
+}

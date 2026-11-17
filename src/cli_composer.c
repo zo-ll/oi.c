@@ -9,11 +9,13 @@
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/signalfd.h>
+#include <time.h>
 #include <unistd.h>
 
 static size_t terminal_columns(int fd) {
@@ -115,6 +117,70 @@ static oi_status apply_event(struct oi_cli_composer *composer,
     return OI_ERR_INVAL;
 }
 
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/*
+ * poll() on the caller's descriptors that also runs `composer->reactor`.
+ * It returns like poll() for the caller's descriptors only: reactor work
+ * alone runs and the wait goes on, until one of them is ready or
+ * `timeout_ms` has passed. Never fails with EINTR.
+ */
+static int composer_poll(struct oi_cli_composer *composer,
+                         struct pollfd *descriptors, nfds_t count,
+                         int timeout_ms) {
+    oi_reactor *reactor = composer->reactor;
+    int64_t deadline = timeout_ms >= 0 ? monotonic_ms() + timeout_ms : 0;
+    for (;;) {
+        struct pollfd all[4];
+        int wait = timeout_ms;
+        if (timeout_ms >= 0) {
+            int64_t left = deadline - monotonic_ms();
+            wait = left > 0 ? (int)left : 0;
+        }
+        if (reactor != NULL) {
+            int reactor_wait = oi_reactor_timeout_ms(reactor);
+            if (reactor_wait >= 0 && (wait < 0 || reactor_wait < wait)) {
+                wait = reactor_wait;
+            }
+        }
+        memcpy(all, descriptors, count * sizeof *all);
+        nfds_t total = count;
+        if (reactor != NULL) {
+            all[total].fd = oi_reactor_fd(reactor);
+            all[total].events = POLLIN;
+            all[total].revents = 0;
+            total++;
+        }
+        int ready = poll(all, total, wait);
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ready < 0) {
+            return -1;
+        }
+        int mine = 0;
+        for (nfds_t i = 0; i < count; i++) {
+            descriptors[i].revents = all[i].revents;
+            mine += all[i].revents != 0;
+        }
+        if (reactor != NULL &&
+            (all[count].revents != 0 || oi_reactor_timeout_ms(reactor) == 0)) {
+            oi_status step_status;
+            (void)oi_reactor_step(reactor, 0, &step_status);
+        }
+        if (mine > 0) {
+            return mine;
+        }
+        if (timeout_ms >= 0 && monotonic_ms() >= deadline) {
+            return 0;
+        }
+    }
+}
+
 oi_status oi_cli_composer_init(struct oi_cli_composer *composer, int input_fd,
                                int output_fd,
                                struct oi_cli_input_history *history) {
@@ -127,6 +193,7 @@ oi_status oi_cli_composer_init(struct oi_cli_composer *composer, int input_fd,
     composer->input_fd = input_fd;
     composer->output_fd = output_fd;
     composer->input_len = 0;
+    composer->reactor = NULL;
     oi_cli_terminal_init(&composer->terminal);
     oi_cli_input_decoder_init(&composer->decoder);
 
@@ -253,7 +320,8 @@ oi_status oi_cli_composer_wait_submit(struct oi_cli_composer *composer,
             }
 
             do {
-                ready = poll(descriptors, ndescriptors, timeout);
+                ready = composer_poll(composer, descriptors, ndescriptors,
+                                      timeout);
             } while (ready < 0 && errno == EINTR);
             if (ready < 0) {
                 status = OI_ERR_IO;
@@ -674,7 +742,8 @@ oi_status oi_cli_composer_select(
             }
 
             do {
-                ready = poll(descriptors, ndescriptors, timeout);
+                ready = composer_poll(composer, descriptors, ndescriptors,
+                                      timeout);
             } while (ready < 0 && errno == EINTR);
             if (ready < 0) {
                 status = OI_ERR_IO;
@@ -866,7 +935,8 @@ static oi_status run_line_entry(struct oi_cli_composer *composer,
         descriptors[1].events = POLLIN;
         descriptors[1].revents = 0;
         do {
-            ready = poll(descriptors, ndescriptors, timeout);
+            ready = composer_poll(composer, descriptors, ndescriptors,
+                                      timeout);
         } while (ready < 0 && errno == EINTR);
         if (ready < 0) {
             return OI_ERR_IO;
@@ -979,7 +1049,7 @@ oi_status oi_cli_composer_wait_fd(
         descriptors[2].events = POLLIN;
         descriptors[2].revents = 0;
         do {
-            ready = poll(descriptors, ndescriptors,
+            ready = composer_poll(composer, descriptors, ndescriptors,
                          pending ? OI_CLI_COMPOSER_ESCAPE_TIMEOUT_MS
                                  : timeout_ms);
         } while (ready < 0 && errno == EINTR);

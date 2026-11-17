@@ -1500,6 +1500,9 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         goto cleanup_present;
     }
     composer_initialized = 1;
+    /* Idle waits run the turn reactor too, so a background token renewal
+     * finishes and releases its lock while the prompt waits for input. */
+    composer.reactor = reactor;
     if (config->initial_draft != NULL && config->initial_draft_len > 0) {
         status = oi_cli_composer_set_draft(&composer, config->initial_draft,
                                            config->initial_draft_len);
@@ -2167,9 +2170,6 @@ have_message:
             oi_cli_bytebuf_free(&turn_input_context.permission_args_line);
             oi_cli_tool_panel_free(&turn_input_context.panel);
             repl_event_context.turn_input = NULL;
-            if (config->login != NULL) {
-                oi_cli_login_turn_ended(config->login);
-            }
             if (signal_registered) {
                 oi_reactor_remove(reactor, signal_fd);
             }

@@ -47,11 +47,13 @@ oi_llm_request_start_events
 oi_reactor_add
 oi_reactor_create
 oi_reactor_destroy
+oi_reactor_fd
 oi_reactor_modify
 oi_reactor_remove
 oi_reactor_run
 oi_reactor_step
 oi_reactor_stop
+oi_reactor_timeout_ms
 oi_reactor_timer_cancel
 oi_reactor_timer_start
 oi_session_arena

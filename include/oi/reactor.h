@@ -76,6 +76,16 @@ oi_status oi_reactor_run(oi_reactor *r);
 /* Requests oi_reactor_run return after the current step. */
 void oi_reactor_stop(oi_reactor *r);
 
+/*
+ * For a caller that waits in its own poll() and must not stop the
+ * reactor's work meanwhile: oi_reactor_fd is readable when a registered
+ * fd or child watch is ready, and oi_reactor_timeout_ms is the time until
+ * the next timer is due (0 when one is due now, -1 with no timer). When
+ * either says so, call oi_reactor_step(r, 0, ...).
+ */
+int oi_reactor_fd(const oi_reactor *r);
+int oi_reactor_timeout_ms(const oi_reactor *r);
+
 typedef void (*oi_reactor_timer_cb)(oi_reactor *r, void *user_data);
 
 /*

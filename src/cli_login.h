@@ -55,20 +55,11 @@ oi_status oi_cli_login_apply_saved(oi_config *cfg, const char *path,
  * renewal is still running. The renewal holds a file lock, because the
  * server rotates the refresh token and a second process must not reuse
  * the old one; a lock that another process holds means that process is
- * renewing.
+ * renewing. The renewal advances only while `reactor` runs, so a caller
+ * that waits for input between turns must run it too (see the `reactor`
+ * member of struct oi_cli_composer).
  */
 oi_status oi_cli_login_before_request(void *user_data);
-
-/*
- * Stops a renewal whose request is not sent yet when a turn ends. The idle
- * prompt does not step the reactor, so such a renewal would hold the
- * credentials lock, which other processes need, until the next turn. A
- * sent renewal stays: the server can already have rotated the refresh
- * token, and only the response carries the new one. It finishes at the
- * next reactor step, at /login, or at oi_cli_login_free. A finished
- * renewal stays for the next request to adopt.
- */
-void oi_cli_login_turn_ended(struct oi_cli_login *login);
 
 /*
  * Runs the /login dialog on an idle REPL: provider, then method, then the

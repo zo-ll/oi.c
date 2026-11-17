@@ -537,14 +537,6 @@ static void finish_sent_renewal(struct oi_cli_login *login) {
     }
 }
 
-void oi_cli_login_turn_ended(struct oi_cli_login *login) {
-    if (login->renewal != NULL && !login->renewal->finished &&
-        !oi_cli_oauth_refresh_sent(login->renewal->call)) {
-        renewal_free(login->renewal);
-        login->renewal = NULL;
-    }
-}
-
 oi_status oi_cli_login_before_request(void *user_data) {
     struct oi_cli_login *login = user_data;
     double now = (double)time(NULL);

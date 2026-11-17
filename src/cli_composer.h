@@ -9,6 +9,7 @@
 #include "cli_render.h"
 #include "cli_selector.h"
 #include "cli_terminal.h"
+#include "oi/reactor.h"
 #include "oi/status.h"
 
 #define OI_CLI_COMPOSER_INPUT_CAP 4096U
@@ -39,6 +40,11 @@ struct oi_cli_composer {
     size_t input_len;
     int input_fd;
     int output_fd;
+    /* Borrowed; NULL by default. While a wait below blocks for input, it
+     * also runs this reactor's work, so background work such as a token
+     * renewal does not stop at the prompt. A wait must never run from
+     * inside a callback of this reactor. */
+    oi_reactor *reactor;
 };
 
 /* Enables raw input/bracketed paste and initializes all composing state.
