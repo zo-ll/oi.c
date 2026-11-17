@@ -165,9 +165,14 @@ static oi_status write_permission_request(
 static oi_status write_model_error(
     FILE *stream, const struct oi_cli_conversation_event *event) {
     char header[96];
-    int header_len = snprintf(header, sizeof header,
-                              "oi: model error body (http=%d): ",
-                              event->as.model_error.http_status);
+    /* http_status 0: no response arrived, and the body names the
+     * connection failure. */
+    int header_len =
+        event->as.model_error.http_status == 0
+            ? snprintf(header, sizeof header, "oi: connection failed: ")
+            : snprintf(header, sizeof header,
+                       "oi: model error body (http=%d): ",
+                       event->as.model_error.http_status);
     oi_status status;
 
     if (header_len < 0 || (size_t)header_len >= sizeof header ||

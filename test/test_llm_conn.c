@@ -2,6 +2,10 @@
 #include "oi/reactor.h"
 #include "test.h"
 
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -162,6 +166,7 @@ struct error_ctx {
     int error_fired;
     oi_status reason;
     int done;
+    char cause[256];
 };
 
 static void err_on_connected(oi_llm_conn *c, void *ud) {
@@ -180,8 +185,9 @@ static void err_on_data(oi_llm_conn *c, const void *data, size_t len,
 }
 
 static void err_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
-    (void)c;
     struct error_ctx *ctx = ud;
+    const char *cause = oi_llm_conn_error_cause(c);
+    snprintf(ctx->cause, sizeof ctx->cause, "%s", cause ? cause : "");
     ctx->error_fired = 1;
     ctx->reason = reason;
     ctx->done = 1;
@@ -204,6 +210,11 @@ TEST(connection_refused_reports_error) {
 
     CHECK(ctx.error_fired);
     CHECK_EQ(ctx.reason, OI_ERR_IO);
+    char expected[128];
+    snprintf(expected, sizeof expected,
+             "could not connect to 127.0.0.1 port %u: Connection refused",
+             (unsigned)port);
+    CHECK_STREQ(ctx.cause, expected);
 
     oi_reactor_destroy(r);
 }
@@ -221,6 +232,9 @@ TEST(resolver_failure_is_reported_asynchronously) {
     run_until(r, &ctx.done, 100);
     CHECK(ctx.error_fired);
     CHECK_EQ(ctx.reason, OI_ERR_IO);
+    CHECK(strncmp(ctx.cause, "could not resolve does-not-exist.invalid: ",
+                  strlen("could not resolve does-not-exist.invalid: ")) ==
+          0);
     (void)conn; /* terminal callback closes it */
     oi_reactor_destroy(r);
 }
@@ -515,6 +529,83 @@ TEST(dead_address_moves_to_the_next_address) {
     waitpid(child, NULL, 0);
 }
 
+/* --- an untrusted certificate names the verify result --- */
+
+/* Serves one TLS handshake with a fresh self-signed certificate, which
+ * the system trust store does not contain. */
+static pid_t start_self_signed_tls_server(unsigned short *out_port) {
+    EVP_PKEY *key = EVP_EC_gen("P-256");
+    X509 *cert = X509_new();
+    CHECK(key != NULL && cert != NULL);
+    X509_set_version(cert, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), 1);
+    X509_gmtime_adj(X509_getm_notBefore(cert), 0);
+    X509_gmtime_adj(X509_getm_notAfter(cert), 3600);
+    X509_set_pubkey(cert, key);
+    X509_NAME *name = X509_get_subject_name(cert);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                               (const unsigned char *)"127.0.0.1", -1, -1, 0);
+    X509_set_issuer_name(cert, name);
+    CHECK(X509_sign(cert, key, EVP_sha256()) > 0);
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    CHECK(ctx != NULL);
+    CHECK_EQ(SSL_CTX_use_certificate(ctx, cert), 1);
+    CHECK_EQ(SSL_CTX_use_PrivateKey(ctx, key), 1);
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listen_fd >= 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, 1), 0);
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    *out_port = ntohs(addr.sin_port);
+
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        int cfd = accept(listen_fd, NULL, NULL);
+        if (cfd >= 0) {
+            SSL *ssl = SSL_new(ctx);
+            SSL_set_fd(ssl, cfd);
+            (void)SSL_accept(ssl); /* the client rejects the certificate */
+            SSL_free(ssl);
+            close(cfd);
+        }
+        _exit(0);
+    }
+    close(listen_fd);
+    SSL_CTX_free(ctx);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+    return pid;
+}
+
+TEST(untrusted_certificate_names_the_verify_result) {
+    unsigned short port;
+    pid_t child = start_self_signed_tls_server(&port);
+
+    oi_reactor *r = oi_reactor_create();
+    struct error_ctx ctx = {0};
+    struct oi_llm_conn_callbacks cbs = {err_on_connected, err_on_data,
+                                         err_on_error};
+    oi_llm_conn *conn = NULL;
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, 1, NULL, &cbs, &ctx,
+                                  &conn),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.error_fired);
+    CHECK_EQ(ctx.reason, OI_ERR_IO);
+    CHECK_STREQ(ctx.cause, "TLS certificate of 127.0.0.1 is not trusted: "
+                           "self-signed certificate");
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
 int main(void) {
     /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
@@ -529,5 +620,6 @@ int main(void) {
     RUN(close_null_safe);
     RUN(connection_preserves_sigpipe_disposition);
     RUN(dead_address_moves_to_the_next_address);
+    RUN(untrusted_certificate_names_the_verify_result);
     return oi_test_report();
 }

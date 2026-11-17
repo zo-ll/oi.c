@@ -683,6 +683,14 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
         return;
     }
 
+    /* A server can report a failure inside a 200 stream. The event is the
+     * only description of it, so it becomes the error body. */
+    if (oi_json_object_get(root, "error") != NULL) {
+        st = error_buf_append(req, data, len);
+        fail_stream(req, st == OI_OK ? OI_ERR_IO : st);
+        return;
+    }
+
     oi_json_value *choices = oi_json_object_get(root, "choices");
     oi_json_value *choice0 = oi_json_array_get(choices, 0);
     oi_json_value *delta = oi_json_object_get(choice0, "delta");
@@ -841,7 +849,6 @@ OI_DIAG_POP
 }
 
 static void req_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
-    (void)c;
     oi_llm_request *req = ud;
     /* A body with no length ends at the close. A close that cut the
      * stream short still fails: complete_body requires the end marker. */
@@ -849,6 +856,12 @@ static void req_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
         oi_llm_http_parser_close(req->http) == OI_OK) {
         complete_body(req);
         return;
+    }
+    /* With no response body to show, the cause names the failure. */
+    const char *cause = oi_llm_conn_error_cause(c);
+    if (cause != NULL && req->error_len == 0 &&
+        error_buf_append(req, cause, strlen(cause)) != OI_OK) {
+        reason = OI_ERR_NOMEM;
     }
     /* If already finished (body_done already drove completion in an
      * earlier on_data call), the connection closing now is just the

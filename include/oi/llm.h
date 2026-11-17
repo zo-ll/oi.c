@@ -71,8 +71,11 @@ typedef void (*oi_llm_event_cb)(const oi_llm_event *event, void *user_data);
  * OI_ERR_TIMEOUT when the configured request deadline expires.
  * `http_status` is the HTTP status code (0 if a response was never
  * received at all). `error_body`/`error_body_len` hold the raw response
- * body when the server returned a non-2xx status (truncated at 64KiB;
- * NULL/0 if there is none, e.g. on a connect failure, or on success).
+ * body when the server returned a non-2xx status, or the raw event when
+ * a 2xx stream reported an error (truncated at 64KiB). With http_status
+ * 0, they hold one line of text that names the connection failure, such
+ * as a DNS error or an untrusted certificate. NULL/0 on success, and when
+ * there is nothing to report.
  */
 typedef void (*oi_llm_done_cb)(oi_status status, int http_status,
                                 const char *error_body, size_t error_body_len,
