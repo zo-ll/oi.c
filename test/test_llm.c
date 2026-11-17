@@ -1362,6 +1362,117 @@ TEST(before_request_hook_can_refuse_and_survives_reconfigure) {
     oi_reactor_destroy(r);
 }
 
+/* A hook that answers OI_ERR_AGAIN `waits` times, then `final`. Before
+ * `final`, it can point the client at `new_port`, as a credential renewal
+ * does. */
+struct waiting_hook {
+    int calls;
+    int waits;
+    oi_status final;
+    oi_llm_client *client;
+    unsigned short new_port;
+};
+
+static oi_status waiting_before_request(void *ud) {
+    struct waiting_hook *hook = ud;
+    hook->calls++;
+    if (hook->calls <= hook->waits) {
+        return OI_ERR_AGAIN;
+    }
+    if (hook->new_port != 0) {
+        struct oi_llm_config cfg = {"127.0.0.1", hook->new_port, 0, NULL,
+                                     "renewed", "/v1/chat/completions", 0};
+        CHECK_EQ(oi_llm_client_reconfigure(hook->client, &cfg, 0), OI_OK);
+        hook->new_port = 0;
+    }
+    return hook->final;
+}
+
+TEST(hook_that_says_again_makes_the_request_wait) {
+    const char *sse_body =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}"
+        "\n\ndata: [DONE]\n\n";
+    size_t total;
+    char *response = build_chunked_response(sse_body, strlen(sse_body),
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    /* The client starts on a port where nothing listens; the hook moves it
+     * to the server, as a renewal adopts a new token, during the wait. */
+    struct oi_llm_config cfg = {"127.0.0.1", 9, 0, NULL, "old",
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct waiting_hook hook = {0, 3, OI_OK, client, port};
+    oi_llm_client_set_before_request(client, waiting_before_request, &hook);
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct stream_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &ctx, &req),
+              OI_OK);
+    CHECK(req != NULL);
+    run_until(r, &ctx.done, 200);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.done_status, OI_OK);
+    CHECK_EQ(hook.calls, 4);
+    CHECK_EQ(ctx.text_len, (size_t)2);
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+TEST(hook_failure_after_a_wait_reaches_on_done) {
+    struct oi_llm_config cfg = {"127.0.0.1", 9, 0, NULL, "k", "/p", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct waiting_hook hook = {0, 2, OI_ERR_DENIED, client, 0};
+    oi_llm_client_set_before_request(client, waiting_before_request, &hook);
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct stream_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.done_status, OI_ERR_DENIED);
+    CHECK_EQ(ctx.http_status, 0);
+    CHECK_EQ(hook.calls, 3);
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+}
+
+TEST(cancel_during_a_hook_wait_stops_the_wait) {
+    struct oi_llm_config cfg = {"127.0.0.1", 9, 0, NULL, "k", "/p", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct waiting_hook hook = {0, 1000000, OI_OK, client, 0};
+    oi_llm_client_set_before_request(client, waiting_before_request, &hook);
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct stream_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &ctx, &req),
+              OI_OK);
+    oi_status st;
+    CHECK_EQ(oi_reactor_step(r, 100, &st), 1); /* one retry ran */
+    int calls = hook.calls;
+    oi_llm_request_cancel(req);
+    /* Nothing is left on the reactor: no retry, no on_done. */
+    CHECK_EQ(oi_reactor_run(r), OI_OK);
+    CHECK_EQ(hook.calls, calls);
+    CHECK(!ctx.done);
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+}
+
 TEST(cancel_null_safe) { oi_llm_request_cancel(NULL); }
 
 int main(void) {
@@ -1400,6 +1511,9 @@ int main(void) {
     RUN(reconfigure_redirects_later_requests);
     RUN(reconfigure_refuses_bad_settings_and_keeps_the_client);
     RUN(before_request_hook_can_refuse_and_survives_reconfigure);
+    RUN(hook_that_says_again_makes_the_request_wait);
+    RUN(hook_failure_after_a_wait_reaches_on_done);
+    RUN(cancel_during_a_hook_wait_stops_the_wait);
     RUN(cancel_null_safe);
     return oi_test_report();
 }

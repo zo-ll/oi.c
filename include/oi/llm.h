@@ -123,8 +123,14 @@ oi_status oi_llm_client_reconfigure(oi_llm_client *client,
 /*
  * Runs `hook` at the start of every request, before anything is sent, so
  * that a caller can renew a short-lived credential through
- * oi_llm_client_reconfigure. A non-OK return fails that request start with
- * the same status. The hook survives a reconfigure; NULL removes it.
+ * oi_llm_client_reconfigure. OI_ERR_AGAIN means "not yet": the request
+ * starts, waits on its reactor, and runs the hook again every 20 ms until
+ * it returns something else. The request does not read the client until
+ * the hook returns OI_OK, so the hook may reconfigure the client also
+ * while its request waits; the request deadline and
+ * oi_llm_request_cancel apply during the wait. Any other non-OK return
+ * fails the request: at once from the start call, or through on_done
+ * after a wait. The hook survives a reconfigure; NULL removes it.
  */
 typedef oi_status (*oi_llm_before_request_cb)(void *user_data);
 void oi_llm_client_set_before_request(oi_llm_client *client,
