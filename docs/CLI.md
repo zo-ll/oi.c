@@ -150,7 +150,8 @@ existing one alone, so this works on a fresh account and is safe to repeat.
 
 Avoid typing the key inline. `export OI_API_KEY=sk-...` lands in your shell
 history, and `--api-key sk-...` additionally shows up in `ps` output for
-every user on the machine for as long as the process runs. `--api-key`
+every user on the machine. `oi` overwrites the key in its argument list
+after startup, but another user can read it before that. `--api-key`
 exists for scripts that already hold the secret in a variable, and even then
 the environment variable is the safer channel.
 
