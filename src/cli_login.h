@@ -55,6 +55,15 @@ oi_status oi_cli_login_apply_saved(oi_config *cfg, const char *path,
 oi_status oi_cli_login_before_request(void *user_data);
 
 /*
+ * Stops a renewal that is still running when a turn ends. The idle prompt
+ * does not step the reactor, so such a renewal would hold the credentials
+ * lock, which other processes need, until the next turn. A finished
+ * renewal stays for the next request to adopt; the next request start
+ * begins a new renewal when one is still needed.
+ */
+void oi_cli_login_turn_ended(struct oi_cli_login *login);
+
+/*
  * Runs the /login dialog on an idle REPL: provider, then method, then the
  * details that method needs. A success updates the live client at once and
  * saves the credentials. Returns non-OK only for a structural failure; every

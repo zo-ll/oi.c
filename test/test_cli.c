@@ -3996,10 +3996,11 @@ static int send_oauth_callback(const char *query, char *reply,
 /* --- a renewal on the reactor, with a turn that does not wait for it --- */
 
 /* Serves each connection in its own process: the token endpoint answers
- * with a new token, and /v1/responses answers after 300 ms with "ok".
+ * with a new token, or with `token_hangs`, never answers and waits for
+ * the client to close; /v1/responses answers after 300 ms with "ok".
  * Each request appends "<path> <Authorization value>" to `log_path`. */
 static pid_t start_renewal_mock(unsigned short *out_port,
-                                const char *log_path) {
+                                const char *log_path, int token_hangs) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
     int one = 1;
@@ -4065,6 +4066,12 @@ static pid_t start_renewal_mock(unsigned short *out_port,
             close(log_fd);
         }
         const char *reply_body;
+        if (token_hangs && strcmp(path, "/api/accounts/oauth/token") == 0) {
+            char byte;
+            while (read(cfd, &byte, 1) > 0) {
+            }
+            _exit(0);
+        }
         if (strcmp(path, "/api/accounts/oauth/token") == 0) {
             reply_body = "{\"access_token\":\"fresh\",\"refresh_token\":"
                          "\"rotated\",\"expires_in\":3600}";
@@ -4098,7 +4105,7 @@ TEST(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it) {
 
     CHECK(mkdtemp(config_root) != NULL);
     snprintf(log_path, sizeof log_path, "%s/requests.log", config_root);
-    pid_t server = start_renewal_mock(&port, log_path);
+    pid_t server = start_renewal_mock(&port, log_path, 0);
     snprintf(base, sizeof base, "http://127.0.0.1:%u", (unsigned)port);
     /* Inside the 300 s renewal margin, but still usable for this turn. */
     int credentials_len = snprintf(
@@ -4164,6 +4171,103 @@ TEST(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it) {
     unlink(path);
     snprintf(path, sizeof path, "%s/oi/credentials.json.lock", config_root);
     unlink(path);
+    snprintf(path, sizeof path, "%s/oi", config_root);
+    rmdir(path);
+    rmdir(config_root);
+}
+
+/* A renewal that is still running when its turn ends must not keep the
+ * credentials lock while the prompt is idle: another oi process needs it
+ * to renew. */
+TEST(renewal_unfinished_at_turn_end_releases_the_credentials_lock) {
+    char config_root[] = "/tmp/oi-cli-renewal-lock-XXXXXX";
+    char session_root[128];
+    char path[256];
+    char lock_path[sizeof path + 8];
+    char log_path[256];
+    char base[64];
+    char credentials[512];
+    unsigned short port;
+    int master_fd = -1;
+    int slave_fd = -1;
+    struct interactive_result result;
+
+    CHECK(mkdtemp(config_root) != NULL);
+    snprintf(log_path, sizeof log_path, "%s/requests.log", config_root);
+    pid_t server = start_renewal_mock(&port, log_path, 1);
+    snprintf(base, sizeof base, "http://127.0.0.1:%u", (unsigned)port);
+    int credentials_len = snprintf(
+        credentials, sizeof credentials,
+        "{\"version\":1,\"active\":\"openai\",\"openai\":{"
+        "\"auth\":\"oauth\",\"client_id\":\"app_test\",\"host_id\":\"h\","
+        "\"access_token\":\"old\",\"refresh_token\":\"refresh\","
+        "\"expires_at\":%.0f,\"welcome_shown\":true}}",
+        (double)time(NULL) + 100);
+    snprintf(path, sizeof path, "%s/oi", config_root);
+    CHECK_EQ(mkdir(path, 0700), 0);
+    snprintf(path, sizeof path, "%s/oi/credentials.json", config_root);
+    snprintf(lock_path, sizeof lock_path, "%s.lock", path);
+    {
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        CHECK(fd >= 0);
+        CHECK_EQ(write(fd, credentials, (size_t)credentials_len),
+                 (ssize_t)credentials_len);
+        close(fd);
+    }
+    snprintf(session_root, sizeof session_root,
+             "/tmp/oi-cli-renewal-lock-sessions-%d", (int)getpid());
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    memset(&result, 0, sizeof result);
+
+    pid_t cli = fork();
+    CHECK(cli >= 0);
+    if (cli == 0) {
+        if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0 ||
+            dup2(slave_fd, STDIN_FILENO) < 0 ||
+            dup2(slave_fd, STDOUT_FILENO) < 0 ||
+            dup2(slave_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        setenv("OI_CHATGPT_TEST_BASE", base, 1);
+        setenv("XDG_CONFIG_HOME", config_root, 1);
+        unsetenv("OI_API_KEY");
+        char *argv[] = {(char *)OI_BIN, (char *)"--deny-tools",
+                        (char *)"--session-dir", session_root, NULL};
+        execv(OI_BIN, argv);
+        _exit(127);
+    }
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "hello\r", 6));
+    /* The turn used the old token and ended; the prompt is back. */
+    CHECK(interactive_wait_for(master_fd, &result, "ok\n\r\x1b[J> ", 1));
+    {
+        int fd = open(lock_path, O_RDWR);
+        struct flock lock;
+        CHECK(fd >= 0);
+        memset(&lock, 0, sizeof lock);
+        lock.l_type = F_WRLCK;
+        lock.l_whence = SEEK_SET;
+        CHECK_EQ(fcntl(fd, F_SETLK, &lock), 0);
+        close(fd);
+    }
+
+    CHECK(write_interactive(master_fd, "\x04", 1));
+    {
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    CHECK_EQ(result.exit_code, 0);
+    kill(server, SIGTERM);
+    waitpid(server, NULL, 0);
+    close(master_fd);
+    remove_sessions_under(session_root);
+    rmdir(session_root);
+    unlink(log_path);
+    unlink(path);
+    unlink(lock_path);
     snprintf(path, sizeof path, "%s/oi", config_root);
     rmdir(path);
     rmdir(config_root);
@@ -7294,6 +7398,7 @@ int main(void) {
     RUN(oauth_callback_with_a_wrong_state_does_not_end_the_login);
     RUN(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal);
     RUN(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it);
+    RUN(renewal_unfinished_at_turn_end_releases_the_credentials_lock);
     RUN(tool_panel_shows_live_output_and_failed_status);
     RUN(tool_panel_survives_malicious_escape_bytes_in_output);
     RUN(tool_panel_coexists_with_resize_and_queued_input);
