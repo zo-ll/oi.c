@@ -63,8 +63,10 @@ static const struct oi_cli_render_line key_header[] = {
 };
 
 static void renewal_free(struct login_renewal *renewal);
+static void finish_sent_renewal(struct oi_cli_login *login);
 
 void oi_cli_login_free(struct oi_cli_login *login) {
+    finish_sent_renewal(login);
     renewal_free(login->renewal);
     login->renewal = NULL;
     free(login->credentials_path);
@@ -518,8 +520,26 @@ static oi_status start_renewal(struct oi_cli_login *login, double now) {
     return st;
 }
 
+static int renewal_running_and_sent(const struct oi_cli_login *login) {
+    return login->renewal != NULL && !login->renewal->finished &&
+           oi_cli_oauth_refresh_sent(login->renewal->call);
+}
+
+/* Steps the reactor until a sent renewal ends, so that its rotated tokens
+ * reach the credentials file. The exchange's own 20 s timeout bounds the
+ * wait. */
+static void finish_sent_renewal(struct oi_cli_login *login) {
+    while (renewal_running_and_sent(login)) {
+        oi_status st = OI_OK;
+        if (oi_reactor_step(login->reactor, 1000, &st) < 0) {
+            break;
+        }
+    }
+}
+
 void oi_cli_login_turn_ended(struct oi_cli_login *login) {
-    if (login->renewal != NULL && !login->renewal->finished) {
+    if (login->renewal != NULL && !login->renewal->finished &&
+        !oi_cli_oauth_refresh_sent(login->renewal->call)) {
         renewal_free(login->renewal);
         login->renewal = NULL;
     }
@@ -1195,9 +1215,14 @@ oi_status oi_cli_login_run(struct oi_cli_login *login,
                            int *out_terminate_signal) {
     char message[768];
     *out_terminate_signal = 0;
-    /* A renewal belongs to the login it started under. Dropped here, it
+    /* A renewal belongs to the login it started under. A sent one finishes
+     * first, so that its rotated tokens are saved; then it is dropped, so it
      * cannot write that login's credentials over the new ones, nor adopt
      * its token after them, and it releases the credentials lock. */
+    if (renewal_running_and_sent(login)) {
+        fputs("oi: finishing the ChatGPT token renewal first\n", login->err);
+        finish_sent_renewal(login);
+    }
     renewal_free(login->renewal);
     login->renewal = NULL;
     oi_status st = run_dialog(login, composer, signal_fd, out_terminate_signal,

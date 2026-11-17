@@ -652,6 +652,7 @@ struct http_call {
     int http_status;
     int done;
     int oversize; /* the body went past OI_CLI_OAUTH_MAX_RESPONSE */
+    int request_queued; /* the server can have the request from here on */
     oi_status status;
     struct text body;
     /* Runs once, when the call ends. NULL for the blocking call, which
@@ -692,7 +693,9 @@ static void http_on_connected(oi_llm_conn *conn, void *user_data) {
     oi_status st = oi_llm_conn_write(conn, call->request, call->request_len);
     if (st != OI_OK) {
         http_finish(call, st);
+        return;
     }
+    call->request_queued = 1;
 }
 
 static void http_on_data(oi_llm_conn *conn, const void *data, size_t len,
@@ -997,6 +1000,10 @@ oi_status oi_cli_oauth_refresh_start(
     }
     *out_call = call;
     return OI_OK;
+}
+
+int oi_cli_oauth_refresh_sent(const struct oi_cli_oauth_refresh_call *call) {
+    return call->http.request_queued;
 }
 
 void oi_cli_oauth_refresh_cancel(struct oi_cli_oauth_refresh_call *call) {
