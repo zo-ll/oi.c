@@ -767,12 +767,11 @@ static void req_on_connected(oi_llm_conn *c, void *ud) {
                       "\r\n",
                       req->client->path, req->client->host, req->body_len);
     }
-    if (n < 0 || (size_t)n >= sizeof header) {
-        finish(req, OI_ERR_INVAL, 0, NULL, 0);
-        return;
+    oi_status st = OI_ERR_INVAL;
+    if (n >= 0 && (size_t)n < sizeof header) {
+        st = oi_llm_conn_write(c, header, (size_t)n);
     }
-
-    oi_status st = oi_llm_conn_write(c, header, (size_t)n);
+    oi_wipe(header, sizeof header);
     if (st == OI_OK) {
         st = oi_llm_conn_write(c, req->body, req->body_len);
     }
