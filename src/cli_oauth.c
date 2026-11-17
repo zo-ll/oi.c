@@ -764,16 +764,18 @@ oi_status oi_cli_oauth_http(const struct oi_cli_oauth_server *server,
     call.request = request;
 
     oi_reactor *reactor = oi_reactor_create();
+    oi_llm_tls *tls = NULL;
     call.parser =
         oi_llm_http_parser_create(http_on_headers, http_on_body, &call);
-    if (reactor == NULL || call.parser == NULL) {
+    if (reactor == NULL || call.parser == NULL ||
+        (server->use_tls && oi_llm_tls_create(ca_file, &tls) != OI_OK)) {
         st = OI_ERR_NOMEM;
     } else {
         struct oi_llm_conn_callbacks callbacks = {
             http_on_connected, http_on_data, http_on_error};
         st = oi_llm_conn_connect(reactor, server->host,
-                                 (unsigned short)server->port, server->use_tls,
-                                 ca_file, &callbacks, &call, &call.conn);
+                                 (unsigned short)server->port, tls,
+                                 &callbacks, &call, &call.conn);
     }
     if (st == OI_OK) {
         double deadline = monotonic_ms() + timeout_ms;
@@ -794,6 +796,7 @@ oi_status oi_cli_oauth_http(const struct oi_cli_oauth_server *server,
     if (call.conn != NULL) {
         oi_llm_conn_close(call.conn);
     }
+    oi_llm_tls_destroy(tls);
     oi_llm_http_parser_destroy(call.parser);
     oi_reactor_destroy(reactor);
     memset(request, 0, call.request_len);

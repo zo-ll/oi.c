@@ -54,13 +54,11 @@ struct oi_llm_conn {
     struct addrinfo *next_address;
     oi_reactor_timer *address_timer;
 
-    int use_tls;
+    oi_llm_tls *tls; /* borrowed; NULL = plain TCP */
     char *host;
     unsigned short port;
     int connect_errno; /* why the last address failed; 0 = none tried */
     char cause[256];   /* see oi_llm_conn_error_cause */
-    char *ca_file; /* NULL = system default trust store */
-    SSL_CTX *ssl_ctx;
     SSL *ssl;
 
     struct oi_llm_conn_callbacks cbs;
@@ -125,6 +123,12 @@ void oi_llm_conn_close(oi_llm_conn *c) {
         return;
     }
     oi_reactor_timer_cancel(c->address_timer);
+    /* One nonblocking close_notify. Without it, SSL_free marks the session
+     * as not resumable, and the next connection pays a full handshake. */
+    if (c->ssl != NULL && c->state == CS_ESTABLISHED) {
+        (void)SSL_shutdown(c->ssl);
+        ERR_clear_error();
+    }
     if (c->fd >= 0) {
         oi_reactor_remove(c->reactor, c->fd);
         close(c->fd);
@@ -154,15 +158,11 @@ void oi_llm_conn_close(oi_llm_conn *c) {
     if (c->ssl) {
         SSL_free(c->ssl);
     }
-    if (c->ssl_ctx) {
-        SSL_CTX_free(c->ssl_ctx);
-    }
     /* The request head holds the Authorization header. */
     oi_wipe(c->out_buf, c->out_cap);
     free(c->out_buf);
     freeaddrinfo(c->addresses);
     free(c->host);
-    free(c->ca_file);
     if (c->destroyed_flag) {
         *c->destroyed_flag = 1;
     }
@@ -291,6 +291,128 @@ static oi_status set_nosigpipe_bio(SSL *ssl, int fd) {
     return OI_OK;
 }
 
+/* --- shared TLS settings --- */
+
+struct oi_llm_tls {
+    char *ca_file; /* NULL = system default trust store */
+    SSL_CTX *ctx;  /* made at the first handshake, then shared */
+};
+
+/* The last session that a server issued on a context, for resumption.
+ * One slot: a client talks to one host. */
+struct tls_session_slot {
+    char *host;
+    unsigned short port;
+    SSL_SESSION *session;
+};
+
+static int tls_slot_index = -1;
+static int tls_conn_index = -1;
+static pthread_once_t tls_index_once = PTHREAD_ONCE_INIT;
+
+static void tls_slot_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
+                          int index, long argl, void *argp) {
+    (void)parent;
+    (void)ad;
+    (void)index;
+    (void)argl;
+    (void)argp;
+    struct tls_session_slot *slot = ptr;
+    if (slot != NULL) {
+        SSL_SESSION_free(slot->session);
+        free(slot->host);
+        free(slot);
+    }
+}
+
+static void make_tls_indexes(void) {
+    tls_slot_index =
+        SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, tls_slot_free);
+    tls_conn_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+}
+
+/* OpenSSL calls this when a server issues a session (for TLS 1.3, after
+ * the handshake). Returns 1 when the slot takes the reference. */
+static int remember_session(SSL *ssl, SSL_SESSION *session) {
+    oi_llm_conn *c = SSL_get_ex_data(ssl, tls_conn_index);
+    struct tls_session_slot *slot =
+        SSL_CTX_get_ex_data(SSL_get_SSL_CTX(ssl), tls_slot_index);
+    if (c == NULL || slot == NULL) {
+        return 0;
+    }
+    char *host = strdup(c->host);
+    if (host == NULL) {
+        return 0;
+    }
+    SSL_SESSION_free(slot->session);
+    free(slot->host);
+    slot->host = host;
+    slot->port = c->port;
+    slot->session = session;
+    return 1;
+}
+
+static oi_status make_tls_context(oi_llm_tls *tls) {
+    pthread_once(&tls_index_once, make_tls_indexes);
+    if (tls_slot_index < 0 || tls_conn_index < 0) {
+        return OI_ERR_NOMEM;
+    }
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    struct tls_session_slot *slot = calloc(1, sizeof *slot);
+    if (ctx == NULL || slot == NULL) {
+        SSL_CTX_free(ctx);
+        free(slot);
+        return OI_ERR_IO;
+    }
+    if (!SSL_CTX_set_ex_data(ctx, tls_slot_index, slot)) {
+        SSL_CTX_free(ctx);
+        free(slot);
+        return OI_ERR_IO;
+    }
+    /* From here, SSL_CTX_free frees the slot through tls_slot_free. */
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_session_cache_mode(
+        ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    SSL_CTX_sess_set_new_cb(ctx, remember_session);
+    int loaded = tls->ca_file != NULL
+                     ? SSL_CTX_load_verify_locations(ctx, tls->ca_file, NULL)
+                     : SSL_CTX_set_default_verify_paths(ctx);
+    if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) || !loaded) {
+        SSL_CTX_free(ctx);
+        return OI_ERR_IO;
+    }
+    tls->ctx = ctx;
+    return OI_OK;
+}
+
+oi_status oi_llm_tls_create(const char *ca_file, oi_llm_tls **out_tls) {
+    if (out_tls == NULL) {
+        return OI_ERR_INVAL;
+    }
+    oi_llm_tls *tls = calloc(1, sizeof *tls);
+    if (tls == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    if (ca_file != NULL) {
+        tls->ca_file = strdup(ca_file);
+        if (tls->ca_file == NULL) {
+            free(tls);
+            return OI_ERR_NOMEM;
+        }
+    }
+    *out_tls = tls;
+    return OI_OK;
+}
+
+void oi_llm_tls_destroy(oi_llm_tls *tls) {
+    if (tls == NULL) {
+        return;
+    }
+    SSL_CTX_free(tls->ctx); /* an open SSL keeps its own reference */
+    free(tls->ca_file);
+    free(tls);
+}
+
 /* --- raw byte I/O, TLS-transparent --- */
 
 /* Returns >0 bytes transferred, 0 on clean EOF (read only), -1 if it
@@ -298,7 +420,7 @@ static oi_status set_nosigpipe_bio(SSL *ssl, int fd) {
 static long conn_raw_read(oi_llm_conn *c, void *buf, size_t len,
                            int *would_block) {
     *would_block = 0;
-    if (c->use_tls) {
+    if (c->tls != NULL) {
         int rc = SSL_read(c->ssl, buf, (int)len);
         if (rc > 0) {
             c->read_needs_write = 0;
@@ -341,7 +463,7 @@ static long conn_raw_read(oi_llm_conn *c, void *buf, size_t len,
 static long conn_raw_write(oi_llm_conn *c, const void *buf, size_t len,
                             int *would_block) {
     *would_block = 0;
-    if (c->use_tls) {
+    if (c->tls != NULL) {
         int rc = SSL_write(c->ssl, buf, (int)len);
         int err = rc > 0 ? SSL_ERROR_NONE : SSL_get_error(c->ssl, rc);
         if (rc > 0) {
@@ -435,25 +557,19 @@ static oi_status flush_write_queue(oi_llm_conn *c) {
 /* --- TLS handshake --- */
 
 static oi_status start_tls_handshake(oi_llm_conn *c) {
-    c->ssl_ctx = SSL_CTX_new(TLS_client_method());
-    if (c->ssl_ctx == NULL) {
+    if (c->tls->ctx == NULL && make_tls_context(c->tls) != OI_OK) {
         return OI_ERR_IO;
     }
-    if (!SSL_CTX_set_min_proto_version(c->ssl_ctx, TLS1_2_VERSION)) {
+    c->ssl = SSL_new(c->tls->ctx);
+    if (c->ssl == NULL || !SSL_set_ex_data(c->ssl, tls_conn_index, c)) {
         return OI_ERR_IO;
     }
-    SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_PEER, NULL);
-
-    int loaded = c->ca_file
-                     ? SSL_CTX_load_verify_locations(c->ssl_ctx, c->ca_file,
-                                                      NULL)
-                     : SSL_CTX_set_default_verify_paths(c->ssl_ctx);
-    if (!loaded) {
-        return OI_ERR_IO;
-    }
-
-    c->ssl = SSL_new(c->ssl_ctx);
-    if (c->ssl == NULL) {
+    struct tls_session_slot *slot =
+        SSL_CTX_get_ex_data(c->tls->ctx, tls_slot_index);
+    if (slot->session != NULL && slot->port == c->port &&
+        strcmp(slot->host, c->host) == 0 &&
+        SSL_SESSION_is_resumable(slot->session) &&
+        !SSL_set_session(c->ssl, slot->session)) {
         return OI_ERR_IO;
     }
     if (set_nosigpipe_bio(c->ssl, c->fd) != OI_OK) {
@@ -694,7 +810,7 @@ static void handle_tcp_connecting(oi_llm_conn *c) {
     c->addresses = NULL;
     c->next_address = NULL;
 
-    if (c->use_tls) {
+    if (c->tls != NULL) {
         if (start_tls_handshake(c) != OI_OK) {
             set_tls_cause(c, "setup");
             fail_conn(c, OI_ERR_IO);
@@ -774,8 +890,7 @@ OI_DIAG_POP
 /* --- public API --- */
 
 oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
-                               unsigned short port, int use_tls,
-                               const char *ca_file,
+                               unsigned short port, oi_llm_tls *tls,
                                const struct oi_llm_conn_callbacks *cbs,
                                void *user_data, oi_llm_conn **out_conn) {
     if (r == NULL || host == NULL || cbs == NULL || out_conn == NULL) {
@@ -789,11 +904,9 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
     c->reactor = r;
     c->fd = -1;
     c->state = CS_RESOLVING;
-    c->use_tls = use_tls;
+    c->tls = tls;
     c->port = port;
     c->host = strdup(host);
-    c->ca_file = NULL;
-    c->ssl_ctx = NULL;
     c->ssl = NULL;
     c->cbs = *cbs;
     c->user_data = user_data;
@@ -809,14 +922,6 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
         free(c);
         return OI_ERR_NOMEM;
     }
-    if (ca_file) {
-        c->ca_file = strdup(ca_file);
-        if (c->ca_file == NULL) {
-            free(c->host);
-            free(c);
-            return OI_ERR_NOMEM;
-        }
-    }
 
     int notify[2] = {-1, -1};
     if (pipe(notify) != 0 || set_nonblocking(notify[0]) != OI_OK ||
@@ -828,7 +933,6 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
             close(notify[1]);
         }
         free(c->host);
-        free(c->ca_file);
         free(c);
         return OI_ERR_IO;
     }
@@ -838,7 +942,6 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
         close(notify[0]);
         close(notify[1]);
         free(c->host);
-        free(c->ca_file);
         free(c);
         return OI_ERR_NOMEM;
     }
@@ -849,7 +952,6 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
         close(notify[0]);
         close(notify[1]);
         free(c->host);
-        free(c->ca_file);
         free(c);
         return OI_ERR_NOMEM;
     }
@@ -868,7 +970,6 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
         close(notify[0]);
         close(notify[1]);
         free(c->host);
-        free(c->ca_file);
         free(c);
         return st;
     }
@@ -880,7 +981,6 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
         free(job->host);
         free(job);
         free(c->host);
-        free(c->ca_file);
         free(c);
         return OI_ERR_IO;
     }
