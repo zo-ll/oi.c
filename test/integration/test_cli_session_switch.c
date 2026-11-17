@@ -304,8 +304,12 @@ TEST(switch_rejects_unsafe_ids_and_missing_sessions) {
 
 TEST(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing) {
     char *root = test_root("busy");
-    char *cwd = getcwd(NULL, 0);
-    oi_session_registry *registry = oi_session_registry_create();
+    /* The child below holds no heap block of this test: under valgrind it
+     * runs its own leak check at _exit, and a report there changes its
+     * exit status. */
+    char cwd_buf[4096];
+    char *cwd = getcwd(cwd_buf, sizeof cwd_buf);
+    oi_session_registry *registry = NULL;
     struct oi_cli_session_switch_result result;
     char history_path[384];
     char *id;
@@ -313,7 +317,7 @@ TEST(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing) {
     int to_parent[2];
     pid_t child;
 
-    CHECK(registry != NULL);
+    CHECK(cwd != NULL);
     id = seed_session(root, "gpt-held", cwd, 1);
     snprintf(history_path, sizeof history_path, "%s/%s/history.oilog", root,
              id);
@@ -345,6 +349,8 @@ TEST(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing) {
         char byte = 0;
         CHECK_EQ(read(to_parent[0], &byte, 1), 1);
     }
+    registry = oi_session_registry_create();
+    CHECK(registry != NULL);
 
     oi_cli_session_switch_result_init(&result);
     CHECK_EQ(oi_cli_session_switch(registry, root, NULL, id, strlen(id),
@@ -384,7 +390,6 @@ TEST(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing) {
     rmdir(root);
     free(id);
     free(root);
-    free(cwd);
 }
 
 TEST(switch_recovers_a_truncated_tail_but_refuses_an_undecodable_log) {

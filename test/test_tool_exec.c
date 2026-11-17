@@ -923,15 +923,18 @@ TEST(child_does_not_inherit_other_tool_descriptors) {
 }
 
 TEST(tool_execution_does_not_reap_unrelated_children) {
-    oi_tool_registry *reg = make_registry();
-    oi_reactor *r = oi_reactor_create();
-    oi_arena *a = oi_arena_create(0);
-
+    /* Forked before any allocation: under valgrind the child runs its own
+     * leak check at _exit, and at -O2 the parent's heap pointers can live
+     * only in registers that the child's check cannot see. */
     pid_t unrelated = fork();
     CHECK(unrelated >= 0);
     if (unrelated == 0) {
         _exit(0);
     }
+
+    oi_tool_registry *reg = make_registry();
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
 
     struct out_ctx ctx = {0};
     oi_tool_call *call = NULL;
