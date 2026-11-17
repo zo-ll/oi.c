@@ -29,6 +29,11 @@ struct oi_cli_login {
     struct login_renewal *renewal; /* owned; a renewal and its result */
 };
 
+/*
+ * Finishes a sent token renewal on `login->reactor`, so its rotated tokens
+ * are saved, then frees what `login` owns. The reactor must stay alive
+ * until this call returns.
+ */
 void oi_cli_login_free(struct oi_cli_login *login);
 
 /*
