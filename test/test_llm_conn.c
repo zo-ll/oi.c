@@ -608,6 +608,11 @@ static pid_t start_self_signed_tls_server(unsigned short *out_port,
             SSL_free(ssl);
             close(cfd);
         }
+        /* Freed so that valgrind's leak check in this child, at _exit,
+         * reports nothing that belongs to the test process. */
+        SSL_CTX_free(ctx);
+        X509_free(cert);
+        EVP_PKEY_free(key);
         _exit(0);
     }
     close(listen_fd);
