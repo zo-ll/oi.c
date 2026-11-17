@@ -754,26 +754,30 @@ The policy is process-wide and one of:
 | `allow` | `--allow-tools`, `/permissions allow` | run without asking |
 | `deny` | `--deny-tools`, `/permissions deny` | refuse every call |
 
-In interactive mode, `ask` shows a selector before the call runs:
+In interactive mode, `ask` prints the full request, then shows a selector
+before the call runs:
 
 ```
+oi: approve tool shell, command:
+ls -la
 Tool: shell
-Args: {"command":"ls -la"}
-> Allow once
+Review the request above before you allow it.
+  Allow once
   Allow for process (skip future prompts)
-  Deny
+> Deny
 ```
 
-*Allow once* starts highlighted, so a reflexive Enter allows that one call —
-read the `Args:` line before pressing it. `1`, `2`, and `3` pick the options
+For `shell`, the request is the decoded `command` string; for another tool,
+it is the raw arguments. Nothing is cut off. *Deny* starts highlighted, so
+Enter alone never runs a tool. `1`, `2`, and `3` pick the options
 directly. Escape or Ctrl+C dismisses the selector as a *deny*, never leaving
 the call hanging. Choosing *Allow for process* is itself the elevation (no
 second confirmation) and prints
 `oi: tool policy set to allow for the rest of this process`.
 
-The tool name and the argument summary (truncated to 200 bytes for display)
-are sanitized before being drawn, so model output cannot inject escape
-sequences into the prompt.
+The tool name and the printed request are sanitized before being drawn, so
+model output cannot inject escape sequences into the prompt. A bidirectional
+control character shows as `<U+XXXX>`.
 
 In one-shot mode there is nothing to ask, so `ask` **refuses**: the run
 prints `oi: tool permission denied` rather than hanging. Non-interactive
