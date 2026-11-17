@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "compat.h"
 #include "cli_loop.h"
 #include "cli_repl.h"
 #include "cli_sessions.h"
@@ -903,10 +904,17 @@ int main(int argc, char **argv) {
     unsetenv("OI_API_KEY");
 
     for (size_t i = 0; i < n_overrides; i++) {
+        int secret = strcmp(overrides[i].key, "api_key") == 0;
         oi_status st = oi_config_set(&cfg, overrides[i].key, overrides[i].value);
+        if (secret) {
+            /* Other users can read the argv strings in /proc/PID/cmdline
+             * and in `ps` for as long as the process runs. */
+            oi_wipe((char *)overrides[i].value, strlen(overrides[i].value));
+        }
         if (st != OI_OK) {
             fprintf(stderr, "oi: invalid value for --%s: %s (%s)\n",
-                    overrides[i].key, overrides[i].value, oi_status_str(st));
+                    overrides[i].key, secret ? "<hidden>" : overrides[i].value,
+                    oi_status_str(st));
             oi_config_free(&cfg);
             return 1;
         }

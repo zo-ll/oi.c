@@ -1115,6 +1115,65 @@ TEST(missing_api_key_fails) {
     CHECK(strstr(r.output, "API key") != NULL);
 }
 
+/* Other users can read /proc/PID/cmdline. When the request reaches the
+ * server, the key must be gone from it. */
+TEST(api_key_flag_is_removed_from_the_command_line) {
+    static const char key[] = "sk-cmdline-secret";
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listen_fd >= 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, 1), 0);
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    char port[8];
+    snprintf(port, sizeof port, "%u", (unsigned)ntohs(addr.sin_port));
+
+    pid_t cli = fork();
+    CHECK(cli >= 0);
+    if (cli == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        dup2(devnull, STDIN_FILENO);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        char *argv[] = {(char *)OI_BIN,     (char *)"--no-tls",
+                        (char *)"--host",   (char *)"127.0.0.1",
+                        (char *)"--port",   port,
+                        (char *)"--api-key", (char *)key,
+                        (char *)"hello",    NULL};
+        execv(OI_BIN, argv);
+        _exit(127);
+    }
+
+    struct pollfd pending = {listen_fd, POLLIN, 0};
+    CHECK_EQ(poll(&pending, 1, 20000), 1);
+    int cfd = accept(listen_fd, NULL, NULL);
+    CHECK(cfd >= 0);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/cmdline", (int)cli);
+    char cmdline[4096];
+    int fd = open(path, O_RDONLY);
+    CHECK(fd >= 0);
+    ssize_t n = read(fd, cmdline, sizeof cmdline - 1);
+    close(fd);
+    CHECK(n > 0);
+    for (ssize_t i = 0; i < n; i++) {
+        if (cmdline[i] == '\0') {
+            cmdline[i] = ' ';
+        }
+    }
+    cmdline[n > 0 ? n : 0] = '\0';
+    CHECK(strstr(cmdline, key) == NULL);
+    CHECK(strstr(cmdline, "--api-key") != NULL);
+
+    close(cfd);
+    close(listen_fd);
+    waitpid(cli, NULL, 0);
+}
+
 TEST(unrecognized_flag_fails) {
     char *argv[] = {(char *)OI_BIN, (char *)"--not-a-real-flag", NULL};
     struct run_result r;
@@ -6895,6 +6954,7 @@ int main(void) {
     RUN(help_flags_are_documented_in_the_guide);
     RUN(piped_prompt_carries_stdin_into_the_request);
     RUN(missing_api_key_fails);
+    RUN(api_key_flag_is_removed_from_the_command_line);
     RUN(unrecognized_flag_fails);
     RUN(flag_missing_value_fails);
     RUN(dry_run_reports_resolved_config);
