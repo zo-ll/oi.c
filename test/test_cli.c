@@ -3996,11 +3996,11 @@ static int send_oauth_callback(const char *query, char *reply,
 /* --- a renewal on the reactor, with a turn that does not wait for it --- */
 
 /* Serves each connection in its own process: the token endpoint answers
- * with a new token, or with `token_hangs`, never answers and waits for
- * the client to close; /v1/responses answers after 300 ms with "ok".
- * Each request appends "<path> <Authorization value>" to `log_path`. */
+ * with a new token after `token_delay_ms`; /v1/responses answers after
+ * 300 ms with "ok". Each request appends "<path> <Authorization value>"
+ * to `log_path`. */
 static pid_t start_renewal_mock(unsigned short *out_port,
-                                const char *log_path, int token_hangs) {
+                                const char *log_path, int token_delay_ms) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
     int one = 1;
@@ -4066,13 +4066,10 @@ static pid_t start_renewal_mock(unsigned short *out_port,
             close(log_fd);
         }
         const char *reply_body;
-        if (token_hangs && strcmp(path, "/api/accounts/oauth/token") == 0) {
-            char byte;
-            while (read(cfd, &byte, 1) > 0) {
-            }
-            _exit(0);
-        }
         if (strcmp(path, "/api/accounts/oauth/token") == 0) {
+            struct timespec delay = {token_delay_ms / 1000,
+                                     (long)(token_delay_ms % 1000) * 1000000L};
+            nanosleep(&delay, NULL);
             reply_body = "{\"access_token\":\"fresh\",\"refresh_token\":"
                          "\"rotated\",\"expires_in\":3600}";
         } else {
@@ -4176,10 +4173,11 @@ TEST(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it) {
     rmdir(config_root);
 }
 
-/* A renewal that is still running when its turn ends must not keep the
- * credentials lock while the prompt is idle: another oi process needs it
- * to renew. */
-TEST(renewal_unfinished_at_turn_end_releases_the_credentials_lock) {
+/* The token server rotates the refresh token when it gets the request, and
+ * answers only after the turn has ended. The renewal must survive the turn
+ * end and save the rotated token, or the next renewal would send a refresh
+ * token that the server has already used. */
+TEST(sent_renewal_survives_the_turn_end_and_saves_the_rotated_token) {
     char config_root[] = "/tmp/oi-cli-renewal-lock-XXXXXX";
     char session_root[128];
     char path[256];
@@ -4194,7 +4192,7 @@ TEST(renewal_unfinished_at_turn_end_releases_the_credentials_lock) {
 
     CHECK(mkdtemp(config_root) != NULL);
     snprintf(log_path, sizeof log_path, "%s/requests.log", config_root);
-    pid_t server = start_renewal_mock(&port, log_path, 1);
+    pid_t server = start_renewal_mock(&port, log_path, 1500);
     snprintf(base, sizeof base, "http://127.0.0.1:%u", (unsigned)port);
     int credentials_len = snprintf(
         credentials, sizeof credentials,
@@ -4242,17 +4240,7 @@ TEST(renewal_unfinished_at_turn_end_releases_the_credentials_lock) {
     CHECK(write_interactive(master_fd, "hello\r", 6));
     /* The turn used the old token and ended; the prompt is back. */
     CHECK(interactive_wait_for(master_fd, &result, "ok\n\r\x1b[J> ", 1));
-    {
-        int fd = open(lock_path, O_RDWR);
-        struct flock lock;
-        CHECK(fd >= 0);
-        memset(&lock, 0, sizeof lock);
-        lock.l_type = F_WRLCK;
-        lock.l_whence = SEEK_SET;
-        CHECK_EQ(fcntl(fd, F_SETLK, &lock), 0);
-        close(fd);
-    }
-
+    /* Exit while the token response is still on its way. */
     CHECK(write_interactive(master_fd, "\x04", 1));
     {
         int status = 0;
@@ -4260,6 +4248,25 @@ TEST(renewal_unfinished_at_turn_end_releases_the_credentials_lock) {
         result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     }
     CHECK_EQ(result.exit_code, 0);
+    {
+        char saved[2048] = "";
+        int fd = open(path, O_RDONLY);
+        CHECK(fd >= 0);
+        ssize_t n = read(fd, saved, sizeof saved - 1);
+        close(fd);
+        saved[n > 0 ? n : 0] = '\0';
+        CHECK(strstr(saved, "\"refresh_token\":\"rotated\"") != NULL);
+        CHECK(strstr(saved, "\"access_token\":\"fresh\"") != NULL);
+    }
+    {
+        char log[1024] = "";
+        int fd = open(log_path, O_RDONLY);
+        CHECK(fd >= 0);
+        ssize_t n = read(fd, log, sizeof log - 1);
+        close(fd);
+        log[n > 0 ? n : 0] = '\0';
+        CHECK_EQ(count_text(log, "/api/accounts/oauth/token"), (size_t)1);
+    }
     kill(server, SIGTERM);
     waitpid(server, NULL, 0);
     close(master_fd);
@@ -7398,7 +7405,7 @@ int main(void) {
     RUN(oauth_callback_with_a_wrong_state_does_not_end_the_login);
     RUN(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal);
     RUN(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it);
-    RUN(renewal_unfinished_at_turn_end_releases_the_credentials_lock);
+    RUN(sent_renewal_survives_the_turn_end_and_saves_the_rotated_token);
     RUN(tool_panel_shows_live_output_and_failed_status);
     RUN(tool_panel_survives_malicious_escape_bytes_in_output);
     RUN(tool_panel_coexists_with_resize_and_queued_input);

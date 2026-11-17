@@ -152,6 +152,13 @@ oi_status oi_cli_oauth_refresh_start(
     struct oi_cli_oauth_refresh_call **out_call);
 void oi_cli_oauth_refresh_cancel(struct oi_cli_oauth_refresh_call *call);
 
+/*
+ * True once the refresh request is queued on the connection. From then
+ * on the server can rotate the refresh token, so a cancel can lose the
+ * only copy of the new one: let such a call finish instead.
+ */
+int oi_cli_oauth_refresh_sent(const struct oi_cli_oauth_refresh_call *call);
+
 oi_status oi_cli_oauth_fetch_models(const struct oi_cli_oauth_server *api,
                                     const char *ca_file, const char *bearer,
                                     struct oi_cli_oauth_models *out);

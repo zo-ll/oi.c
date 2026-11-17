@@ -55,11 +55,13 @@ oi_status oi_cli_login_apply_saved(oi_config *cfg, const char *path,
 oi_status oi_cli_login_before_request(void *user_data);
 
 /*
- * Stops a renewal that is still running when a turn ends. The idle prompt
- * does not step the reactor, so such a renewal would hold the credentials
- * lock, which other processes need, until the next turn. A finished
- * renewal stays for the next request to adopt; the next request start
- * begins a new renewal when one is still needed.
+ * Stops a renewal whose request is not sent yet when a turn ends. The idle
+ * prompt does not step the reactor, so such a renewal would hold the
+ * credentials lock, which other processes need, until the next turn. A
+ * sent renewal stays: the server can already have rotated the refresh
+ * token, and only the response carries the new one. It finishes at the
+ * next reactor step, at /login, or at oi_cli_login_free. A finished
+ * renewal stays for the next request to adopt.
  */
 void oi_cli_login_turn_ended(struct oi_cli_login *login);
 
