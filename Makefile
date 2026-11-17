@@ -1,7 +1,16 @@
 CC ?= cc
 CSTD = -std=c11 -D_POSIX_C_SOURCE=200809L
 WARN = -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Werror
-CFLAGS ?= -g -O0
+# The default build is what `make install` ships, so it is optimized and
+# hardened. _FORTIFY_SOURCE has no effect without optimization; -U first
+# because some compilers predefine it, and a redefinition fails -Werror.
+# The sanitizer tiers replace CFLAGS with their own -O1 flags.
+CFLAGS ?= -g -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+# PIE and full RELRO do not depend on CFLAGS or on compiler defaults, so a
+# CFLAGS override still links: -pie needs every object built with -fPIE.
+PIE_CFLAGS = -fPIE
+RELRO_LDFLAGS = -Wl,-z,relro,-z,now
+EXE_LDFLAGS = -pie $(RELRO_LDFLAGS) $(LDFLAGS)
 # -MMD writes a <object>.d dependency file next to each object, so a header
 # edit rebuilds every compile that includes it instead of silently linking
 # stale objects against a new declaration (an ABI drift that the suite then
@@ -109,10 +118,10 @@ $(CLI_OBJ_BUILD):
 	mkdir -p $(CLI_OBJ_BUILD)
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
 
 $(CLI_OBJ_BUILD)/%.o: src/%.c | $(CLI_OBJ_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
 
 $(PIC_BUILD)/%.o: src/%.c | $(PIC_BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) -fPIC $(INCLUDES) $(DEPFLAGS) -c $< -o $@
@@ -121,7 +130,7 @@ $(LIB): $(LIB_OBJS)
 	ar rcs $@ $^
 
 $(LIB_SO_REAL): $(PIC_OBJS) $(SHARED_DEPS)
-	$(CC) $(SHARED_FLAGS) -o $@ $(PIC_OBJS) $(LDLIBS)
+	$(CC) $(SHARED_FLAGS) $(RELRO_LDFLAGS) $(LDFLAGS) -o $@ $(PIC_OBJS) $(LDLIBS)
 
 $(LIB_SO_SONAME): $(LIB_SO_REAL)
 	ln -sfn "$(notdir $(LIB_SO_REAL))" $@
@@ -134,10 +143,10 @@ $(CLI_TEST_LIB): $(CLI_TEST_OBJS)
 	ar rcs $@ $^
 
 $(CLI_BIN): $(CLI_OBJS) $(LIB) | $(BUILD)
-	$(CC) $(CFLAGS) $(CLI_OBJS) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CFLAGS) $(EXE_LDFLAGS) $(CLI_OBJS) $(LIB) -o $@ $(LDLIBS)
 
 $(BUILD)/test_%: test/test_%.c $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS)
 
 # test_tool_exec records the kill() calls that liboi makes.
 $(BUILD)/test_tool_exec: LDLIBS += -Wl,--wrap=kill
@@ -145,10 +154,10 @@ $(BUILD)/test_tool_exec: LDLIBS += -Wl,--wrap=kill
 $(BUILD)/test_llm_conn: LDLIBS += -Wl,--wrap=getaddrinfo
 
 $(BUILD)/test_cli: test/test_cli.c $(LIB) $(CLI_BIN) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS) $(PTY_LIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS) $(PTY_LIBS)
 
 $(BUILD)/test_cli_%: test/test_cli_%.c $(CLI_TEST_LIB) $(LIB) | $(BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS)
 
 $(BUILD)/test_cli_terminal $(BUILD)/test_cli_composer: LDLIBS += $(PTY_LIBS)
 
@@ -272,16 +281,16 @@ $(INTEGRATION_BUILD):
 	mkdir -p $(INTEGRATION_BUILD)
 
 $(INTEGRATION_BUILD)/%: test/integration/%.c $(LIB) | $(INTEGRATION_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS)
 
 $(INTEGRATION_BUILD)/test_cli_conversation: test/integration/test_cli_conversation.c $(CLI_TEST_LIB) $(LIB) | $(INTEGRATION_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS)
 
 $(INTEGRATION_BUILD)/test_cli_compact: test/integration/test_cli_compact.c $(CLI_TEST_LIB) $(LIB) | $(INTEGRATION_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS)
 
 $(INTEGRATION_BUILD)/test_cli_session_switch: test/integration/test_cli_session_switch.c $(CLI_TEST_LIB) $(LIB) | $(INTEGRATION_BUILD)
-	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) -o $@ $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS)
 
 test-integration: $(INTEGRATION_BINS)
 	@if [ -z "$(INTEGRATION_BINS)" ]; then \
