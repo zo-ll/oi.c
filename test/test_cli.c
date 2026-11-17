@@ -2447,8 +2447,14 @@ TEST(typing_during_a_turn_does_not_corrupt_the_display) {
         "\"ered\"}}]}\n\n"
         "data: [DONE]\n\n";
     size_t reply_len;
-    char *reply = build_chunked_response(reply_sse, strlen(reply_sse),
+    char *built = build_chunked_response(reply_sse, strlen(reply_sse),
                                          "HTTP/1.1 200 OK", &reply_len);
+    /* On the stack: the server child below holds no heap block of this
+     * test, which valgrind's leak check in that child would report. */
+    char reply[512];
+    CHECK(reply_len <= sizeof reply);
+    memcpy(reply, built, reply_len);
+    free(built);
     unsigned short port;
     pid_t server;
     pid_t cli;
@@ -2499,7 +2505,6 @@ TEST(typing_during_a_turn_does_not_corrupt_the_display) {
     CHECK_EQ(result.exit_code, 0);
     close(master_fd);
     waitpid(server, NULL, 0);
-    free(reply);
 
     {
         DIR *directory = opendir(session_root);
