@@ -1,5 +1,7 @@
 #include "oi/json.h"
 
+#include "compat.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +58,8 @@ void oi_json_writer_destroy(oi_json_writer *w) {
     if (w == NULL) {
         return;
     }
+    /* The buffer can hold a secret, for example saved credentials. */
+    oi_wipe(w->buf, w->len);
     free(w->buf);
     free(w->frames);
     free(w);
@@ -76,10 +80,15 @@ static oi_status ensure_buf(oi_json_writer *w, size_t additional) {
         }
         new_cap *= 2;
     }
-    char *new_buf = realloc(w->buf, new_cap);
+    /* Not realloc: a moved block would keep a copy of the text in freed
+     * memory, where oi_json_writer_destroy cannot wipe it. */
+    char *new_buf = malloc(new_cap);
     if (new_buf == NULL) {
         return OI_ERR_NOMEM;
     }
+    memcpy(new_buf, w->buf, w->len + 1);
+    oi_wipe(w->buf, w->len);
+    free(w->buf);
     w->buf = new_buf;
     w->cap = new_cap;
     return OI_OK;
