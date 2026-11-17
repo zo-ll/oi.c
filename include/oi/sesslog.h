@@ -6,7 +6,7 @@
 #include "oi/status.h"
 
 /*
- * Durable append-only log for session state: one write() syscall per
+ * Durable append-only log for session state: one writev() system call per
  * record. Each record carries a CRC-32 of its payload. A short/error
  * write is rolled back before returning; a genuine mid-write process
  * crash is recovered by discarding the partial tail on the next open.
@@ -46,7 +46,7 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log);
 /* NULL-safe. Releases the lock and closes the underlying fd. */
 void oi_sesslog_close(oi_sesslog *log);
 
-/* Appends one record in a single write() call. OI_ERR_INVAL if `len`
+/* Appends one record in a single writev() call. OI_ERR_INVAL if `len`
  * exceeds OI_SESSLOG_MAX_RECORD. OI_ERR_IO leaves the prior valid log
  * contents intact whenever the filesystem permits rollback. */
 oi_status oi_sesslog_append(oi_sesslog *log, const void *data, size_t len);

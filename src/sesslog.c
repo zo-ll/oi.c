@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #define OI_SESSLOG_MAGIC "OISESLOG"
@@ -23,6 +24,9 @@ struct oi_sesslog {
     int fd;
     uint32_t version;
     size_t damaged_bytes;
+    /* The file size after the last complete record. The lifetime flock
+     * keeps other appenders out, so only this handle changes it. */
+    off_t size;
 };
 
 static size_t record_head_len(uint32_t version) {
@@ -208,6 +212,7 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log) {
 
     uint32_t version = OI_SESSLOG_VERSION;
     size_t damaged_bytes = 0;
+    off_t size = OI_SESSLOG_HEADER_LEN;
     if (st.st_size == 0) {
         unsigned char header[OI_SESSLOG_HEADER_LEN];
         memcpy(header, OI_SESSLOG_MAGIC, OI_SESSLOG_MAGIC_LEN);
@@ -255,6 +260,7 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log) {
             close(fd);
             return st2;
         }
+        size = valid_end;
         if (valid_end < st.st_size) {
             if (ftruncate(fd, valid_end) != 0) {
                 close(fd);
@@ -271,6 +277,7 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log) {
     log->fd = fd;
     log->version = version;
     log->damaged_bytes = damaged_bytes;
+    log->size = size;
     *out_log = log;
     return OI_OK;
 }
@@ -292,39 +299,31 @@ oi_status oi_sesslog_append(oi_sesslog *log, const void *data, size_t len) {
         return OI_ERR_INVAL;
     }
 
-    struct stat before;
-    if (fstat(log->fd, &before) != 0) {
-        return OI_ERR_IO;
-    }
-
+    unsigned char head[8];
     size_t head_len = record_head_len(log->version);
-    size_t total = head_len + len;
-    unsigned char *buf = malloc(total);
-    if (buf == NULL) {
-        return OI_ERR_NOMEM;
-    }
-    encode_u32le(buf, (uint32_t)len);
+    encode_u32le(head, (uint32_t)len);
     if (head_len == 8) {
-        encode_u32le(buf + 4, crc32_update(0, data, len));
+        encode_u32le(head + 4, crc32_update(0, data, len));
     }
-    if (len > 0) {
-        memcpy(buf + head_len, data, len);
-    }
+    struct iovec parts[2] = {
+        {head, head_len},
+        {(void *)data, len},
+    };
+    size_t total = head_len + len;
 
     ssize_t n;
     do {
-        n = write(log->fd, buf, total);
+        n = writev(log->fd, parts, len > 0 ? 2 : 1);
     } while (n < 0 && errno == EINTR);
-    free(buf);
 
     if (n < 0 || (size_t)n != total) {
         /* The handle stays usable after a short/error write: remove any
          * partial tail now instead of waiting for a future reopen to
-         * discover and recover it. The lifetime flock excludes another
-         * appender from racing this rollback. */
-        best_effort_truncate(log->fd, before.st_size);
+         * discover and recover it. */
+        best_effort_truncate(log->fd, log->size);
         return OI_ERR_IO;
     }
+    log->size += (off_t)total;
     return OI_OK;
 }
 
