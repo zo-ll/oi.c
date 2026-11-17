@@ -3,6 +3,7 @@
 
 #include <fcntl.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -174,6 +175,43 @@ TEST(modify_changes_interest) {
 
     CHECK_EQ(oi_reactor_modify(r, 99999, OI_EV_READ), OI_ERR_IO);
     CHECK_EQ(oi_reactor_modify(r, fds[0], 0), OI_ERR_INVAL);
+
+    close(fds[0]);
+    close(fds[1]);
+    oi_reactor_destroy(r);
+}
+
+/* The test links with -Wl,--wrap=epoll_ctl to count the system calls. */
+static int epoll_mod_calls;
+
+int __real_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+
+int __wrap_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) {
+    if (op == EPOLL_CTL_MOD) {
+        epoll_mod_calls++;
+    }
+    return __real_epoll_ctl(epfd, op, fd, event);
+}
+
+TEST(modify_to_the_same_interest_makes_no_system_call) {
+    oi_reactor *r = oi_reactor_create();
+    int fds[2];
+    make_socketpair(fds);
+    struct capture cap = {0};
+    CHECK_EQ(oi_reactor_add(r, fds[0], OI_EV_READ, capture_cb, &cap), OI_OK);
+
+    epoll_mod_calls = 0;
+    CHECK_EQ(oi_reactor_modify(r, fds[0], OI_EV_READ), OI_OK);
+    CHECK_EQ(epoll_mod_calls, 0);
+    CHECK_EQ(oi_reactor_modify(r, fds[0], OI_EV_READ | OI_EV_WRITE), OI_OK);
+    CHECK_EQ(epoll_mod_calls, 1);
+    CHECK_EQ(oi_reactor_modify(r, fds[0], OI_EV_READ | OI_EV_WRITE), OI_OK);
+    CHECK_EQ(epoll_mod_calls, 1);
+
+    /* The new interest is in effect: the socket is writable now. */
+    oi_status st;
+    CHECK_EQ(oi_reactor_step(r, 10, &st), 1);
+    CHECK(cap.revents & OI_EV_WRITE);
 
     close(fds[0]);
     close(fds[1]);
@@ -460,6 +498,7 @@ int main(void) {
     RUN(dispatches_on_readable);
     RUN(dispatches_on_writable);
     RUN(modify_changes_interest);
+    RUN(modify_to_the_same_interest_makes_no_system_call);
     RUN(remove_during_dispatch_is_safe);
     RUN(stale_event_does_not_target_reused_fd);
     RUN(reports_hup_on_peer_close);

@@ -150,6 +150,8 @@ $(BUILD)/test_%: test/test_%.c $(LIB) | $(BUILD)
 
 # test_tool_exec records the kill() calls that liboi makes.
 $(BUILD)/test_tool_exec: LDLIBS += -Wl,--wrap=kill
+# test_reactor counts the epoll_ctl calls that liboi makes.
+$(BUILD)/test_reactor: LDLIBS += -Wl,--wrap=epoll_ctl
 # test_llm_conn gives one host name a dead address and a live address.
 $(BUILD)/test_llm_conn: LDLIBS += -Wl,--wrap=getaddrinfo
 
