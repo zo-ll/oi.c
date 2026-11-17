@@ -188,6 +188,12 @@ oi_status oi_reactor_modify(oi_reactor *r, int fd, int interest) {
     if (st != OI_OK) {
         return st;
     }
+    /* The backend is level-triggered, so the same interest again changes
+     * nothing; callers re-assert their interest after each read. */
+    if ((size_t)fd < r->capacity && r->entries[fd].in_use &&
+        r->entries[fd].interest == interest) {
+        return OI_OK;
+    }
 
     uint32_t generation =
         (size_t)fd < r->capacity ? r->entries[fd].generation : 0;
