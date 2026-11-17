@@ -141,6 +141,8 @@ $(BUILD)/test_%: test/test_%.c $(LIB) | $(BUILD)
 
 # test_tool_exec records the kill() calls that liboi makes.
 $(BUILD)/test_tool_exec: LDLIBS += -Wl,--wrap=kill
+# test_llm_conn gives one host name a dead address and a live address.
+$(BUILD)/test_llm_conn: LDLIBS += -Wl,--wrap=getaddrinfo
 
 $(BUILD)/test_cli: test/test_cli.c $(LIB) $(CLI_BIN) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) -o $@ $(LDLIBS) $(PTY_LIBS)

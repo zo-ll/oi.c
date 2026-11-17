@@ -17,6 +17,12 @@
 
 #include "compat.h"
 
+/* A connect() that has no answer after this time moves to the next
+ * address, so a dead route (often IPv6) does not use the full request
+ * deadline. The last address has no such timer: it gets the remainder
+ * of the request deadline. */
+#define OI_LLM_CONN_ADDRESS_TIMEOUT_MS 3000
+
 enum conn_state {
     CS_RESOLVING,
     CS_TCP_CONNECTING,
@@ -43,6 +49,7 @@ struct oi_llm_conn {
     struct resolver_job *resolver;
     struct addrinfo *addresses;
     struct addrinfo *next_address;
+    oi_reactor_timer *address_timer;
 
     int use_tls;
     char *host; /* only needed (and non-NULL) when use_tls */
@@ -111,6 +118,7 @@ void oi_llm_conn_close(oi_llm_conn *c) {
     if (c == NULL) {
         return;
     }
+    oi_reactor_timer_cancel(c->address_timer);
     if (c->fd >= 0) {
         oi_reactor_remove(c->reactor, c->fd);
         close(c->fd);
@@ -425,7 +433,11 @@ static void drive_tls_handshake(oi_llm_conn *c) {
 
 /* --- reactor dispatch --- */
 
-static int begin_tcp_connect(oi_llm_conn *c) {
+static void on_address_timeout(oi_reactor *r, void *user_data);
+
+/* Starts a non-blocking connect to the next address that accepts one and
+ * registers it for OI_EV_WRITE. */
+static oi_status connect_next_address(oi_llm_conn *c) {
     int fd = -1;
     while (c->next_address != NULL) {
         struct addrinfo *ai = c->next_address;
@@ -448,11 +460,46 @@ static int begin_tcp_connect(oi_llm_conn *c) {
         fd = -1;
     }
     if (fd < 0) {
-        return -1;
+        return OI_ERR_IO;
     }
     c->fd = fd;
     c->state = CS_TCP_CONNECTING;
-    return 0;
+    oi_status st = oi_reactor_add(c->reactor, fd, OI_EV_WRITE, on_fd_event, c);
+    if (st != OI_OK) {
+        close(fd);
+        c->fd = -1;
+        return st;
+    }
+    if (c->next_address != NULL) {
+        st = oi_reactor_timer_start(c->reactor, OI_LLM_CONN_ADDRESS_TIMEOUT_MS,
+                                    on_address_timeout, c, &c->address_timer);
+    }
+    return st;
+}
+
+static void abandon_address(oi_llm_conn *c) {
+    oi_reactor_timer_cancel(c->address_timer);
+    c->address_timer = NULL;
+    oi_reactor_remove(c->reactor, c->fd);
+    close(c->fd);
+    c->fd = -1;
+}
+
+static void on_address_timeout(oi_reactor *r, void *user_data) {
+    (void)r;
+    oi_llm_conn *c = user_data;
+    int destroyed = 0;
+OI_DIAG_PUSH_IGNORE_DANGLING
+    c->destroyed_flag = &destroyed;
+OI_DIAG_POP
+    abandon_address(c);
+    oi_status st = connect_next_address(c);
+    if (st != OI_OK) {
+        fail_conn(c, st);
+    }
+    if (!destroyed) {
+        c->destroyed_flag = NULL;
+    }
 }
 
 static void resolver_job_free(struct resolver_job *job) {
@@ -523,12 +570,7 @@ static void handle_resolver_ready(oi_llm_conn *c) {
 
     c->addresses = result;
     c->next_address = result;
-    if (gai_error != 0 || begin_tcp_connect(c) != 0) {
-        fail_conn(c, OI_ERR_IO);
-        return;
-    }
-    oi_status st =
-        oi_reactor_add(c->reactor, c->fd, OI_EV_WRITE, on_fd_event, c);
+    oi_status st = gai_error != 0 ? OI_ERR_IO : connect_next_address(c);
     if (st != OI_OK) {
         fail_conn(c, st);
     }
@@ -539,19 +581,15 @@ static void handle_tcp_connecting(oi_llm_conn *c) {
     socklen_t len = sizeof err;
     if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 ||
         err != 0) {
-        oi_reactor_remove(c->reactor, c->fd);
-        close(c->fd);
-        c->fd = -1;
-        if (begin_tcp_connect(c) == 0) {
-            oi_status st = oi_reactor_add(c->reactor, c->fd, OI_EV_WRITE,
-                                          on_fd_event, c);
-            if (st == OI_OK) {
-                return;
-            }
+        abandon_address(c);
+        oi_status st = connect_next_address(c);
+        if (st != OI_OK) {
+            fail_conn(c, st);
         }
-        fail_conn(c, OI_ERR_IO);
         return;
     }
+    oi_reactor_timer_cancel(c->address_timer);
+    c->address_timer = NULL;
     freeaddrinfo(c->addresses);
     c->addresses = NULL;
     c->next_address = NULL;

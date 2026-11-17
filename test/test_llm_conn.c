@@ -3,8 +3,11 @@
 #include "test.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -412,6 +415,106 @@ TEST(connection_preserves_sigpipe_disposition) {
     waitpid(child, NULL, 0);
 }
 
+/* --- a dead address moves the connect to the next address --- */
+
+/* The test links with -Wl,--wrap=getaddrinfo. A lookup of DEAD_THEN_LIVE
+ * returns two loopback addresses: first `dead_port`, then `live_port`. */
+#define DEAD_THEN_LIVE "dead-then-live.test"
+static unsigned short dead_port;
+static unsigned short live_port;
+
+int __real_getaddrinfo(const char *node, const char *service,
+                       const struct addrinfo *hints, struct addrinfo **res);
+
+int __wrap_getaddrinfo(const char *node, const char *service,
+                       const struct addrinfo *hints, struct addrinfo **res) {
+    if (node == NULL || strcmp(node, DEAD_THEN_LIVE) != 0) {
+        return __real_getaddrinfo(node, service, hints, res);
+    }
+    struct addrinfo numeric = *hints;
+    numeric.ai_family = AF_INET;
+    numeric.ai_flags |= AI_NUMERICHOST | AI_NUMERICSERV;
+    char port[8];
+    struct addrinfo *dead = NULL;
+    struct addrinfo *live = NULL;
+    snprintf(port, sizeof port, "%u", (unsigned)dead_port);
+    int rc = __real_getaddrinfo("127.0.0.1", port, &numeric, &dead);
+    if (rc != 0) {
+        return rc;
+    }
+    snprintf(port, sizeof port, "%u", (unsigned)live_port);
+    rc = __real_getaddrinfo("127.0.0.1", port, &numeric, &live);
+    if (rc != 0) {
+        freeaddrinfo(dead);
+        return rc;
+    }
+    struct addrinfo *tail = dead;
+    while (tail->ai_next != NULL) {
+        tail = tail->ai_next;
+    }
+    tail->ai_next = live;
+    *res = dead;
+    return 0;
+}
+
+/* A listener that never accepts, with its accept queue full: the kernel
+ * drops each new SYN, so a connect() to it gets no answer. */
+static int start_dead_listener(unsigned short *out_port, int fillers[4]) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(fd >= 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(fd, 0), 0);
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(fd, (struct sockaddr *)&addr, &alen), 0);
+    *out_port = ntohs(addr.sin_port);
+    for (int i = 0; i < 4; i++) {
+        fillers[i] = socket(AF_INET, SOCK_STREAM, 0);
+        CHECK(fillers[i] >= 0);
+        fcntl(fillers[i], F_SETFL, O_NONBLOCK);
+        connect(fillers[i], (struct sockaddr *)&addr, sizeof addr);
+    }
+    return fd;
+}
+
+static void close_on_connected(oi_llm_conn *c, void *ud) {
+    struct echo_ctx *ctx = ud;
+    ctx->connected = 1;
+    oi_llm_conn_close(c);
+    ctx->done = 1;
+}
+
+TEST(dead_address_moves_to_the_next_address) {
+    int fillers[4];
+    int dead_fd = start_dead_listener(&dead_port, fillers);
+    pid_t child = start_echo_server(&live_port);
+
+    oi_reactor *r = oi_reactor_create();
+    struct echo_ctx ctx = {0};
+    struct oi_llm_conn_callbacks cbs = {close_on_connected, echo_on_data,
+                                         echo_on_error};
+    oi_llm_conn *conn = NULL;
+    CHECK_EQ(oi_llm_conn_connect(r, DEAD_THEN_LIVE, 1, 0, NULL, &cbs, &ctx,
+                                  &conn),
+              OI_OK);
+    /* 6 s: more than the 3 s address timeout, much less than the
+     * kernel's SYN retries on the dead address. */
+    run_until(r, &ctx.done, 30);
+
+    CHECK(ctx.connected);
+    CHECK(!ctx.error_fired);
+    oi_reactor_destroy(r);
+    for (int i = 0; i < 4; i++) {
+        close(fillers[i]);
+    }
+    close(dead_fd);
+    kill(child, SIGTERM);
+    waitpid(child, NULL, 0);
+}
+
 int main(void) {
     /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
@@ -425,5 +528,6 @@ int main(void) {
     RUN(write_before_connected_rejected);
     RUN(close_null_safe);
     RUN(connection_preserves_sigpipe_disposition);
+    RUN(dead_address_moves_to_the_next_address);
     return oi_test_report();
 }
