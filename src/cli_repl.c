@@ -317,10 +317,10 @@ struct repl_turn_input_context {
      * instead of the ordinary prompt frame.
      */
     int awaiting_permission;
-    /* 0 = allow once, 1 = allow for process, 2 = deny -- reset to 0 each
-     * time a new AWAITING_PERMISSION event arrives. */
+    /* 0 = allow once, 1 = allow for process, 2 = deny -- reset to deny
+     * each time a new AWAITING_PERMISSION event arrives. */
     size_t permission_selected;
-    /* Sanitized/bounded "Tool: <name>"/"Args: <summary>" header lines,
+    /* The sanitized "Tool: <name>" line and the one-line review hint,
      * rebuilt fresh by build_permission_header for each AWAITING_PERMISSION
      * event -- copied immediately rather than keeping the event's own
      * borrowed pointers, which aren't guaranteed to outlive the call. */
