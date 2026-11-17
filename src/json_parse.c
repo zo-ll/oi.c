@@ -713,6 +713,24 @@ oi_status oi_json_parser_feed(oi_json_parser *p, const void *bytes,
     const unsigned char *buf = bytes;
     size_t i = 0;
     while (i < len) {
+        /* Inside a string, copy each run of plain bytes in one call; only
+         * a quote, a backslash, or a control byte needs the state machine. */
+        if (p->state == PS_STRING && !p->pending_high_surrogate) {
+            size_t run = i;
+            while (run < len && buf[run] != '"' && buf[run] != '\\' &&
+                   buf[run] >= 0x20) {
+                run++;
+            }
+            if (run > i) {
+                oi_status st =
+                    str_buf_append_bytes(p, (const char *)buf + i, run - i);
+                if (st != OI_OK) {
+                    return st;
+                }
+                i = run;
+                continue;
+            }
+        }
         int consumed;
         oi_status st = step(p, buf[i], &consumed);
         if (st != OI_OK) {

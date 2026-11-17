@@ -790,6 +790,71 @@ TEST(write_many_elements_grows_buffer_and_frames) {
     oi_json_writer_destroy(w);
 }
 
+/* Parses `doc` in one feed call, which takes the plain-run fast path. */
+static oi_json_value *parse_whole(oi_arena *arena, const char *doc,
+                                  size_t len, oi_status *out_st) {
+    oi_json_parser *p = oi_json_parser_create(arena);
+    oi_status st = oi_json_parser_feed(p, doc, len);
+    *out_st = st;
+    oi_json_value *root = st == OI_OK ? oi_json_parser_root(p) : NULL;
+    oi_json_parser_destroy(p);
+    return root;
+}
+
+TEST(string_runs_parse_like_single_bytes) {
+    static const char *const good[] = {
+        "\"plain text\"",
+        "\"a\\\"b\\\\c\\nd\\u00e9e\\ud83d\\ude00f\"",
+        "\"\\ud83d\\ude00\"",
+        "[\"x\",\"y z\",{\"k\":\"v\\tw\"}]",
+        "\"utf-8 \xc3\xa9 \xe2\x82\xac\"",
+    };
+    static const char *const bad[] = {
+        "\"tab\there\"",          /* raw control byte */
+        "\"\\ud83dx\"",          /* high surrogate then a plain byte */
+        "\"bad \\q escape\"",
+    };
+    for (size_t i = 0; i < sizeof good / sizeof good[0]; i++) {
+        oi_arena *a = oi_arena_create(0);
+        oi_status whole_st;
+        oi_status byte_st;
+        oi_json_value *whole = parse_whole(a, good[i], strlen(good[i]),
+                                           &whole_st);
+        oi_json_value *bytes = parse_byte_by_byte(a, good[i], strlen(good[i]),
+                                                  &byte_st);
+        CHECK_EQ(whole_st, OI_OK);
+        CHECK_EQ(byte_st, OI_OK);
+        CHECK_EQ(oi_json_type_of(whole), oi_json_type_of(bytes));
+        if (oi_json_type_of(whole) == OI_JSON_STRING) {
+            const char *ws;
+            const char *bs;
+            size_t wl;
+            size_t bl;
+            CHECK_EQ(oi_json_get_string(whole, &ws, &wl), OI_OK);
+            CHECK_EQ(oi_json_get_string(bytes, &bs, &bl), OI_OK);
+            CHECK_EQ(wl, bl);
+            CHECK(memcmp(ws, bs, wl) == 0);
+        }
+        oi_arena_destroy(a);
+    }
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        oi_arena *a = oi_arena_create(0);
+        oi_status st;
+        CHECK(parse_whole(a, bad[i], strlen(bad[i]), &st) == NULL);
+        CHECK_EQ(st, OI_ERR_PARSE);
+        oi_arena_destroy(a);
+    }
+}
+
+TEST(write_string_escapes_between_plain_runs) {
+    static const char in[] = "ab\"cd\\ef\x01gh\n\xc3\xa9";
+    oi_json_writer *w = oi_json_writer_create();
+    CHECK_EQ(oi_json_write_string(w, in, sizeof in - 1), OI_OK);
+    CHECK_STREQ(oi_json_writer_data(w, NULL),
+                "\"ab\\\"cd\\\\ef\\u0001gh\\n\xc3\xa9\"");
+    oi_json_writer_destroy(w);
+}
+
 /* A program that embeds liboi can set a locale with a comma radix. The
  * test is a no-op on a host that has none of these locales. */
 TEST(numbers_ignore_the_locale_radix) {
@@ -860,6 +925,8 @@ int main(void) {
     RUN(write_scalars);
     RUN(write_rejects_nonfinite_number);
     RUN(numbers_ignore_the_locale_radix);
+    RUN(string_runs_parse_like_single_bytes);
+    RUN(write_string_escapes_between_plain_runs);
     RUN(write_array);
     RUN(write_empty_array_and_object);
     RUN(write_object);

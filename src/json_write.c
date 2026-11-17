@@ -252,6 +252,22 @@ static oi_status append_escaped_string(oi_json_writer *w, const char *s,
     }
 
     for (size_t i = 0; i < len; i++) {
+        /* Append each run of bytes that need no escape in one call. */
+        size_t run = i;
+        while (run < len && (unsigned char)s[run] >= 0x20 && s[run] != '"' &&
+               s[run] != '\\') {
+            run++;
+        }
+        if (run > i) {
+            st = append_bytes(w, s + i, run - i);
+            if (st != OI_OK) {
+                return st;
+            }
+            i = run;
+            if (i == len) {
+                break;
+            }
+        }
         unsigned char c = (unsigned char)s[i];
         char esc[8];
         const char *out = NULL;
@@ -286,15 +302,10 @@ static oi_status append_escaped_string(oi_json_writer *w, const char *s,
             out = "\\t";
             out_len = 2;
             break;
-        default:
-            if (c < 0x20) {
-                snprintf(esc, sizeof esc, "\\u%04x", c);
-                out = esc;
-                out_len = 6;
-            } else {
-                out = (const char *)&s[i];
-                out_len = 1;
-            }
+        default: /* a control byte; the run above took every other byte */
+            snprintf(esc, sizeof esc, "\\u%04x", c);
+            out = esc;
+            out_len = 6;
             break;
         }
 
