@@ -6,6 +6,8 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -52,7 +54,10 @@ struct oi_llm_conn {
     oi_reactor_timer *address_timer;
 
     int use_tls;
-    char *host; /* only needed (and non-NULL) when use_tls */
+    char *host;
+    unsigned short port;
+    int connect_errno; /* why the last address failed; 0 = none tried */
+    char cause[256];   /* see oi_llm_conn_error_cause */
     char *ca_file; /* NULL = system default trust store */
     SSL_CTX *ssl_ctx;
     SSL *ssl;
@@ -163,6 +168,34 @@ void oi_llm_conn_close(oi_llm_conn *c) {
     free(c);
 }
 
+static void set_cause(oi_llm_conn *c, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    vsnprintf(c->cause, sizeof c->cause, format, args);
+    va_end(args);
+}
+
+/* Names the TLS failure: an untrusted certificate, an OpenSSL error, or
+ * the socket errno under SSL_ERROR_SYSCALL. */
+static void set_tls_cause(oi_llm_conn *c, const char *what) {
+    long verify = c->ssl != NULL ? SSL_get_verify_result(c->ssl) : X509_V_OK;
+    unsigned long error = ERR_peek_last_error();
+    if (verify != X509_V_OK) {
+        set_cause(c, "TLS certificate of %s is not trusted: %s", c->host,
+                  X509_verify_cert_error_string(verify));
+    } else if (error != 0) {
+        char text[160];
+        ERR_error_string_n(error, text, sizeof text);
+        set_cause(c, "TLS %s with %s failed: %s", what, c->host, text);
+    } else if (errno != 0) {
+        set_cause(c, "TLS %s with %s failed: %s", what, c->host,
+                  strerror(errno));
+    } else {
+        set_cause(c, "TLS %s with %s failed", what, c->host);
+    }
+    ERR_clear_error();
+}
+
 /* Invokes on_error, then closes `c` unless the callback already did so
  * reentrantly. Callers must treat `c` as potentially freed once this
  * returns. */
@@ -205,6 +238,7 @@ static long conn_raw_read(oi_llm_conn *c, void *buf, size_t len,
             *would_block = 1;
             return -1;
         }
+        set_tls_cause(c, "read");
         return -2;
     }
 
@@ -219,6 +253,7 @@ static long conn_raw_read(oi_llm_conn *c, void *buf, size_t len,
         *would_block = 1;
         return -1;
     }
+    set_cause(c, "read from %s failed: %s", c->host, strerror(errno));
     return -2;
 }
 
@@ -281,6 +316,7 @@ static long conn_raw_write(oi_llm_conn *c, const void *buf, size_t len,
             *would_block = 1;
             return -1;
         }
+        set_tls_cause(c, "write");
         return -2;
     }
 
@@ -296,6 +332,7 @@ static long conn_raw_write(oi_llm_conn *c, const void *buf, size_t len,
         *would_block = 1;
         return -1;
     }
+    set_cause(c, "write to %s failed: %s", c->host, strerror(errno));
     return -2;
 }
 
@@ -315,6 +352,7 @@ static void read_available(oi_llm_conn *c) {
             continue;
         }
         if (n == 0) {
+            set_cause(c, "%s closed the connection", c->host);
             fail_conn(c, OI_ERR_CLOSED);
             return;
         }
@@ -429,6 +467,7 @@ static void drive_tls_handshake(oi_llm_conn *c) {
     } else if (err == SSL_ERROR_WANT_WRITE) {
         oi_reactor_modify(c->reactor, c->fd, OI_EV_WRITE);
     } else {
+        set_tls_cause(c, "handshake");
         fail_conn(c, OI_ERR_IO);
     }
 }
@@ -446,10 +485,12 @@ static oi_status connect_next_address(oi_llm_conn *c) {
         c->next_address = ai->ai_next;
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) {
+            c->connect_errno = errno;
             continue;
         }
         if (set_cloexec(fd) != OI_OK || set_nonblocking(fd) != OI_OK ||
             set_no_sigpipe(fd) != OI_OK) {
+            c->connect_errno = errno;
             close(fd);
             fd = -1;
             continue;
@@ -458,10 +499,15 @@ static oi_status connect_next_address(oi_llm_conn *c) {
         if (rc == 0 || errno == EINPROGRESS) {
             break;
         }
+        c->connect_errno = errno;
         close(fd);
         fd = -1;
     }
     if (fd < 0) {
+        set_cause(c, "could not connect to %s port %u: %s", c->host,
+                  (unsigned)c->port,
+                  c->connect_errno != 0 ? strerror(c->connect_errno)
+                                        : "no address");
         return OI_ERR_IO;
     }
     c->fd = fd;
@@ -494,6 +540,7 @@ static void on_address_timeout(oi_reactor *r, void *user_data) {
 OI_DIAG_PUSH_IGNORE_DANGLING
     c->destroyed_flag = &destroyed;
 OI_DIAG_POP
+    c->connect_errno = ETIMEDOUT;
     abandon_address(c);
     oi_status st = connect_next_address(c);
     if (st != OI_OK) {
@@ -554,6 +601,7 @@ static void handle_resolver_ready(oi_llm_conn *c) {
         n = read(c->fd, &byte, 1);
     } while (n < 0 && errno == EINTR);
     if (n != 1) {
+        set_cause(c, "address lookup for %s failed", c->host);
         fail_conn(c, OI_ERR_IO);
         return;
     }
@@ -572,7 +620,14 @@ static void handle_resolver_ready(oi_llm_conn *c) {
 
     c->addresses = result;
     c->next_address = result;
-    oi_status st = gai_error != 0 ? OI_ERR_IO : connect_next_address(c);
+    oi_status st;
+    if (gai_error != 0) {
+        set_cause(c, "could not resolve %s: %s", c->host,
+                  gai_strerror(gai_error));
+        st = OI_ERR_IO;
+    } else {
+        st = connect_next_address(c);
+    }
     if (st != OI_OK) {
         fail_conn(c, st);
     }
@@ -583,6 +638,7 @@ static void handle_tcp_connecting(oi_llm_conn *c) {
     socklen_t len = sizeof err;
     if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 ||
         err != 0) {
+        c->connect_errno = err != 0 ? err : errno;
         abandon_address(c);
         oi_status st = connect_next_address(c);
         if (st != OI_OK) {
@@ -598,6 +654,7 @@ static void handle_tcp_connecting(oi_llm_conn *c) {
 
     if (c->use_tls) {
         if (start_tls_handshake(c) != OI_OK) {
+            set_tls_cause(c, "setup");
             fail_conn(c, OI_ERR_IO);
             return;
         }
@@ -691,6 +748,7 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
     c->fd = -1;
     c->state = CS_RESOLVING;
     c->use_tls = use_tls;
+    c->port = port;
     c->host = strdup(host);
     c->ca_file = NULL;
     c->ssl_ctx = NULL;
@@ -828,4 +886,8 @@ oi_status oi_llm_conn_write(oi_llm_conn *c, const void *data, size_t len) {
     c->out_len += len;
     update_interest(c);
     return OI_OK;
+}
+
+const char *oi_llm_conn_error_cause(const oi_llm_conn *c) {
+    return c != NULL && c->cause[0] != '\0' ? c->cause : NULL;
 }

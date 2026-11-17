@@ -66,12 +66,13 @@ static oi_status feed_tool_starting(struct oi_cli_present *present,
 }
 
 static oi_status feed_model_error(struct oi_cli_present *present,
-                                  const char *body, size_t body_len) {
+                                  int http_status, const char *body,
+                                  size_t body_len) {
     struct oi_cli_conversation_event event;
 
     memset(&event, 0, sizeof event);
     event.type = OI_CLI_CONVERSATION_EVENT_MODEL_ERROR;
-    event.as.model_error.http_status = 500;
+    event.as.model_error.http_status = http_status;
     event.as.model_error.body = body;
     event.as.model_error.body_len = body_len;
     return oi_cli_present_event(&event, present);
@@ -279,9 +280,30 @@ TEST(model_error_body_sanitization_leaves_trusted_header_untouched) {
 
     CHECK_EQ(oi_cli_present_init(&present, out, err, 0, 0, NULL, NULL),
              OI_OK);
-    CHECK_EQ(feed_model_error(&present, body, sizeof body - 1), OI_OK);
+    CHECK_EQ(feed_model_error(&present, 500, body, sizeof body - 1), OI_OK);
     result = read_stream(err);
     CHECK_STREQ(result, "oi: model error body (http=500): badbody\n");
+
+    free(result);
+    oi_cli_present_free(&present);
+    fclose(out);
+    fclose(err);
+}
+
+TEST(error_without_a_response_shows_the_connection_cause) {
+    FILE *out = tmpfile();
+    FILE *err = tmpfile();
+    struct oi_cli_present present;
+    static const char cause[] = "could not resolve api.invalid: Name or "
+                                "service not known";
+    char *result;
+
+    CHECK_EQ(oi_cli_present_init(&present, out, err, 0, 0, NULL, NULL),
+             OI_OK);
+    CHECK_EQ(feed_model_error(&present, 0, cause, sizeof cause - 1), OI_OK);
+    result = read_stream(err);
+    CHECK_STREQ(result, "oi: connection failed: could not resolve "
+                        "api.invalid: Name or service not known\n");
 
     free(result);
     oi_cli_present_free(&present);
@@ -346,6 +368,7 @@ int main(void) {
     RUN(permission_request_shows_the_decoded_command_and_bidi_controls);
     RUN(permission_request_without_a_command_shows_the_raw_arguments);
     RUN(model_error_body_sanitization_leaves_trusted_header_untouched);
+    RUN(error_without_a_response_shows_the_connection_cause);
     RUN(response_done_emits_trailing_reset_for_an_unclosed_bold_span);
     RUN(turn_done_without_response_done_still_flushes_render_state);
     return oi_test_report();

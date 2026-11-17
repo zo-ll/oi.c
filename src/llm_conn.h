@@ -71,4 +71,12 @@ oi_status oi_llm_conn_write(oi_llm_conn *c, const void *data, size_t len);
  */
 void oi_llm_conn_close(oi_llm_conn *c);
 
+/*
+ * The reason for the failure that on_error reports, as one line of text:
+ * for example the getaddrinfo error, the connect errno, or the TLS
+ * certificate verify result. NULL when there is no specific reason. Valid
+ * only inside on_error.
+ */
+const char *oi_llm_conn_error_cause(const oi_llm_conn *c);
+
 #endif /* OI_LLM_CONN_H */

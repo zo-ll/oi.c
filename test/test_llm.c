@@ -716,6 +716,89 @@ TEST(non_2xx_status_reports_error_body) {
     waitpid(child, NULL, 0);
 }
 
+/* --- an error event inside a 200 stream becomes the error body --- */
+
+TEST(error_event_in_a_success_stream_reports_the_event) {
+    static const char event[] =
+        "{\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}";
+    char sse_body[256];
+    snprintf(sse_body, sizeof sse_body,
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+             "\"Hi\"}}]}\n\n"
+             "data: %s\n\n",
+             event);
+    size_t total;
+    char *response = build_chunked_response(sse_body, strlen(sse_body),
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct error_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, err_on_delta,
+                                   err_on_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.done_status, OI_ERR_IO);
+    CHECK_EQ(ctx.http_status, 200);
+    CHECK_EQ(ctx.delta_count, 1);
+    CHECK_EQ(ctx.error_body_len, strlen(event));
+    CHECK(memcmp(ctx.error_body, event, ctx.error_body_len) == 0);
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+/* --- a connection failure names its cause in the error body --- */
+
+TEST(refused_connection_names_the_cause) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(fd, (struct sockaddr *)&addr, &alen), 0);
+    unsigned short port = ntohs(addr.sin_port);
+    close(fd); /* nothing listens on the port now */
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    struct error_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, err_on_delta,
+                                   err_on_done, &ctx, &req),
+              OI_OK);
+    run_until(r, &ctx.done, 100);
+
+    CHECK(ctx.done);
+    CHECK_EQ(ctx.done_status, OI_ERR_IO);
+    CHECK_EQ(ctx.http_status, 0);
+    char expected[128];
+    int n = snprintf(expected, sizeof expected,
+                     "could not connect to 127.0.0.1 port %u: "
+                     "Connection refused",
+                     (unsigned)port);
+    CHECK_EQ(ctx.error_body_len, (size_t)n);
+    CHECK(memcmp(ctx.error_body, expected, ctx.error_body_len) == 0);
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+}
+
 /* --- malformed SSE payload surfaces a parse error, not silent loss --- */
 
 struct malformed_ctx {
@@ -1296,6 +1379,8 @@ int main(void) {
     RUN(tool_call_count_has_a_limit);
     RUN(tool_call_arguments_have_a_size_limit);
     RUN(non_2xx_status_reports_error_body);
+    RUN(error_event_in_a_success_stream_reports_the_event);
+    RUN(refused_connection_names_the_cause);
     RUN(malformed_sse_json_is_reported_not_dropped);
     RUN(success_response_requires_done_sentinel);
     RUN(unterminated_done_sentinel_completes_stream);
