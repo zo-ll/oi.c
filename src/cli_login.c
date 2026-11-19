@@ -1253,12 +1253,12 @@ oi_status oi_cli_login_run(struct oi_cli_login *login,
      * cannot write that login's credentials over the new ones, nor adopt
      * its token after them, and it releases the credentials lock. The raw
      * prompt turns Ctrl+C into a byte; ISIG makes it the SIGINT that ends
-     * the wait. */
-    oi_status st = oi_cli_terminal_set_isig(&composer->terminal, 1);
-    if (st == OI_OK) {
-        finish_sent_renewal(login);
-        st = oi_cli_terminal_set_isig(&composer->terminal, 0);
-    }
+     * the wait. The wait runs without ISIG too: the save must not depend
+     * on the terminal. */
+    int isig = oi_cli_terminal_set_isig(&composer->terminal, 1) == OI_OK;
+    finish_sent_renewal(login);
+    oi_status st =
+        isig ? oi_cli_terminal_set_isig(&composer->terminal, 0) : OI_OK;
     renewal_free(login->renewal);
     login->renewal = NULL;
     if (st != OI_OK) {
