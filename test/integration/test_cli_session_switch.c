@@ -304,9 +304,9 @@ TEST(switch_rejects_unsafe_ids_and_missing_sessions) {
 
 TEST(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing) {
     char *root = test_root("busy");
-    /* The child below holds no heap block of this test: under valgrind it
-     * runs its own leak check at _exit, and a report there changes its
-     * exit status. */
+    /* The child below frees the heap blocks of this test first: under
+     * valgrind it runs its own leak check at _exit, and a report there
+     * changes its exit status. */
     char cwd_buf[4096];
     char *cwd = getcwd(cwd_buf, sizeof cwd_buf);
     oi_session_registry *registry = NULL;
@@ -329,6 +329,8 @@ TEST(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing) {
     if (child == 0) {
         oi_sesslog *log = NULL;
         char byte = 0;
+        free(id);
+        free(root);
         close(to_child[1]);
         close(to_parent[0]);
         if (oi_sesslog_open(history_path, &log) != OI_OK) {

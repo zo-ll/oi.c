@@ -445,13 +445,18 @@ TEST(delta_and_tool_arguments_larger_than_an_arena_block_complete) {
         "data: [DONE]\n\n",
         filler, filler);
     size_t total;
-    char *response = build_chunked_response(sse_body, (size_t)body_len,
-                                             "HTTP/1.1 200 OK", &total);
-    unsigned short port;
-    pid_t child = start_mock_server(response, total, &port);
-    free(response);
+    char *built = build_chunked_response(sse_body, (size_t)body_len,
+                                          "HTTP/1.1 200 OK", &total);
+    /* Static: the server child below holds no heap block of this test,
+     * which valgrind's leak check in that child would report. */
+    static char response[2 * LARGE + 2048];
+    CHECK(total <= sizeof response);
+    memcpy(response, built, total);
+    free(built);
     free(sse_body);
     free(filler);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
 
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
