@@ -4315,9 +4315,6 @@ TEST(sent_renewal_survives_the_turn_end_and_finishes_while_idle) {
     rmdir(config_root);
 }
 
-/* At exit, a sent renewal against a slow token server makes oi wait. The
- * wait says so at once, and Ctrl+C ends it without a change to the
- * credentials file. */
 /* A sent token renewal waits 10 s for its answer, at the exit or at
  * /login. The wait is reported, Ctrl+C ends it in under 1 s, and the
  * credentials file keeps the tokens it had. */
