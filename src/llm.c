@@ -34,6 +34,12 @@ struct oi_llm_client {
     int responses_api;
     oi_llm_before_request_cb before_request;
     void *before_request_user_data;
+    oi_llm_addr_cache *addresses; /* shared by every request */
+    int keep_alive;
+    /* With keep_alive: the connection of the last complete response, on
+     * the reactor of that request, ready for the next one. */
+    oi_llm_conn *idle_conn;
+    oi_reactor *idle_reactor;
 };
 
 struct oi_llm_tool_state {
@@ -62,6 +68,8 @@ struct oi_llm_request {
 
     oi_reactor *reactor; /* borrowed */
     oi_llm_conn *conn;
+    int reused_conn;      /* `conn` came from the client's idle slot */
+    int response_started; /* a response byte arrived on `conn` */
     oi_reactor_timer *timer;
     oi_reactor_timer *hook_timer; /* set while a hook says OI_ERR_AGAIN */
     oi_llm_http_parser *http;
@@ -161,7 +169,8 @@ static oi_llm_client *client_create(const struct oi_llm_config *cfg,
     if (c->host == NULL || c->path == NULL ||
         (cfg->ca_file != NULL && c->ca_file == NULL) ||
         (cfg->api_key != NULL && c->api_key == NULL) ||
-        (c->use_tls && oi_llm_tls_create(c->ca_file, &c->tls) != OI_OK)) {
+        (c->use_tls && oi_llm_tls_create(c->ca_file, &c->tls) != OI_OK) ||
+        oi_llm_addr_cache_create(&c->addresses) != OI_OK) {
         oi_llm_client_destroy(c);
         return NULL;
     }
@@ -176,10 +185,18 @@ oi_llm_client *oi_llm_client_create_responses(const struct oi_llm_config *cfg) {
     return client_create(cfg, 1);
 }
 
+static void close_idle_conn(oi_llm_client *c) {
+    oi_llm_conn_close(c->idle_conn);
+    c->idle_conn = NULL;
+    c->idle_reactor = NULL;
+}
+
 void oi_llm_client_destroy(oi_llm_client *c) {
     if (c == NULL) {
         return;
     }
+    close_idle_conn(c); /* before the cache that the connection borrows */
+    oi_llm_addr_cache_destroy(c->addresses);
     free(c->host);
     oi_llm_tls_destroy(c->tls);
     free(c->ca_file);
@@ -201,6 +218,7 @@ oi_status oi_llm_client_reconfigure(oi_llm_client *client,
     }
     fresh->before_request = client->before_request;
     fresh->before_request_user_data = client->before_request_user_data;
+    fresh->keep_alive = client->keep_alive;
     struct oi_llm_client previous = *client;
     *client = *fresh;
     *fresh = previous;
@@ -216,6 +234,13 @@ oi_status oi_llm_client_reconfigure(oi_llm_client *client,
     }
     oi_llm_client_destroy(fresh);
     return OI_OK;
+}
+
+void oi_llm_client_set_keep_alive(oi_llm_client *client, int enabled) {
+    client->keep_alive = enabled != 0;
+    if (!client->keep_alive) {
+        close_idle_conn(client);
+    }
 }
 
 void oi_llm_client_set_before_request(oi_llm_client *client,
@@ -251,12 +276,56 @@ static void request_teardown(oi_llm_request *req) {
     free(req);
 }
 
+/* An idle connection expects nothing: data or a close ends it. */
+static void idle_on_connected(oi_llm_conn *c, void *ud) {
+    (void)c;
+    (void)ud;
+}
+
+static void idle_on_data(oi_llm_conn *c, const void *data, size_t len,
+                         void *ud) {
+    (void)data;
+    (void)len;
+    oi_llm_client *client = ud;
+    client->idle_conn = NULL;
+    client->idle_reactor = NULL;
+    oi_llm_conn_close(c);
+}
+
+static void idle_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
+    (void)c;
+    (void)reason;
+    oi_llm_client *client = ud;
+    client->idle_conn = NULL; /* the connection closes itself */
+    client->idle_reactor = NULL;
+}
+
+/* Keeps the connection of a complete response for the next request. It
+ * runs before on_done, which can start that request at once. */
+static void park_connection(oi_llm_request *req) {
+    oi_llm_client *client = req->client;
+    if (!client->keep_alive || req->conn == NULL ||
+        client->idle_conn != NULL ||
+        !oi_llm_http_parser_reusable(req->http)) {
+        return;
+    }
+    static const struct oi_llm_conn_callbacks idle_cbs = {
+        idle_on_connected, idle_on_data, idle_on_error};
+    oi_llm_conn_set_callbacks(req->conn, &idle_cbs, client);
+    client->idle_conn = req->conn;
+    client->idle_reactor = req->reactor;
+    req->conn = NULL;
+}
+
 static void finish(oi_llm_request *req, oi_status status, int http_status,
                     const char *error_body, size_t error_body_len) {
     if (req->finished) {
         return;
     }
     req->finished = 1;
+    if (status == OI_OK) {
+        park_connection(req);
+    }
     if (req->on_done) {
         req->on_done(status, http_status, error_body, error_body_len,
                      req->user_data);
@@ -770,10 +839,11 @@ static void req_on_body(const void *data, size_t len, void *ud) {
 
 /* ================= connection callbacks ================= */
 
-static void req_on_connected(oi_llm_conn *c, void *ud) {
-    oi_llm_request *req = ud;
+/* Queues the request head and body on `c`. */
+static oi_status send_request(oi_llm_request *req, oi_llm_conn *c) {
     /* OAuth access tokens are JWTs, which run to several kilobytes. */
     char header[16 * 1024];
+    const char *connection = req->client->keep_alive ? "keep-alive" : "close";
     int n;
 
     if (req->client->api_key) {
@@ -783,19 +853,20 @@ static void req_on_connected(oi_llm_conn *c, void *ud) {
                       "Content-Type: application/json\r\n"
                       "Content-Length: %zu\r\n"
                       "Authorization: Bearer %s\r\n"
-                      "Connection: close\r\n"
+                      "Connection: %s\r\n"
                       "\r\n",
                       req->client->path, req->client->host, req->body_len,
-                      req->client->api_key);
+                      req->client->api_key, connection);
     } else {
         n = snprintf(header, sizeof header,
                       "POST %s HTTP/1.1\r\n"
                       "Host: %s\r\n"
                       "Content-Type: application/json\r\n"
                       "Content-Length: %zu\r\n"
-                      "Connection: close\r\n"
+                      "Connection: %s\r\n"
                       "\r\n",
-                      req->client->path, req->client->host, req->body_len);
+                      req->client->path, req->client->host, req->body_len,
+                      connection);
     }
     oi_status st = OI_ERR_INVAL;
     if (n >= 0 && (size_t)n < sizeof header) {
@@ -805,9 +876,14 @@ static void req_on_connected(oi_llm_conn *c, void *ud) {
     if (st == OI_OK) {
         st = oi_llm_conn_write(c, req->body, req->body_len);
     }
+    return st;
+}
+
+static void req_on_connected(oi_llm_conn *c, void *ud) {
+    oi_llm_request *req = ud;
+    oi_status st = send_request(req, c);
     if (st != OI_OK) {
         finish(req, st, 0, NULL, 0);
-        return;
     }
 }
 
@@ -842,6 +918,7 @@ static void req_on_data(oi_llm_conn *c, const void *data, size_t len,
                          void *ud) {
     (void)c;
     oi_llm_request *req = ud;
+    req->response_started = 1;
 
     int destroyed = 0;
 OI_DIAG_PUSH_IGNORE_DANGLING
@@ -869,6 +946,22 @@ OI_DIAG_POP
 
 static void req_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
     oi_llm_request *req = ud;
+    /* A kept connection that the server had closed fails before any
+     * response byte: send the request once more, on a new connection.
+     * `c` closes itself after this callback. */
+    if (req->reused_conn && !req->response_started) {
+        req->reused_conn = 0;
+        req->conn = NULL;
+        struct oi_llm_conn_callbacks cbs = {req_on_connected, req_on_data,
+                                             req_on_error};
+        oi_status st = oi_llm_conn_connect(
+            req->reactor, req->client->host, req->client->port,
+            req->client->tls, req->client->addresses, &cbs, req, &req->conn);
+        if (st != OI_OK) {
+            finish(req, st, 0, NULL, 0);
+        }
+        return;
+    }
     /* A body with no length ends at the close. A close that cut the
      * stream short still fails: complete_body requires the end marker. */
     if (reason == OI_ERR_CLOSED &&
@@ -926,8 +1019,20 @@ static oi_status request_begin(oi_llm_request *req) {
     }
     struct oi_llm_conn_callbacks cbs = {req_on_connected, req_on_data,
                                          req_on_error};
+    if (client->idle_conn != NULL && client->idle_reactor != req->reactor) {
+        close_idle_conn(client);
+    }
+    if (client->idle_conn != NULL) {
+        req->conn = client->idle_conn;
+        req->reused_conn = 1;
+        client->idle_conn = NULL;
+        client->idle_reactor = NULL;
+        oi_llm_conn_set_callbacks(req->conn, &cbs, req);
+        return send_request(req, req->conn);
+    }
     return oi_llm_conn_connect(req->reactor, client->host, client->port,
-                               client->tls, &cbs, req, &req->conn);
+                               client->tls, client->addresses, &cbs, req,
+                               &req->conn);
 }
 
 static void retry_before_request(oi_reactor *reactor, void *ud) {

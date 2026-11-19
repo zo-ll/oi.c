@@ -43,6 +43,7 @@ OI_0.1 {
         oi_llm_client_destroy;
         oi_llm_client_reconfigure;
         oi_llm_client_set_before_request;
+        oi_llm_client_set_keep_alive;
         oi_llm_request_cancel;
         oi_llm_request_start;
         oi_llm_request_start_events;

@@ -260,6 +260,44 @@ TEST(every_split_point_of_chunked_doc) {
     }
 }
 
+/* Returns oi_llm_http_parser_reusable after `doc`, and after a close when
+ * `close_after` is set. */
+static int reusable_after(const char *doc, int close_after) {
+    struct capture c = {0};
+    oi_llm_http_parser *p =
+        oi_llm_http_parser_create(on_headers_done, on_body, &c);
+    CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_OK);
+    if (close_after) {
+        CHECK_EQ(oi_llm_http_parser_close(p), OI_OK);
+    }
+    int reusable = oi_llm_http_parser_reusable(p);
+    oi_llm_http_parser_destroy(p);
+    return reusable;
+}
+
+TEST(only_a_framed_http_1_1_response_without_close_is_reusable) {
+    CHECK(reusable_after("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", 0));
+    CHECK(reusable_after("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                         "\r\n2\r\nok\r\n0\r\n\r\n",
+                         0));
+    CHECK(reusable_after("HTTP/1.1 204 No Content\r\n\r\n", 0));
+    CHECK(reusable_after("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"
+                         "Content-Length: 0\r\n\r\n",
+                         0));
+    /* Not reusable: the server ends the connection, an old protocol, a
+     * body that ended at the close, and a body not yet complete. */
+    CHECK(!reusable_after("HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                          "Content-Length: 2\r\n\r\nok",
+                          0));
+    CHECK(!reusable_after("HTTP/1.1 200 OK\r\nconnection: Upgrade, CLOSE\r\n"
+                          "Content-Length: 2\r\n\r\nok",
+                          0));
+    CHECK(!reusable_after("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                          0));
+    CHECK(!reusable_after("HTTP/1.1 200 OK\r\n\r\nuntil close", 1));
+    CHECK(!reusable_after("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok", 0));
+}
+
 TEST(create_null_callbacks_ok) {
     oi_llm_http_parser *p = oi_llm_http_parser_create(NULL, NULL, NULL);
     CHECK(p != NULL);
@@ -405,6 +443,7 @@ int main(void) {
     RUN(feed_after_done_is_ignored);
     RUN(feed_after_error_stays_failed);
     RUN(every_split_point_of_chunked_doc);
+    RUN(only_a_framed_http_1_1_response_without_close_is_reusable);
     RUN(create_null_callbacks_ok);
     RUN(destroy_null_safe);
     RUN(destroy_from_headers_callback_is_safe);

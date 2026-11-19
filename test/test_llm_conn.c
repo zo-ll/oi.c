@@ -13,6 +13,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -147,7 +148,7 @@ TEST(connect_write_echo_and_reentrant_close) {
 
     /* A hostname exercises asynchronous resolution and address fallback
      * (localhost commonly returns IPv6 before this IPv4 listener). */
-    oi_status st = oi_llm_conn_connect(r, "localhost", port, NULL, &cbs,
+    oi_status st = oi_llm_conn_connect(r, "localhost", port, NULL, NULL, &cbs,
                                         &ctx, &ctx.conn);
     CHECK_EQ(st, OI_OK);
 
@@ -204,7 +205,7 @@ TEST(connection_refused_reports_error) {
                                          err_on_error};
     oi_llm_conn *conn = NULL;
 
-    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, &cbs,
+    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, NULL, &cbs,
                                         &ctx, &conn);
     CHECK_EQ(st, OI_OK);
 
@@ -227,7 +228,7 @@ TEST(resolver_failure_is_reported_asynchronously) {
     struct oi_llm_conn_callbacks cbs = {err_on_connected, err_on_data,
                                          err_on_error};
     oi_llm_conn *conn = NULL;
-    CHECK_EQ(oi_llm_conn_connect(r, "does-not-exist.invalid", 443, NULL,
+    CHECK_EQ(oi_llm_conn_connect(r, "does-not-exist.invalid", 443, NULL, NULL,
                                   &cbs, &ctx, &conn),
               OI_OK);
     CHECK(!ctx.done); /* connect never blocks to resolve */
@@ -247,7 +248,7 @@ TEST(cancel_during_resolution_is_silent) {
     struct oi_llm_conn_callbacks cbs = {err_on_connected, err_on_data,
                                          err_on_error};
     oi_llm_conn *conn = NULL;
-    CHECK_EQ(oi_llm_conn_connect(r, "localhost", 443, NULL, &cbs, &ctx,
+    CHECK_EQ(oi_llm_conn_connect(r, "localhost", 443, NULL, NULL, &cbs, &ctx,
                                   &conn),
               OI_OK);
     oi_llm_conn_close(conn);
@@ -343,7 +344,7 @@ TEST(peer_close_reports_closed) {
     struct oi_llm_conn_callbacks cbs = {half_on_connected, half_on_data,
                                          half_on_error};
     oi_llm_conn *conn = NULL;
-    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, &cbs,
+    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, NULL, &cbs,
                                         &ctx, &conn);
     CHECK_EQ(st, OI_OK);
 
@@ -368,13 +369,13 @@ TEST(connect_rejects_bad_args) {
     oi_reactor *r = oi_reactor_create();
     struct oi_llm_conn_callbacks cbs = {NULL, NULL, NULL};
     oi_llm_conn *conn;
-    CHECK_EQ(oi_llm_conn_connect(NULL, "x", 1, NULL, &cbs, NULL, &conn),
+    CHECK_EQ(oi_llm_conn_connect(NULL, "x", 1, NULL, NULL, &cbs, NULL, &conn),
               OI_ERR_INVAL);
-    CHECK_EQ(oi_llm_conn_connect(r, NULL, 1, NULL, &cbs, NULL, &conn),
+    CHECK_EQ(oi_llm_conn_connect(r, NULL, 1, NULL, NULL, &cbs, NULL, &conn),
               OI_ERR_INVAL);
-    CHECK_EQ(oi_llm_conn_connect(r, "x", 1, NULL, NULL, NULL, &conn),
+    CHECK_EQ(oi_llm_conn_connect(r, "x", 1, NULL, NULL, NULL, NULL, &conn),
               OI_ERR_INVAL);
-    CHECK_EQ(oi_llm_conn_connect(r, "x", 1, NULL, &cbs, NULL, NULL),
+    CHECK_EQ(oi_llm_conn_connect(r, "x", 1, NULL, NULL, &cbs, NULL, NULL),
               OI_ERR_INVAL);
     oi_reactor_destroy(r);
 }
@@ -389,7 +390,7 @@ TEST(write_before_connected_rejected) {
     /* Use a no-op connected callback for this test by overriding: skip
      * writing in on_connected and instead try to write immediately,
      * before the reactor has had a chance to establish the connection. */
-    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, &cbs,
+    oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, NULL, &cbs,
                                         &ctx, &ctx.conn);
     CHECK_EQ(st, OI_OK);
     CHECK_EQ(oi_llm_conn_write(ctx.conn, "x", 1), OI_ERR_INVAL);
@@ -417,7 +418,7 @@ TEST(connection_preserves_sigpipe_disposition) {
     struct echo_ctx ctx = {0};
     struct oi_llm_conn_callbacks cbs = {echo_on_connected, echo_on_data,
                                          echo_on_error};
-    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, NULL, &cbs, &ctx,
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, NULL, NULL, &cbs, &ctx,
                                   &ctx.conn),
               OI_OK);
     run_until(r, &ctx.done, 100);
@@ -442,8 +443,12 @@ static unsigned short live_port;
 int __real_getaddrinfo(const char *node, const char *service,
                        const struct addrinfo *hints, struct addrinfo **res);
 
+/* Atomic: a cancelled lookup's resolver thread can still run. */
+static atomic_int getaddrinfo_calls;
+
 int __wrap_getaddrinfo(const char *node, const char *service,
                        const struct addrinfo *hints, struct addrinfo **res) {
+    getaddrinfo_calls++;
     if (node == NULL || strcmp(node, DEAD_THEN_LIVE) != 0) {
         return __real_getaddrinfo(node, service, hints, res);
     }
@@ -513,7 +518,7 @@ TEST(dead_address_moves_to_the_next_address) {
     struct oi_llm_conn_callbacks cbs = {close_on_connected, echo_on_data,
                                          echo_on_error};
     oi_llm_conn *conn = NULL;
-    CHECK_EQ(oi_llm_conn_connect(r, DEAD_THEN_LIVE, 1, NULL, &cbs, &ctx,
+    CHECK_EQ(oi_llm_conn_connect(r, DEAD_THEN_LIVE, 1, NULL, NULL, &cbs, &ctx,
                                   &conn),
               OI_OK);
     /* 6 s: more than the 3 s address timeout, much less than the
@@ -633,7 +638,7 @@ TEST(untrusted_certificate_names_the_verify_result) {
     oi_llm_conn *conn = NULL;
     oi_llm_tls *tls = NULL;
     CHECK_EQ(oi_llm_tls_create(NULL, &tls), OI_OK);
-    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, &cbs, &ctx,
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, NULL, &cbs, &ctx,
                                   &conn),
               OI_OK);
     run_until(r, &ctx.done, 100);
@@ -717,7 +722,7 @@ TEST(tls_round_trip_sends_with_msg_nosignal) {
     CHECK_EQ(oi_llm_tls_create(ca_path, &tls), OI_OK);
     sends_total = 0;
     sends_without_nosignal = 0;
-    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, &cbs, &ctx,
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, NULL, &cbs, &ctx,
                                   &conn),
               OI_OK);
     run_until(r, &ctx.done, 100);
@@ -777,12 +782,12 @@ TEST(second_connection_reuses_the_context_and_resumes_the_session) {
 
     struct reuse_ctx first = {0, 0};
     oi_llm_conn *conn = NULL;
-    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, &cbs, &first,
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, NULL, &cbs, &first,
                                   &conn),
               OI_OK);
     run_until(r, &first.done, 100);
     struct reuse_ctx second = {0, 0};
-    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, &cbs, &second,
+    CHECK_EQ(oi_llm_conn_connect(r, "127.0.0.1", port, tls, NULL, &cbs, &second,
                                   &conn),
               OI_OK);
     run_until(r, &second.done, 100);
@@ -794,6 +799,57 @@ TEST(second_connection_reuses_the_context_and_resumes_the_session) {
     oi_llm_tls_destroy(tls);
     waitpid(child, NULL, 0);
     unlink(ca_path);
+}
+
+/* --- a shared address cache skips the second lookup --- */
+
+static void cache_on_connected(oi_llm_conn *c, void *ud) {
+    struct echo_ctx *ctx = ud;
+    ctx->connected = 1;
+    oi_llm_conn_close(c);
+    ctx->done = 1;
+}
+
+TEST(address_cache_resolves_once_for_two_connections) {
+    /* Never accepts: the kernel completes both connections from the
+     * listen backlog. */
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, 4), 0);
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    unsigned short port = ntohs(addr.sin_port);
+    oi_reactor *r = oi_reactor_create();
+    oi_llm_addr_cache *cache = NULL;
+    CHECK_EQ(oi_llm_addr_cache_create(&cache), OI_OK);
+    struct oi_llm_conn_callbacks cbs = {cache_on_connected, echo_on_data,
+                                         echo_on_error};
+    getaddrinfo_calls = 0;
+
+    struct echo_ctx first = {0};
+    oi_llm_conn *conn = NULL;
+    CHECK_EQ(oi_llm_conn_connect(r, "localhost", port, NULL, cache, &cbs,
+                                  &first, &conn),
+             OI_OK);
+    run_until(r, &first.done, 100);
+    CHECK(first.connected);
+    CHECK_EQ(getaddrinfo_calls, 1);
+
+    struct echo_ctx second = {0};
+    CHECK_EQ(oi_llm_conn_connect(r, "localhost", port, NULL, cache, &cbs,
+                                  &second, &conn),
+             OI_OK);
+    run_until(r, &second.done, 100);
+    CHECK(second.connected);
+    CHECK_EQ(getaddrinfo_calls, 1);
+
+    oi_reactor_destroy(r);
+    oi_llm_addr_cache_destroy(cache);
+    close(listen_fd);
 }
 
 int main(void) {
@@ -813,5 +869,6 @@ int main(void) {
     RUN(untrusted_certificate_names_the_verify_result);
     RUN(tls_round_trip_sends_with_msg_nosignal);
     RUN(second_connection_reuses_the_context_and_resumes_the_session);
+    RUN(address_cache_resolves_once_for_two_connections);
     return oi_test_report();
 }

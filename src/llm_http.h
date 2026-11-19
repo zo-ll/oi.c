@@ -41,4 +41,10 @@ oi_status oi_llm_http_parser_close(oi_llm_http_parser *p);
 int oi_llm_http_parser_body_done(const oi_llm_http_parser *p);
 int oi_llm_http_parser_failed(const oi_llm_http_parser *p);
 
+/* True when the response is complete, ended by its own framing (a
+ * Content-Length, chunks, or a status with no body), and came from
+ * HTTP/1.1 with no "Connection: close": the connection can carry the next
+ * request. */
+int oi_llm_http_parser_reusable(const oi_llm_http_parser *p);
+
 #endif /* OI_LLM_HTTP_H */
