@@ -4318,7 +4318,10 @@ TEST(sent_renewal_survives_the_turn_end_and_finishes_while_idle) {
 /* At exit, a sent renewal against a slow token server makes oi wait. The
  * wait says so at once, and Ctrl+C ends it without a change to the
  * credentials file. */
-TEST(exit_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it) {
+/* A sent token renewal waits 10 s for its answer, at the exit or at
+ * /login. The wait is reported, Ctrl+C ends it in under 1 s, and the
+ * credentials file keeps the tokens it had. */
+static void ctrl_c_ends_the_renewal_wait(int at_login) {
     char config_root[] = "/tmp/oi-cli-renewal-exit-XXXXXX";
     char session_root[128];
     char path[256];
@@ -4380,7 +4383,11 @@ TEST(exit_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "ok\n\r\x1b[J> ", 1));
-    CHECK(write_interactive(master_fd, "\x04", 1));
+    if (at_login) {
+        CHECK(write_interactive(master_fd, "/login\r", 7));
+    } else {
+        CHECK(write_interactive(master_fd, "\x04", 1));
+    }
     CHECK(interactive_wait_for(master_fd, &result,
                                "finishing the ChatGPT token renewal", 1));
 
@@ -4388,7 +4395,10 @@ TEST(exit_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it) {
     struct timespec after;
     clock_gettime(CLOCK_MONOTONIC, &before);
     CHECK(write_interactive(master_fd, "\x03", 1));
-    {
+    if (at_login) {
+        CHECK(interactive_wait_for(master_fd, &result, "choose a provider",
+                                   1));
+    } else {
         int status = 0;
         CHECK_EQ(waitpid(cli, &status, 0), cli);
         result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -4397,6 +4407,15 @@ TEST(exit_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it) {
     double waited = (double)(after.tv_sec - before.tv_sec) +
                     (double)(after.tv_nsec - before.tv_nsec) / 1e9;
     CHECK(waited < 1.0);
+    if (at_login) {
+        CHECK(write_interactive(master_fd, "\x1b", 1));
+        CHECK(interactive_wait_for(master_fd, &result, "oi: login cancelled",
+                                   1));
+        CHECK(write_interactive(master_fd, "\x04", 1));
+        int status = 0;
+        CHECK_EQ(waitpid(cli, &status, 0), cli);
+        result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
     CHECK_EQ(result.exit_code, 0);
     {
         char saved[2048] = "";
@@ -4419,6 +4438,14 @@ TEST(exit_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it) {
     snprintf(path, sizeof path, "%s/oi", config_root);
     rmdir(path);
     rmdir(config_root);
+}
+
+TEST(exit_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it) {
+    ctrl_c_ends_the_renewal_wait(0);
+}
+
+TEST(login_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it) {
+    ctrl_c_ends_the_renewal_wait(1);
 }
 
 /* A token renewal waits for a server that accepts and never answers. The
@@ -7548,6 +7575,7 @@ int main(void) {
     RUN(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it);
     RUN(sent_renewal_survives_the_turn_end_and_finishes_while_idle);
     RUN(exit_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it);
+    RUN(login_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it);
     RUN(tool_panel_shows_live_output_and_failed_status);
     RUN(tool_panel_survives_malicious_escape_bytes_in_output);
     RUN(tool_panel_coexists_with_resize_and_queued_input);
