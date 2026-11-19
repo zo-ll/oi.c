@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <openssl/err.h>
@@ -51,7 +52,9 @@ struct oi_llm_conn {
     enum conn_state state;
     struct resolver_job *resolver;
     struct addrinfo *addresses;
+    int addresses_copied; /* from copy_addresses, not from getaddrinfo */
     struct addrinfo *next_address;
+    oi_llm_addr_cache *cache; /* borrowed; NULL = resolve every time */
     oi_reactor_timer *address_timer;
 
     oi_llm_tls *tls; /* borrowed; NULL = plain TCP */
@@ -118,6 +121,118 @@ static void update_interest(oi_llm_conn *c) {
     oi_reactor_modify(c->reactor, c->fd, interest);
 }
 
+/* --- address cache --- */
+
+/* How long a resolved address list serves later connections. */
+#define OI_LLM_ADDR_CACHE_MS 60000
+
+struct oi_llm_addr_cache {
+    char *host;
+    unsigned short port;
+    struct addrinfo *addresses; /* from copy_addresses */
+    int64_t expires_ms;         /* CLOCK_MONOTONIC */
+};
+
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static void free_addresses(struct addrinfo *list) {
+    while (list != NULL) {
+        struct addrinfo *next = list->ai_next;
+        free(list); /* the sockaddr lives in the same block */
+        list = next;
+    }
+}
+
+/* A deep copy that this module frees with free_addresses: getaddrinfo's
+ * own lists may only go to freeaddrinfo. ai_canonname is not kept. */
+static struct addrinfo *copy_addresses(const struct addrinfo *list) {
+    struct addrinfo *head = NULL;
+    struct addrinfo **tail = &head;
+    for (; list != NULL; list = list->ai_next) {
+        struct addrinfo *node = malloc(sizeof *node + list->ai_addrlen);
+        if (node == NULL) {
+            free_addresses(head);
+            return NULL;
+        }
+        *node = *list;
+        node->ai_addr = (struct sockaddr *)(node + 1);
+        memcpy(node->ai_addr, list->ai_addr, list->ai_addrlen);
+        node->ai_canonname = NULL;
+        node->ai_next = NULL;
+        *tail = node;
+        tail = &node->ai_next;
+    }
+    return head;
+}
+
+static void cache_clear(oi_llm_addr_cache *cache) {
+    free_addresses(cache->addresses);
+    free(cache->host);
+    cache->addresses = NULL;
+    cache->host = NULL;
+}
+
+oi_status oi_llm_addr_cache_create(oi_llm_addr_cache **out_cache) {
+    oi_llm_addr_cache *cache = calloc(1, sizeof *cache);
+    if (cache == NULL) {
+        return OI_ERR_NOMEM;
+    }
+    *out_cache = cache;
+    return OI_OK;
+}
+
+void oi_llm_addr_cache_destroy(oi_llm_addr_cache *cache) {
+    if (cache != NULL) {
+        cache_clear(cache);
+        free(cache);
+    }
+}
+
+/* A fresh copy of the cached list for `host` and `port`, or NULL. */
+static struct addrinfo *cache_lookup(oi_llm_addr_cache *cache,
+                                     const char *host, unsigned short port) {
+    if (cache == NULL || cache->addresses == NULL || cache->port != port ||
+        strcmp(cache->host, host) != 0) {
+        return NULL;
+    }
+    if (monotonic_ms() >= cache->expires_ms) {
+        cache_clear(cache);
+        return NULL;
+    }
+    return copy_addresses(cache->addresses);
+}
+
+static void cache_store(oi_llm_addr_cache *cache, const char *host,
+                        unsigned short port, const struct addrinfo *list) {
+    char *copy_host = strdup(host);
+    struct addrinfo *copy = copy_addresses(list);
+    if (copy_host == NULL || copy == NULL) {
+        free(copy_host);
+        free_addresses(copy);
+        return; /* the cache is an optimization; this lookup still works */
+    }
+    cache_clear(cache);
+    cache->host = copy_host;
+    cache->port = port;
+    cache->addresses = copy;
+    cache->expires_ms = monotonic_ms() + OI_LLM_ADDR_CACHE_MS;
+}
+
+static void release_addresses(oi_llm_conn *c) {
+    if (c->addresses_copied) {
+        free_addresses(c->addresses);
+    } else {
+        freeaddrinfo(c->addresses);
+    }
+    c->addresses = NULL;
+    c->next_address = NULL;
+    c->addresses_copied = 0;
+}
+
 void oi_llm_conn_close(oi_llm_conn *c) {
     if (c == NULL) {
         return;
@@ -161,7 +276,7 @@ void oi_llm_conn_close(oi_llm_conn *c) {
     /* The request head holds the Authorization header. */
     oi_wipe(c->out_buf, c->out_cap);
     free(c->out_buf);
-    freeaddrinfo(c->addresses);
+    release_addresses(c);
     free(c->host);
     if (c->destroyed_flag) {
         *c->destroyed_flag = 1;
@@ -662,6 +777,10 @@ static oi_status connect_next_address(oi_llm_conn *c) {
         fd = -1;
     }
     if (fd < 0) {
+        /* Every cached address failed: resolve afresh next time. */
+        if (c->cache != NULL && c->addresses_copied) {
+            cache_clear(c->cache);
+        }
         set_cause(c, "could not connect to %s port %u: %s", c->host,
                   (unsigned)c->port,
                   c->connect_errno != 0 ? strerror(c->connect_errno)
@@ -778,6 +897,9 @@ static void handle_resolver_ready(oi_llm_conn *c) {
 
     c->addresses = result;
     c->next_address = result;
+    if (gai_error == 0 && c->cache != NULL) {
+        cache_store(c->cache, c->host, c->port, result);
+    }
     oi_status st;
     if (gai_error != 0) {
         set_cause(c, "could not resolve %s: %s", c->host,
@@ -806,9 +928,7 @@ static void handle_tcp_connecting(oi_llm_conn *c) {
     }
     oi_reactor_timer_cancel(c->address_timer);
     c->address_timer = NULL;
-    freeaddrinfo(c->addresses);
-    c->addresses = NULL;
-    c->next_address = NULL;
+    release_addresses(c);
 
     if (c->tls != NULL) {
         if (start_tls_handshake(c) != OI_OK) {
@@ -889,8 +1009,29 @@ OI_DIAG_POP
 
 /* --- public API --- */
 
+/* A cache hit skips the resolver thread; the connect still starts from the
+ * reactor, so that every callback stays asynchronous. */
+static void start_from_cache(oi_reactor *r, void *user_data) {
+    (void)r;
+    oi_llm_conn *c = user_data;
+    int destroyed = 0;
+OI_DIAG_PUSH_IGNORE_DANGLING
+    c->destroyed_flag = &destroyed;
+OI_DIAG_POP
+    oi_reactor_timer_cancel(c->address_timer);
+    c->address_timer = NULL;
+    oi_status st = connect_next_address(c);
+    if (st != OI_OK) {
+        fail_conn(c, st);
+    }
+    if (!destroyed) {
+        c->destroyed_flag = NULL;
+    }
+}
+
 oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
                                unsigned short port, oi_llm_tls *tls,
+                               oi_llm_addr_cache *cache,
                                const struct oi_llm_conn_callbacks *cbs,
                                void *user_data, oi_llm_conn **out_conn) {
     if (r == NULL || host == NULL || cbs == NULL || out_conn == NULL) {
@@ -921,6 +1062,22 @@ oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
     if (c->host == NULL) {
         free(c);
         return OI_ERR_NOMEM;
+    }
+    c->cache = cache;
+    c->addresses = cache_lookup(cache, host, port);
+    if (c->addresses != NULL) {
+        c->addresses_copied = 1;
+        c->next_address = c->addresses;
+        oi_status st = oi_reactor_timer_start(r, 1, start_from_cache, c,
+                                              &c->address_timer);
+        if (st != OI_OK) {
+            release_addresses(c);
+            free(c->host);
+            free(c);
+            return st;
+        }
+        *out_conn = c;
+        return OI_OK;
     }
 
     int notify[2] = {-1, -1};
@@ -1028,6 +1185,13 @@ oi_status oi_llm_conn_write(oi_llm_conn *c, const void *data, size_t len) {
     c->out_len += len;
     update_interest(c);
     return OI_OK;
+}
+
+void oi_llm_conn_set_callbacks(oi_llm_conn *c,
+                               const struct oi_llm_conn_callbacks *cbs,
+                               void *user_data) {
+    c->cbs = *cbs;
+    c->user_data = user_data;
 }
 
 const char *oi_llm_conn_error_cause(const oi_llm_conn *c) {

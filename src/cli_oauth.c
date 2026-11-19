@@ -791,7 +791,7 @@ oi_status oi_cli_oauth_http(const struct oi_cli_oauth_server *server,
         struct oi_llm_conn_callbacks callbacks = {
             http_on_connected, http_on_data, http_on_error};
         st = oi_llm_conn_connect(reactor, server->host,
-                                 (unsigned short)server->port, tls,
+                                 (unsigned short)server->port, tls, NULL,
                                  &callbacks, &call, &call.conn);
     }
     if (st == OI_OK) {
@@ -987,7 +987,7 @@ oi_status oi_cli_oauth_refresh_start(
         struct oi_llm_conn_callbacks callbacks = {
             http_on_connected, http_on_data, http_on_error};
         st = oi_llm_conn_connect(reactor, auth->host,
-                                 (unsigned short)auth->port, call->tls,
+                                 (unsigned short)auth->port, call->tls, NULL,
                                  &callbacks, &call->http, &call->http.conn);
     }
     if (st == OI_OK) {

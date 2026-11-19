@@ -4,6 +4,7 @@
 #include "test.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -12,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Reads (and discards) whatever the client sends until the socket is
@@ -1473,6 +1475,184 @@ TEST(cancel_during_a_hook_wait_stops_the_wait) {
     oi_reactor_destroy(r);
 }
 
+/* --- keep-alive --- */
+
+/* Serves up to `connections` connections, one after another, and each
+ * request on them, with a Content-Length response. With `close_after`,
+ * it waits 200 ms after each response and closes without reading more,
+ * so a request sent in that window gets no answer. Each accept writes
+ * one byte to *out_accepts_fd. */
+static pid_t start_keep_alive_server(int connections, int close_after,
+                                     unsigned short *out_port,
+                                     int *out_accepts_fd) {
+    static const char body[] =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}"
+        "\n\ndata: [DONE]\n\n";
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    int accepts[2];
+    CHECK(listen_fd >= 0);
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, 4), 0);
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    *out_port = ntohs(addr.sin_port);
+    CHECK_EQ(pipe(accepts), 0);
+
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid != 0) {
+        close(listen_fd);
+        close(accepts[1]);
+        *out_accepts_fd = accepts[0];
+        return pid;
+    }
+    close(accepts[0]);
+    for (int i = 0; i < connections; i++) {
+        int cfd = accept(listen_fd, NULL, NULL);
+        if (cfd < 0) {
+            break;
+        }
+        (void)!write(accepts[1], "a", 1);
+        for (;;) {
+            char request[8192];
+            size_t len = 0;
+            const char *head_end = NULL;
+            size_t content_length = 0;
+            while (len < sizeof request - 1) {
+                ssize_t n = read(cfd, request + len, sizeof request - 1 - len);
+                if (n <= 0) {
+                    break;
+                }
+                len += (size_t)n;
+                request[len] = '\0';
+                head_end = strstr(request, "\r\n\r\n");
+                if (head_end != NULL) {
+                    const char *cl = strstr(request, "Content-Length: ");
+                    content_length =
+                        cl != NULL ? strtoul(cl + 16, NULL, 10) : 0;
+                    if ((size_t)(request + len - (head_end + 4)) >=
+                        content_length) {
+                        break;
+                    }
+                }
+            }
+            if (head_end == NULL) {
+                break; /* the client closed the connection */
+            }
+            char head[128];
+            int head_len = snprintf(head, sizeof head,
+                                    "HTTP/1.1 200 OK\r\nContent-Length: "
+                                    "%zu\r\n\r\n",
+                                    sizeof body - 1);
+            (void)!write(cfd, head, (size_t)head_len);
+            (void)!write(cfd, body, sizeof body - 1);
+            if (close_after) {
+                struct timespec pause = {0, 200 * 1000 * 1000};
+                nanosleep(&pause, NULL);
+                break;
+            }
+        }
+        close(cfd);
+    }
+    _exit(0);
+}
+
+static int count_accepts(int fd) {
+    char bytes[16];
+    int fl = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    ssize_t n = read(fd, bytes, sizeof bytes);
+    return n > 0 ? (int)n : 0;
+}
+
+/* Two requests, the second started right after the first one's on_done,
+ * as a tool loop does. Returns the second request's status. */
+static oi_status two_requests(oi_llm_client *client, oi_reactor *r) {
+    oi_arena *a = oi_arena_create(0);
+    struct stream_ctx first = {0};
+    struct stream_ctx second = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &first, &req),
+             OI_OK);
+    run_until(r, &first.done, 100);
+    CHECK(first.done);
+    CHECK_EQ(first.done_status, OI_OK);
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &second, &req),
+             OI_OK);
+    run_until(r, &second.done, 100);
+    CHECK(second.done);
+    CHECK_EQ(second.text_len, (size_t)2);
+    oi_arena_destroy(a);
+    return second.done_status;
+}
+
+TEST(keep_alive_sends_two_requests_on_one_connection) {
+    unsigned short port;
+    int accepts_fd;
+    pid_t child = start_keep_alive_server(1, 0, &port, &accepts_fd);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    oi_llm_client_set_keep_alive(client, 1);
+    oi_reactor *r = oi_reactor_create();
+
+    CHECK_EQ(two_requests(client, r), OI_OK);
+    CHECK_EQ(count_accepts(accepts_fd), 1);
+
+    oi_llm_client_destroy(client); /* closes the kept connection */
+    oi_reactor_destroy(r);
+    kill(child, SIGKILL); /* a failed test leaves it in accept() */
+    waitpid(child, NULL, 0);
+    close(accepts_fd);
+}
+
+TEST(without_keep_alive_each_request_has_its_own_connection) {
+    unsigned short port;
+    int accepts_fd;
+    pid_t child = start_keep_alive_server(2, 0, &port, &accepts_fd);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    oi_reactor *r = oi_reactor_create();
+
+    CHECK_EQ(two_requests(client, r), OI_OK);
+    CHECK_EQ(count_accepts(accepts_fd), 2);
+
+    oi_llm_client_destroy(client);
+    oi_reactor_destroy(r);
+    kill(child, SIGKILL); /* a failed test leaves it in accept() */
+    waitpid(child, NULL, 0);
+    close(accepts_fd);
+}
+
+TEST(kept_connection_closed_by_the_server_is_replaced_once) {
+    unsigned short port;
+    int accepts_fd;
+    pid_t child = start_keep_alive_server(2, 1, &port, &accepts_fd);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    oi_llm_client_set_keep_alive(client, 1);
+    oi_reactor *r = oi_reactor_create();
+
+    /* Request 2 goes out on the kept connection, which the server then
+     * closes unanswered; it succeeds on a second connection. */
+    CHECK_EQ(two_requests(client, r), OI_OK);
+    CHECK_EQ(count_accepts(accepts_fd), 2);
+
+    oi_llm_client_destroy(client);
+    oi_reactor_destroy(r);
+    kill(child, SIGKILL); /* a failed test leaves it in accept() */
+    waitpid(child, NULL, 0);
+    close(accepts_fd);
+}
+
 TEST(cancel_null_safe) { oi_llm_request_cancel(NULL); }
 
 int main(void) {
@@ -1514,6 +1694,9 @@ int main(void) {
     RUN(hook_that_says_again_makes_the_request_wait);
     RUN(hook_failure_after_a_wait_reaches_on_done);
     RUN(cancel_during_a_hook_wait_stops_the_wait);
+    RUN(keep_alive_sends_two_requests_on_one_connection);
+    RUN(without_keep_alive_each_request_has_its_own_connection);
+    RUN(kept_connection_closed_by_the_server_is_replaced_once);
     RUN(cancel_null_safe);
     return oi_test_report();
 }

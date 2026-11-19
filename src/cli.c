@@ -1276,6 +1276,9 @@ int main(int argc, char **argv) {
         exit_code = 1;
         goto cleanup;
     }
+    /* cleanup destroys the client before the reactor, as keep-alive
+     * requires. */
+    oi_llm_client_set_keep_alive(client, 1);
     login.client = client;
     login.reactor = reactor;
     oi_llm_client_set_before_request(client, oi_cli_login_before_request,

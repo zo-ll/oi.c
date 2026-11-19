@@ -40,6 +40,8 @@ struct oi_llm_http_parser {
     size_t line_cap;
 
     int status_code;
+    int keep_alive; /* HTTP/1.1 with no "Connection: close" */
+    int framed;     /* the body ends by its own framing, not by a close */
     int is_chunked;
     long content_length; /* -1 = absent */
     long remaining;      /* bytes left in the current chunk / content body */
@@ -72,6 +74,8 @@ oi_llm_http_parser *oi_llm_http_parser_create(
     p->line_len = 0;
     p->state = ST_STATUS_LINE;
     p->status_code = 0;
+    p->keep_alive = 0;
+    p->framed = 0;
     p->is_chunked = 0;
     p->content_length = -1;
     p->remaining = 0;
@@ -103,6 +107,10 @@ oi_status oi_llm_http_parser_close(oi_llm_http_parser *p) {
 
 int oi_llm_http_parser_body_done(const oi_llm_http_parser *p) {
     return p != NULL && p->state == ST_DONE;
+}
+
+int oi_llm_http_parser_reusable(const oi_llm_http_parser *p) {
+    return p != NULL && p->state == ST_DONE && p->framed && p->keep_alive;
 }
 
 int oi_llm_http_parser_failed(const oi_llm_http_parser *p) {
@@ -153,6 +161,7 @@ static oi_status handle_status_line(oi_llm_http_parser *p) {
     p->status_code = (p->line_buf[i] - '0') * 100 +
                       (p->line_buf[i + 1] - '0') * 10 +
                       (p->line_buf[i + 2] - '0');
+    p->keep_alive = memcmp(p->line_buf, "HTTP/1.1 ", 9) == 0;
     p->state = ST_HEADER_LINE;
     return OI_OK;
 }
@@ -162,6 +171,7 @@ static oi_status finish_headers(oi_llm_http_parser *p) {
         p->state = ST_ERROR;
         return OI_ERR_PARSE;
     }
+    p->framed = 1;
     if (p->is_chunked) {
         p->state = ST_CHUNK_SIZE_LINE;
     } else if (p->content_length >= 0) {
@@ -177,6 +187,7 @@ static oi_status finish_headers(oi_llm_http_parser *p) {
     } else {
         /* Neither chunked nor Content-Length: the body ends when the
          * peer closes the connection (oi_llm_http_parser_close). */
+        p->framed = 0;
         p->state = ST_UNTIL_CLOSE_BODY;
     }
     if (p->on_headers_done) {
@@ -246,6 +257,30 @@ static oi_status handle_header_line(oi_llm_http_parser *p) {
             return OI_ERR_PARSE;
         }
         p->content_length = v;
+    } else if (name_len == 10 &&
+               strncasecmp(p->line_buf, "Connection", 10) == 0) {
+        /* A comma-separated token list; "close" in it ends the
+         * connection after this response. */
+        size_t k = vi;
+        while (k < value_end) {
+            size_t end = k;
+            while (end < value_end && p->line_buf[end] != ',') {
+                end++;
+            }
+            size_t a = k;
+            size_t b = end;
+            while (a < b && (p->line_buf[a] == ' ' || p->line_buf[a] == '\t')) {
+                a++;
+            }
+            while (b > a &&
+                   (p->line_buf[b - 1] == ' ' || p->line_buf[b - 1] == '\t')) {
+                b--;
+            }
+            if (b - a == 5 && strncasecmp(p->line_buf + a, "close", 5) == 0) {
+                p->keep_alive = 0;
+            }
+            k = end + 1;
+        }
     }
 
     p->state = ST_HEADER_LINE;

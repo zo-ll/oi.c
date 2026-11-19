@@ -121,6 +121,17 @@ oi_status oi_llm_client_reconfigure(oi_llm_client *client,
                                     int responses_api);
 
 /*
+ * Off by default. When on, a request sends "Connection: keep-alive", and
+ * after a complete, length-framed response the client keeps the
+ * connection, registered on that request's reactor, for its next request
+ * on the same reactor. A kept connection that the server has closed is
+ * replaced once, before any response byte. Turning it off closes the kept
+ * connection. With keep-alive on, destroy the client (or turn keep-alive
+ * off) before the reactor of its last request.
+ */
+void oi_llm_client_set_keep_alive(oi_llm_client *client, int enabled);
+
+/*
  * Runs `hook` at the start of every request, before anything is sent, so
  * that a caller can renew a short-lived credential through
  * oi_llm_client_reconfigure. OI_ERR_AGAIN means "not yet": the request

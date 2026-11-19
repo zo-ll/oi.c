@@ -50,10 +50,22 @@ struct oi_llm_conn_callbacks {
 };
 
 /*
+ * The last address list resolved for one host and port, kept for 60
+ * seconds, so that a later connection skips the resolver thread. A
+ * connection that cannot reach any cached address clears the cache. A
+ * connection borrows its cache, so the cache must stay alive until that
+ * connection is closed.
+ */
+typedef struct oi_llm_addr_cache oi_llm_addr_cache;
+oi_status oi_llm_addr_cache_create(oi_llm_addr_cache **out_cache);
+void oi_llm_addr_cache_destroy(oi_llm_addr_cache *cache); /* NULL-safe */
+
+/*
  * Begins asynchronous resolution of `host`, then a non-blocking connect,
  * wrapping the connection in TLS with `tls` once the TCP handshake
  * completes; `tls` NULL means plain TCP. Certificate verification is
- * always on (hostname + chain); there is no way to disable it.
+ * always on (hostname + chain); there is no way to disable it. `cache`
+ * NULL resolves `host` every time.
  *
  * Returns the new connection via *out_conn immediately, before it's
  * connected; `cbs->on_connected` (or `cbs->on_error` on failure) fires
@@ -62,6 +74,7 @@ struct oi_llm_conn_callbacks {
  */
 oi_status oi_llm_conn_connect(oi_reactor *r, const char *host,
                                unsigned short port, oi_llm_tls *tls,
+                               oi_llm_addr_cache *cache,
                                const struct oi_llm_conn_callbacks *cbs,
                                void *user_data, oi_llm_conn **out_conn);
 
@@ -82,6 +95,15 @@ oi_status oi_llm_conn_write(oi_llm_conn *c, const void *data, size_t len);
  * ownership rules.
  */
 void oi_llm_conn_close(oi_llm_conn *c);
+
+/*
+ * Moves an established connection to a new owner: later callbacks go to
+ * `cbs` and `user_data`. Safe from inside one of the connection's own
+ * callbacks.
+ */
+void oi_llm_conn_set_callbacks(oi_llm_conn *c,
+                               const struct oi_llm_conn_callbacks *cbs,
+                               void *user_data);
 
 /*
  * The reason for the failure that on_error reports, as one line of text:
