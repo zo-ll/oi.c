@@ -135,7 +135,7 @@ static int composer_poll(struct oi_cli_composer *composer,
     oi_reactor *reactor = composer->reactor;
     int64_t deadline = timeout_ms >= 0 ? monotonic_ms() + timeout_ms : 0;
     for (;;) {
-        struct pollfd all[4];
+        struct pollfd all[4]; /* at most 3 from the callers, + the reactor */
         int wait = timeout_ms;
         if (timeout_ms >= 0) {
             int64_t left = deadline - monotonic_ms();

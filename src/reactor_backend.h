@@ -45,16 +45,16 @@ oi_status oi_reactor_backend_process_add(oi_reactor_backend *b, pid_t pid,
 oi_status oi_reactor_backend_process_remove(oi_reactor_backend *b,
                                              uintptr_t handle);
 
+/* The descriptor that the backend waits on; readable when an event is
+ * pending. */
+int oi_reactor_backend_fd(const oi_reactor_backend *b);
+
 /*
  * Waits up to timeout_ms (-1 = indefinite) for ready fds. On success,
  * fills out_tokens/out_revents (parallel arrays, caller-owned, capacity
  * max_events) and returns the count via *out_n (0 on timeout). Returns
  * OI_ERR_IO on a hard backend failure.
  */
-/* The descriptor that the backend waits on; readable when an event is
- * pending. */
-int oi_reactor_backend_fd(const oi_reactor_backend *b);
-
 oi_status oi_reactor_backend_wait(oi_reactor_backend *b, int timeout_ms,
                                    uint64_t *out_tokens, int *out_revents,
                                    int max_events, int *out_n);
