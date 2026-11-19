@@ -1251,11 +1251,20 @@ oi_status oi_cli_login_run(struct oi_cli_login *login,
     /* A renewal belongs to the login it started under. A sent one finishes
      * first, so that its rotated tokens are saved; then it is dropped, so it
      * cannot write that login's credentials over the new ones, nor adopt
-     * its token after them, and it releases the credentials lock. */
-    finish_sent_renewal(login);
+     * its token after them, and it releases the credentials lock. The raw
+     * prompt turns Ctrl+C into a byte; ISIG makes it the SIGINT that ends
+     * the wait. */
+    oi_status st = oi_cli_terminal_set_isig(&composer->terminal, 1);
+    if (st == OI_OK) {
+        finish_sent_renewal(login);
+        st = oi_cli_terminal_set_isig(&composer->terminal, 0);
+    }
     renewal_free(login->renewal);
     login->renewal = NULL;
-    oi_status st = run_dialog(login, composer, signal_fd, out_terminate_signal,
+    if (st != OI_OK) {
+        return st;
+    }
+    st = run_dialog(login, composer, signal_fd, out_terminate_signal,
                               message, sizeof message);
     if (st != OI_OK || *out_terminate_signal != 0) {
         return st;
