@@ -110,13 +110,16 @@ deadline, and tool policy.
 
 ## Tools
 
-The CLI advertises a built-in `shell` tool, which runs `sh -c <command>` in
-the session working directory. That is arbitrary code execution requested by
-a model, so the default policy is `ask`: interactive runs prompt before each
-call, and a one-shot run refuses the call rather than prompting. Pass
-`--allow-tools` deliberately for unattended tool use, or `--deny-tools` to
-refuse everything. `oi` follows tool calls with their results until the model
-returns a final answer or `--max-turns` (default 8) is reached.
+The CLI advertises four built-in tools: `read`, `edit`, and `write` work on
+files without a shell, and `bash` runs `bash -c <command>` in the session
+working directory. A `read` inside the project runs without a prompt. The
+other calls can change files or run arbitrary code requested by a model, so
+the default policy is `ask`: interactive runs prompt before each call, and a
+one-shot run refuses the call rather than prompting. Approval for file access
+does not approve commands. Pass `--allow-tools` deliberately for unattended
+tool use, or `--deny-tools` to refuse everything. `oi` follows tool calls
+with their results until the model returns a final answer or `--max-turns`
+(default 8) is reached.
 
 Session files are append-only `.oilog` logs with a CRC-32 for each record.
 They recover a torn trailing record after a process crash, and keep a

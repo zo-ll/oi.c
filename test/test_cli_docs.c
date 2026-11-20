@@ -57,7 +57,7 @@ static char *read_flattened(const char *path) {
 
 static char *capture_help(void) {
     struct oi_cli_command_parse parse;
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context;
     enum oi_cli_command_result result;
     FILE *sink = tmpfile();

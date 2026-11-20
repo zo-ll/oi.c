@@ -37,7 +37,7 @@ static oi_status dispatch(
 TEST(help_lists_commands_and_exit_requests_exit) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "test-model",
         .permission = &permission,
@@ -62,7 +62,7 @@ TEST(help_lists_commands_and_exit_requests_exit) {
 TEST(help_with_an_argument_prints_usage) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "test-model",
         .permission = &permission,
@@ -87,7 +87,7 @@ TEST(help_with_an_argument_prints_usage) {
 TEST(permissions_are_process_scoped_and_validated) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "test-model",
         .permission = &permission, .session_id = "session-1",
@@ -150,7 +150,7 @@ static oi_status silent_status(void *user_data,
 TEST(status_reports_the_assembled_snapshot) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct status_cb_call call = {0, OI_OK};
     struct oi_cli_command_context context = {
         .out = out,
@@ -189,7 +189,7 @@ TEST(status_reports_the_assembled_snapshot) {
 TEST(status_reports_unknown_for_everything_a_callback_leaves_alone) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ALLOW};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ALLOW};
     struct status_cb_call call = {0, OI_OK};
     struct oi_cli_command_context context = {
         .out = out,
@@ -226,7 +226,7 @@ TEST(status_reports_unknown_for_everything_a_callback_leaves_alone) {
 TEST(status_rejects_arguments_and_survives_an_unavailable_snapshot) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct status_cb_call call = {0, OI_ERR_IO};
     struct oi_cli_command_context context = {
         .out = out,
@@ -284,7 +284,7 @@ static oi_status record_set_model(void *user_data, const char *name,
 TEST(model_with_no_argument_prints_the_active_model) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
         .permission = &permission,
@@ -303,7 +303,7 @@ TEST(model_with_no_argument_prints_the_active_model) {
 TEST(model_with_no_callback_reports_unavailable) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
         .permission = &permission,
@@ -322,7 +322,7 @@ TEST(model_with_no_callback_reports_unavailable) {
 TEST(model_with_argument_invokes_the_callback_with_exact_bytes) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct model_cb_call call = {.result = OI_OK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
@@ -345,7 +345,7 @@ TEST(model_with_argument_invokes_the_callback_with_exact_bytes) {
 TEST(model_callback_failure_is_reported_and_stays_in_the_repl) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct model_cb_call call = {.result = OI_ERR_INVAL};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
@@ -367,7 +367,7 @@ TEST(model_callback_failure_is_reported_and_stays_in_the_repl) {
 TEST(model_callback_structural_failure_propagates) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct model_cb_call call = {.result = OI_ERR_IO};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
@@ -384,7 +384,7 @@ TEST(model_callback_structural_failure_propagates) {
 TEST(model_rejects_an_oversized_name_without_calling_back) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct model_cb_call call = {.result = OI_OK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
@@ -431,7 +431,7 @@ static oi_status record_set_cwd(void *user_data, const char *path,
 TEST(cwd_with_no_argument_prints_the_process_cwd) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
         .permission = &permission,
@@ -450,7 +450,7 @@ TEST(cwd_with_no_argument_prints_the_process_cwd) {
 TEST(cwd_with_no_callback_reports_unavailable) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
         .permission = &permission,
@@ -469,7 +469,7 @@ TEST(cwd_with_no_callback_reports_unavailable) {
 TEST(cwd_with_argument_invokes_the_callback_with_exact_bytes) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct cwd_cb_call call = {.result = OI_OK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
@@ -492,7 +492,7 @@ TEST(cwd_with_argument_invokes_the_callback_with_exact_bytes) {
 TEST(cwd_callback_failure_is_reported_and_stays_in_the_repl) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct cwd_cb_call call = {.result = OI_ERR_INVAL};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "current-model",
@@ -631,7 +631,7 @@ static struct oi_cli_command_session_ops wired_ops(
 TEST(session_list_renders_every_entry_state) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "m", .permission = &permission,
@@ -671,7 +671,7 @@ TEST(session_list_renders_every_entry_state) {
 TEST(session_list_reports_an_empty_directory_and_a_read_failure) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "m", .permission = &permission,
@@ -701,7 +701,7 @@ TEST(session_list_reports_an_empty_directory_and_a_read_failure) {
 TEST(session_current_reports_health_live) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "m", .permission = &permission,
@@ -735,7 +735,7 @@ TEST(session_current_reports_health_live) {
 TEST(session_rename_passes_exact_bytes_and_reports_details) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "m", .permission = &permission,
@@ -780,7 +780,7 @@ TEST(session_rename_passes_exact_bytes_and_reports_details) {
 TEST(session_trash_and_restore_take_exactly_one_id) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct session_cb_state state;
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "m", .permission = &permission,
@@ -825,7 +825,7 @@ TEST(session_trash_and_restore_take_exactly_one_id) {
 TEST(session_reports_unavailable_operations_and_bad_subcommands) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "m", .permission = &permission,
     };
@@ -864,7 +864,7 @@ TEST(repl_owned_commands_are_a_caller_error) {
     };
     FILE *out = tmpfile();
     FILE *err = tmpfile();
-    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
     struct oi_cli_command_context context = {
         .out = out, .err = err, .model = "m", .permission = &permission,
     };

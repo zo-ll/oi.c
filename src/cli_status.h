@@ -21,11 +21,17 @@ enum oi_cli_status_permission {
     OI_CLI_STATUS_PERMISSION_UNKNOWN = 0,
     OI_CLI_STATUS_PERMISSION_ASK,
     OI_CLI_STATUS_PERMISSION_ALLOW,
-    OI_CLI_STATUS_PERMISSION_DENY
+    OI_CLI_STATUS_PERMISSION_DENY,
+    OI_CLI_STATUS_PERMISSION_ASK_FILE_ACCESS_ALLOWED,
+    OI_CLI_STATUS_PERMISSION_ASK_COMMANDS_ALLOWED,
+    OI_CLI_STATUS_PERMISSION_ASK_BOTH_ALLOWED
 };
 
-enum oi_cli_status_permission oi_cli_status_permission_from_policy(
-    oi_cli_tool_policy policy);
+enum oi_cli_status_permission oi_cli_status_permission_from(
+    const struct oi_cli_permission *permission);
+
+const char *oi_cli_status_permission_text(
+    enum oi_cli_status_permission permission);
 
 enum oi_cli_status_queue_state {
     OI_CLI_STATUS_QUEUE_UNKNOWN = 0,

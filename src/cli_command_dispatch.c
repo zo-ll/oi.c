@@ -7,18 +7,6 @@
 
 #define OI_CLI_COMMAND_MODEL_MAX_LEN 256u
 
-static const char *permission_name(oi_cli_tool_policy policy) {
-    switch (policy) {
-    case OI_CLI_TOOLS_ASK:
-        return "ask";
-    case OI_CLI_TOOLS_ALLOW:
-        return "allow";
-    case OI_CLI_TOOLS_DENY:
-        return "deny";
-    }
-    return "unknown";
-}
-
 static oi_status print_help(FILE *out) {
     size_t i;
 
@@ -81,33 +69,37 @@ static int argument_equals(const struct oi_cli_command_parse *command,
            memcmp(command->arguments, value, value_len) == 0;
 }
 
+static oi_status print_permissions(struct oi_cli_command_context *context) {
+    enum oi_cli_status_permission permission =
+        oi_cli_status_permission_from(context->permission);
+
+    return fprintf(context->out, "Permissions: %s\n",
+                   oi_cli_status_permission_text(permission)) < 0 ||
+                   fflush(context->out) != 0
+               ? OI_ERR_IO
+               : OI_OK;
+}
+
 static oi_status dispatch_permissions(
     const struct oi_cli_command_parse *command,
     struct oi_cli_command_context *context) {
     if (command->arguments_len == 0) {
-        return fprintf(context->out, "Permissions: %s\n",
-                       permission_name(context->permission->policy)) < 0 ||
-                       fflush(context->out) != 0
-                   ? OI_ERR_IO
-                   : OI_OK;
+        return print_permissions(context);
     }
     if (argument_equals(command, "ask")) {
-        context->permission->policy = OI_CLI_TOOLS_ASK;
+        oi_cli_permission_set_policy(context->permission, OI_CLI_TOOLS_ASK);
     } else if (argument_equals(command, "allow")) {
-        context->permission->policy = OI_CLI_TOOLS_ALLOW;
+        oi_cli_permission_set_policy(context->permission,
+                                     OI_CLI_TOOLS_ALLOW);
     } else if (argument_equals(command, "deny")) {
-        context->permission->policy = OI_CLI_TOOLS_DENY;
+        oi_cli_permission_set_policy(context->permission, OI_CLI_TOOLS_DENY);
     } else {
         return fputs("oi: usage: /permissions [ask|allow|deny]\n",
                      context->err) == EOF
                    ? OI_ERR_IO
                    : OI_OK;
     }
-    return fprintf(context->out, "Permissions: %s\n",
-                   permission_name(context->permission->policy)) < 0 ||
-                   fflush(context->out) != 0
-               ? OI_ERR_IO
-               : OI_OK;
+    return print_permissions(context);
 }
 
 static oi_status dispatch_model(
