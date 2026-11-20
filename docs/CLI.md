@@ -241,6 +241,7 @@ is read.
 | `--allow-tools` | run requested tools without asking |
 | `--deny-tools` | refuse every requested tool |
 | `--usage` | after a one-shot run, print the token usage to stderr |
+| `--tool-output-limit BYTES` | tool output bytes sent to the model, default 12288, 0 for no limit (see [Tools and security](#tools-and-security)) |
 | `--dry-run` | print the resolved request; no network, no key needed |
 | `-h`, `--help` | usage summary |
 
@@ -766,6 +767,22 @@ process of its own binary (through `/proc/self/exe`), and only `bash` starts
 Bash. Command execution therefore
 needs `bash` on `PATH`; without it, a `bash` call fails with
 `error: cannot run bash`, and the file tools still work.
+
+The model gets at most `--tool-output-limit` bytes (default 12288) of a
+tool result. A longer result keeps its first quarter and its last three
+quarters, cut at line boundaries, with a marker between them:
+
+```
+[oi: lines 41-1960 (98304 of 110592 bytes) are omitted. For this run, the full output is in /tmp/oi-tool-output-AbC123/output-XyZ789.txt: read it with offset 41.]
+```
+
+`oi` saves the full result in a private directory under `$TMPDIR` (or `/tmp`)
+and removes the directory when it exits normally. A one-shot run that a
+signal ends, such as Ctrl+C, can leave the directory behind. A `read` of a
+file in that directory runs without a prompt, so the model can look at the
+omitted lines without a second run of the command. The session log keeps the
+full result. A `read` result is not cut this way, because `read` has its own
+limits. `--tool-output-limit 0` sends every result in full.
 
 Each tool call runs with the environment `oi` itself was started with, minus
 `OI_API_KEY`: `oi` removes that variable at startup, so a tool cannot read

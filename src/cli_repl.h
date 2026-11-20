@@ -61,6 +61,7 @@ struct oi_cli_repl_config {
     const char *model;
     int max_turns;
     int tool_timeout_ms;
+    size_t tool_output_limit;
     struct oi_cli_status_endpoint *endpoint;
     struct oi_cli_login *login;
     int request_timeout_ms;

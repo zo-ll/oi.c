@@ -21,6 +21,7 @@ struct oi_cli_permission {
     oi_cli_tool_policy policy;
     int file_access_allowed;
     int commands_allowed;
+    const char *output_dir;
 };
 
 oi_status oi_cli_tools_register(oi_tool_registry *registry,
@@ -29,7 +30,8 @@ oi_status oi_cli_tools_register(oi_tool_registry *registry,
 oi_status oi_cli_tools_write_definitions(oi_json_writer *writer);
 
 enum oi_cli_tool_category oi_cli_tool_category_of(const char *tool_name,
-                                                  const oi_json_value *args);
+                                                  const oi_json_value *args,
+                                                  const char *output_dir);
 
 void oi_cli_permission_set_policy(struct oi_cli_permission *permission,
                                   oi_cli_tool_policy policy);

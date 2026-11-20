@@ -1,9 +1,13 @@
+#define _GNU_SOURCE
+
 #include "cli_conversation.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "cli_history.h"
 #include "cli_tools.h"
@@ -530,13 +534,147 @@ static void on_tool_output(const void *data, size_t len, void *user_data) {
     }
 }
 
+static size_t count_lines(const char *data, size_t len) {
+    size_t lines = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        lines += data[i] == '\n';
+    }
+    return lines;
+}
+
+static size_t character_start(const char *data, size_t at) {
+    while (at > 0 && ((unsigned char)data[at] & 0xc0) == 0x80) {
+        at--;
+    }
+    return at;
+}
+
+static int save_tool_output(const char *directory, const struct buffer *text,
+                            char *path, size_t path_size) {
+    int fd;
+    size_t written = 0;
+
+    if (directory == NULL ||
+        snprintf(path, path_size, "%s/output-XXXXXX.txt", directory) >=
+            (int)path_size) {
+        return 0;
+    }
+    fd = mkstemps(path, 4);
+    if (fd < 0) {
+        return 0;
+    }
+    while (written < text->len) {
+        ssize_t n = write(fd, text->data + written, text->len - written);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            close(fd);
+            unlink(path);
+            return 0;
+        }
+        written += (size_t)n;
+    }
+    return close(fd) == 0;
+}
+
+static oi_status bound_tool_text(const oi_cli_conversation *conversation,
+                                 struct buffer *text) {
+    size_t limit = conversation->config.tool_output_limit;
+    char path[4096];
+    char marker[4096 + 256];
+    struct buffer bounded = {0};
+    size_t head_end;
+    size_t tail_start;
+    const char *newline;
+    int marker_len;
+    oi_status st;
+
+    if (limit == 0 || text->len <= limit) {
+        return OI_OK;
+    }
+    head_end = character_start(text->data, limit / 4);
+    newline = memrchr(text->data, '\n', head_end);
+    if (newline != NULL) {
+        head_end = (size_t)(newline - text->data) + 1;
+    }
+    tail_start = character_start(text->data, text->len - (limit - limit / 4));
+    newline = tail_start > 0 && text->data[tail_start - 1] == '\n'
+                  ? NULL
+                  : memchr(text->data + tail_start, '\n',
+                           text->len - tail_start);
+    if (newline != NULL && (size_t)(newline - text->data) + 1 < text->len) {
+        tail_start = (size_t)(newline - text->data) + 1;
+    }
+    size_t first_omitted = count_lines(text->data, head_end) + 1;
+    size_t last_omitted = count_lines(text->data, tail_start);
+    if (last_omitted < first_omitted) {
+        last_omitted = first_omitted;
+    }
+    int saved = save_tool_output(conversation->config.tool_output_dir, text,
+                                 path, sizeof path);
+    if (saved) {
+        marker_len = snprintf(
+            marker, sizeof marker,
+            "[oi: lines %zu-%zu (%zu of %zu bytes) are omitted. For this "
+            "run, the full output is in %s: read it with offset %zu.]\n",
+            first_omitted, last_omitted, tail_start - head_end, text->len,
+            path, first_omitted);
+    } else {
+        marker_len = snprintf(
+            marker, sizeof marker,
+            "[oi: lines %zu-%zu (%zu of %zu bytes) are omitted. The full "
+            "output was not saved.]\n",
+            first_omitted, last_omitted, tail_start - head_end, text->len);
+    }
+    if (marker_len < 0 || (size_t)marker_len >= sizeof marker) {
+        return OI_ERR_NOMEM;
+    }
+    if (tail_start - head_end <= (size_t)marker_len) {
+        if (saved) {
+            unlink(path);
+        }
+        return OI_OK;
+    }
+    st = buffer_append(&bounded, text->data, head_end,
+                       OI_CLI_HISTORY_MAX_CONTENT);
+    if (st == OI_OK && head_end > 0 && text->data[head_end - 1] != '\n') {
+        st = buffer_append(&bounded, "\n", 1, OI_CLI_HISTORY_MAX_CONTENT);
+    }
+    if (st == OI_OK) {
+        st = buffer_append(&bounded, marker, (size_t)marker_len,
+                           OI_CLI_HISTORY_MAX_CONTENT);
+    }
+    if (st == OI_OK) {
+        st = buffer_append(&bounded, text->data + tail_start,
+                           text->len - tail_start,
+                           OI_CLI_HISTORY_MAX_CONTENT);
+    }
+    if (st != OI_OK) {
+        buffer_free(&bounded);
+        return st;
+    }
+    buffer_free(text);
+    *text = bounded;
+    return OI_OK;
+}
+
 static void on_tool_done(oi_tool_exit_kind kind, int code, void *user_data) {
     oi_cli_conversation *conversation = user_data;
     conversation->tool = NULL;
     struct buffer text = {0};
+    const struct oi_cli_message *assistant =
+        &conversation->messages.items[conversation->assistant_message_index];
+    const struct oi_cli_tool_call_value *call =
+        &assistant->tool_calls[conversation->tool_index];
     oi_status st = normalize_utf8(
         (const unsigned char *)conversation->tool_output.data,
         conversation->tool_output.len, &text);
+    if (st == OI_OK &&
+        !(call->name.len == 4 && memcmp(call->name.data, "read", 4) == 0)) {
+        st = bound_tool_text(conversation, &text);
+    }
     if (st == OI_OK && (kind != OI_TOOL_EXIT_NORMAL || code != 0)) {
         char status[96];
         int len = snprintf(status, sizeof status,
@@ -549,10 +687,6 @@ static void on_tool_done(oi_tool_exit_kind kind, int code, void *user_data) {
                                OI_CLI_HISTORY_MAX_CONTENT);
         }
     }
-    const struct oi_cli_message *assistant =
-        &conversation->messages.items[conversation->assistant_message_index];
-    const struct oi_cli_tool_call_value *call =
-        &assistant->tool_calls[conversation->tool_index];
     if (st == OI_OK) {
         enum oi_cli_conversation_tool_outcome outcome =
             kind == OI_TOOL_EXIT_NORMAL && code == 0
