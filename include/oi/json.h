@@ -33,8 +33,6 @@ typedef enum oi_json_type {
     OI_JSON_OBJECT
 } oi_json_type;
 
-/* --- parsing --- */
-
 /* `arena` is borrowed: the parser does not destroy it. Returns NULL on
  * allocation failure or if `arena` is NULL. */
 oi_json_parser *oi_json_parser_create(oi_arena *arena);
@@ -64,10 +62,8 @@ oi_status oi_json_parser_feed(oi_json_parser *p, const void *bytes,
  */
 oi_status oi_json_parser_finish(oi_json_parser *p);
 
-/* True once a complete top-level value has been parsed. */
 int oi_json_parser_done(const oi_json_parser *p);
 
-/* True once the parser has hit a malformed-input error. */
 int oi_json_parser_failed(const oi_json_parser *p);
 
 /*
@@ -82,8 +78,6 @@ oi_json_value *oi_json_parser_root(const oi_json_parser *p);
  * previously parsed values remain valid until the arena itself is
  * reset. */
 void oi_json_parser_reset(oi_json_parser *p);
-
-/* --- value accessors --- */
 
 /* `v` must be non-NULL (a programming-error precondition, not a runtime
  * one -- values that might be absent come from oi_json_array_get /
@@ -143,4 +137,4 @@ oi_status oi_json_write_object_end(oi_json_writer *w);
  * next write call or oi_json_writer_destroy. */
 const char *oi_json_writer_data(const oi_json_writer *w, size_t *out_len);
 
-#endif /* OI_JSON_H */
+#endif

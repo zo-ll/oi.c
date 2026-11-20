@@ -10,14 +10,14 @@ static oi_status noop_build_argv(const oi_json_value *args, oi_arena *arena,
     (void)arena;
     (void)ud;
     (void)out_argv;
-    return OI_ERR_INVAL; /* never actually invoked in these tests */
+    return OI_ERR_INVAL;
 }
 
 TEST(create_destroy) {
     oi_tool_registry *reg = oi_tool_registry_create();
     CHECK(reg != NULL);
     oi_tool_registry_destroy(reg);
-    oi_tool_registry_destroy(NULL); /* NULL-safe */
+    oi_tool_registry_destroy(NULL);
 }
 
 TEST(add_and_lookup_schema) {

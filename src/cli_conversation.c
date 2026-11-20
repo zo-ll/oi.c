@@ -45,43 +45,9 @@ struct oi_cli_conversation {
     size_t assistant_message_index;
     size_t tool_index;
     struct buffer tool_output;
-    /*
-     * False from the moment start_model_request begins awaiting a new
-     * assistant reply (the very first model round of a turn, or a later
-     * round following resolved tool results) until on_llm_done commits one
-     * -- lets close_out_incomplete_turn tell whether assistant_message_index
-     * already refers to this round's reply (and so whether its tool_calls,
-     * if any, might need repairing) or is still a stale index from a
-     * previous round.
-     */
     int assistant_committed;
-    /*
-     * Set by oi_cli_conversation_steer, consulted only at the top of
-     * start_next_tool's loop body -- unlike cancel, steering never touches
-     * request/tool directly; it just changes what happens the next time
-     * that loop runs (whether entered fresh from on_llm_done or re-entered
-     * from on_tool_done), letting whatever is already running finish
-     * naturally.
-     */
     int steering;
-    /*
-     * Set only between request_tool_call staging a call whose policy
-     * decision is OI_TOOL_ASK and oi_cli_conversation_resolve_permission
-     * supplying the eventual decision -- mutually exclusive with `tool`
-     * (only ever set once a process has actually spawned) and `request`
-     * (only ever set while awaiting a model reply): exactly one of the
-     * three, or none, is non-NULL at any moment while busy.
-     */
     oi_tool_call *pending_permission_tool;
-    /*
-     * Set for the duration of oi_cli_conversation_cancel's own unwind --
-     * from before the partial-response event it emits until finish_turn
-     * clears it. Purely for reporting: the events emitted during that
-     * window (PARTIAL_ASSISTANT, then each repair MESSAGE) run callbacks
-     * that can ask what the conversation is doing, and "streaming" or
-     * "running a tool" would both be wrong answers by then, since cancel
-     * has already detached whatever was in flight.
-     */
     int cancelling;
 };
 
@@ -164,10 +130,6 @@ static oi_status emit_message(
     enum oi_cli_conversation_tool_outcome outcome,
     const unsigned char *raw_output, size_t raw_output_len, int has_raw,
     int is_repair) {
-    /* A repair placeholder isn't attributable to any real model reply --
-     * history_message_is_valid requires a REPAIR-sourced assistant message
-     * to carry no model, matching cli_history_repair.c's own
-     * append_interruption_marker. */
     int attribute_model =
         message->role == OI_CLI_MESSAGE_ASSISTANT && !is_repair;
     struct oi_cli_conversation_event event = {
@@ -489,22 +451,6 @@ static const char cancelled_tool_unknown_text[] =
 static const char cancelled_tool_not_executed_text[] =
     "[tool not executed: cancelled before it started]";
 
-/*
- * Restores protocol validity after cancelling a running (or about-to-run)
- * tool: the assistant message committed by on_llm_done already carries the
- * full tool_calls array, but only calls before tool_index have a matching
- * tool-result message. Commits a placeholder for the call at tool_index --
- * OUTCOME_UNKNOWN (with whatever raw output it had already produced) if
- * `first_call_may_have_started`, else NOT_EXECUTED, matching whether a
- * process was actually spawned for it -- and a NOT_EXECUTED placeholder for
- * each later call that never started. Makes conversation->messages
- * immediately safe to reuse for a next turn without touching the
- * durable-replay repair machinery at all. Captures tool_calls/tool_calls_len
- * once, up front: each commit_tool_text call below can append to and
- * reallocate conversation->messages.items, which would invalidate a pointer
- * held directly into that array, but not the assistant message's own
- * (separately-allocated, ownership-copied) tool_calls array.
- */
 static oi_status repair_dangling_tool_calls(oi_cli_conversation *conversation,
                                             int first_call_may_have_started) {
     const struct oi_cli_message *assistant =
@@ -520,25 +466,18 @@ static oi_status repair_dangling_tool_calls(oi_cli_conversation *conversation,
         oi_status st;
 
         if (i == cancelled_index && first_call_may_have_started) {
-            /* is_repair=0: history_message_is_valid requires a
-             * REPAIR-sourced tool message to never carry raw output, but
-             * this placeholder's whole value over the durable crash-repair
-             * equivalent (cli_history_repair.c's append_repair_tool, which
-             * always passes NULL/0) is carrying whatever was already
-             * buffered -- NORMAL is the source that permits that for an
-             * OUTCOME_UNKNOWN tool result. */
             st = commit_tool_text(
                 conversation, call, cancelled_tool_unknown_text,
                 sizeof cancelled_tool_unknown_text - 1,
                 OI_CLI_CONVERSATION_TOOL_OUTCOME_UNKNOWN,
                 (const unsigned char *)conversation->tool_output.data,
-                conversation->tool_output.len, 1, /*is_repair=*/0);
+                conversation->tool_output.len, 1, 0);
         } else {
             st = commit_tool_text(
                 conversation, call, cancelled_tool_not_executed_text,
                 sizeof cancelled_tool_not_executed_text - 1,
                 OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED, NULL, 0, 0,
-                /*is_repair=*/0);
+                0);
         }
         if (st != OI_OK && first_status == OI_OK) {
             first_status = st;
@@ -553,18 +492,6 @@ static const char steered_tool_not_executed_text[] =
 static const char denied_tool_not_executed_text[] =
     "[tool not executed: denied by user]";
 
-/*
- * Steering's analog of repair_dangling_tool_calls, deliberately not a
- * reuse of it: that function's wording ("cancelled while it may have
- * already started") is simply false here. By construction, steering is
- * only ever consulted at the top of start_next_tool's loop -- the call
- * actively running (if any) always finishes normally through the ordinary
- * on_tool_done path first, so every call from tool_index onward here was
- * never started. Unlike a cancelled turn, the assistant reply that
- * produced these tool_calls already completed normally (RESPONSE_DONE
- * already fired), so there is no interrupted-turn bookend to add either --
- * the caller finishes the turn with OI_OK once this returns OI_OK.
- */
 static oi_status skip_steered_tool_calls(oi_cli_conversation *conversation) {
     const struct oi_cli_message *assistant =
         &conversation->messages.items[conversation->assistant_message_index];
@@ -578,7 +505,7 @@ static oi_status skip_steered_tool_calls(oi_cli_conversation *conversation) {
             conversation, &tool_calls[i], steered_tool_not_executed_text,
             sizeof steered_tool_not_executed_text - 1,
             OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED, NULL, 0, 0,
-            /*is_repair=*/0);
+            0);
         if (st != OI_OK && first_status == OI_OK) {
             first_status = st;
         }
@@ -589,23 +516,6 @@ static oi_status skip_steered_tool_calls(oi_cli_conversation *conversation) {
 static const char steered_turn_ended_text[] =
     "[assistant turn ended: a new message was queued]";
 
-/*
- * Steering's own turn-closing bookend -- needed for exactly the reason
- * repair_interrupted_turn's own doc comment gives (durable replay requires
- * an assistant message with no tool_calls to return its phase machine to
- * "expect user" before anything else can validly follow), but with
- * accurate wording: unlike a cancelled/aborted turn, this assistant reply
- * already completed normally (RESPONSE_DONE already fired) -- it's
- * steering's own decision not to make the follow-up model round that
- * would ordinarily supply that bookend, so nothing else ever will.
- * Skipping this (as the original steering design assumed it could,
- * reasoning "the reply already completed, so there's no interrupted-turn
- * bookend to add") leaves the durable log with an unresolved phase the
- * moment all of a round's tool_calls happen to have already resolved
- * normally when steering is consulted -- the very next durable write
- * (e.g. resolving a queued item into its own turn) then fails replay
- * validation.
- */
 static oi_status close_out_steered_turn(oi_cli_conversation *conversation) {
     struct oi_cli_message message;
     oi_status st;
@@ -616,7 +526,7 @@ static oi_status close_out_steered_turn(oi_cli_conversation *conversation) {
     if (st == OI_OK) {
         st = commit_message(conversation, &message,
                             OI_CLI_CONVERSATION_TOOL_NONE, NULL, 0, 0,
-                            /*is_repair=*/1);
+                            1);
     }
     oi_cli_message_free(&message);
     return st;
@@ -647,7 +557,7 @@ static void on_tool_output(const void *data, size_t len, void *user_data) {
         conversation->tool = NULL;
         oi_tool_call_cancel(tool);
         finish_turn_with_repair(conversation, st,
-                               /*first_call_may_have_started=*/1);
+                               1);
     }
 }
 
@@ -683,31 +593,19 @@ static void on_tool_done(oi_tool_exit_kind kind, int code, void *user_data) {
         st = commit_tool_text(
             conversation, call, text.data, text.len, outcome,
             (const unsigned char *)conversation->tool_output.data,
-            conversation->tool_output.len, 1, /*is_repair=*/0);
+            conversation->tool_output.len, 1, 0);
     }
     buffer_free(&text);
     buffer_free(&conversation->tool_output);
     if (st != OI_OK) {
         finish_turn_with_repair(conversation, st,
-                               /*first_call_may_have_started=*/1);
+                               1);
         return;
     }
     conversation->tool_index++;
     start_next_tool(conversation);
 }
 
-/*
- * Today's synchronous ALLOW tail (TOOL_STARTING emit, the reentrant-cancel-
- * during-emit guard, conversation->tool = staged, oi_tool_call_resolve,
- * set_timeout/close_stdin) and today's synchronous DENY handling, unified
- * behind one `allow` bool -- called either immediately (a synchronous
- * OI_TOOL_ALLOW/OI_TOOL_DENY decision) or arbitrarily later, from
- * oi_cli_conversation_resolve_permission, once an OI_TOOL_ASK decision's
- * answer finally arrives. `call` must be freshly derived from
- * conversation->tool_index/assistant_message_index by the caller, never a
- * pointer held across the (potentially indefinite) async gap: committing
- * other messages in between can reallocate conversation->messages.items.
- */
 static void resolve_permission_body(oi_cli_conversation *conversation,
                                     const struct oi_cli_tool_call_value *call,
                                     oi_tool_call *staged, int allow) {
@@ -715,23 +613,14 @@ static void resolve_permission_body(oi_cli_conversation *conversation,
 
     if (!allow) {
         (void)oi_tool_call_resolve(staged, 0);
-        /* Committed directly (not via repair_dangling_tool_calls) so this
-         * specific call gets its own distinct wording -- a denial is not
-         * the same thing as a genuine cancel-before-start, which is what
-         * repair_dangling_tool_calls' shared text otherwise means. Any
-         * later tool_calls in the same round that never got this far are
-         * still exactly a "cancelled before it started" case, so bumping
-         * tool_index past just this one and letting the ordinary repair
-         * path handle the rest (via finish_turn_with_repair below) is
-         * correct for them. */
         st = commit_tool_text(conversation, call, denied_tool_not_executed_text,
                               sizeof denied_tool_not_executed_text - 1,
                               OI_CLI_CONVERSATION_TOOL_DENIED, NULL, 0,
-                              0, /*is_repair=*/0);
+                              0, 0);
         conversation->tool_index++;
         finish_turn_with_repair(conversation,
                                 st != OI_OK ? st : OI_ERR_DENIED,
-                                /*first_call_may_have_started=*/0);
+                                0);
         return;
     }
 
@@ -743,19 +632,10 @@ static void resolve_permission_body(oi_cli_conversation *conversation,
     if (st != OI_OK) {
         oi_tool_call_cancel(staged);
         finish_turn_with_repair(conversation, st,
-                                /*first_call_may_have_started=*/0);
+                                0);
         return;
     }
     if (!conversation->busy) {
-        /* The embedder's on_event callback cancelled the conversation
-         * reentrantly from within the TOOL_STARTING emit above (a
-         * supported pattern one layer down, mirroring
-         * oi_tool_call_cancel's own documented reentrancy from within
-         * its own on_output). oi_cli_conversation_cancel's repair now
-         * runs unconditionally (no longer gated on conversation->tool
-         * != NULL), so that reentrant call already closed the turn out
-         * fully -- nothing left to do here but tear down the
-         * staged-but-never-started call. */
         oi_tool_call_cancel(staged);
         return;
     }
@@ -764,7 +644,7 @@ static void resolve_permission_body(oi_cli_conversation *conversation,
     if (st != OI_OK) {
         conversation->tool = NULL;
         finish_turn_with_repair(conversation, st,
-                                /*first_call_may_have_started=*/1);
+                                1);
         return;
     }
     if (conversation->config.tool_timeout_ms > 0) {
@@ -779,19 +659,10 @@ static void resolve_permission_body(oi_cli_conversation *conversation,
         conversation->tool = NULL;
         oi_tool_call_cancel(tool);
         finish_turn_with_repair(conversation, st,
-                                /*first_call_may_have_started=*/1);
+                                1);
     }
 }
 
-/*
- * Stages a tool call (already done by the caller) and asks the embedder's
- * policy what to do with it. OI_TOOL_ASK defers the actual decision:
- * conversation->pending_permission_tool holds the staged call, an
- * AWAITING_PERMISSION event is emitted, and this returns without resolving
- * anything -- the turn stays busy until oi_cli_conversation_resolve_permission
- * is called, arbitrarily later, from anywhere. ALLOW/DENY resolve
- * immediately via resolve_permission_body, exactly as before this split.
- */
 static void request_tool_call(oi_cli_conversation *conversation,
                               const struct oi_cli_tool_call_value *call,
                               const oi_json_value *arguments,
@@ -817,15 +688,10 @@ static void request_tool_call(oi_cli_conversation *conversation,
             conversation->pending_permission_tool = NULL;
             oi_tool_call_cancel(staged);
             finish_turn_with_repair(conversation, st,
-                                    /*first_call_may_have_started=*/0);
+                                    0);
             return;
         }
         if (!conversation->busy) {
-            /* Reentrant cancel from within the AWAITING_PERMISSION emit
-             * above, mirroring the same TOOL_STARTING reentrancy pattern
-             * documented in resolve_permission_body --
-             * oi_cli_conversation_cancel's own pending_permission_tool
-             * branch already cleared it and cancelled staged. */
             return;
         }
         return;
@@ -840,19 +706,6 @@ static void start_next_tool(oi_cli_conversation *conversation) {
             &conversation->messages
                  .items[conversation->assistant_message_index];
         if (conversation->steering) {
-            /* Consulted here and only here -- entered fresh from
-             * on_llm_done (tool_index == 0) or re-entered from
-             * on_tool_done (tool_index already past whatever just
-             * finished normally) -- so it doesn't matter whether steering
-             * was requested mid-stream, mid-tool, or between rounds: any
-             * remaining tool_calls this round are skipped, and no new
-             * model round starts either (one more round would only
-             * produce more tool_calls that get skipped right back here on
-             * the next re-entry, at the cost of a wasted request). Either
-             * way, close_out_steered_turn's bookend is still required --
-             * skipping some calls doesn't produce it, and when there was
-             * nothing left to skip (the round's only tool_call already
-             * resolved normally), nothing else would supply it at all. */
             oi_status st = skip_steered_tool_calls(conversation);
             if (st == OI_OK) {
                 st = close_out_steered_turn(conversation);
@@ -864,7 +717,7 @@ static void start_next_tool(oi_cli_conversation *conversation) {
             oi_status st = start_model_request(conversation);
             if (st != OI_OK) {
                 finish_turn_with_repair(conversation, st,
-                                        /*first_call_may_have_started=*/0);
+                                        0);
             }
             return;
         }
@@ -875,7 +728,7 @@ static void start_next_tool(oi_cli_conversation *conversation) {
             parse_arguments(conversation, &call->arguments, &arguments);
         if (st != OI_OK) {
             finish_turn_with_repair(conversation, st,
-                                    /*first_call_may_have_started=*/0);
+                                    0);
             return;
         }
 
@@ -886,7 +739,7 @@ static void start_next_tool(oi_cli_conversation *conversation) {
             on_tool_done, conversation, &staged);
         if (st != OI_OK) {
             finish_turn_with_repair(conversation, st,
-                                    /*first_call_may_have_started=*/0);
+                                    0);
             return;
         }
         request_tool_call(conversation, call, arguments, staged);
@@ -934,7 +787,7 @@ static void on_llm_event(const oi_llm_event *event, void *user_data) {
         conversation->request = NULL;
         oi_llm_request_cancel(request);
         finish_turn_with_repair(conversation, st,
-                               /*first_call_may_have_started=*/0);
+                               0);
     }
 }
 
@@ -967,7 +820,7 @@ static void on_llm_done(oi_status status, int http_status,
             }
         }
         finish_turn_with_repair(conversation, status,
-                               /*first_call_may_have_started=*/0);
+                               0);
         return;
     }
 
@@ -977,12 +830,12 @@ static void on_llm_done(oi_status status, int http_status,
     if (st == OI_OK) {
         st = commit_message(conversation, &assistant,
                             OI_CLI_CONVERSATION_TOOL_NONE, NULL, 0, 0,
-                            /*is_repair=*/0);
+                            0);
     }
     oi_cli_message_free(&assistant);
     if (st != OI_OK) {
         finish_turn_with_repair(conversation, st,
-                               /*first_call_may_have_started=*/0);
+                               0);
         return;
     }
     conversation->assistant_message_index = conversation->messages.len - 1;
@@ -1000,7 +853,7 @@ static void on_llm_done(oi_status status, int http_status,
     st = emit(conversation, &response_done);
     if (st != OI_OK) {
         finish_turn_with_repair(conversation, st,
-                               /*first_call_may_have_started=*/0);
+                               0);
     } else if (tool_calls_len == 0) {
         finish_turn(conversation, OI_OK);
     } else {
@@ -1009,10 +862,6 @@ static void on_llm_done(oi_status status, int http_status,
 }
 
 static oi_status start_model_request(oi_cli_conversation *conversation) {
-    /* About to await a new assistant reply (the turn's first model round,
-     * or a later one following resolved tool results): nothing commits it
-     * until on_llm_done runs, so close_out_incomplete_turn must not treat
-     * assistant_message_index as belonging to this round until then. */
     conversation->assistant_committed = 0;
     if (conversation->model_steps >=
         conversation->config.max_model_steps) {
@@ -1129,7 +978,7 @@ oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
     if (st == OI_OK) {
         st = commit_message(conversation, &user,
                             OI_CLI_CONVERSATION_TOOL_NONE, NULL, 0, 0,
-                            /*is_repair=*/0);
+                            0);
     }
     oi_cli_message_free(&user);
     if (st == OI_OK) {
@@ -1144,20 +993,6 @@ oi_status oi_cli_conversation_start(oi_cli_conversation *conversation,
 static const char interrupted_turn_text[] =
     "[assistant turn interrupted before completion]";
 
-/*
- * Closes out the turn's own assistant slot after a cancel, whether or not
- * any content had streamed in yet: oi_cli_conversation_start always commits
- * the user message before start_model_request ever runs, so durable replay
- * is already expecting a matching assistant message for this turn the
- * instant a turn becomes busy -- cancelling without ever supplying one
- * leaves replay stuck expecting an assistant message forever (the next
- * turn's user message is then itself invalid). Mirrors
- * cli_history_repair.c's append_interruption_marker, the equivalent repair
- * applied at process-restart replay time for a turn a crash left dangling;
- * marked as a repair (not a real model reply) since replay requires that
- * tag on the assistant message that closes out a turn for which a
- * PARTIAL_ASSISTANT record was already written.
- */
 static oi_status repair_interrupted_turn(oi_cli_conversation *conversation) {
     struct oi_cli_message message;
     oi_cli_message_init(&message);
@@ -1166,28 +1001,12 @@ static oi_status repair_interrupted_turn(oi_cli_conversation *conversation) {
     if (st == OI_OK) {
         st = commit_message(conversation, &message,
                             OI_CLI_CONVERSATION_TOOL_NONE, NULL, 0, 0,
-                            /*is_repair=*/1);
+                            1);
     }
     oi_cli_message_free(&message);
     return st;
 }
 
-/*
- * The single place that decides what (if anything) needs repairing before a
- * turn ends any way other than a normal, fully-resolved completion --
- * cancellation, tool denial, a mid-loop failure, or anything else. Whether
- * this round's assistant message has been committed yet
- * (assistant_committed) and, if so, whether all of its tool_calls already
- * have a matching result (tool_index vs. tool_calls_len) together say
- * exactly how much of the turn's protocol shape is still open; closing it
- * is always repair_dangling_tool_calls (if anything there is still open)
- * followed by repair_interrupted_turn (unconditionally, since neither an
- * uncommitted assistant reply nor a pending tool loop leaves replay back at
- * REPLAY_EXPECT_USER on its own). Returns the first repair-commit failure,
- * if any -- a genuine structural problem that should replace the turn's
- * original status rather than being masked by it, matching how
- * oi_cli_conversation_cancel already treated its own repair failures.
- */
 static oi_status close_out_incomplete_turn(oi_cli_conversation *conversation,
                                            int first_call_may_have_started) {
     oi_status status = OI_OK;
@@ -1206,9 +1025,6 @@ static oi_status close_out_incomplete_turn(oi_cli_conversation *conversation,
     return status;
 }
 
-/* Convenience wrapper for the common case: repair, then finish with
- * whichever of the repair failure or the turn's own status is worse
- * (repair failure wins, since it's the more structural problem). */
 static void finish_turn_with_repair(oi_cli_conversation *conversation,
                                     oi_status status,
                                     int first_call_may_have_started) {
@@ -1225,8 +1041,6 @@ void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
     if (conversation == NULL || !conversation->busy) {
         return;
     }
-    /* Before the first event this unwind emits, so no callback can see a
-     * conversation that still claims to be streaming or running a tool. */
     conversation->cancelling = 1;
     if (conversation->request != NULL) {
         oi_llm_request *request = conversation->request;
@@ -1245,8 +1059,6 @@ void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
         oi_tool_call *staged = conversation->pending_permission_tool;
         conversation->pending_permission_tool = NULL;
         oi_tool_call_cancel(staged);
-        /* first_call_may_have_started stays 0: nothing was ever spawned
-         * for a call still awaiting a permission decision. */
     }
     if (conversation->tool != NULL) {
         oi_tool_call *tool = conversation->tool;
@@ -1274,19 +1086,10 @@ enum oi_cli_conversation_activity oi_cli_conversation_activity(
         return OI_CLI_CONVERSATION_ACTIVITY_IDLE;
     }
     if (!conversation->busy) {
-        /* A completed cancel is idle, not failed, even though it leaves a
-         * non-OK last_status behind (OI_ERR_CLOSED): the same reasoning
-         * cli_repl.c applies when it treats a cancelled turn as always
-         * recoverable. Reporting the status the cancel happened to carry
-         * would describe a working prompt as broken. */
         return conversation->last_status == OI_OK || conversation->cancelled
                    ? OI_CLI_CONVERSATION_ACTIVITY_IDLE
                    : OI_CLI_CONVERSATION_ACTIVITY_FAILED;
     }
-    /* Checked before the three in-flight kinds: cancel detaches whichever
-     * one was set before emitting anything, so by the time a callback can
-     * observe this they are all NULL anyway -- ordering it first states the
-     * intent rather than relying on that. */
     if (conversation->cancelling) {
         return OI_CLI_CONVERSATION_ACTIVITY_CANCELLING;
     }
@@ -1330,11 +1133,6 @@ oi_status oi_cli_conversation_resolve_permission(
     }
     staged = conversation->pending_permission_tool;
     conversation->pending_permission_tool = NULL;
-    /* Freshly derived, not a pointer carried across the async gap since
-     * this was staged: committing other messages in between (e.g. a
-     * steered sibling call's placeholder) can reallocate
-     * conversation->messages.items, but tool_index/assistant_message_index
-     * themselves stay valid the whole time nothing has resolved yet. */
     assistant =
         &conversation->messages.items[conversation->assistant_message_index];
     call = &assistant->tool_calls[conversation->tool_index];

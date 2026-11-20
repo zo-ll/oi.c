@@ -26,14 +26,10 @@ struct oi_cli_loop_config {
 };
 
 struct oi_cli_loop_result {
-    char *assistant_text; /* caller-owned; free with free() */
+    char *assistant_text;
     size_t assistant_text_len;
 };
 
-/*
- * Runs one user turn through zero or more model-requested tool calls.
- * The passed reactor, arena, client, and registry are borrowed.
- */
 oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
                           oi_arena *arena, oi_tool_registry *tools,
                           const struct oi_cli_loop_config *config,

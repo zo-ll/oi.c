@@ -14,13 +14,6 @@ enum oi_cli_command_result {
     OI_CLI_COMMAND_EXIT_REPL
 };
 
-/*
- * /model and /cwd request changes through these callbacks rather than
- * touching files or the conversation object directly -- cli_repl.c/cli.c
- * own what a change actually does (live conversation update, durable
- * history append, metadata refresh); dispatch only validates bounds and
- * reports the result.
- */
 typedef oi_status (*oi_cli_command_set_model_cb)(void *user_data,
                                                   const char *name,
                                                   size_t name_len);
@@ -28,53 +21,15 @@ typedef oi_status (*oi_cli_command_set_cwd_cb)(void *user_data,
                                                const char *path,
                                                size_t path_len);
 
-/*
- * Fills in the /status snapshot. Assembled on demand rather than handed in
- * pre-built, for two reasons: /status must be able to report a turn that is
- * active *right now*, and the snapshot's borrowed strings (a working
- * directory in particular) would otherwise have to stay valid across every
- * other command's dispatch too.
- *
- * Every pointer written into `*out_snapshot` is borrowed from the callee and
- * valid only until the next call through the same callback -- the same
- * contract as oi_cli_command_session_ops::current. Dispatch runs
- * oi_cli_status_snapshot_init before calling, so any field the callee leaves
- * alone renders as explicitly unknown rather than as a stale value or a
- * plausible-looking default.
- *
- * Returning non-OK means no snapshot could be assembled; dispatch reports
- * that and stays in the REPL.
- */
 typedef oi_status (*oi_cli_command_status_cb)(
     void *user_data, struct oi_cli_status_snapshot *out_snapshot);
 
-/*
- * What /session current reports. Both strings are borrowed and valid only
- * until the next call through the same ops.
- */
 struct oi_cli_command_session_current {
-    const char *id;   /* NULL when no durable session exists */
-    const char *path; /* the session directory or log; may be NULL */
-    int healthy;      /* selector metadata present and owned by this id */
+    const char *id;
+    const char *path;
+    int healthy;
 };
 
-/*
- * /session delegates every filesystem operation through these, for the
- * same reason /model and /cwd do: dispatch validates grammar and renders
- * the result, while cli.c owns what an operation actually does. Grouped
- * rather than spread across a dozen flat fields because they share one
- * owner, one lifetime, and one `user_data`.
- *
- * `list`/`list_trashed` fill a caller-initialized list that dispatch then
- * formats and frees. `rename`, `trash`, and `restore` report a specific
- * cause through `*out_error_detail` (caller-owned, may be left NULL).
- *
- * Any callback may be NULL, meaning that operation is unavailable in this
- * context; dispatch says so rather than crashing. /session switch, delete,
- * and import are absent by design -- they need the composer's confirmation
- * flow or the live conversation, so cli_repl.c intercepts them before
- * dispatch is reached.
- */
 struct oi_cli_command_session_ops {
     void *user_data;
     oi_status (*list)(void *user_data, struct oi_cli_session_list *out_list);
@@ -97,13 +52,13 @@ struct oi_cli_command_context {
     const char *model;
     struct oi_cli_permission *permission;
     const char *session_id;
-    oi_cli_command_set_model_cb set_model; /* NULL if unavailable */
+    oi_cli_command_set_model_cb set_model;
     void *set_model_user_data;
-    oi_cli_command_set_cwd_cb set_cwd; /* NULL if unavailable */
+    oi_cli_command_set_cwd_cb set_cwd;
     void *set_cwd_user_data;
-    oi_cli_command_status_cb status; /* NULL if unavailable */
+    oi_cli_command_status_cb status;
     void *status_user_data;
-    struct oi_cli_command_session_ops session; /* all-NULL if unavailable */
+    struct oi_cli_command_session_ops session;
 };
 
 oi_status oi_cli_command_dispatch(

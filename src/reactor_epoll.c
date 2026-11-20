@@ -162,8 +162,6 @@ oi_status oi_reactor_backend_modify(oi_reactor_backend *b, int fd,
 }
 
 oi_status oi_reactor_backend_remove(oi_reactor_backend *b, int fd) {
-    /* Pre-2.6.9 kernels required a non-NULL event pointer for
-     * EPOLL_CTL_DEL even though it's ignored; pass a zeroed dummy. */
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);
 

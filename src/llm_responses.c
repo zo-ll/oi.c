@@ -25,7 +25,6 @@ static int non_empty_string(const oi_json_value *value) {
     return oi_json_get_string(value, &text, &len) == OI_OK && len > 0;
 }
 
-/* The parser bounds nesting depth, so this recursion is bounded too. */
 static oi_status write_value(oi_json_writer *writer,
                              const oi_json_value *value) {
     switch (value->type) {
@@ -118,8 +117,6 @@ static oi_status write_input_items(oi_json_writer *writer,
         return oi_json_write_object_end(writer);
     }
     if (string_equals(role, "assistant")) {
-        /* A tool-calling turn stores empty content; an empty message item
-         * would add a turn the model never produced. */
         if (non_empty_string(content)) {
             WRITE(write_message_item(writer, "assistant", content));
         }
@@ -166,7 +163,6 @@ static oi_status write_tools(oi_json_writer *writer,
             WRITE(oi_json_write_object_key(writer, "parameters", 10));
             WRITE(write_value(writer, parameters));
         }
-        /* Chat tool schemas make no strict-mode promise. */
         WRITE(oi_json_write_object_key(writer, "strict", 6));
         WRITE(oi_json_write_bool(writer, 0));
         WRITE(oi_json_write_object_end(writer));

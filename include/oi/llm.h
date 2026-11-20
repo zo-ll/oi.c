@@ -7,19 +7,6 @@
 #include "oi/reactor.h"
 #include "oi/status.h"
 
-/*
- * A streaming client for the OpenAI-compatible Chat Completions wire
- * format. Scope is deliberately narrow: this module owns HTTP+SSE
- * transport mechanics (connection, request framing, incremental
- * response parsing) and nothing about message-history or tool-schema
- * modeling -- the request body is JSON the caller already builds with
- * oi/json.h (whatever shape "messages"/"tools" end up being is a
- * session/tool-registry concern, not this module's).
- *
- * Each request opens its own connection (HTTP "Connection: close");
- * there is no keep-alive/connection pooling in this first cut.
- */
-
 typedef struct oi_llm_client oi_llm_client;
 typedef struct oi_llm_request oi_llm_request;
 
@@ -82,12 +69,12 @@ typedef void (*oi_llm_done_cb)(oi_status status, int http_status,
                                 void *user_data);
 
 struct oi_llm_config {
-    const char *host;    /* e.g. "api.openai.com" */
-    unsigned short port; /* e.g. 443 */
+    const char *host;
+    unsigned short port;
     int use_tls;
     const char *ca_file; /* NULL = system default trust store */
     const char *api_key; /* sent as "Authorization: Bearer <key>"; NULL to omit */
-    const char *path;    /* e.g. "/v1/chat/completions" */
+    const char *path;
     int timeout_ms;      /* end-to-end request deadline; 0 disables */
 };
 
@@ -183,4 +170,4 @@ oi_status oi_llm_request_start_events(
  */
 void oi_llm_request_cancel(oi_llm_request *req);
 
-#endif /* OI_LLM_H */
+#endif

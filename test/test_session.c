@@ -19,7 +19,7 @@ TEST(create_destroy_registry) {
     oi_session_registry *reg = oi_session_registry_create();
     CHECK(reg != NULL);
     oi_session_registry_destroy(reg);
-    oi_session_registry_destroy(NULL); /* NULL-safe */
+    oi_session_registry_destroy(NULL);
 }
 
 TEST(create_lookup_session) {
@@ -79,7 +79,6 @@ TEST(destroy_removes_from_registry) {
     oi_session_destroy(reg, s);
     CHECK(oi_session_lookup(reg, "gone") == NULL);
 
-    /* The id is now free to reuse. */
     oi_session *s2;
     CHECK_EQ(oi_session_create(reg, "gone", path, 0, &s2), OI_OK);
 
@@ -123,8 +122,6 @@ TEST(multiple_independent_sessions) {
     unlink(p3);
 }
 
-/* --- fault containment --- */
-
 TEST(fail_marks_failed_and_releases_resources) {
     oi_session_registry *reg = oi_session_registry_create();
     const char *path = fresh_log_path();
@@ -136,7 +133,6 @@ TEST(fail_marks_failed_and_releases_resources) {
     CHECK_EQ(oi_session_state_of(s), OI_SESSION_FAILED);
     CHECK(oi_session_arena(s) == NULL);
     CHECK(oi_session_log(s) == NULL);
-    /* still in the registry -- fault containment doesn't remove it */
     CHECK(oi_session_lookup(reg, "faulty") == s);
 
     oi_session_registry_destroy(reg);
@@ -149,7 +145,7 @@ TEST(fail_is_idempotent) {
     oi_session *s;
     CHECK_EQ(oi_session_create(reg, "x", path, 0, &s), OI_OK);
     oi_session_fail(s);
-    oi_session_fail(s); /* must not double-free */
+    oi_session_fail(s);
     oi_session_fail(s);
     CHECK_EQ(oi_session_state_of(s), OI_SESSION_FAILED);
     oi_session_registry_destroy(reg);
@@ -164,7 +160,7 @@ TEST(destroy_after_fail_is_clean) {
     oi_session *s;
     CHECK_EQ(oi_session_create(reg, "x", path, 0, &s), OI_OK);
     oi_session_fail(s);
-    oi_session_destroy(reg, s); /* arena/log already NULL; must not crash */
+    oi_session_destroy(reg, s);
     CHECK(oi_session_lookup(reg, "x") == NULL);
     oi_session_registry_destroy(reg);
     unlink(path);
@@ -194,8 +190,6 @@ TEST(failed_session_does_not_affect_siblings) {
     unlink(p2);
 }
 
-/* --- resume from an existing log across a simulated restart --- */
-
 struct collected {
     char buf[256];
     size_t len;
@@ -213,15 +207,13 @@ static void collect_cb(const void *data, size_t len, void *ud) {
 TEST(resume_replays_prior_records) {
     const char *path = fresh_log_path();
 
-    /* "before restart" */
     oi_session_registry *reg1 = oi_session_registry_create();
     oi_session *s1;
     CHECK_EQ(oi_session_create(reg1, "resumable", path, 0, &s1), OI_OK);
     CHECK_EQ(oi_sesslog_append(oi_session_log(s1), "turn-1", 6), OI_OK);
     CHECK_EQ(oi_sesslog_append(oi_session_log(s1), "turn-2", 6), OI_OK);
-    oi_session_registry_destroy(reg1); /* closes the log's fd/lock */
+    oi_session_registry_destroy(reg1);
 
-    /* "after restart": a fresh registry, same id and log_path */
     oi_session_registry *reg2 = oi_session_registry_create();
     oi_session *s2;
     CHECK_EQ(oi_session_create(reg2, "resumable", path, 0, &s2), OI_OK);
@@ -231,7 +223,6 @@ TEST(resume_replays_prior_records) {
     CHECK_EQ(c.count, 2);
     CHECK(memcmp(c.buf, "turn-1turn-2", 12) == 0);
 
-    /* Resuming must not stop the session from being used further. */
     CHECK_EQ(oi_sesslog_append(oi_session_log(s2), "turn-3", 6), OI_OK);
 
     oi_session_registry_destroy(reg2);
@@ -245,8 +236,6 @@ TEST(create_propagates_locked_log_error) {
 
     oi_session_registry *reg = oi_session_registry_create();
     oi_session *s;
-    /* The log is already locked by raw_log, so opening it as a session
-     * must fail with the same error oi_sesslog_open would give. */
     CHECK_EQ(oi_session_create(reg, "locked-out", path, 0, &s),
               OI_ERR_EXISTS);
 

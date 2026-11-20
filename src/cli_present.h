@@ -23,12 +23,6 @@ struct oi_cli_present {
     void *external_user_data;
 };
 
-/*
- * `styling_enabled` gates Markdown/SGR styling for streamed assistant
- * text (interactive REPL: 1; one-shot: always 0, regardless of stdout's
- * TTY-ness, so one-shot output stays plain and script-friendly).
- * Sanitization of untrusted bytes applies unconditionally either way.
- */
 oi_status oi_cli_present_init(
     struct oi_cli_present *present, FILE *out, FILE *err,
     int capture_assistant, int styling_enabled,
@@ -40,7 +34,6 @@ void oi_cli_present_reset_turn(struct oi_cli_present *present);
 oi_status oi_cli_present_event(
     const struct oi_cli_conversation_event *event, void *user_data);
 
-/* Moves the captured assistant text to the caller. */
 oi_status oi_cli_present_take_assistant(struct oi_cli_present *present,
                                         char **out_text, size_t *out_len);
 

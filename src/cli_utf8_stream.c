@@ -32,11 +32,6 @@ static oi_status flush_pending(struct oi_cli_utf8_stream *stream,
     return status;
 }
 
-/*
- * Consumes one byte. Sets *reprocess when the byte was not consumed (a
- * pending sequence broke, and this byte must be reconsidered from a clean
- * state) -- the caller must call this again with the same byte.
- */
 static oi_status feed_one(struct oi_cli_utf8_stream *stream,
                           unsigned char byte, struct oi_cli_bytebuf *out,
                           int *reprocess) {

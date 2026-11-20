@@ -11,8 +11,6 @@
 #define OI_CLI_HISTORY_MAX_CONTENT (1024u * 1024u)
 #define OI_CLI_HISTORY_MAX_RECORD (8u * 1024u * 1024u)
 
-/* Shared ceiling for a durable session setting's value (model name or
- * working directory). Doubles as metadata.json's field ceiling. */
 #define OI_CLI_HISTORY_MAX_SETTING_VALUE 4096u
 
 enum oi_cli_history_record_kind {
@@ -27,10 +25,6 @@ enum oi_cli_history_record_kind {
     OI_CLI_HISTORY_RECORD_SESSION_SETTING
 };
 
-/* Which durable session setting a session_setting record carries. Values
- * are stable on-disk identifiers (encoded as strings, not these ints, but
- * kept nonzero so a zeroed/uninitialized field is never mistaken for a
- * real one). */
 enum oi_cli_history_session_setting_field {
     OI_CLI_HISTORY_SESSION_SETTING_MODEL = 1,
     OI_CLI_HISTORY_SESSION_SETTING_CWD
@@ -110,7 +104,6 @@ struct oi_cli_history {
     size_t cap;
 };
 
-/* Records must be initialized before being passed to a set function. */
 void oi_cli_history_record_init(struct oi_cli_history_record *record);
 void oi_cli_history_record_free(struct oi_cli_history_record *record);
 int oi_cli_history_record_is_valid(

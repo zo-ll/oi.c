@@ -5,8 +5,8 @@
 
 struct oi_session {
     char *id;
-    oi_arena *arena; /* NULL once failed */
-    oi_sesslog *log; /* NULL once failed */
+    oi_arena *arena;
+    oi_sesslog *log;
     oi_session_state state;
 };
 

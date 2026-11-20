@@ -23,8 +23,6 @@ static char *read_stream(FILE *stream) {
     return text;
 }
 
-/* Feeds the whole input in one call, then finish(); returns the rendered
- * output as a malloc'd NUL-terminated string. */
 static char *render_whole(const char *input, size_t len) {
     struct oi_cli_markdown_block block;
     FILE *out = tmpfile();
@@ -42,8 +40,6 @@ static char *render_whole(const char *input, size_t len) {
     return result;
 }
 
-/* Verifies every possible two-call chunk split of `input` produces the
- * exact same rendered output as feeding it whole. */
 static void check_split_invariant(const char *input, size_t len) {
     size_t split;
 
@@ -157,7 +153,7 @@ TEST(blank_line_separates_paragraphs) {
 
 TEST(cap_overflow_falls_back_to_literal_and_recovers) {
     size_t filler_len = OI_CLI_MARKDOWN_LINE_CAP + 100;
-    size_t total_len = filler_len + 1 /* '\n' */ + 5 /* "safe\n" */;
+    size_t total_len = filler_len + 1 + 5 ;
     char *in = malloc(total_len);
     char *out;
 
@@ -170,8 +166,6 @@ TEST(cap_overflow_falls_back_to_literal_and_recovers) {
     memcpy(in + filler_len + 1, "safe\n", 5);
 
     out = render_whole(in, total_len);
-    /* The overlong line is emitted literally (unstyled), and "safe" on
-     * the next line renders as its own ordinary unstyled paragraph. */
     CHECK(out != NULL);
     if (out != NULL) {
         size_t out_len = strlen(out);
@@ -197,7 +191,6 @@ TEST(finish_flushes_an_unterminated_final_line) {
     CHECK_EQ(oi_cli_markdown_block_finish(&block, out, &style_active), OI_OK);
     result = read_stream(out);
     CHECK_STREQ(result, "partial\n");
-    /* finish() is idempotent: nothing left to flush the second time. */
     CHECK_EQ(oi_cli_markdown_block_finish(&block, out, &style_active), OI_OK);
     free(result);
     result = read_stream(out);

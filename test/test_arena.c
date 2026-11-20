@@ -9,7 +9,7 @@ TEST(create_destroy) {
     oi_arena *a = oi_arena_create(0);
     CHECK(a != NULL);
     oi_arena_destroy(a);
-    oi_arena_destroy(NULL); /* NULL-safe */
+    oi_arena_destroy(NULL);
 }
 
 TEST(create_rejects_overflowing_block_size) {
@@ -39,8 +39,6 @@ TEST(allocations_are_aligned) {
     oi_arena *a = oi_arena_create(0);
     size_t align = alignof(max_align_t);
     for (int i = 0; i < 50; i++) {
-        /* Odd sizes deliberately misalign the bump pointer unless the
-         * allocator rounds up correctly. */
         void *p = oi_arena_alloc(a, (size_t)(i % 7) + 1);
         CHECK(p != NULL);
         CHECK_EQ((uintptr_t)p % align, 0u);
@@ -69,7 +67,6 @@ TEST(allocations_do_not_overlap) {
 }
 
 TEST(alloc_spans_multiple_blocks) {
-    /* Small block_size forces many block-growth transitions. */
     oi_arena *a = oi_arena_create(64);
     int count = 0;
     for (int i = 0; i < 100; i++) {
@@ -85,9 +82,6 @@ TEST(alloc_exactly_block_size_fits) {
     oi_arena *a = oi_arena_create(64);
     void *p = oi_arena_alloc(a, 64);
     CHECK(p != NULL);
-    /* A second allocation of any size must roll to a new block, since
-     * the first exactly filled the current one (post-alignment room may
-     * be 0). */
     void *q = oi_arena_alloc(a, 1);
     CHECK(q != NULL);
     CHECK(q != p);
@@ -103,7 +97,6 @@ TEST(alloc_larger_than_a_block_gets_its_own_block) {
     CHECK_EQ((uintptr_t)big % _Alignof(max_align_t), 0);
     memset(small, 'a', 16);
     memset(big, 'b', 1000);
-    /* The current block keeps its free space after the large request. */
     char *next = oi_arena_alloc(a, 16);
     CHECK(next == small + 16);
     memset(next, 'c', 16);
@@ -121,7 +114,6 @@ TEST(reset_releases_oversize_blocks_and_keeps_regular_ones) {
     CHECK(oi_arena_alloc(a, 5000) != NULL);
     oi_arena_reset(a);
     CHECK_EQ(oi_arena_used(a), 0);
-    /* The regular block is reused from its start. */
     CHECK(oi_arena_alloc(a, 16) == first);
     char *big = oi_arena_alloc(a, 2000);
     CHECK(big != NULL);
@@ -140,8 +132,6 @@ TEST(reset_reclaims_space) {
 
     void *p2 = oi_arena_alloc(a, 100);
     CHECK(p2 != NULL);
-    /* Reusing the same (now-empty) first block should hand back the same
-     * address as before the reset. */
     CHECK(p2 == p1);
     oi_arena_destroy(a);
 }
@@ -149,7 +139,6 @@ TEST(reset_reclaims_space) {
 TEST(reset_reuse_cycle_reuses_all_blocks) {
     oi_arena *a = oi_arena_create(64);
 
-    /* First cycle: force growth to several blocks. */
     void *first_addrs[10];
     for (int i = 0; i < 10; i++) {
         first_addrs[i] = oi_arena_alloc(a, 64);
@@ -159,8 +148,6 @@ TEST(reset_reuse_cycle_reuses_all_blocks) {
     oi_arena_reset(a);
     CHECK_EQ(oi_arena_used(a), 0u);
 
-    /* Second cycle with the same allocation pattern must reuse the same
-     * chain of blocks (same addresses) rather than mallocing anew. */
     for (int i = 0; i < 10; i++) {
         void *p = oi_arena_alloc(a, 64);
         CHECK(p != NULL);
@@ -186,7 +173,7 @@ TEST(used_tracks_across_growth) {
     oi_arena *a = oi_arena_create(64);
     CHECK_EQ(oi_arena_used(a), 0u);
     oi_arena_alloc(a, 32);
-    oi_arena_alloc(a, 64); /* forces a new block */
+    oi_arena_alloc(a, 64);
     CHECK(oi_arena_used(a) >= 96u);
     oi_arena_destroy(a);
 }

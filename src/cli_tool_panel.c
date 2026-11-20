@@ -20,9 +20,6 @@ static void trim_tail_to_bound(struct oi_cli_bytebuf *tail, size_t max_bytes) {
         }
     }
     if (!found) {
-        /* No newline anywhere in the excess -- one pathologically long
-         * line; drop it all rather than leave something still over the
-         * bound. */
         tail->len = 0;
         return;
     }
@@ -180,12 +177,6 @@ size_t oi_cli_tool_panel_lines(struct oi_cli_tool_panel *panel,
     }
     content_lines_wanted = max_lines - 1;
 
-    /* Find the start of the last content_lines_wanted lines by scanning
-     * backward for that many newlines -- excluding a bare trailing '\n'
-     * from consideration first (the common case, since every fed chunk
-     * typically ends with one): it terminates the last line rather than
-     * separating it from a line after it, so counting it here would
-     * wrongly stop one line short of the one actually wanted. */
     if (panel->tail.len > 0) {
         size_t effective_len = panel->tail.len;
 

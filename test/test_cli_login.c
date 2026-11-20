@@ -17,8 +17,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Serves one token request. It writes one byte to *out_received_fd when
- * the request arrives, and answers with rotated tokens `delay_ms` later. */
 static pid_t start_token_server(int delay_ms, unsigned short *out_port,
                                 int *out_received_fd) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -83,10 +81,6 @@ static pid_t start_token_server(int delay_ms, unsigned short *out_port,
     _exit(0);
 }
 
-/* /login finishes a sent renewal also when the terminal refuses ISIG, so
- * the rotated refresh token reaches the credentials file. The terminal's
- * input descriptor is /dev/null, where tcgetattr fails; the composer still
- * reads the pty, and an Escape there cancels the dialog. */
 TEST(login_finishes_a_sent_renewal_when_isig_cannot_be_set) {
     char config_root[] = "/tmp/oi-cli-login-isig-XXXXXX";
     char path[256];
@@ -188,7 +182,7 @@ TEST(login_finishes_a_sent_renewal_when_isig_cannot_be_set) {
     fclose(err);
     oi_reactor_destroy(reactor);
     unsetenv("OI_CHATGPT_TEST_BASE");
-    kill(server, SIGKILL); /* a failed test leaves it in accept() */
+    kill(server, SIGKILL);
     waitpid(server, NULL, 0);
     close(received_fd);
     close(master_fd);
@@ -199,7 +193,6 @@ TEST(login_finishes_a_sent_renewal_when_isig_cannot_be_set) {
 }
 
 int main(void) {
-    /* A regression that hangs the dialog must fail this binary, not CI. */
     oi_test_set_deadline(120);
     signal(SIGCHLD, SIG_DFL);
     RUN(login_finishes_a_sent_renewal_when_isig_cannot_be_set);

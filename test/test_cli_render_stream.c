@@ -142,7 +142,6 @@ TEST(truncated_utf8_at_end_of_turn_emits_one_replacement) {
     result = read_stream(out);
     CHECK_EQ(strlen(result), (size_t)3);
     CHECK(memcmp(result, "\xef\xbf\xbd", 3) == 0);
-    /* finish() is idempotent: calling again appends nothing further. */
     CHECK_EQ(oi_cli_render_stream_finish(&stream), OI_OK);
     free(result);
     result = read_stream(out);
@@ -157,17 +156,14 @@ TEST(unclosed_bold_at_finish_is_literal_plus_safety_reset) {
     static const char in[] = "**bold";
     char *out = run_whole(in, sizeof in - 1, 1);
 
-    /* No closing "**" ever arrived: the whole thing stays literal text,
-     * finish() still guarantees a trailing reset call happened (a no-op
-     * here since nothing was ever actually styled). */
     CHECK_STREQ(out, "**bold\n");
     free(out);
 }
 
 TEST(long_unterminated_control_string_recovers_before_later_markdown) {
     size_t filler_len = 5000;
-    size_t total_len = 6 /* "before" */ + 2 /* ESC ] */ + filler_len +
-                       1 /* '\n' */ + 8 /* "**bold**" */;
+    size_t total_len = 6 + 2 + filler_len +
+                       1 + 8 ;
     char *in = malloc(total_len);
     struct oi_cli_render_stream stream;
     FILE *out = tmpfile();
@@ -194,8 +190,6 @@ TEST(long_unterminated_control_string_recovers_before_later_markdown) {
     CHECK_EQ(oi_cli_render_stream_feed(&stream, in, total_len), OI_OK);
     CHECK_EQ(oi_cli_render_stream_finish(&stream), OI_OK);
     result = read_stream(out);
-    /* Whatever happened with the runaway control string, the later
-     * "**bold**" line must still render correctly styled. */
     CHECK(strstr(result, "\x1b[0m\x1b[1mbold\n") != NULL);
 
     free(result);

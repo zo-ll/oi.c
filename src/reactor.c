@@ -11,16 +11,11 @@
 
 #include "reactor_process.h"
 
-/* The generic layer passes OI_EV_* bits straight through to the backend
- * without translation; keep the two bit-layouts in lockstep. */
 _Static_assert(OI_EV_READ == OI_BACKEND_EV_READ, "read bit mismatch");
 _Static_assert(OI_EV_WRITE == OI_BACKEND_EV_WRITE, "write bit mismatch");
 _Static_assert(OI_EV_ERROR == OI_BACKEND_EV_ERROR, "error bit mismatch");
 _Static_assert(OI_EV_HUP == OI_BACKEND_EV_HUP, "hup bit mismatch");
 
-/* Bound on fd value accepted by oi_reactor_add, to keep the fd-indexed
- * table from growing unboundedly on a bogus/huge fd. Comfortably above
- * any realistic RLIMIT_NOFILE. */
 #define OI_REACTOR_MAX_FD (1 << 20)
 
 struct fd_entry {
@@ -38,9 +33,6 @@ struct oi_reactor {
     size_t registered_count;
     int stop_requested;
     uint64_t next_native_id;
-    /* Active timers as a binary min-heap on deadline_ns. The heap, not a
-     * kernel timer, decides the epoll_wait timeout, so starting and
-     * cancelling a timer make no system call. */
     struct oi_reactor_timer **timer_heap;
     size_t timer_count;
     size_t timer_cap;
@@ -49,7 +41,7 @@ struct oi_reactor {
 
 struct oi_reactor_timer {
     oi_reactor *reactor;
-    uint64_t deadline_ns; /* CLOCK_MONOTONIC */
+    uint64_t deadline_ns;
     size_t heap_index;
     oi_reactor_timer_cb cb;
     void *user_data;
@@ -128,8 +120,6 @@ static void heap_remove(oi_reactor *r, oi_reactor_timer *t) {
     heap_sift_down(r, last->heap_index);
 }
 
-/* The epoll_wait timeout: the caller's limit, cut to the time left to the
- * next timer deadline, rounded up so a wake is never early. */
 static int wait_timeout(const oi_reactor *r, int timeout_ms) {
     if (r->timer_count == 0) {
         return timeout_ms;
@@ -269,8 +259,6 @@ oi_status oi_reactor_modify(oi_reactor *r, int fd, int interest) {
     if (st != OI_OK) {
         return st;
     }
-    /* The backend is level-triggered, so the same interest again changes
-     * nothing; callers re-assert their interest after each read. */
     if ((size_t)fd < r->capacity && r->entries[fd].in_use &&
         r->entries[fd].interest == interest) {
         return OI_OK;
@@ -357,15 +345,12 @@ int oi_reactor_step(oi_reactor *r, int timeout_ms, oi_status *out_status) {
         uint32_t generation = (uint32_t)(tokens[i] >> 32);
         if ((size_t)fd >= r->capacity || !r->entries[fd].in_use ||
             r->entries[fd].generation != generation) {
-            /* Removed or replaced by an earlier callback in this batch. */
             continue;
         }
         r->entries[fd].cb(r, fd, revents[i], r->entries[fd].user_data);
         dispatched++;
     }
 
-    /* `now` is read once, so a timer that a callback starts here waits
-     * for a later step, even with a deadline that has already passed. */
     uint64_t now = monotonic_ns();
     while (r->timer_count > 0 && r->timer_heap[0]->deadline_ns <= now) {
         oi_reactor_timer *timer = r->timer_heap[0];

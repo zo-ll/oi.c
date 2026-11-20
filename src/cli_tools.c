@@ -62,10 +62,6 @@ oi_tool_decision oi_cli_tool_permission(const char *tool_name,
     case OI_CLI_TOOLS_DENY:
         return OI_TOOL_DENY;
     case OI_CLI_TOOLS_ASK:
-        /* Deferred to the embedder: cli_tools has no terminal I/O. An
-         * interactive caller (cli_repl.c) resolves this asynchronously
-         * via oi_cli_conversation_resolve_permission once a decision
-         * arrives through its own UI. */
         return OI_TOOL_ASK;
     }
     return OI_TOOL_DENY;
@@ -82,12 +78,6 @@ oi_tool_decision oi_cli_tool_permission_noninteractive(
         return OI_TOOL_ALLOW;
     case OI_CLI_TOOLS_DENY:
     case OI_CLI_TOOLS_ASK:
-        /* Never defers: a caller with no way to ever resolve a deferred
-         * ASK (the non-interactive one-shot loop, cli_loop.c) would stage
-         * a call and then hang forever waiting for a resolution nothing
-         * will ever supply -- deny outright instead, matching "ask
-         * without a usable controlling terminal denies safely rather
-         * than hanging." */
         return OI_TOOL_DENY;
     }
     return OI_TOOL_DENY;

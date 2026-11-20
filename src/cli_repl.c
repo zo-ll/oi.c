@@ -1,8 +1,3 @@
-/* realpath(3) is a BSD/SVID extension, and struct signalfd_siginfo /
- * signalfd(2) are GNU/Linux extensions; _GNU_SOURCE is a superset of
- * _DEFAULT_SOURCE (previously defined here just for realpath) and covers
- * both, matching the same precedent in reactor_epoll.c for other GNU fd
- * primitives (timerfd, pidfd). */
 #define _GNU_SOURCE
 
 #include "cli_repl.h"
@@ -54,24 +49,9 @@ struct repl_setting_context {
     const struct oi_cli_repl_config *config;
     struct oi_cli_string *current_model;
     oi_cli_conversation **conversation;
-    /*
-     * Live provenance of *current_model, seeded from config->model_origin
-     * and updated by whichever thing replaces the model: /model here, and a
-     * /session switch adopting the target's own restored value. Kept beside
-     * the model rather than in the status snapshot's own state, so the value
-     * and the story about where it came from can never be updated
-     * separately.
-     */
     enum oi_cli_session_model_origin model_origin;
 };
 
-/*
- * The one-slot pending item, owned entirely by cli_repl.c. cli_conversation
- * only ever receives a bare "steer" signal, never queued content, and
- * cli_history only encodes/replays the durable record shape; deciding what
- * is queued belongs to the REPL. Reset to NONE at the top of
- * oi_cli_repl_run's turn loop each time it is consumed or discarded.
- */
 enum oi_cli_repl_pending_kind {
     OI_CLI_REPL_PENDING_NONE = 0,
     OI_CLI_REPL_PENDING_MESSAGE,
@@ -82,9 +62,6 @@ struct oi_cli_repl_pending {
     enum oi_cli_repl_pending_kind kind;
     char *text;
     size_t text_len;
-    /* Opaque durable record id from persist_queued_input, passed back
-     * verbatim to persist_queue_resolved; 0 if persistence is disabled
-     * (ephemeral session) or failed benignly under a store==NULL config. */
     uint64_t record_id;
 };
 
@@ -96,43 +73,15 @@ static void repl_pending_free(struct oi_cli_repl_pending *pending) {
     pending->record_id = 0;
 }
 
-/*
- * What the /status snapshot is assembled from. Holds no state of its own
- * beyond `cwd` scratch space and one run-local counter, because everything
- * else is already owned somewhere: borrowing keeps a single copy of each
- * fact rather than a second one that can drift out of step with it.
- *
- * Every member is borrowed and outlives any single dispatch, which is what
- * makes it safe for repl_status_snapshot to hand dispatch pointers straight
- * out of here.
- */
 struct repl_status_context {
     const struct oi_cli_repl_config *config;
     struct repl_setting_context *setting;
-    /* Points at oi_cli_repl_run's own conversation slot, not at a
-     * conversation: it is NULL before the first message and is replaced by a
-     * /session switch, and /status must report whichever one is live now. */
     oi_cli_conversation **conversation;
     const struct oi_cli_repl_pending *pending;
-    /* Checkpoints /compact spliced into active context this run. Reset by a
-     * /session switch, which replaces that context wholesale. */
     unsigned int checkpoints_applied;
-    /*
-     * Scratch for the snapshot's borrowed `cwd`. Owned here rather than
-     * heap-allocated per call so assembling a snapshot cannot fail for want
-     * of memory, and so the borrowed pointer's lifetime is plainly this
-     * context's.
-     */
     char cwd[PATH_MAX];
 };
 
-/*
- * Which durable session, if any, this run has. Derived rather than stored: a
- * /session switch can turn a run with no session into one with an active
- * session, and only the live callbacks know that. `id` is the already-
- * resolved current id, passed in rather than fetched again so the state and
- * the id in the same report can never come from two different reads.
- */
 static enum oi_cli_status_session_state repl_session_state(
     const struct oi_cli_repl_config *config, const char *id) {
     if (id != NULL) {
@@ -142,15 +91,10 @@ static enum oi_cli_status_session_state repl_session_state(
                    ? OI_CLI_STATUS_SESSION_FAILED
                    : OI_CLI_STATUS_SESSION_ACTIVE;
     }
-    /* No id and no lazy-creation hook means no session will ever exist this
-     * run -- distinct from an automatic session that simply has not been
-     * created yet, and worth saying so, since nothing is being persisted. */
     return config->prepare == NULL ? OI_CLI_STATUS_SESSION_EPHEMERAL
                                    : OI_CLI_STATUS_SESSION_NOT_CREATED;
 }
 
-/* The REPL always knows its own slot, so there is no unknown to report
- * here: an unoccupied slot is genuinely empty. */
 static enum oi_cli_status_queue_state repl_queue_state(
     const struct oi_cli_repl_pending *pending) {
     switch (pending->kind) {
@@ -164,22 +108,6 @@ static enum oi_cli_status_queue_state repl_queue_state(
     return OI_CLI_STATUS_QUEUE_EMPTY;
 }
 
-/*
- * Assembles the /status snapshot. Registered as the dispatch context's
- * status callback at both call sites -- the idle prompt and the mid-turn
- * read-only path -- because /status must answer for a turn that is running
- * right now, and everything read here is either an accessor or a borrowed
- * pointer, so nothing about doing it mid-turn is unsafe.
- *
- * Never fails: an unresolvable working directory is reported as unknown
- * rather than turning /status into an error, since the rest of the report is
- * still accurate and useful.
- *
- * Every field is assigned, so nothing is left at the unknown the caller's
- * oi_cli_status_snapshot_init established -- the REPL genuinely knows all of
- * this. The one exception is the checkpoint's durable half, which belongs to
- * a nullable callback.
- */
 static oi_status repl_status_snapshot(
     void *user_data, struct oi_cli_status_snapshot *out_snapshot) {
     struct repl_status_context *context = user_data;
@@ -213,28 +141,16 @@ static oi_status repl_status_snapshot(
     }
     out_snapshot->checkpoint.applied_this_run =
         context->checkpoints_applied > 0;
-    /* Active context begins with a checkpoint summary if either a durable
-     * checkpoint was replayed into it or /compact spliced one in this run.
-     * The second case is the only one an ephemeral session can have. */
     out_snapshot->checkpoint.context_compacted =
         out_snapshot->checkpoint.has_durable_checkpoint ||
         out_snapshot->checkpoint.applied_this_run;
-    /* Reported last, and unconditionally: whether or not a durable-checkpoint
-     * callback was wired, the REPL has now answered both halves of the
-     * question, so "nobody looked" is no longer true. */
     out_snapshot->checkpoint.known = 1;
     return OI_OK;
 }
 
 struct repl_turn_signal_context {
     oi_cli_conversation *conversation;
-    /* 0, or the signal (SIGTERM/SIGHUP) that requested the whole REPL
-     * terminate once this turn finishes unwinding. */
     int terminate_signal;
-    /* Set on SIGWINCH; the turn loop checks this after each step to decide
-     * whether the composer's frame needs redrawing -- see
-     * repl_turn_input_context.dirty for why this can't just redraw
-     * unconditionally on every step. */
     int resize_pending;
 };
 
@@ -245,9 +161,6 @@ static void handle_turn_signal(oi_reactor *reactor, int fd, int revents,
 
     (void)reactor;
     (void)revents;
-    /* Each of SIGWINCH/SIGINT/SIGTERM/SIGHUP is a standard (non-realtime)
-     * signal, so at most one of each is ever actually pending -- looping
-     * is defensive, not load-bearing. */
     while (read(fd, &info, sizeof info) == (ssize_t)sizeof info) {
         switch (info.ssi_signo) {
         case SIGWINCH:
@@ -282,71 +195,20 @@ struct repl_turn_input_context {
     const struct oi_cli_repl_config *config;
     struct oi_cli_string *current_model;
     struct repl_setting_context *setting_context;
-    /* Shared with the idle path: /status must report the same snapshot
-     * whether it was typed at the prompt or during a turn. */
     struct repl_status_context *status_context;
     struct oi_cli_repl_pending *pending;
-    /* Owned by this context: cancelled unconditionally when the turn ends
-     * (whichever way), since a still-pending timer firing after this
-     * stack-local context goes out of scope would be a use-after-free. */
     oi_reactor_timer *escape_timer;
-    /* First composer error seen (e.g. OI_ERR_CLOSED if input_fd hit EOF);
-     * checked by the turn loop after each step alongside the reactor's own
-     * step_status, since this callback has no return value of its own. */
     oi_status status;
-    /*
-     * Set whenever input was actually decoded this step; the turn loop
-     * checks this (and resize_pending above) after each step to decide
-     * whether to redraw the composer's frame at all. Redrawing
-     * unconditionally on every step -- regardless of whether *this*
-     * step's ready fds had anything to do with the composer -- would
-     * interleave its escape sequences into the turn's own streamed
-     * output (config->out and config->output_fd are the same fd)
-     * whenever a multi-chunk reply and typing land in different steps,
-     * corrupting normal token-by-token streaming, not just risking
-     * flicker. Only redrawing when something composer-relevant actually
-     * happened this step avoids that entirely.
-     */
     int dirty;
-    /*
-     * True from the moment an AWAITING_PERMISSION event arrives until the
-     * decision is resolved one way or another -- while set,
-     * handle_turn_input/handle_turn_escape_timeout route decoded input
-     * through the permission selector instead of the composer's normal
-     * editor-applying path, and the turn loop's redraw draws the selector
-     * instead of the ordinary prompt frame.
-     */
     int awaiting_permission;
-    /* 0 = allow once, 1 = allow for process, 2 = deny -- reset to deny
-     * each time a new AWAITING_PERMISSION event arrives. */
     size_t permission_selected;
-    /* The sanitized "Tool: <name>" line and the one-line review hint,
-     * rebuilt fresh by build_permission_header for each AWAITING_PERMISSION
-     * event -- copied immediately rather than keeping the event's own
-     * borrowed pointers, which aren't guaranteed to outlive the call. */
     struct oi_cli_bytebuf permission_tool_line;
     struct oi_cli_bytebuf permission_args_line;
-    /*
-     * Live tool-execution presentation, driven by repl_conversation_event
-     * (TOOL_STARTING/_OUTPUT/a tool-role MESSAGE). Fresh (inactive) for
-     * each new turn via this struct's own zero-initialization; stays
-     * active through the rest of the turn once a tool call starts, so its
-     * last state (e.g. "shell: completed") remains visible until either
-     * another call starts in the same turn or the turn ends.
-     */
     struct oi_cli_tool_panel panel;
 };
 
-/* Index of "Deny" in the permission selector's options. */
 #define PERMISSION_OPTION_DENY 2u
 
-/*
- * Builds the "Tool: <name>" header line shown above the permission
- * selector, sanitized like every other untrusted string on the terminal.
- * The selector redraws these lines, so they stay one row each: the full
- * request goes to scrollback once, through cli_present, before the first
- * draw. Copied because `name` is event-scoped.
- */
 static oi_status build_permission_header(struct oi_cli_bytebuf *tool_line,
                                          struct oi_cli_bytebuf *args_line,
                                          const struct oi_cli_string *name) {
@@ -374,16 +236,9 @@ static oi_status build_permission_header(struct oi_cli_bytebuf *tool_line,
 
 struct repl_event_context {
     struct oi_cli_present *present;
-    /* Set to the current turn's context at the start of each turn, and
-     * only ever dereferenced while a turn is genuinely active (conversation
-     * events can't fire otherwise) -- see oi_cli_repl_run. */
     struct repl_turn_input_context *turn_input;
 };
 
-/* Maps the conversation's durable-plus-presentation outcome to the live
- * panel's final label. FAILED and DENIED deliberately remain distinct here
- * even though persistence collapses them into the existing completed and
- * not-executed history outcomes respectively. */
 static enum oi_cli_tool_panel_status tool_panel_status_for_outcome(
     enum oi_cli_conversation_tool_outcome outcome) {
     switch (outcome) {
@@ -426,7 +281,6 @@ static oi_status repl_conversation_event(
             return status;
         }
         turn_input->awaiting_permission = 1;
-        /* Enter on a fresh prompt must not run anything. */
         turn_input->permission_selected = PERMISSION_OPTION_DENY;
         turn_input->dirty = 1;
         break;
@@ -481,15 +335,6 @@ static const char permission_option_deny[] = "Deny";
 static const char permission_allowed_for_process_text[] =
     "oi: tool policy set to allow for the rest of this process\n";
 
-/*
- * Applies one decoded event to the permission selector (via
- * oi_cli_selector_apply) instead of the editor -- called through
- * oi_cli_composer_feed_raw/_resolve_escape_raw, which never touch
- * composer->state, so the in-progress draft can't be corrupted by keys
- * being intercepted here. Returns nonzero once the decision is settled
- * (confirmed or cancelled), matching feed_raw's "stop at the first
- * decisive action" contract.
- */
 static int permission_selector_key(const struct oi_cli_input_event *event,
                                    void *user_data) {
     struct repl_turn_input_context *context = user_data;
@@ -515,10 +360,6 @@ static int permission_selector_key(const struct oi_cli_input_event *event,
             context->conversation,
             context->permission_selected != PERMISSION_OPTION_DENY);
         if (status != OI_OK) {
-            /* A signal callback earlier in the same reactor batch may
-             * already have cancelled the pending call. Stale selector
-             * input must not elevate process policy, but it also must not
-             * turn that successful cancellation into a new error. */
             if (oi_cli_conversation_is_busy(context->conversation) &&
                 context->status == OI_OK) {
                 context->status = status;
@@ -528,10 +369,6 @@ static int permission_selector_key(const struct oi_cli_input_event *event,
             return 1;
         }
         if (context->permission_selected == 1) {
-            /* "Allow for process" is itself the explicit confirming act --
-             * distinctly labeled from "allow once" in the selector, so no
-             * further confirmation is layered on top here. Apply the
-             * elevation only after the staged decision was accepted. */
             context->config->permission->policy = OI_CLI_TOOLS_ALLOW;
             report_busy_io_error(
                 context,
@@ -543,9 +380,6 @@ static int permission_selector_key(const struct oi_cli_input_event *event,
         context->dirty = 1;
         return 1;
     case OI_CLI_SELECTOR_ACTION_CANCEL:
-        /* Dismissing the prompt (Escape or Ctrl+C while the selector is
-         * up) must never leave the tool call hanging -- resolve as deny,
-         * exactly like explicitly selecting "Deny" would. */
         status =
             oi_cli_conversation_resolve_permission(context->conversation, 0);
         if (status != OI_OK &&
@@ -600,16 +434,6 @@ static void report_busy_io_error(struct repl_turn_input_context *context,
     }
 }
 
-/*
- * Handles Enter pressed while a turn is active. /help and /status (the
- * only OI_CLI_COMMAND_READ_ONLY commands) dispatch immediately regardless
- * of the pending slot; everything else -- a plain message, or any other
- * command (including /exit) -- goes through the one-slot rule: refused
- * non-destructively if the slot is already occupied (the draft is only
- * ever committed/cleared once the submission is accepted, one way or the
- * other), else committed and durably persisted as QUEUED_INPUT, to be
- * steered into the turn at the next safe boundary.
- */
 static void handle_busy_submit(struct repl_turn_input_context *context) {
     struct oi_cli_command_parse peek;
     oi_status status;
@@ -680,9 +504,6 @@ static void handle_busy_submit(struct repl_turn_input_context *context) {
             };
             enum oi_cli_command_result command_result;
 
-            /* Read-only by construction (checked above): /help and
-             * /status never return EXIT_REPL or mutate model/cwd, so
-             * command_result needs no further handling here. */
             status = oi_cli_command_dispatch(&committed, &command_context,
                                              &command_result);
         }
@@ -737,10 +558,6 @@ static void handle_busy_submit(struct repl_turn_input_context *context) {
         context->pending->kind = kind;
         context->pending->text = text;
         context->pending->text_len = text_len;
-        /* Now that something is queued, no new tool call (or follow-up
-         * model round) should start ahead of it -- whatever's already in
-         * flight (the model request, or a running tool) still finishes
-         * naturally. */
         oi_cli_conversation_steer(context->conversation);
         report_busy_io_error(
             context, fputs(busy_queued_text, context->config->err) != EOF &&
@@ -748,15 +565,6 @@ static void handle_busy_submit(struct repl_turn_input_context *context) {
     }
 }
 
-/*
- * Ctrl+C during a turn always cancels it (handled by the caller before this
- * runs); this handles the one additional thing that's true only when
- * something is also queued: the pending item must not silently survive to
- * run after a turn the user just asked to stop entirely, so it's discarded
- * (persisted QUEUE_RESOLVED(DISCARDED), matching the schema -- there's no
- * "abandoned" resolution) and handed back verbatim as the live draft,
- * rather than dropped, since Ctrl+C is "stop", not "delete what I typed".
- */
 static void discard_pending_on_cancel(struct repl_turn_input_context *context) {
     oi_status status = OI_OK;
 
@@ -766,7 +574,7 @@ static void discard_pending_on_cancel(struct repl_turn_input_context *context) {
     if (context->config->persist_queue_resolved != NULL) {
         status = context->config->persist_queue_resolved(
             context->config->persist_queue_resolved_user_data,
-            context->pending->record_id, /*consumed=*/0);
+            context->pending->record_id, 0);
     }
     if (status == OI_OK) {
         status = oi_cli_composer_set_draft(context->composer,
@@ -799,8 +607,6 @@ static void handle_turn_input(oi_reactor *reactor, int fd, int revents,
         context->escape_timer = NULL;
     }
     if (context->awaiting_permission) {
-        /* Keys are intercepted by the selector entirely -- never reach
-         * the editor -- for as long as a decision is outstanding. */
         status = oi_cli_composer_feed_raw(context->composer,
                                           permission_selector_key, context);
     } else {
@@ -814,12 +620,6 @@ static void handle_turn_input(oi_reactor *reactor, int fd, int revents,
             } else if (action == OI_CLI_COMPOSER_ACTION_SUBMIT) {
                 handle_busy_submit(context);
             }
-            /* EXIT (Ctrl+D at an empty draft) while busy is still a
-             * documented no-op: not explicitly required by the issue, and
-             * there is no pressing need to synthesize an "/exit" queue
-             * entry for it ahead of an explicitly typed /exit, which
-             * already goes through the one-slot rule above like any other
-             * command. */
         }
     }
     if (status != OI_OK) {
@@ -852,9 +652,6 @@ static oi_status dispatch_set_model(void *user_data, const char *name,
     if (status != OI_OK) {
         return status;
     }
-    /* Set with the value, not after the whole change lands: the name is
-     * already the active one at this point, so leaving the provenance behind
-     * would make /status describe a model that is no longer there. */
     context->model_origin = OI_CLI_SESSION_MODEL_COMMAND;
     if (*context->conversation != NULL) {
         status = oi_cli_conversation_set_model(*context->conversation, name,
@@ -900,12 +697,7 @@ static oi_status dispatch_set_cwd(void *user_data, const char *path,
             context->config->persist_cwd_user_data, resolved,
             strlen(resolved));
         if (status != OI_OK) {
-            /* Nothing was durably written yet: roll the live chdir back
-             * rather than leaving live and durable state disagreeing. A
-             * failed rollback has no further fallback -- `status` (the
-             * persist failure) is still the right thing to report. */
             if (chdir(previous) != 0) {
-                /* best effort: nothing more to do */
             }
             free(previous);
             return status;
@@ -915,18 +707,10 @@ static oi_status dispatch_set_cwd(void *user_data, const char *path,
     return OI_OK;
 }
 
-/* --- /session subcommands that need the conversation or the composer --- */
-
 static int repl_is_space(char value) {
     return value == ' ' || value == '\t' || value == '\r' || value == '\n';
 }
 
-/*
- * Same split cli_command_dispatch performs, duplicated here rather than
- * shared: it is ten lines, the two translation units have no other reason to
- * depend on each other, and an import path must keep its internal spaces
- * verbatim in both places.
- */
 static void repl_split_first_token(const char *text, size_t len,
                                    const char **out_token,
                                    size_t *out_token_len, const char **out_rest,
@@ -954,21 +738,11 @@ static int repl_token_equals(const char *token, size_t token_len,
 }
 
 struct repl_session_switch_outcome {
-    int terminate; /* a terminating signal arrived during a selector */
-    /* Set only once the switch has committed: the caller's run-local
-     * reporting state describes the session that was just replaced, so it
-     * has to be told, and only the committed path knows the difference. */
+    int terminate;
     int switched;
     enum oi_cli_session_model_origin model_origin;
 };
 
-/*
- * Runs a two-option confirmation selector and reports the choice.
- *
- * A cancel counts as choosing the safe first option, per
- * oi_cli_composer_select's contract. Erases the selector frame afterwards so
- * the ordinary idle prompt is what remains on screen.
- */
 static oi_status repl_confirm(struct oi_cli_composer *composer, int signal_fd,
                               const char *cancel_text,
                               const char *proceed_text, int *out_confirmed,
@@ -1021,15 +795,6 @@ static oi_status repl_confirmation_text(
     return OI_OK;
 }
 
-/*
- * Dumps a restored conversation so the user can see what they switched into.
- *
- * A deliberately plain role-tagged dump rather than the streaming Markdown
- * renderer: that renderer is built around incremental state for a turn that
- * is actively arriving, and driving it over a static list would mean
- * fabricating turn boundaries it does not have. Legibility here is worth more
- * than styling.
- */
 static oi_status repl_print_replay(FILE *out,
                                    const struct oi_cli_message_list *context) {
     size_t index;
@@ -1107,18 +872,6 @@ static const char *repl_switch_outcome_text(
     }
 }
 
-/*
- * Swaps the live conversation over to another session.
- *
- * The ordering is the whole point. The conversation is destroyed *before*
- * switch_session is called, because a successful switch destroys the old
- * session's arena and the conversation allocates from it. That means this
- * function is briefly holding no conversation at all, so every path out of
- * here must either build a new one or rebuild the old one -- which is why the
- * current messages are cloned up front, before anything is torn down.
- *
- * Returns non-OK only for a structural failure the REPL should end on.
- */
 static oi_status repl_handle_session_switch(
     const struct oi_cli_repl_config *config,
     struct oi_cli_composer *composer, int signal_fd, oi_llm_client *client,
@@ -1157,17 +910,6 @@ static oi_status repl_handle_session_switch(
                    : OI_OK;
     }
 
-    /*
-     * Clone the live messages before anything is destroyed: this is the only
-     * way back if the switch fails.
-     *
-     * There may be no conversation yet -- an automatic session is created
-     * lazily on the first message, so switching before then is legitimate and
-     * has nothing to tear down or restore. `had_conversation` records which
-     * case this is, because on the failure path an absent conversation must
-     * be left absent: `*active_arena` is still NULL until the first one is
-     * built, so there would be nothing to rebuild it on.
-     */
     had_conversation = *conversation != NULL;
     oi_cli_message_list_init(&rollback_context);
     if (had_conversation) {
@@ -1191,19 +933,12 @@ static oi_status repl_handle_session_switch(
     status = config->switch_session(config->switch_session_user_data, id,
                                     id_len, &result);
     if (status != OI_OK) {
-        /* Structural: the loop is ending, so there is nothing to rebuild. */
         oi_cli_session_switch_result_free(&result);
         oi_cli_message_list_free(&rollback_context);
         return status;
     }
 
     if (result.outcome != OI_CLI_SESSION_SWITCH_OK) {
-        /*
-         * Nothing durable changed and the old arena is untouched, so rebuild
-         * the conversation exactly as it was. A conversation holds no state
-         * across destroy/create beyond the arena and the message list, both
-         * of which are still here.
-         */
         oi_status message_status = OI_OK;
         if (fprintf(config->err, "oi: %.*s: %s\n", (int)id_len, id,
                     repl_switch_outcome_text(result.outcome)) < 0 ||
@@ -1222,12 +957,9 @@ static oi_status repl_handle_session_switch(
         return status != OI_OK ? status : message_status;
     }
 
-    /* Committed. Adopt the new session's arena, model, context, and input
-     * history, then build the conversation on top of them. */
     oi_cli_message_list_free(&rollback_context);
     size_t damaged = oi_sesslog_damaged_bytes(oi_session_log(result.session));
     if (damaged > 0) {
-        /* A warning that cannot be written does not undo the switch. */
         (void)fprintf(config->err,
                       "oi: %.*s: session log was damaged: removed %zu bytes; "
                       "the original file is kept next to it with a .corrupt "
@@ -1244,8 +976,6 @@ static oi_status repl_handle_session_switch(
         *switched_context = result.initial_context;
         result.initial_context = (struct oi_cli_message_list){0};
         *has_switched_context = 1;
-        /* Input history is per-session: rebuild it from the user messages of
-         * the session just opened. */
         oi_cli_input_history_free(input_history);
         oi_cli_input_history_init(input_history);
         status = seed_input_history(input_history, switched_context);
@@ -1267,8 +997,6 @@ static oi_status repl_handle_session_switch(
         return OI_ERR_IO;
     }
 
-    /* Offer the restored conversation, since a bare prompt gives no hint of
-     * what was just loaded. */
     if (switched_context->len > 0) {
         int confirmed = 0;
         int terminate = 0;
@@ -1368,8 +1096,6 @@ static oi_status repl_handle_session_import(
     int terminate = 0;
     oi_status status;
 
-    /* The remainder is a path taken verbatim: it may contain spaces, so it is
-     * never tokenized further. */
     if (rest_len == 0) {
         return fputs("oi: usage: /session import PATH\n", config->err) ==
                            EOF ||
@@ -1433,19 +1159,7 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     int composer_initialized = 0;
     struct oi_cli_conversation_config conversation_config;
     oi_cli_conversation *conversation = NULL;
-    /*
-     * The arena the live conversation allocates from. Loop-scoped rather
-     * than block-local to the lazy-create path, because /session switch
-     * replaces it: a successful switch destroys the old session's arena and
-     * adopts the new session's, and a failed switch has to rebuild the
-     * conversation on the unchanged old one.
-     */
     oi_arena *active_arena = arena;
-    /*
-     * The context the conversation is (re)built from. Starts as the caller's
-     * startup context and is replaced by a switch, so the lazy-create path
-     * below and the switch path agree on what "current context" means.
-     */
     const struct oi_cli_message_list *active_context = config->initial_context;
     struct oi_cli_message_list switched_context;
     int has_switched_context = 0;
@@ -1485,23 +1199,18 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         }
     }
     status = oi_cli_present_init(
-        &present, config->out, config->err, 0, /*styling_enabled=*/1,
+        &present, config->out, config->err, 0, 1,
         config->on_event, config->event_user_data);
     if (status != OI_OK) {
         goto cleanup_history;
     }
 
-    /* Raw mode/bracketed paste now spans the whole REPL run, not each
-     * prompt read: reading and redrawing terminal input during a turn
-     * needs raw mode active during the turn too. */
     status = oi_cli_composer_init(&composer, config->input_fd,
                                   config->output_fd, &input_history);
     if (status != OI_OK) {
         goto cleanup_present;
     }
     composer_initialized = 1;
-    /* Idle waits run the turn reactor too, so a background token renewal
-     * finishes and releases its lock while the prompt waits for input. */
     composer.reactor = reactor;
     if (config->initial_draft != NULL && config->initial_draft_len > 0) {
         status = oi_cli_composer_set_draft(&composer, config->initial_draft,
@@ -1519,12 +1228,6 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         sigaddset(&signal_mask, SIGINT);
         sigaddset(&signal_mask, SIGTERM);
         sigaddset(&signal_mask, SIGHUP);
-        /* Graceful degradation, never a hard failure: if blocking the
-         * signals or creating the signalfd fails for any reason, signal_fd
-         * stays -1, which oi_cli_composer_wait_submit already treats as
-         * "signal handling unavailable" -- the REPL still works exactly as
-         * it does without this feature (just without live resize, and
-         * without Ctrl+C/SIGTERM/SIGHUP being caught cleanly). */
         if (sigprocmask(SIG_BLOCK, &signal_mask, NULL) == 0) {
             signal_fd =
                 signalfd(-1, &signal_mask, SFD_NONBLOCK | SFD_CLOEXEC);
@@ -1540,10 +1243,6 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
     status_context.conversation = &conversation;
     status_context.pending = &pending;
 
-    /* conversation_config.model is set fresh just before each
-     * oi_cli_conversation_create call below (not here): a /model command
-     * before the first message reallocates current_model->data, and
-     * capturing the pointer this early would leave it dangling. */
     conversation_config.max_model_steps = config->max_turns;
     conversation_config.tool_timeout_ms = config->tool_timeout_ms;
     conversation_config.permission = oi_cli_tool_permission;
@@ -1561,15 +1260,6 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         struct oi_cli_command_parse parsed;
 
         if (pending.kind != OI_CLI_REPL_PENDING_NONE) {
-            /* The safe boundary the previous turn's steering was waiting
-             * for has been reached (present.done, back at the top of this
-             * loop): resolve the queue durably before running it, per the
-             * issue's own requirement, and run it immediately, before
-             * returning to an idle read. A queued command always resolves
-             * DISCARDED (the durable schema has no "consumed by running a
-             * command" shape -- see cli_history_replay.c's queue_consumed
-             * gate); only a queued plain message can ever resolve
-             * CONSUMED. */
             int consumed = pending.kind == OI_CLI_REPL_PENDING_MESSAGE;
 
             if (config->persist_queue_resolved != NULL) {
@@ -1600,12 +1290,6 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
             pending.kind = OI_CLI_REPL_PENDING_NONE;
             pending.record_id = 0;
             if (consumed) {
-                /* Already known to be a plain message as of queueing time
-                 * (any leading "//" already stripped then, too) --
-                 * skip straight past command parsing/dispatch instead of
-                 * re-parsing it, which would wrongly re-trigger command
-                 * handling for message content that happens to start with
-                 * a bare "/". */
                 goto have_message;
             }
             status = oi_cli_command_parse_text(prompt, prompt_len, &parsed);
@@ -1619,10 +1303,6 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
         status = oi_cli_composer_wait_submit(
             &composer, signal_fd, &prompt, &prompt_len, &exit_requested,
             &terminate_signal);
-        /* No turn is active at this point in the loop (we're between
-         * turns, about to read the next prompt), so a terminate signal
-         * here needs no conversation cancellation -- just end cleanly,
-         * exactly like Ctrl+D. */
         if (status != OI_OK || exit_requested || terminate_signal != 0) {
             free(prompt);
             break;
@@ -1665,15 +1345,6 @@ have_parsed_command:
                 }
                 continue;
             }
-            /*
-             * /compact never reaches cli_command_dispatch.c: dispatch has
-             * no access to the conversation, durable history store, or LLM
-             * client by design, and this command genuinely needs all
-             * three. Handled entirely here, at the same idle/safe-boundary
-             * label a freshly-typed and a dequeued pending command both
-             * funnel through -- matching the /permissions allow gate right
-             * below.
-             */
             if (parsed.command->id == OI_CLI_COMMAND_COMPACT) {
                 size_t keep_turns = 8;
                 size_t turns_value = 0;
@@ -1802,10 +1473,6 @@ have_parsed_command:
                     continue;
                 }
 
-                /* OI_CLI_COMPACT_OK: durable append must fully succeed
-                 * before anything live changes, so a failure here leaves
-                 * both the durable log and the live conversation
-                 * completely untouched -- see cli.c's persist_checkpoint. */
                 status = OI_OK;
                 if (config->persist_checkpoint != NULL) {
                     status = config->persist_checkpoint(
@@ -1831,10 +1498,6 @@ have_parsed_command:
                     free(prompt);
                     continue;
                 }
-                /* Allocation-free ownership transfer: compact_result already
-                 * owns the summary buffer, so after the durable append there
-                 * is no resource-exhaustion failure that can leave durable
-                 * and live state out of lock-step. */
                 status =
                     oi_cli_conversation_apply_checkpoint_take_summary(
                     conversation, prefix_count, &compact_result.summary,
@@ -1845,11 +1508,6 @@ have_parsed_command:
                     free(prompt);
                     break;
                 }
-                /* Counted only after the live splice succeeded, so /status
-                 * cannot claim a compacted context that was never spliced.
-                 * This is what lets a session with no durable storage report
-                 * its compaction at all -- there is no record to read it
-                 * back from. */
                 status_context.checkpoints_applied++;
                 if (fprintf(config->out,
                            "oi: compacted %zu turn%s into a checkpoint "
@@ -1864,14 +1522,6 @@ have_parsed_command:
                 free(prompt);
                 continue;
             }
-            /*
-             * /session switch, delete, and import cannot go through
-             * cli_command_dispatch: switch destroys and rebuilds the live
-             * conversation, and delete and import need the composer's
-             * confirmation flow. Handled here at the same idle/safe-boundary
-             * label everything else funnels through, so a dequeued pending
-             * command behaves identically to a freshly-typed one.
-             */
             if (parsed.command->id == OI_CLI_COMMAND_SESSION &&
                 parsed.arguments_len > 0) {
                 const char *subcommand = NULL;
@@ -1894,9 +1544,6 @@ have_parsed_command:
                         rest, rest_len, &conversation, &active_arena,
                         &switched_context, &has_switched_context, &outcome);
                     if (status == OI_OK && outcome.switched) {
-                        /* The adopted session's context is whatever its own
-                         * history replayed into, so this run's own compaction
-                         * count no longer describes anything. */
                         status_context.checkpoints_applied = 0;
                         setting_context.model_origin = outcome.model_origin;
                     }
@@ -1928,18 +1575,6 @@ have_parsed_command:
                     continue;
                 }
             }
-            /*
-             * /permissions allow must not silently elevate the process-
-             * wide tool policy. Gated here rather than in
-             * cli_command_dispatch.c (which has no composer/terminal
-             * access by design and should not gain any) or in
-             * dispatch_permissions itself, so this one insertion covers
-             * both a freshly-typed command and a dequeued pending one --
-             * the one-slot queue funnels through this same
-             * have_parsed_command label. /permissions ask/deny, and a
-             * redundant allow when already allowed, skip this gate and
-             * dispatch directly.
-             */
             if (parsed.command->id == OI_CLI_COMMAND_PERMISSIONS &&
                 parsed.arguments_len == 5 &&
                 memcmp(parsed.arguments, "allow", 5) == 0 &&
@@ -1966,9 +1601,6 @@ have_parsed_command:
                     free(prompt);
                     break;
                 }
-                /* Erases the confirm selector's own frame and redraws the
-                 * ordinary idle prompt in its place -- self-contained,
-                 * same as any other post-selector cleanup in this file. */
                 status = oi_cli_composer_redraw(&composer);
                 if (status != OI_OK) {
                     free(prompt);
@@ -1985,8 +1617,6 @@ have_parsed_command:
                     free(prompt);
                     continue;
                 }
-                /* selected == 1 ("Allow..."): fall through to the ordinary
-                 * dispatch below, which is what actually applies it. */
             }
             struct oi_cli_command_context command_context = {
                 .out = config->out,
@@ -2025,8 +1655,6 @@ have_message:
         if (conversation == NULL) {
             oi_arena *conversation_arena = active_arena;
 
-            /* Only the first-ever creation goes through prepare; after a
-             * switch the arena is already the new session's. */
             if (config->prepare != NULL && !has_switched_context) {
                 status = config->prepare(config->prepare_user_data,
                                          &conversation_arena);
@@ -2035,9 +1663,6 @@ have_message:
                 status = OI_ERR_INVAL;
             }
             if (status == OI_OK) {
-                /* Read current_model->data only now: config->prepare (the
-                 * lazy automatic-session path) may have just resolved a
-                 * restored/rebuilt value into it. */
                 conversation_config.model = current_model->data;
                 status = oi_cli_conversation_create(
                     client, reactor, conversation_arena, tools,
@@ -2084,24 +1709,6 @@ have_message:
             while (status == OI_OK && !present.done) {
                 oi_status step_status;
 
-                /* Clear the composer's frame (if drawn) before the step,
-                 * then redraw fresh once it settles: the turn's own
-                 * streamed output and any decoded keystrokes both land on
-                 * the same fd, and interleaving them without this erase/
-                 * redraw bracket would corrupt both writers' row-count
-                 * assumptions (see oi_cli_render_erase's own doc comment).
-                 * The redraw itself only happens when this step actually
-                 * touched the composer (input decoded, or a resize) --
-                 * redrawing unconditionally on every step, including ones
-                 * that were purely model/tool activity, would inject the
-                 * composer's escape sequences into the *middle* of a
-                 * multi-chunk streamed reply whenever that reply and some
-                 * unrelated composer-relevant step happen to land in
-                 * separate oi_reactor_step calls, corrupting normal
-                 * token-by-token streaming outright, not just risking
-                 * flicker. The erase, in contrast, is always safe to run
-                 * unconditionally: it's a no-op whenever nothing is
-                 * currently drawn. */
                 oi_cli_render_erase(&composer.render);
                 if (oi_reactor_step(reactor, -1, &step_status) < 0) {
                     status = step_status;
@@ -2181,26 +1788,11 @@ have_message:
                 status = present.status;
             }
             if (turn_signal_context.terminate_signal != 0) {
-                /* SIGTERM/SIGHUP: the conversation was already cancelled
-                 * above; clean up and exit regardless of anything else.
-                 * Report a clean exit (OI_OK), matching the idle-prompt
-                 * SIGTERM/SIGHUP path (oi_cli_composer_wait_submit's own
-                 * terminate_signal out-param leaves its return status
-                 * OI_OK) rather than leaking the cancellation's own
-                 * OI_ERR_CLOSED as if the turn itself had failed. */
                 status = OI_OK;
                 break;
             }
             if (turn_input_context.status == OI_OK &&
                 oi_cli_conversation_was_cancelled(conversation)) {
-                /* Ctrl+C during this turn: always recoverable, regardless
-                 * of whatever oi_status got attached to it -- but only when
-                 * nothing else went wrong. A genuine REPL-level failure
-                 * (e.g. discard_pending_on_cancel's own persist call
-                 * failing) must not be masked as an ordinary cancel; the
-                 * turn_input_context.status != OI_OK case falls through to
-                 * the generic status != OI_OK handling below instead, which
-                 * reports it properly. */
                 if (fputs("oi: cancelled\n", config->err) == EOF ||
                     fflush(config->err) != 0) {
                     status = OI_ERR_IO;

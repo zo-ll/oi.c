@@ -42,11 +42,8 @@ oi_status oi_tool_registry_add(oi_tool_registry *reg, const char *name,
                                 oi_tool_build_argv build_argv,
                                 void *user_data);
 
-/* NULL if `name` isn't registered. */
 const char *oi_tool_registry_schema(const oi_tool_registry *reg,
                                      const char *name);
-
-/* --- execution --- */
 
 typedef struct oi_tool_call oi_tool_call;
 
@@ -148,4 +145,4 @@ oi_status oi_tool_call_set_timeout(oi_tool_call *call, int timeout_ms);
  */
 void oi_tool_call_cancel(oi_tool_call *call);
 
-#endif /* OI_TOOL_H */
+#endif

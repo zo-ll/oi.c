@@ -16,10 +16,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Reads (and discards) whatever the client sends until the socket is
- * quiet for 150ms -- test-only stand-in for actually parsing
- * Content-Length, since the mock server doesn't need to validate the
- * request, only let the client finish writing it before responding. */
 static void drain_request(int cfd) {
     char buf[8192];
     for (;;) {
@@ -38,10 +34,6 @@ static void drain_request(int cfd) {
     }
 }
 
-/* The response of the server child. A file-scope pointer keeps the
- * caller's heap block reachable in that child until _exit, so valgrind's
- * leak check there does not report it; volatile makes the store happen
- * before the fork. */
 static const char *volatile mock_response;
 
 static pid_t start_mock_server(const char *response, size_t response_len,
@@ -138,8 +130,6 @@ static void run_until(oi_reactor *r, const int *done_flag, int max_steps) {
     }
 }
 
-/* --- successful streaming completion --- */
-
 struct stream_ctx {
     char text[256];
     size_t text_len;
@@ -203,7 +193,7 @@ TEST(streaming_success_delivers_deltas) {
     CHECK(ctx.done);
     CHECK_EQ(ctx.done_status, OI_OK);
     CHECK_EQ(ctx.http_status, 200);
-    CHECK_EQ(ctx.delta_count, 2); /* the empty-delta finish chunk adds none */
+    CHECK_EQ(ctx.delta_count, 2);
     CHECK_EQ(ctx.text_len, strlen("Hello, world"));
     CHECK(memcmp(ctx.text, "Hello, world", ctx.text_len) == 0);
 
@@ -212,8 +202,6 @@ TEST(streaming_success_delivers_deltas) {
     oi_reactor_destroy(r);
     waitpid(child, NULL, 0);
 }
-
-/* --- structured tool-call streaming --- */
 
 struct tool_event_ctx {
     char id[2][32];
@@ -357,8 +345,6 @@ TEST(empty_tool_call_arguments_arrive_as_an_empty_object) {
     waitpid(child, NULL, 0);
 }
 
-/* A response with no Content-Length and no chunking; the mock server
- * closes the connection after the last byte. */
 static void run_until_close_stream(const char *sse_body,
                                    struct tool_event_ctx *ctx) {
     char response[512];
@@ -434,7 +420,6 @@ static void large_event_done(oi_status status, int http_status,
     ctx->done = 1;
 }
 
-/* Each value is larger than the 64 KiB default arena block. */
 TEST(delta_and_tool_arguments_larger_than_an_arena_block_complete) {
     enum { LARGE = 70000 };
     char *filler = malloc(LARGE + 1);
@@ -483,8 +468,6 @@ TEST(delta_and_tool_arguments_larger_than_an_arena_block_complete) {
     waitpid(child, NULL, 0);
 }
 
-/* Runs a stream of `events` text deltas; returns the caller arena's use
- * at the end of the stream. */
 static size_t arena_use_after_stream(size_t events) {
     static const char event[] =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ab\"}}]}"
@@ -534,7 +517,6 @@ TEST(arena_use_does_not_grow_with_the_event_count) {
     CHECK(large <= small);
 }
 
-/* Runs one chat-completions stream and returns what the events carried. */
 static struct large_event_ctx run_stream(const char *sse_body,
                                          size_t body_len) {
     size_t total;
@@ -594,8 +576,6 @@ TEST(tool_call_count_has_a_limit) {
 }
 
 TEST(tool_call_arguments_have_a_size_limit) {
-    /* 17 fragments of 1 MB each go past the 16 MiB limit. Each fragment
-     * stays below the 1 MiB SSE line limit. */
     enum { FRAGMENTS = 17, FRAGMENT = 1000 * 1000 };
     static const char head[] =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -616,8 +596,6 @@ TEST(tool_call_arguments_have_a_size_limit) {
     memcpy(body + FRAGMENTS * event_len, done, sizeof done - 1);
     struct large_event_ctx ctx = run_stream(body, body_len);
     CHECK_EQ(ctx.status, OI_ERR_PARSE);
-    /* The stream stops at the fragment that goes past the limit, before
-     * the end, where the text that is not JSON would also fail it. */
     CHECK_EQ(ctx.arguments_len, (size_t)16 * FRAGMENT);
     free(body);
 }
@@ -654,8 +632,6 @@ TEST(incomplete_tool_call_rejects_stream) {
     oi_reactor_destroy(r);
     waitpid(child, NULL, 0);
 }
-
-/* --- non-2xx status surfaces the error body --- */
 
 struct error_ctx {
     int done;
@@ -726,8 +702,6 @@ TEST(non_2xx_status_reports_error_body) {
     waitpid(child, NULL, 0);
 }
 
-/* --- an error event inside a 200 stream becomes the error body --- */
-
 TEST(error_event_in_a_success_stream_reports_the_event) {
     static const char event[] =
         "{\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}";
@@ -768,8 +742,6 @@ TEST(error_event_in_a_success_stream_reports_the_event) {
     waitpid(child, NULL, 0);
 }
 
-/* --- a connection failure names its cause in the error body --- */
-
 TEST(refused_connection_names_the_cause) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
@@ -780,7 +752,7 @@ TEST(refused_connection_names_the_cause) {
     socklen_t alen = sizeof addr;
     CHECK_EQ(getsockname(fd, (struct sockaddr *)&addr, &alen), 0);
     unsigned short port = ntohs(addr.sin_port);
-    close(fd); /* nothing listens on the port now */
+    close(fd);
 
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
@@ -808,8 +780,6 @@ TEST(refused_connection_names_the_cause) {
     oi_arena_destroy(a);
     oi_reactor_destroy(r);
 }
-
-/* --- malformed SSE payload surfaces a parse error, not silent loss --- */
 
 struct malformed_ctx {
     int done;
@@ -962,8 +932,6 @@ TEST(request_deadline_reports_timeout) {
     waitpid(child, NULL, 0);
 }
 
-/* --- cancellation from within on_delta --- */
-
 struct cancel_ctx {
     oi_llm_request *req;
     int delta_count;
@@ -986,7 +954,7 @@ static void cancel_on_done(oi_status status, int http_status,
     (void)error_body;
     (void)error_body_len;
     struct cancel_ctx *ctx = ud;
-    ctx->done_fired = 1; /* must never happen */
+    ctx->done_fired = 1;
 }
 
 TEST(cancel_from_within_on_delta) {
@@ -1016,9 +984,9 @@ TEST(cancel_from_within_on_delta) {
     CHECK_EQ(st, OI_OK);
 
     int never_done = 0;
-    run_until(r, &never_done, 20); /* bounded: cancellation means no "done" signal to wait for */
+    run_until(r, &never_done, 20);
 
-    CHECK_EQ(ctx.delta_count, 1); /* canceled after the first delta */
+    CHECK_EQ(ctx.delta_count, 1);
     CHECK(!ctx.done_fired);
 
     oi_llm_client_destroy(client);
@@ -1026,8 +994,6 @@ TEST(cancel_from_within_on_delta) {
     oi_reactor_destroy(r);
     waitpid(child, NULL, 0);
 }
-
-/* --- argument validation --- */
 
 TEST(start_rejects_bad_args) {
     oi_reactor *r = oi_reactor_create();
@@ -1372,9 +1338,6 @@ TEST(before_request_hook_can_refuse_and_survives_reconfigure) {
     oi_reactor_destroy(r);
 }
 
-/* A hook that answers OI_ERR_AGAIN `waits` times, then `final`. Before
- * `final`, it can point the client at `new_port`, as a credential renewal
- * does. */
 struct waiting_hook {
     int calls;
     int waits;
@@ -1409,8 +1372,6 @@ TEST(hook_that_says_again_makes_the_request_wait) {
     pid_t child = start_mock_server(response, total, &port);
     free(response);
 
-    /* The client starts on a port where nothing listens; the hook moves it
-     * to the server, as a renewal adopts a new token, during the wait. */
     struct oi_llm_config cfg = {"127.0.0.1", 9, 0, NULL, "old",
                                  "/v1/chat/completions", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
@@ -1471,10 +1432,9 @@ TEST(cancel_during_a_hook_wait_stops_the_wait) {
                                    &ctx, &req),
               OI_OK);
     oi_status st;
-    CHECK_EQ(oi_reactor_step(r, 100, &st), 1); /* one retry ran */
+    CHECK_EQ(oi_reactor_step(r, 100, &st), 1);
     int calls = hook.calls;
     oi_llm_request_cancel(req);
-    /* Nothing is left on the reactor: no retry, no on_done. */
     CHECK_EQ(oi_reactor_run(r), OI_OK);
     CHECK_EQ(hook.calls, calls);
     CHECK(!ctx.done);
@@ -1483,13 +1443,6 @@ TEST(cancel_during_a_hook_wait_stops_the_wait) {
     oi_reactor_destroy(r);
 }
 
-/* --- keep-alive --- */
-
-/* Serves up to `connections` connections, one after another, and each
- * request on them, with a Content-Length response. With `close_after`,
- * it waits 200 ms after each response and closes without reading more,
- * so a request sent in that window gets no answer. Each accept writes
- * one byte to *out_accepts_fd. */
 static pid_t start_keep_alive_server(int connections, int close_after,
                                      unsigned short *out_port,
                                      int *out_accepts_fd) {
@@ -1549,7 +1502,7 @@ static pid_t start_keep_alive_server(int connections, int close_after,
                 }
             }
             if (head_end == NULL) {
-                break; /* the client closed the connection */
+                break;
             }
             char head[128];
             int head_len = snprintf(head, sizeof head,
@@ -1577,8 +1530,6 @@ static int count_accepts(int fd) {
     return n > 0 ? (int)n : 0;
 }
 
-/* Two requests, the second started right after the first one's on_done,
- * as a tool loop does. Returns the second request's status. */
 static oi_status two_requests(oi_llm_client *client, oi_reactor *r) {
     oi_arena *a = oi_arena_create(0);
     struct stream_ctx first = {0};
@@ -1613,9 +1564,9 @@ TEST(keep_alive_sends_two_requests_on_one_connection) {
     CHECK_EQ(two_requests(client, r), OI_OK);
     CHECK_EQ(count_accepts(accepts_fd), 1);
 
-    oi_llm_client_destroy(client); /* closes the kept connection */
+    oi_llm_client_destroy(client);
     oi_reactor_destroy(r);
-    kill(child, SIGKILL); /* a failed test leaves it in accept() */
+    kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     close(accepts_fd);
 }
@@ -1634,7 +1585,7 @@ TEST(without_keep_alive_each_request_has_its_own_connection) {
 
     oi_llm_client_destroy(client);
     oi_reactor_destroy(r);
-    kill(child, SIGKILL); /* a failed test leaves it in accept() */
+    kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     close(accepts_fd);
 }
@@ -1649,19 +1600,16 @@ TEST(kept_connection_closed_by_the_server_is_replaced_once) {
     oi_llm_client_set_keep_alive(client, 1);
     oi_reactor *r = oi_reactor_create();
 
-    /* Request 2 goes out on the kept connection, which the server then
-     * closes unanswered; it succeeds on a second connection. */
     CHECK_EQ(two_requests(client, r), OI_OK);
     CHECK_EQ(count_accepts(accepts_fd), 2);
 
     oi_llm_client_destroy(client);
     oi_reactor_destroy(r);
-    kill(child, SIGKILL); /* a failed test leaves it in accept() */
+    kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     close(accepts_fd);
 }
 
-/* Runs one request to completion and returns its status. */
 static oi_status one_request(oi_llm_client *client, oi_reactor *r) {
     oi_arena *a = oi_arena_create(0);
     struct stream_ctx ctx = {0};
@@ -1692,7 +1640,7 @@ TEST(keep_alive_off_closes_the_kept_connection) {
 
     oi_llm_client_destroy(client);
     oi_reactor_destroy(r);
-    kill(child, SIGKILL); /* a failed test leaves it in accept() */
+    kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     close(accepts_fd);
 }
@@ -1716,8 +1664,6 @@ TEST(reconfigure_closes_the_kept_connection) {
 
     CHECK_EQ(one_request(client, r), OI_OK);
     CHECK_EQ(oi_llm_client_reconfigure(client, &new_cfg, 0), OI_OK);
-    /* The old server serves one connection and exits at its EOF, so it
-     * exits only when the reconfigure closes the kept connection. */
     pid_t exited = 0;
     for (int i = 0; i < 500 && exited == 0; i++) {
         struct timespec pause = {0, 10 * 1000 * 1000};
@@ -1731,11 +1677,11 @@ TEST(reconfigure_closes_the_kept_connection) {
 
     oi_llm_client_destroy(client);
     oi_reactor_destroy(r);
-    if (exited != old_server) { /* a failed test leaves it in read() */
+    if (exited != old_server) {
         kill(old_server, SIGKILL);
         waitpid(old_server, NULL, 0);
     }
-    kill(new_server, SIGKILL); /* a failed test leaves it in accept() */
+    kill(new_server, SIGKILL);
     waitpid(new_server, NULL, 0);
     close(old_accepts_fd);
     close(new_accepts_fd);
@@ -1744,7 +1690,6 @@ TEST(reconfigure_closes_the_kept_connection) {
 TEST(cancel_null_safe) { oi_llm_request_cancel(NULL); }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     signal(SIGCHLD, SIG_DFL);
     RUN(streaming_success_delivers_deltas);

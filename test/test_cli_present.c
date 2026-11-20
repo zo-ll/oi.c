@@ -197,8 +197,6 @@ TEST(permission_request_shows_the_decoded_command_and_bidi_controls) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
     struct oi_cli_present present;
-    /* The command holds a JSON escape for the letter A, an escaped and a
-     * raw bidirectional control, and an escaped terminal sequence. */
     static const char arguments[] =
         "{\"command\":\"echo \\u0041 \\u202eevil \xe2\x81\xa6 "
         "\\u001b[2Jend\\nline two\"}";
@@ -323,10 +321,6 @@ TEST(response_done_emits_trailing_reset_for_an_unclosed_bold_span) {
     CHECK_EQ(feed_delta(&present, in, sizeof in - 1), OI_OK);
     CHECK_EQ(feed_response_done(&present), OI_OK);
     result = read_stream(out);
-    /* Unclosed "**bold" never matched, so it renders literal; the point
-     * of this test is that RESPONSE_DONE's render_stream_finish() ran
-     * (safe/no-op here since nothing was ever actually styled) before the
-     * trailing newline. */
     CHECK_STREQ(result, "**bold\n");
 
     free(result);
@@ -345,9 +339,6 @@ TEST(turn_done_without_response_done_still_flushes_render_state) {
     CHECK_EQ(oi_cli_present_init(&present, out, err, 0, 1, NULL, NULL),
              OI_OK);
     CHECK_EQ(feed_delta(&present, in, sizeof in - 1), OI_OK);
-    /* A turn that fails/cancels before RESPONSE_DONE ever fires must
-     * still flush any pending styled line, not leave it in the markdown
-     * module's buffer forever. */
     CHECK_EQ(feed_turn_done(&present, OI_ERR_TIMEOUT), OI_OK);
     CHECK_EQ(present.status, OI_ERR_TIMEOUT);
     result = read_stream(out);

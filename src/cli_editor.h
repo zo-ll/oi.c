@@ -7,10 +7,6 @@
 
 #define OI_CLI_EDITOR_MAX_BYTES (1024U * 1024U)
 
-/*
- * Pure editable-text state. Cursor positions are byte offsets at UTF-8 code
- * point boundaries. Terminal input decoding and rendering live elsewhere.
- */
 struct oi_cli_editor {
     char *data;
     size_t len;

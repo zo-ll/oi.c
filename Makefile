@@ -72,7 +72,7 @@ CLI_TEST_LIB = $(BUILD)/liboi_cli_test.a
 
 .PHONY: all lib so cli install uninstall test quick check verify \
 	verify-compilers \
-	compiler-stamp tier-audit timings abi-check asan ubsan tsan valgrind \
+	compiler-stamp tier-audit comment-lint comment-ratchet timings abi-check asan ubsan tsan valgrind \
 	fuzz fuzz-run test-integration clean
 
 all: lib cli
@@ -239,6 +239,21 @@ quick: $(PURE_TEST_BINS) $(CLI_BIN)
 #   nonexistent -- add a name matching no test/test_*.c
 #   duplicate   -- repeat a name within one tier
 #   overlap     -- add a PURE_TESTS name to IMPURE_TESTS as well
+COMMENT_BASELINE = tools/comment-baseline.txt
+COMMENT_LINT_FILES = $(sort $(wildcard src/*.c src/*.h include/oi/*.h \
+	test/*.c test/*.h test/integration/*.c test/integration/*.h \
+	test/fuzz/*.c tools/*.c docs/issue-33/*.c)) Makefile \
+	$(wildcard .github/workflows/*.yml)
+
+$(BUILD)/comment_lint: tools/comment_lint.c | $(BUILD)
+	$(CC) $(CSTD) $(WARN) -O2 $< -o $@
+
+comment-lint: $(BUILD)/comment_lint
+	@$(BUILD)/comment_lint check $(COMMENT_BASELINE) $(COMMENT_LINT_FILES)
+
+comment-ratchet: $(BUILD)/comment_lint
+	@$(BUILD)/comment_lint ratchet $(COMMENT_BASELINE) $(COMMENT_LINT_FILES)
+
 tier-audit:
 	@all=`echo $(TEST_SRCS) | tr ' ' '\n' | sed 's|test/||;s|\.c$$||'`; \
 	pure=`echo $(PURE_TESTS) | tr ' ' '\n'`; \
@@ -311,7 +326,7 @@ test-integration: $(INTEGRATION_BINS)
 # rather than `test` alone, so instrumentation covers the integration
 # tests too -- they are where the reactor, the socket paths, and the
 # tool subprocesses actually run together.
-check: tier-audit
+check: tier-audit comment-lint
 	+@$(MAKE) --no-print-directory test
 	+@$(MAKE) --no-print-directory test-integration
 

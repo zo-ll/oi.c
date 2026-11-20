@@ -1,25 +1,6 @@
 #ifndef OI_MOCK_API_H
 #define OI_MOCK_API_H
 
-/*
- * A scripted, local, OpenAI-compatible mock API server for integration
- * tests -- header-only, in the same spirit as test.h.
- *
- * It runs in a forked child so the test process can drive its own
- * reactor loop against a real socket rather than a stubbed transport:
- * everything from connect() through HTTP framing, chunked
- * transfer-decoding, and SSE splitting is exercised for real, and only
- * the model behind it is fake.
- *
- * Each request the client makes is served the next scripted turn, and
- * the raw bytes of every request are captured to a file so the parent
- * can assert on what the harness actually sent -- which is how a test
- * verifies that a tool result made it back into the next turn.
- *
- * The client opens one connection per request ("Connection: close"), so
- * one scripted turn is consumed per connection.
- */
-
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -35,16 +16,11 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Refuses to buffer a request larger than this; no test sends one. */
 #define MOCK_MAX_REQUEST (1u << 20)
 
 struct mock_turn {
-    /* NULL selects "HTTP/1.1 200 OK". */
     const char *status_line;
-    /* Response body, sent with Transfer-Encoding: chunked. */
     const char *body;
-    /* Bytes per HTTP chunk, so a test can force event boundaries to
-     * straddle chunks. 0 sends the whole body as one chunk. */
     size_t chunk_size;
 };
 
@@ -53,8 +29,6 @@ struct mock_api {
     unsigned short port;
     char capture_path[64];
 };
-
-/* --- child side --- */
 
 static long mock_parse_content_length(const char *buf, size_t header_len) {
     const char *name = "content-length:";
@@ -85,9 +59,6 @@ static long mock_parse_content_length(const char *buf, size_t header_len) {
     return -1;
 }
 
-/* Reads one complete HTTP request (headers plus any Content-Length
- * body). Returns its length and, via *out, a malloc'd buffer the caller
- * owns; -1 on failure with *out untouched. */
 static ssize_t mock_read_request(int fd, char **out) {
     size_t cap = 4096;
     size_t len = 0;
@@ -134,7 +105,7 @@ static ssize_t mock_read_request(int fd, char **out) {
         }
         if (header_end > 0) {
             if (content_length < 0) {
-                break; /* no body announced */
+                break;
             }
             if (len >= header_end + (size_t)content_length) {
                 break;
@@ -192,8 +163,6 @@ static void mock_serve_turn(int cfd, const struct mock_turn *turn) {
     mock_write_all(cfd, "0\r\n\r\n", 5);
 }
 
-/* Capture format: each request stored as a decimal length, a newline,
- * then that many raw bytes. */
 static void mock_capture(int fd, const char *req, size_t len) {
     char hdr[32];
     int hn = snprintf(hdr, sizeof hdr, "%zu\n", len);
@@ -202,10 +171,6 @@ static void mock_capture(int fd, const char *req, size_t len) {
     }
 }
 
-/* --- parent side --- */
-
-/* Returns 1 on success. On success the caller must call
- * mock_api_stop to reap the child and remove the capture file. */
 static int mock_api_start(struct mock_api *api, const struct mock_turn *turns,
                            size_t nturns) {
     memset(api, 0, sizeof *api);
@@ -256,7 +221,6 @@ static int mock_api_start(struct mock_api *api, const struct mock_turn *turns,
     }
 
     if (pid == 0) {
-        /* A client that gives up mid-response must not kill the mock. */
         signal(SIGPIPE, SIG_IGN);
         for (size_t i = 0; i < nturns; i++) {
             int cfd = accept(listen_fd, NULL, NULL);
@@ -296,7 +260,6 @@ static void mock_api_stop(struct mock_api *api) {
         if (rc == 0) {
             kill(api->pid, SIGKILL);
             while (waitpid(api->pid, NULL, 0) < 0 && errno == EINTR) {
-                /* retry */
             }
         }
         api->pid = -1;
@@ -307,12 +270,6 @@ static void mock_api_stop(struct mock_api *api) {
     }
 }
 
-/*
- * Returns request number `index` (0-based) as a malloc'd, NUL-terminated
- * buffer the caller owns, or NULL if the mock never received that many.
- * Only meaningful after the child has finished serving them, i.e. after
- * the request that triggered it has completed.
- */
 static char *mock_api_request(const struct mock_api *api, size_t index,
                                size_t *out_len) {
     FILE *f = fopen(api->capture_path, "rb");
@@ -352,4 +309,4 @@ static char *mock_api_request(const struct mock_api *api, size_t index,
     return result;
 }
 
-#endif /* OI_MOCK_API_H */
+#endif

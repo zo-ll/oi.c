@@ -16,7 +16,6 @@
 #include "cli_session_metadata_store.h"
 #include "oi/sesslog.h"
 
-/* Reads a whole file for byte-for-byte comparisons. */
 static void read_whole_file(const char *path, char **out_data,
                            size_t *out_len) {
     FILE *file = fopen(path, "rb");
@@ -128,23 +127,18 @@ TEST(metadata_path_derivation_rules) {
              OI_ERR_INVAL);
 }
 
-/* --- oi_cli_session_id_is_safe / oi_cli_session_resolve --- */
-
 TEST(safe_ids_accept_only_bounded_portable_components) {
     char overlong[OI_CLI_SESSION_SAFE_ID_MAX_LEN + 2];
     char at_limit[OI_CLI_SESSION_SAFE_ID_MAX_LEN + 1];
 
-    /* The shape oi actually generates. */
     CHECK_EQ(oi_cli_session_id_is_safe("20260730-091500-1234-000", 24), 1);
     CHECK_EQ(oi_cli_session_id_is_safe("a", 1), 1);
     CHECK_EQ(oi_cli_session_id_is_safe("A_b-9", 5), 1);
-    /* A leading dash is legal: ids never reach an option parser. */
     CHECK_EQ(oi_cli_session_id_is_safe("-lead", 5), 1);
 
     CHECK_EQ(oi_cli_session_id_is_safe(NULL, 4), 0);
     CHECK_EQ(oi_cli_session_id_is_safe("", 0), 0);
 
-    /* Traversal and separators fall out of the charset rule alone. */
     CHECK_EQ(oi_cli_session_id_is_safe(".", 1), 0);
     CHECK_EQ(oi_cli_session_id_is_safe("..", 2), 0);
     CHECK_EQ(oi_cli_session_id_is_safe("../escape", 9), 0);
@@ -152,21 +146,15 @@ TEST(safe_ids_accept_only_bounded_portable_components) {
     CHECK_EQ(oi_cli_session_id_is_safe("/abs", 4), 0);
     CHECK_EQ(oi_cli_session_id_is_safe(".trash", 6), 0);
     CHECK_EQ(oi_cli_session_id_is_safe(".hidden", 7), 0);
-    /* No '.' at all, so a plausible-looking dotted id is still refused. */
     CHECK_EQ(oi_cli_session_id_is_safe("history.oilog", 13), 0);
 
-    /* Anything outside [A-Za-z0-9_-]. */
     CHECK_EQ(oi_cli_session_id_is_safe("has space", 9), 0);
     CHECK_EQ(oi_cli_session_id_is_safe("semi;colon", 10), 0);
     CHECK_EQ(oi_cli_session_id_is_safe("new\nline", 8), 0);
     CHECK_EQ(oi_cli_session_id_is_safe("\x7f", 1), 0);
-    /* High-bit bytes are rejected regardless of char's signedness. */
     CHECK_EQ(oi_cli_session_id_is_safe("\xc3\xa9", 2), 0);
 
-    /* An embedded NUL cannot be smuggled past by over-reporting id_len:
-     * '\0' simply isn't in the allowed charset. */
     CHECK_EQ(oi_cli_session_id_is_safe("ok\0hidden", 9), 0);
-    /* ...and the honest prefix of that same buffer is still fine. */
     CHECK_EQ(oi_cli_session_id_is_safe("ok\0hidden", 2), 1);
 
     memset(at_limit, 'a', sizeof at_limit - 1);
@@ -189,7 +177,6 @@ TEST(resolve_accepts_a_real_directory_and_refuses_everything_else) {
     snprintf(root, sizeof root, "/tmp/oi-session-resolve-%ld", (long)getpid());
     CHECK(mkdir(root, 0700) == 0 || errno == EEXIST);
 
-    /* A genuine session directory resolves to its joined path. */
     snprintf(path, sizeof path, "%s/live", root);
     CHECK(mkdir(path, 0700) == 0 || errno == EEXIST);
     CHECK_EQ(oi_cli_session_resolve(root, "live", 4, &directory), OI_OK);
@@ -197,13 +184,10 @@ TEST(resolve_accepts_a_real_directory_and_refuses_everything_else) {
     free(directory);
     directory = NULL;
 
-    /* Nothing there at all. */
     CHECK_EQ(oi_cli_session_resolve(root, "absent", 6, &directory),
              OI_ERR_NOTFOUND);
     CHECK(directory == NULL);
 
-    /* A symlink pointing at a real directory is refused, not followed --
-     * this is the symlink-escape case. */
     snprintf(path, sizeof path, "%s/link", root);
     unlink(path);
     CHECK_EQ(symlink("/tmp", path), 0);
@@ -212,8 +196,6 @@ TEST(resolve_accepts_a_real_directory_and_refuses_everything_else) {
     CHECK(directory == NULL);
     CHECK_EQ(unlink(path), 0);
 
-    /* A dangling symlink is refused as a wrong type, not reported
-     * missing: lstat succeeds on the link itself. */
     snprintf(path, sizeof path, "%s/dangling", root);
     unlink(path);
     CHECK_EQ(symlink("/tmp/oi-does-not-exist-anywhere", path), 0);
@@ -221,7 +203,6 @@ TEST(resolve_accepts_a_real_directory_and_refuses_everything_else) {
              OI_ERR_INVAL);
     CHECK_EQ(unlink(path), 0);
 
-    /* A stray regular file where a directory belongs. */
     snprintf(path, sizeof path, "%s/plainfile", root);
     {
         FILE *stray = fopen(path, "w");
@@ -232,13 +213,11 @@ TEST(resolve_accepts_a_real_directory_and_refuses_everything_else) {
              OI_ERR_INVAL);
     CHECK_EQ(unlink(path), 0);
 
-    /* Unsafe ids never reach the filesystem. */
     CHECK_EQ(oi_cli_session_resolve(root, "..", 2, &directory), OI_ERR_INVAL);
     CHECK_EQ(oi_cli_session_resolve(root, "a/b", 3, &directory),
              OI_ERR_INVAL);
     CHECK_EQ(oi_cli_session_resolve(root, "", 0, &directory), OI_ERR_INVAL);
 
-    /* Bad arguments. */
     CHECK_EQ(oi_cli_session_resolve(NULL, "live", 4, &directory),
              OI_ERR_INVAL);
     CHECK_EQ(oi_cli_session_resolve("", "live", 4, &directory),
@@ -250,13 +229,6 @@ TEST(resolve_accepts_a_real_directory_and_refuses_everything_else) {
     CHECK_EQ(rmdir(root), 0);
 }
 
-/* --- oi_cli_sessions_enumerate --- */
-
-/*
- * Builds a session directory the way a real run leaves one behind:
- * a history.oilog carrying a transition plus durable model/cwd settings,
- * and (unless `write_metadata` is 0) a matching metadata.json cache.
- */
 static void seed_session(const char *root, const char *id, const char *model,
                          const char *cwd, int64_t created_at,
                          int64_t updated_at, int write_metadata) {
@@ -328,7 +300,6 @@ static void remove_session(const char *root, const char *id) {
     unlink(path);
     snprintf(path, sizeof path, "%s/%s/metadata.json", root, id);
     unlink(path);
-    /* Left behind by any metadata update that took the lock. */
     snprintf(path, sizeof path, "%s/%s/metadata.json.lock", root, id);
     unlink(path);
     snprintf(path, sizeof path, "%s/%s", root, id);
@@ -355,7 +326,6 @@ TEST(enumerate_lists_sessions_newest_first_and_skips_non_sessions) {
     seed_session(root, "sess-older", "gpt-a", "/tmp", 100, 200, 1);
     seed_session(root, "sess-newer", "gpt-b", "/tmp", 300, 400, 1);
 
-    /* Entries that are not oi sessions must be skipped in silence. */
     snprintf(path, sizeof path, "%s/.trash", root);
     CHECK(mkdir(path, 0700) == 0 || errno == EEXIST);
     snprintf(path, sizeof path, "%s/.hidden", root);
@@ -373,7 +343,6 @@ TEST(enumerate_lists_sessions_newest_first_and_skips_non_sessions) {
     oi_cli_session_list_init(&list);
     CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
     CHECK_EQ(list.len, 2);
-    /* Most recently updated first. */
     CHECK_STREQ(list.entries[0].id, "sess-newer");
     CHECK_STREQ(list.entries[1].id, "sess-older");
     CHECK_STREQ(list.entries[0].model.data, "gpt-b");
@@ -422,7 +391,6 @@ TEST(enumerate_rebuilds_missing_and_malformed_metadata_from_history) {
     seed_session(root, "no-metadata", "gpt-recovered", "/tmp", 1, 2, 0);
     seed_session(root, "bad-metadata", "gpt-salvaged", "/tmp", 3, 4, 1);
 
-    /* Corrupt the second session's cache. */
     snprintf(metadata_path, sizeof metadata_path, "%s/bad-metadata/"
              "metadata.json", root);
     {
@@ -436,14 +404,11 @@ TEST(enumerate_rebuilds_missing_and_malformed_metadata_from_history) {
     CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
     CHECK_EQ(list.len, 2);
 
-    /* Both are still listed, both flagged, both recovered from the log --
-     * which is the authoritative record the cache only ever mirrored. */
     entry = find_entry(&list, "no-metadata");
     CHECK(entry != NULL);
     CHECK_EQ(entry->degraded, 1);
     CHECK_STREQ(entry->model.data, "gpt-recovered");
     CHECK_STREQ(entry->cwd.data, "/tmp");
-    /* mtime stands in for the timestamps the cache would have held. */
     CHECK(entry->updated_at > 0);
 
     entry = find_entry(&list, "bad-metadata");
@@ -469,12 +434,6 @@ TEST(enumerate_distrusts_metadata_belonging_to_another_session) {
                                    NULL),
              OI_OK);
 
-    /*
-     * A perfectly valid cache that names a *different* session -- a stray
-     * copy, an interrupted manual move, a restored backup. It parses, so
-     * without an ownership check this session would be listed as healthy
-     * while displaying another session's model, cwd, and name.
-     */
     snprintf(metadata_path, sizeof metadata_path,
              "%s/real-session/metadata.json", root);
     {
@@ -495,12 +454,9 @@ TEST(enumerate_distrusts_metadata_belonging_to_another_session) {
     CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
     CHECK_EQ(list.len, 1);
     CHECK_STREQ(list.entries[0].id, "real-session");
-    /* Flagged, not trusted. */
     CHECK_EQ(list.entries[0].degraded, 1);
-    /* Rebuilt from the history actually in this directory... */
     CHECK_STREQ(list.entries[0].model.data, "gpt-real");
     CHECK_STREQ(list.entries[0].cwd.data, "/tmp");
-    /* ...and none of the impostor's values leaked into the row. */
     CHECK(list.entries[0].display_name.len == 0);
     oi_cli_session_list_free(&list);
 
@@ -517,8 +473,6 @@ TEST(enumerate_lists_an_unreplayable_session_with_only_its_id) {
              (long)getpid());
     seed_session(root, "garbage-log", "gpt-x", "/tmp", 1, 2, 0);
 
-    /* A log whose header is not an oi log at all: nothing is recoverable,
-     * but the session must remain listable so it can be trashed. */
     snprintf(history_path, sizeof history_path, "%s/garbage-log/"
              "history.oilog", root);
     {
@@ -561,8 +515,6 @@ TEST(enumerate_reports_a_session_held_by_another_process_as_busy) {
     child = fork();
     CHECK(child >= 0);
     if (child == 0) {
-        /* Hold the log's lock exactly as a second live oi would, tell the
-         * parent it is held, then wait to be released. */
         oi_sesslog *log = NULL;
         char byte = 0;
         close(to_child[1]);
@@ -589,7 +541,6 @@ TEST(enumerate_reports_a_session_held_by_another_process_as_busy) {
     oi_cli_session_list_init(&list);
     CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
     CHECK_EQ(list.len, 2);
-    /* Busy is a normal selectable state, not an error and not an omission. */
     CHECK_EQ(find_entry(&list, "held-session")->lock_state,
              OI_CLI_SESSION_LOCK_BUSY);
     CHECK_EQ(find_entry(&list, "held-session")->degraded, 0);
@@ -598,7 +549,6 @@ TEST(enumerate_reports_a_session_held_by_another_process_as_busy) {
              OI_CLI_SESSION_LOCK_FREE);
     oi_cli_session_list_free(&list);
 
-    /* Release the holder; the same session now probes as free. */
     CHECK_EQ(write(to_child[1], "x", 1), 1);
     {
         int wait_status = 0;
@@ -639,24 +589,11 @@ TEST(enumerate_does_not_rewrite_the_logs_it_lists) {
     CHECK_EQ(list.len, 1);
     oi_cli_session_list_free(&list);
 
-    /* Listing is a read: the healthy path takes no exclusive lock and
-     * must leave every byte and the mtime alone. */
     CHECK_EQ(stat(history_path, &after), 0);
     CHECK_EQ(before.st_size, after.st_size);
     CHECK_EQ(before.st_mtime, after.st_mtime);
 
-    /*
-     * The case that actually distinguishes a read-only flock probe from
-     * opening the log through oi_sesslog_open: a record left incomplete
-     * by a crash. oi_sesslog_open recovers such a log by truncating that
-     * trailing fragment, which is right when a session is being opened
-     * for use and wrong as a side effect of listing. With the cache
-     * intact there is no reason to touch the log at all, so the fragment
-     * must survive being listed.
-     */
     {
-        /* A length prefix claiming far more than the bytes that follow --
-         * exactly what a crash mid-append leaves behind. */
         static const unsigned char fragment[] = {
             0xff, 0xff, 0xff, 0xff, 'p', 'a', 'r', 't'};
         FILE *appender = fopen(history_path, "ab");
@@ -670,7 +607,6 @@ TEST(enumerate_does_not_rewrite_the_logs_it_lists) {
     oi_cli_session_list_init(&list);
     CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
     CHECK_EQ(list.len, 1);
-    /* Cache still valid, so the entry reads clean and needs no replay. */
     CHECK_EQ(list.entries[0].degraded, 0);
     oi_cli_session_list_free(&list);
 
@@ -680,8 +616,6 @@ TEST(enumerate_does_not_rewrite_the_logs_it_lists) {
     remove_session(root, "untouched");
     CHECK_EQ(rmdir(root), 0);
 }
-
-/* --- oi_cli_session_rename --- */
 
 static struct oi_cli_string read_display_name(const char *root,
                                               const char *id) {
@@ -719,16 +653,12 @@ TEST(rename_sets_a_display_name_without_moving_the_directory) {
                                    NULL),
              OI_OK);
 
-    /* The name is recorded... */
     name = read_display_name(root, "sess-rename");
     CHECK_STREQ(name.data, "my refactor");
     oi_cli_string_free(&name);
-    /* ...and the directory keeps its original id, because every derived
-     * path depends on it. */
     CHECK_EQ(stat(directory, &info), 0);
     CHECK(S_ISDIR(info.st_mode));
 
-    /* Renaming again replaces the previous name. */
     CHECK_EQ(oi_cli_session_rename(root, "sess-rename", 11, "second", 6,
                                    NULL),
              OI_OK);
@@ -736,7 +666,6 @@ TEST(rename_sets_a_display_name_without_moving_the_directory) {
     CHECK_STREQ(name.data, "second");
     oi_cli_string_free(&name);
 
-    /* And the model/cwd the cache carried are untouched by all of this. */
     oi_cli_session_list_init(&list);
     CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
     CHECK_EQ(list.len, 1);
@@ -756,8 +685,6 @@ TEST(rename_repairs_a_missing_metadata_cache_from_history) {
 
     snprintf(root, sizeof root, "/tmp/oi-session-rename-repair-%ld",
              (long)getpid());
-    /* No metadata.json at all: the name still has to land somewhere, so
-     * the cache is rebuilt from history first. */
     seed_session(root, "no-cache", "gpt-recovered", "/tmp", 0, 0, 0);
 
     CHECK_EQ(oi_cli_session_rename(root, "no-cache", 8, "named anyway", 12,
@@ -767,7 +694,6 @@ TEST(rename_repairs_a_missing_metadata_cache_from_history) {
     CHECK_STREQ(name.data, "named anyway");
     oi_cli_string_free(&name);
     {
-        /* Repaired, not invented: model and cwd came from the log. */
         struct oi_cli_session_list list;
         oi_cli_session_list_init(&list);
         CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
@@ -796,7 +722,6 @@ TEST(rename_merges_with_the_current_cache_not_a_stale_copy) {
                                    NULL),
              OI_OK);
 
-    /* Another process changes the model, the way /model does. */
     {
         struct oi_cli_session_metadata changed;
         oi_cli_session_metadata_init(&changed);
@@ -812,8 +737,6 @@ TEST(rename_merges_with_the_current_cache_not_a_stale_copy) {
         oi_cli_session_metadata_free(&changed);
     }
 
-    /* A second rename must merge against what is on disk now, not against
-     * anything it read earlier, so the new model survives. */
     CHECK_EQ(oi_cli_session_rename(root, "sess-merge", 10, "second name", 11,
                                    NULL),
              OI_OK);
@@ -834,8 +757,6 @@ TEST(rename_merges_with_the_current_cache_not_a_stale_copy) {
     CHECK_EQ(rmdir(root), 0);
 }
 
-/* Waits a beat, long enough that a rename which was never going to block
- * would certainly have finished. */
 static void short_pause(void) {
     struct timespec pause;
     pause.tv_sec = 0;
@@ -850,25 +771,12 @@ TEST(a_rename_waits_for_a_settings_update_and_merges_its_value) {
     int lock_fd;
     pid_t child;
 
-    /*
-     * Both updaters read metadata.json, merge one field, and replace the
-     * file. Interleaved, each discards the other's field -- a rename that
-     * read before a concurrent /model landed writes the stale model back.
-     *
-     * The window is far too narrow to hit reliably by hammering, so this
-     * tests the property that closes it instead: a rename cannot read until
-     * whoever is mid-update has finished. The test holds the metadata lock
-     * itself -- reaching into an implementation detail deliberately,
-     * because mutual exclusion is exactly what is being asserted.
-     */
     snprintf(root, sizeof root, "/tmp/oi-session-race-%ld", (long)getpid());
     seed_session(root, "racer", "gpt-initial", "/tmp", 100, 200, 1);
     snprintf(metadata_path, sizeof metadata_path, "%s/racer/metadata.json",
              root);
     snprintf(lock_path, sizeof lock_path, "%s.lock", metadata_path);
 
-    /* Stand in for a live process partway through refreshing settings: hold
-     * the lock, then publish a new model while still holding it. */
     lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     CHECK(lock_fd >= 0);
     CHECK_EQ(flock(lock_fd, LOCK_EX), 0);
@@ -894,7 +802,6 @@ TEST(a_rename_waits_for_a_settings_update_and_merges_its_value) {
                   : 1);
     }
 
-    /* While the lock is held the rename must not have landed. */
     short_pause();
     {
         struct oi_cli_session_metadata midway;
@@ -905,7 +812,6 @@ TEST(a_rename_waits_for_a_settings_update_and_merges_its_value) {
         oi_cli_session_metadata_free(&midway);
     }
 
-    /* Release, and let the rename proceed. */
     CHECK_EQ(flock(lock_fd, LOCK_UN), 0);
     close(lock_fd);
     {
@@ -915,12 +821,6 @@ TEST(a_rename_waits_for_a_settings_update_and_merges_its_value) {
         CHECK_EQ(WEXITSTATUS(wait_status), 0);
     }
 
-    /*
-     * Both fields survive. The model assertion is the anti-lost-update one:
-     * the rename read after acquiring the lock, so it saw "gpt-committed"
-     * and carried it forward. Reading before locking would have merged the
-     * pre-update model and silently reverted the change.
-     */
     {
         struct oi_cli_session_metadata final_state;
         oi_cli_session_metadata_init(&final_state);
@@ -948,12 +848,6 @@ TEST(a_planted_lock_symlink_is_refused_and_never_followed) {
     oi_sesslog *log = NULL;
     char *detail = NULL;
 
-    /*
-     * The lock path is the one path in this module built by appending to a
-     * name rather than resolved through oi_cli_session_resolve, so it needs
-     * its own symlink defence: followed, a planted "metadata.json.lock"
-     * would be opened O_RDWR|O_CREAT at whatever it pointed to.
-     */
     snprintf(root, sizeof root, "/tmp/oi-session-locksym-%ld",
              (long)getpid());
     seed_session(root, "sess-lock", "gpt-before", "/tmp", 100, 200, 1);
@@ -974,21 +868,17 @@ TEST(a_planted_lock_symlink_is_refused_and_never_followed) {
     unlink(lock_path);
     CHECK_EQ(symlink(decoy_path, lock_path), 0);
 
-    /* Rename cannot skip: the metadata write is the whole operation, so it
-     * must fail rather than proceed unlocked. */
     CHECK_EQ(oi_cli_session_rename(root, "sess-lock", 9, "new name", 8,
                                    &detail),
              OI_ERR_IO);
     CHECK(detail != NULL);
     CHECK(strstr(detail, "lock") != NULL);
     free(detail);
-    /* No name was recorded... */
     {
         struct oi_cli_string name = read_display_name(root, "sess-lock");
         CHECK(name.data == NULL);
         oi_cli_string_free(&name);
     }
-    /* ...and the symlink target was neither followed nor written. */
     {
         char *contents = NULL;
         size_t len = 0;
@@ -1001,11 +891,6 @@ TEST(a_planted_lock_symlink_is_refused_and_never_followed) {
         CHECK(S_ISLNK(info.st_mode));
     }
 
-    /*
-     * A settings change is the opposite case: history is authoritative and
-     * already durable, so the optional cache refresh is skipped rather than
-     * raced, and the change itself still succeeds.
-     */
     CHECK_EQ(oi_sesslog_open(history_path, &log), OI_OK);
     oi_cli_history_store_init(&store);
     oi_cli_history_replay_state_init(&state);
@@ -1014,9 +899,7 @@ TEST(a_planted_lock_symlink_is_refused_and_never_followed) {
                  &store, &state, metadata_path, "sess-lock",
                  OI_CLI_HISTORY_SESSION_SETTING_MODEL, "gpt-after", 9),
              OI_OK);
-    /* Durable in history... */
     CHECK_STREQ(state.last_model.data, "gpt-after");
-    /* ...while the cache was left alone rather than written unlocked. */
     {
         struct oi_cli_session_metadata stale;
         oi_cli_session_metadata_init(&stale);
@@ -1029,8 +912,6 @@ TEST(a_planted_lock_symlink_is_refused_and_never_followed) {
     oi_cli_history_replay_state_free(&state);
     oi_sesslog_close(log);
 
-    /* With the symlink gone, both operations work again and the cache
-     * self-heals to the durable truth. */
     CHECK_EQ(unlink(lock_path), 0);
     CHECK_EQ(oi_cli_session_rename(root, "sess-lock", 9, "new name", 8, NULL),
              OI_OK);
@@ -1054,7 +935,6 @@ TEST(rename_refuses_unnameable_and_invalid_targets) {
              (long)getpid());
     seed_session(root, "sess-ok", "gpt-a", "/tmp", 100, 200, 1);
 
-    /* Unsafe ids never reach the filesystem. */
     CHECK_EQ(oi_cli_session_rename(root, "..", 2, "x", 1, &detail),
              OI_ERR_INVAL);
     CHECK_STREQ(detail, "invalid session id");
@@ -1063,14 +943,12 @@ TEST(rename_refuses_unnameable_and_invalid_targets) {
     CHECK_EQ(oi_cli_session_rename(root, "a/b", 3, "x", 1, NULL),
              OI_ERR_INVAL);
 
-    /* A session that does not exist. */
     CHECK_EQ(oi_cli_session_rename(root, "absent", 6, "x", 1, &detail),
              OI_ERR_NOTFOUND);
     CHECK_STREQ(detail, "no such session");
     free(detail);
     detail = NULL;
 
-    /* Names that would be unsafe or useless to display. */
     CHECK_EQ(oi_cli_session_rename(root, "sess-ok", 7, "", 0, &detail),
              OI_ERR_INVAL);
     CHECK_STREQ(detail, "a session name cannot be empty");
@@ -1095,18 +973,12 @@ TEST(rename_refuses_unnameable_and_invalid_targets) {
         free(detail);
         detail = NULL;
     }
-    /* A rejected rename leaves the session exactly as it was. */
     {
         struct oi_cli_string name = read_display_name(root, "sess-ok");
         CHECK(name.data == NULL);
         oi_cli_string_free(&name);
     }
 
-    /*
-     * A session with neither a cache nor a readable log has no model or
-     * cwd to write alongside a name, and filling those in with invented
-     * values would corrupt what a later open trusts. Refuse instead.
-     */
     seed_session(root, "hopeless", "gpt-x", "/tmp", 0, 0, 0);
     snprintf(history_path, sizeof history_path, "%s/hopeless/history.oilog",
              root);
@@ -1127,8 +999,6 @@ TEST(rename_refuses_unnameable_and_invalid_targets) {
     CHECK_EQ(rmdir(root), 0);
 }
 
-/* --- trash / restore / delete --- */
-
 static int path_is_directory(const char *path) {
     struct stat info;
     return lstat(path, &info) == 0 && S_ISDIR(info.st_mode);
@@ -1139,7 +1009,6 @@ static int path_is_directory_of(const char *root, const char *id) {
     snprintf(path, sizeof path, "%s/%s", root, id);
     return path_is_directory(path);
 }
-
 
 TEST(trash_and_restore_round_trip_preserving_history) {
     char root[192];
@@ -1163,7 +1032,6 @@ TEST(trash_and_restore_round_trip_preserving_history) {
     }
 
     CHECK_EQ(oi_cli_session_trash(root, "sess-trash", 10, NULL, NULL), OI_OK);
-    /* The whole directory moved; nothing was copied or rewritten. */
     CHECK(!path_is_directory(live));
     CHECK(path_is_directory(trashed));
     {
@@ -1174,13 +1042,10 @@ TEST(trash_and_restore_round_trip_preserving_history) {
         CHECK_EQ(info.st_size, original_size);
     }
 
-    /* A trashed session drops out of the live listing with no filtering
-     * logic -- it is simply not in the root anymore. */
     oi_cli_session_list_init(&list);
     CHECK_EQ(oi_cli_sessions_enumerate(root, &list), OI_OK);
     CHECK_EQ(list.len, 0);
     oi_cli_session_list_free(&list);
-    /* ...and shows up in the trash listing instead, name intact. */
     oi_cli_session_list_init(&list);
     CHECK_EQ(oi_cli_sessions_enumerate_trash(root, &list), OI_OK);
     CHECK_EQ(list.len, 1);
@@ -1216,8 +1081,6 @@ TEST(trash_refuses_the_active_session_and_unknown_ids) {
              (long)getpid());
     seed_session(root, "sess-active", "gpt-a", "/tmp", 100, 200, 1);
 
-    /* Trashing the session you are sitting in would leave the running
-     * process writing into a directory that has moved. */
     CHECK_EQ(oi_cli_session_trash(root, "sess-active", 11, "sess-active",
                                   &detail),
              OI_ERR_INVAL);
@@ -1227,7 +1090,6 @@ TEST(trash_refuses_the_active_session_and_unknown_ids) {
     detail = NULL;
     CHECK(path_is_directory_of(root, "sess-active"));
 
-    /* A different active session is no obstacle. */
     CHECK_EQ(oi_cli_session_trash(root, "sess-active", 11, "some-other",
                                   &detail),
              OI_OK);
@@ -1295,8 +1157,6 @@ TEST(trash_refuses_a_session_open_in_another_process) {
         CHECK_EQ(read(to_parent[0], &byte, 1), 1);
     }
 
-    /* Moving a directory out from under a live process is exactly what
-     * durable history exists to prevent. */
     CHECK_EQ(oi_cli_session_trash(root, "sess-held", 9, NULL, &detail),
              OI_ERR_EXISTS);
     CHECK(detail != NULL);
@@ -1314,7 +1174,6 @@ TEST(trash_refuses_a_session_open_in_another_process) {
     close(to_child[1]);
     close(to_parent[0]);
 
-    /* Released, so the same call now succeeds. */
     CHECK_EQ(oi_cli_session_trash(root, "sess-held", 9, NULL, NULL), OI_OK);
 
     CHECK_EQ(oi_cli_session_delete(root, "sess-held", 9, NULL), OI_OK);
@@ -1335,11 +1194,6 @@ TEST(delete_only_reaches_trashed_sessions_and_removes_them_completely) {
     seed_session(root, "sess-live", "gpt-a", "/tmp", 100, 200, 1);
     snprintf(trashed, sizeof trashed, "%s/.trash/sess-live", root);
 
-    /*
-     * A live session is not in the trash, so delete cannot find it -- that
-     * is what makes "refuses the current session" structural rather than a
-     * check that could be forgotten.
-     */
     CHECK_EQ(oi_cli_session_delete(root, "sess-live", 9, &detail),
              OI_ERR_NOTFOUND);
     CHECK(detail != NULL);
@@ -1351,7 +1205,6 @@ TEST(delete_only_reaches_trashed_sessions_and_removes_them_completely) {
     CHECK_EQ(oi_cli_session_trash(root, "sess-live", 9, NULL, NULL), OI_OK);
     CHECK(path_is_directory(trashed));
     CHECK_EQ(oi_cli_session_delete(root, "sess-live", 9, NULL), OI_OK);
-    /* Gone: files and directory both. */
     CHECK(!path_is_directory(trashed));
     {
         struct oi_cli_session_list list;
@@ -1360,7 +1213,6 @@ TEST(delete_only_reaches_trashed_sessions_and_removes_them_completely) {
         CHECK_EQ(list.len, 0);
         oi_cli_session_list_free(&list);
     }
-    /* And a second delete simply reports nothing to delete. */
     CHECK_EQ(oi_cli_session_delete(root, "sess-live", 9, NULL),
              OI_ERR_NOTFOUND);
     CHECK_EQ(oi_cli_session_delete(root, "..", 2, NULL), OI_ERR_INVAL);
@@ -1399,30 +1251,21 @@ TEST(delete_fails_closed_on_a_directory_it_did_not_create) {
         history_size = info.st_size;
     }
 
-    /* Something oi never puts in a session directory. */
     snprintf(nested, sizeof nested, "%s/unexpected", trashed);
     CHECK_EQ(mkdir(nested, 0700), 0);
 
-    /* Rather than recursing into whatever it finds, deletion stops. */
     CHECK_EQ(oi_cli_session_delete(root, "sess-odd", 8, &detail), OI_ERR_IO);
     CHECK(detail != NULL);
     CHECK(strstr(detail, "unexpected entry") != NULL);
     free(detail);
     CHECK(path_is_directory(nested));
 
-    /*
-     * Failing closed has to mean the session is still there. Deciding and
-     * deleting in one pass used to unlink the history and metadata first and
-     * only then hit the unexpected entry, reporting failure over a session
-     * that could no longer be restored.
-     */
     {
         struct stat info;
         CHECK_EQ(stat(history_path, &info), 0);
         CHECK_EQ(info.st_size, history_size);
         CHECK_EQ(stat(metadata_path, &info), 0);
     }
-    /* And it is still genuinely restorable, name and all. */
     CHECK_EQ(rmdir(nested), 0);
     CHECK_EQ(oi_cli_session_restore_trashed(root, "sess-odd", 8, NULL),
              OI_OK);
@@ -1450,15 +1293,6 @@ TEST(trash_reports_a_cross_device_trash_directory_distinctly) {
     int reachable;
 
     snprintf(root, sizeof root, "/tmp/oi-session-exdev-%ld", (long)getpid());
-    /*
-     * The trash normally lives inside the sessions root, making every
-     * trash/restore a same-filesystem rename. A user who relocates it --
-     * here, a symlink onto another filesystem -- deserves a specific
-     * message rather than a bare I/O error.
-     *
-     * Skipped where /dev/shm is not a separate filesystem, since EXDEV
-     * then genuinely cannot be provoked.
-     */
     snprintf(foreign_trash, sizeof foreign_trash, "/dev/shm/oi-exdev-%ld",
              (long)getpid());
     {
@@ -1482,7 +1316,6 @@ TEST(trash_reports_a_cross_device_trash_directory_distinctly) {
     CHECK(detail != NULL);
     CHECK(strstr(detail, "different filesystem") != NULL);
     free(detail);
-    /* Failure-atomic: the session is still exactly where it was. */
     CHECK(path_is_directory_of(root, "sess-exdev"));
 
     CHECK_EQ(unlink(trash_link), 0);
@@ -1511,8 +1344,6 @@ TEST(restore_refuses_unknown_ids_and_will_not_clobber_a_live_session) {
     free(detail);
     detail = NULL;
 
-    /* Contrive the collision generated ids make impossible, and confirm
-     * restore refuses rather than renaming over a live session. */
     CHECK_EQ(oi_cli_session_trash(root, "sess-dup", 8, NULL, NULL), OI_OK);
     seed_session(root, "sess-dup", "gpt-live", "/tmp", 300, 400, 1);
     CHECK_EQ(oi_cli_session_restore_trashed(root, "sess-dup", 8, &detail),
@@ -1520,7 +1351,6 @@ TEST(restore_refuses_unknown_ids_and_will_not_clobber_a_live_session) {
     CHECK(detail != NULL);
     CHECK(strstr(detail, "already exists") != NULL);
     free(detail);
-    /* The live session is untouched. */
     {
         struct oi_cli_session_list list;
         oi_cli_session_list_init(&list);
@@ -1540,13 +1370,6 @@ TEST(restore_refuses_unknown_ids_and_will_not_clobber_a_live_session) {
     CHECK_EQ(rmdir(root), 0);
 }
 
-/* --- oi_cli_session_import --- */
-
-/*
- * Writes a legacy-format log: raw alternating user/assistant payloads with
- * no transition record, exactly the shape test_cli_history_store.c uses
- * for its own legacy-replay coverage.
- */
 static void write_legacy_log(const char *path) {
     oi_sesslog *log = NULL;
     unlink(path);
@@ -1580,16 +1403,12 @@ TEST(import_adopts_a_legacy_log_and_leaves_the_source_untouched) {
     CHECK(new_id != NULL);
     CHECK(oi_cli_session_id_is_safe(new_id, strlen(new_id)));
 
-    /* The source is preserved byte for byte and not even its mtime moved:
-     * import only ever reads it. */
     read_whole_file(source, &after, &after_len);
     CHECK_EQ(after_len, before_len);
     CHECK_EQ(memcmp(before, after, before_len), 0);
     CHECK_EQ(stat(source, &after_info), 0);
     CHECK_EQ(before_info.st_mtime, after_info.st_mtime);
 
-    /* The new session is a real, selectable session whose history is the
-     * imported content -- replayed here through the ordinary listing path. */
     {
         struct oi_cli_session_list list;
         char imported_path[384];
@@ -1609,7 +1428,6 @@ TEST(import_adopts_a_legacy_log_and_leaves_the_source_untouched) {
         CHECK_EQ(memcmp(before, imported, before_len), 0);
         free(imported);
     }
-    /* No scratch file left lying around. */
     {
         char scratch[256];
         snprintf(scratch, sizeof scratch, "%s/.import-%ld.tmp", root,
@@ -1637,7 +1455,6 @@ TEST(import_refuses_bad_sources_and_leaves_nothing_behind) {
     snprintf(source, sizeof source, "/tmp/oi-not-a-log-%ld.oilog",
              (long)getpid());
 
-    /* A file that is not a session log at all. */
     {
         FILE *garbage = fopen(source, "w");
         CHECK(garbage != NULL);
@@ -1651,8 +1468,6 @@ TEST(import_refuses_bad_sources_and_leaves_nothing_behind) {
     CHECK_STREQ(detail, "not a valid oi session log");
     free(detail);
     detail = NULL;
-    /* Rejected cleanly: no session directory, no scratch file, source
-     * still there. */
     {
         struct oi_cli_session_list list;
         oi_cli_session_list_init(&list);
@@ -1669,7 +1484,6 @@ TEST(import_refuses_bad_sources_and_leaves_nothing_behind) {
     CHECK_EQ(access(source, F_OK), 0);
     CHECK_EQ(unlink(source), 0);
 
-    /* A symlink source is refused rather than followed. */
     write_legacy_log(source);
     snprintf(link_path, sizeof link_path, "/tmp/oi-legacy-link-%ld.oilog",
              (long)getpid());
@@ -1683,14 +1497,12 @@ TEST(import_refuses_bad_sources_and_leaves_nothing_behind) {
     detail = NULL;
     CHECK_EQ(unlink(link_path), 0);
 
-    /* A directory is not a log. */
     CHECK_EQ(oi_cli_session_import(root, "/tmp", 4, &new_id, &detail),
              OI_ERR_INVAL);
     CHECK_STREQ(detail, "not a regular file");
     free(detail);
     detail = NULL;
 
-    /* Nothing there. */
     CHECK_EQ(oi_cli_session_import(root, "/tmp/oi-absolutely-absent", 24,
                                    &new_id, &detail),
              OI_ERR_NOTFOUND);
@@ -1719,12 +1531,6 @@ TEST(import_works_around_a_stale_scratch_file) {
     write_legacy_log(source);
     CHECK(mkdir(root, 0700) == 0 || errno == EEXIST);
 
-    /*
-     * A scratch file left behind by a killed earlier run. Since the copy is
-     * created O_EXCL to avoid ever overwriting anything, a fixed name would
-     * let this block every future import from a process that reused the
-     * same pid.
-     */
     snprintf(stale, sizeof stale, "%s/.import-%ld-0.tmp", root,
              (long)getpid());
     {
@@ -1738,7 +1544,6 @@ TEST(import_works_around_a_stale_scratch_file) {
                                    NULL),
              OI_OK);
     CHECK(new_id != NULL);
-    /* The stale file was stepped over, not overwritten. */
     CHECK_EQ(access(stale, F_OK), 0);
     {
         char *contents = NULL;
@@ -1773,8 +1578,6 @@ TEST(import_refuses_a_source_already_inside_the_sessions_root) {
                                    NULL),
              OI_OK);
 
-    /* Re-importing a session oi already manages is a misunderstanding
-     * worth naming, not a second copy to make. */
     snprintf(imported_path, sizeof imported_path, "%s/%s/history.oilog", root,
              new_id);
     CHECK_EQ(oi_cli_session_import(root, imported_path, strlen(imported_path),
@@ -1785,7 +1588,6 @@ TEST(import_refuses_a_source_already_inside_the_sessions_root) {
     CHECK(strstr(detail, "already an oi-managed session") != NULL);
     free(detail);
 
-    /* Still exactly one session. */
     {
         struct oi_cli_session_list list;
         oi_cli_session_list_init(&list);
@@ -1799,8 +1601,6 @@ TEST(import_refuses_a_source_already_inside_the_sessions_root) {
     CHECK_EQ(rmdir(root), 0);
     CHECK_EQ(unlink(source), 0);
 }
-
-/* --- oi_cli_session_restore_settings / oi_cli_session_apply_setting --- */
 
 static char *save_cwd(void) { return getcwd(NULL, 0); }
 
@@ -1827,9 +1627,6 @@ static const char *fresh_log_path(const char *suffix) {
     return path;
 }
 
-/* Opens a brand-new log, appends its schema transition, and returns
- * everything needed to call oi_cli_session_restore_settings/
- * oi_cli_session_apply_setting against it. */
 struct fresh_store {
     oi_sesslog *log;
     struct oi_cli_history_store store;
@@ -1881,14 +1678,10 @@ TEST(fresh_session_records_initial_model_and_cwd) {
              OI_OK);
     CHECK_STREQ(restore.model.data, "gpt-default");
     CHECK_STREQ(restore.cwd.data, target_dir);
-    /* Nothing to restore from and no override: the fallback branch won, and
-     * says so. /status reports this provenance verbatim, so the resolution
-     * branch itself is what has to be asserted -- the resolved name alone
-     * cannot distinguish a default from an override of the same value. */
     CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_DEFAULT);
     CHECK(!restore.metadata_missing_or_corrupt);
     CHECK(!restore.cwd_fallback_applied);
-    CHECK_EQ(fresh.store.typed_history.len, 3); /* transition + model + cwd */
+    CHECK_EQ(fresh.store.typed_history.len, 3);
     {
         char actual_cwd[512];
         CHECK(getcwd(actual_cwd, sizeof actual_cwd) != NULL);
@@ -1929,8 +1722,6 @@ TEST(unchanged_resume_writes_no_new_records_but_refreshes_metadata) {
     history_len_after_first = fresh.store.typed_history.len;
     oi_cli_session_restore_free(&restore);
 
-    /* Simulate the metadata cache existing and still matching: resolving
-     * again with is_new_session=0 should not append anything new. */
     oi_cli_session_restore_init(&restore);
     CHECK_EQ(oi_cli_session_restore_settings(
                  &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
@@ -1939,9 +1730,6 @@ TEST(unchanged_resume_writes_no_new_records_but_refreshes_metadata) {
     CHECK_EQ(fresh.store.typed_history.len, history_len_after_first);
     CHECK_STREQ(restore.model.data, "gpt-default");
     CHECK_STREQ(restore.cwd.data, target_dir);
-    /* The same name as the default, but reached through the replayed setting
-     * record the first call wrote -- which is a different provenance, and the
-     * one a resume must report. */
     CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_HISTORY);
 
     oi_cli_session_restore_free(&restore);
@@ -1973,16 +1761,12 @@ TEST(apply_setting_writes_a_record_and_persists_through_restore) {
              OI_OK);
     CHECK_STREQ(fresh.state.last_model.data, "gpt-changed");
 
-    /* A fresh restore (as if the process restarted) picks up the change
-     * from metadata without needing to replay history at all. */
     oi_cli_session_restore_init(&restore);
     CHECK_EQ(oi_cli_session_restore_settings(
                  &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
                  0, NULL, "gpt-default", target_dir, NULL, &restore),
              OI_OK);
     CHECK_STREQ(restore.model.data, "gpt-changed");
-    /* A /model change lands in history first, so a later resume attributes it
-     * to history rather than to the cache it also refreshed. */
     CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_HISTORY);
 
     oi_cli_session_restore_free(&restore);
@@ -2009,8 +1793,6 @@ TEST(missing_metadata_rebuilds_from_history_with_a_diagnostic) {
              OI_OK);
     oi_cli_session_restore_free(&restore);
 
-    /* Delete the metadata cache: history alone must still resolve the
-     * same effective model/cwd. */
     unlink(fresh.metadata_path);
     oi_cli_session_restore_init(&restore);
     CHECK_EQ(oi_cli_session_restore_settings(
@@ -2020,7 +1802,7 @@ TEST(missing_metadata_rebuilds_from_history_with_a_diagnostic) {
     CHECK(restore.metadata_missing_or_corrupt);
     CHECK_STREQ(restore.model.data, "gpt-default");
     CHECK_STREQ(restore.cwd.data, target_dir);
-    CHECK_EQ(access(fresh.metadata_path, F_OK), 0); /* self-healed */
+    CHECK_EQ(access(fresh.metadata_path, F_OK), 0);
     {
         long len;
         CHECK_EQ(fflush(diagnostics), 0);
@@ -2054,8 +1836,6 @@ TEST(mismatched_session_id_in_metadata_is_treated_as_corrupt) {
              OI_OK);
     oi_cli_session_restore_free(&restore);
 
-    /* Overwrite metadata with a plausible-looking file for a *different*
-     * session id -- must not be trusted. */
     oi_cli_session_metadata_init(&wrong_owner);
     CHECK_EQ(oi_cli_session_metadata_set(&wrong_owner, "some-other-session",
                                          18, "gpt-wrong", 9, "/nonexistent",
@@ -2098,7 +1878,6 @@ TEST(missing_prior_cwd_falls_back_with_a_diagnostic) {
                  1, NULL, "gpt-default", deleted_dir, NULL, &restore),
              OI_OK);
     oi_cli_session_restore_free(&restore);
-    /* The directory the session was durably recorded in is now gone. */
     CHECK_EQ(rmdir(deleted_dir), 0);
 
     oi_cli_session_restore_init(&restore);
@@ -2153,8 +1932,6 @@ TEST(explicit_model_override_wins_and_persists) {
                  &restore),
              OI_OK);
     CHECK_STREQ(restore.model.data, "gpt-override");
-    /* The override outranks the setting record the first call wrote, and the
-     * reported provenance follows the branch that actually won. */
     CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_EXPLICIT);
     CHECK_STREQ(fresh.state.last_model.data, "gpt-override");
     {
@@ -2190,7 +1967,6 @@ TEST(a_display_name_survives_setting_changes_and_reopens) {
              OI_OK);
     oi_cli_session_restore_free(&restore);
 
-    /* Name the session, the way /session rename will. */
     {
         struct oi_cli_session_metadata named;
         oi_cli_session_metadata_init(&named);
@@ -2208,11 +1984,6 @@ TEST(a_display_name_survives_setting_changes_and_reopens) {
         oi_cli_session_metadata_free(&named);
     }
 
-    /*
-     * The name lives only in metadata.json, and both of the paths that
-     * refresh that cache rebuild it from scratch -- so each has to carry
-     * the name forward or a plain /model change would silently discard it.
-     */
     CHECK_EQ(oi_cli_session_apply_setting(
                  &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
                  OI_CLI_HISTORY_SESSION_SETTING_MODEL, "gpt-changed", 11),
@@ -2228,7 +1999,6 @@ TEST(a_display_name_survives_setting_changes_and_reopens) {
         oi_cli_session_metadata_free(&after);
     }
 
-    /* Same for reopening the session. */
     oi_cli_session_restore_init(&restore);
     CHECK_EQ(oi_cli_session_restore_settings(
                  &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
@@ -2268,23 +2038,12 @@ TEST(a_stale_metadata_cache_never_overrides_or_rewrites_history) {
              OI_OK);
     oi_cli_session_restore_free(&restore);
 
-    /* A durable model change: history is authoritative for it. */
     CHECK_EQ(oi_cli_session_apply_setting(
                  &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
                  OI_CLI_HISTORY_SESSION_SETTING_MODEL, "gpt-new", 7),
              OI_OK);
     CHECK_STREQ(fresh.state.last_model.data, "gpt-new");
 
-    /*
-     * Simulate the metadata refresh having failed: the cache still names
-     * the old model, and is otherwise perfectly valid and owned by this
-     * session, so it would pass every validity check.
-     *
-     * The cache must not win. If it did, this open would resolve "gpt-old",
-     * notice it differs from what history last recorded, and append that
-     * stale value back -- letting an unwritable cache silently rewrite the
-     * authoritative log.
-     */
     {
         struct oi_cli_session_metadata stale;
         oi_cli_session_metadata_init(&stale);
@@ -2308,14 +2067,11 @@ TEST(a_stale_metadata_cache_never_overrides_or_rewrites_history) {
                  &fresh.store, &fresh.state, fresh.metadata_path, "sess-1",
                  0, NULL, "gpt-default", target_dir, NULL, &restore),
              OI_OK);
-    /* History won. */
     CHECK_STREQ(restore.model.data, "gpt-new");
     CHECK_STREQ(fresh.state.last_model.data, "gpt-new");
-    /* And nothing was appended, because nothing actually changed. */
     CHECK_EQ(fresh.store.typed_history.len, history_len_before);
     oi_cli_session_restore_free(&restore);
 
-    /* The refresh also repaired the cache back to the durable truth. */
     {
         struct oi_cli_session_metadata repaired;
         oi_cli_session_metadata_init(&repaired);
@@ -2340,9 +2096,6 @@ TEST(the_metadata_cache_still_supplies_settings_history_never_recorded) {
     struct fresh_store fresh;
     struct oi_cli_session_restore restore;
 
-    /* A session whose history has a transition but no setting records --
-     * the cache is then the only place a prior model could survive, so it
-     * must still be used as a fallback rather than ignored outright. */
     fresh_store_open(&fresh, fresh_log_path("cache-fallback"), 0);
     {
         struct oi_cli_session_metadata cached;
@@ -2365,8 +2118,6 @@ TEST(the_metadata_cache_still_supplies_settings_history_never_recorded) {
                  0, NULL, "gpt-default", target_dir, NULL, &restore),
              OI_OK);
     CHECK_STREQ(restore.model.data, "gpt-from-cache");
-    /* History recorded nothing, so the cache branch won -- reported as the
-     * cache, not as history, since a rebuilt cache is a weaker claim. */
     CHECK_EQ(restore.model_origin, OI_CLI_SESSION_MODEL_METADATA);
     oi_cli_session_restore_free(&restore);
 
@@ -2404,7 +2155,6 @@ TEST(restore_settings_rejects_bad_arguments) {
 }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     RUN(default_root_uses_xdg_state_home);
     RUN(create_makes_private_timestamped_session);

@@ -103,8 +103,6 @@ const char *oi_tool_registry_schema(const oi_tool_registry *reg,
     return e ? e->json_schema : NULL;
 }
 
-/* Internal accessor used by tool_exec.c; not part of the public header
- * since callers only ever need the schema string. */
 oi_status oi_tool_registry_lookup(const oi_tool_registry *reg,
                                    const char *name,
                                    oi_tool_build_argv *out_build_argv,

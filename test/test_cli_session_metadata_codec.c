@@ -16,8 +16,6 @@ TEST(encoding_is_stable) {
              OI_OK);
     CHECK_EQ(oi_cli_session_metadata_encode(&metadata, &json, &json_len),
              OI_OK);
-    /* Every write emits version 2, with display_name present as "" when
-     * unset so the object stays at a fixed seven fields. */
     CHECK_STREQ(json,
                "{\"version\":2,\"session_id\":\"sess-1\","
                "\"model\":\"gpt-test\",\"cwd\":\"/home/az/project\","
@@ -62,22 +60,16 @@ TEST(a_version_1_file_still_decodes_and_upgrades_in_memory) {
     size_t reencoded_len = 0;
     oi_cli_session_metadata_init(&decoded);
 
-    /* A file written before display_name existed must keep working: the
-     * schema change is additive, and metadata is a cache users never
-     * migrate by hand. */
     CHECK_EQ(oi_cli_session_metadata_decode(v1, strlen(v1), &decoded), OI_OK);
     CHECK_STREQ(decoded.session_id.data, "sess-1");
     CHECK_STREQ(decoded.model.data, "gpt-test");
     CHECK_STREQ(decoded.cwd.data, "/home/az/project");
     CHECK_EQ(decoded.created_at, 100);
     CHECK_EQ(decoded.updated_at, 200);
-    /* No name, and upgraded in memory to the current version. */
     CHECK_EQ(decoded.display_name.len, (size_t)0);
     CHECK_EQ(decoded.version,
              (unsigned int)OI_CLI_SESSION_METADATA_SCHEMA_VERSION);
 
-    /* So the next write of it emits version 2 -- the upgrade rides along
-     * with a change rather than needing a migration pass. */
     CHECK_EQ(oi_cli_session_metadata_encode(&decoded, &reencoded,
                                             &reencoded_len),
              OI_OK);
@@ -141,25 +133,18 @@ static void check_decode_fails(const char *json) {
 TEST(strict_decoder_rejects_malformed_metadata) {
     check_decode_fails("not json");
     check_decode_fails("[]");
-    /* Version 2 without display_name: six fields where seven belong. */
     check_decode_fails(
         "{\"version\":2,\"session_id\":\"s\",\"model\":\"m\",\"cwd\":\"c\","
         "\"created_at\":\"1\",\"updated_at\":\"1\"}");
-    /* Version 1 *with* display_name: the field did not exist yet, so
-     * seven fields is as wrong here as six is for version 2. */
     check_decode_fails(
         "{\"version\":1,\"session_id\":\"s\",\"model\":\"m\",\"cwd\":\"c\","
         "\"display_name\":\"n\",\"created_at\":\"1\",\"updated_at\":\"1\"}");
-    /* An unknown version is refused outright rather than guessed at. */
     check_decode_fails(
         "{\"version\":3,\"session_id\":\"s\",\"model\":\"m\",\"cwd\":\"c\","
         "\"display_name\":\"n\",\"created_at\":\"1\",\"updated_at\":\"1\"}");
-    /* A misspelled key still fails rather than being quietly ignored --
-     * the exact-count check per version is what preserves that. */
     check_decode_fails(
         "{\"version\":2,\"session_id\":\"s\",\"model\":\"m\",\"cwd\":\"c\","
         "\"dispaly_name\":\"n\",\"created_at\":\"1\",\"updated_at\":\"1\"}");
-    /* A control byte in a name that would be echoed to the terminal. */
     check_decode_fails(
         "{\"version\":2,\"session_id\":\"s\",\"model\":\"m\",\"cwd\":\"c\","
         "\"display_name\":\"a\\u0007b\",\"created_at\":\"1\","

@@ -13,14 +13,6 @@
 #include "cli_sessions.h"
 #include "oi/sesslog.h"
 
-/*
- * Exercises oi_cli_session_switch directly against a real registry, real
- * logs, and a real second process holding a lock -- no REPL, no PTY, no
- * mock server. The REPL-level wiring is covered separately in test_cli.c.
- */
-
-/* Wraps a plain user or assistant message into a durable record, the same
- * way the REPL's own persistence callbacks do. */
 static void set_user_record(struct oi_cli_history_record *record,
                             uint64_t record_id, uint64_t turn_id,
                             const char *content) {
@@ -62,8 +54,6 @@ static char *test_root(const char *suffix) {
     return copy;
 }
 
-/* Builds a session directory with a real log carrying `turns` completed
- * user/assistant exchanges plus durable model and cwd settings. */
 static char *seed_session(const char *root, const char *model,
                           const char *cwd, unsigned turns) {
     struct oi_cli_session_location location;
@@ -172,26 +162,15 @@ TEST(switch_opens_replays_and_restores_the_target) {
     CHECK_STREQ(oi_session_id(result.session), id);
     CHECK(oi_session_arena(result.session) != NULL);
 
-    /* The target's durable settings win over the process defaults. */
     CHECK_STREQ(result.model.data, "gpt-target");
     CHECK_STREQ(result.cwd.data, target_cwd);
-    /*
-     * And the provenance restore_settings decided is propagated out, not
-     * recomputed or dropped: the seeded target carries a model setting
-     * record, so history is what won. A switch passes no override at all, so
-     * this can never be OI_CLI_SESSION_MODEL_EXPLICIT -- that is structural,
-     * not incidental, and the REPL adopts whatever arrives here as the
-     * newly-active model's story.
-     */
     CHECK_EQ(result.model_origin, OI_CLI_SESSION_MODEL_HISTORY);
-    /* ...and the working directory really moved. */
     {
         char now[256];
         CHECK(getcwd(now, sizeof now) != NULL);
         CHECK_STREQ(now, target_cwd);
     }
 
-    /* Full model-visible context came back, in order: two exchanges. */
     CHECK_EQ(result.initial_context.len, (size_t)4);
     CHECK_STREQ(result.initial_context.items[0].content.data, "question 0");
     CHECK_STREQ(result.initial_context.items[1].content.data, "answer 0");
@@ -203,7 +182,6 @@ TEST(switch_opens_replays_and_restores_the_target) {
     }
     CHECK(result.metadata_path != NULL);
     CHECK(strstr(result.metadata_path, "metadata.json") != NULL);
-    /* The store/state moved out and are usable by the caller. */
     CHECK(result.store.log == oi_session_log(result.session));
     CHECK(result.state.next_turn_id > 0);
 
@@ -228,7 +206,6 @@ TEST(switch_to_the_same_session_is_a_no_op) {
 
     CHECK(registry != NULL);
     oi_cli_session_switch_result_init(&result);
-    /* Reported before any I/O, and without registering anything. */
     CHECK_EQ(oi_cli_session_switch(registry, root, "sess-a", "sess-a", 6,
                                    "gpt-default", cwd, NULL, &result),
              OI_OK);
@@ -273,7 +250,6 @@ TEST(switch_rejects_unsafe_ids_and_missing_sessions) {
     CHECK(result.session == NULL);
     oi_cli_session_switch_result_free(&result);
 
-    /* A symlink standing in for a session directory is not switchable. */
     {
         char link_path[320];
         snprintf(link_path, sizeof link_path, "%s/linked", root);
@@ -288,7 +264,6 @@ TEST(switch_rejects_unsafe_ids_and_missing_sessions) {
         CHECK_EQ(unlink(link_path), 0);
     }
 
-    /* Bad arguments are the caller's bug, not a business outcome. */
     CHECK_EQ(oi_cli_session_switch(NULL, root, NULL, "x", 1, "m", cwd, NULL,
                                    &result),
              OI_ERR_INVAL);
@@ -304,9 +279,6 @@ TEST(switch_rejects_unsafe_ids_and_missing_sessions) {
 
 TEST(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing) {
     char *root = test_root("busy");
-    /* The child below frees the heap blocks of this test first: under
-     * valgrind it runs its own leak check at _exit, and a report there
-     * changes its exit status. */
     char cwd_buf[4096];
     char *cwd = getcwd(cwd_buf, sizeof cwd_buf);
     oi_session_registry *registry = NULL;
@@ -358,10 +330,8 @@ TEST(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing) {
     CHECK_EQ(oi_cli_session_switch(registry, root, NULL, id, strlen(id),
                                    "gpt-default", cwd, NULL, &result),
              OI_OK);
-    /* Busy is an ordinary outcome, not an error that ends the REPL. */
     CHECK_EQ(result.outcome, OI_CLI_SESSION_SWITCH_BUSY);
     CHECK(result.session == NULL);
-    /* And nothing was left behind in the registry to leak or collide. */
     CHECK_EQ(registry_size(registry, id), 0u);
     oi_cli_session_switch_result_free(&result);
 
@@ -375,7 +345,6 @@ TEST(switch_to_a_session_held_elsewhere_reports_busy_and_registers_nothing) {
     close(to_child[1]);
     close(to_parent[0]);
 
-    /* Once released, the very same switch succeeds. */
     oi_cli_session_switch_result_init(&result);
     CHECK_EQ(oi_cli_session_switch(registry, root, NULL, id, strlen(id),
                                    "gpt-default", cwd, NULL, &result),
@@ -407,11 +376,6 @@ TEST(switch_recovers_a_truncated_tail_but_refuses_an_undecodable_log) {
     recoverable = seed_session(root, "gpt-recover", cwd, 1);
     undecodable = seed_session(root, "gpt-broken", cwd, 1);
 
-    /*
-     * A record left incomplete by a crash is recovered, not rejected --
-     * oi_sesslog_open truncates the fragment and everything before it is
-     * preserved, so the session is still switchable.
-     */
     snprintf(history_path, sizeof history_path, "%s/%s/history.oilog", root,
              recoverable);
     {
@@ -434,8 +398,6 @@ TEST(switch_recovers_a_truncated_tail_but_refuses_an_undecodable_log) {
     result.session = NULL;
     oi_cli_session_switch_result_free(&result);
 
-    /* A log whose header is not an oi log at all cannot be opened, and is
-     * reported as corrupt rather than crashing or ending the REPL. */
     snprintf(history_path, sizeof history_path, "%s/%s/history.oilog", root,
              undecodable);
     {
@@ -474,14 +436,6 @@ TEST(a_failed_switch_leaves_the_working_directory_alone) {
     CHECK(registry != NULL);
     id = seed_session(root, "gpt-a", original_cwd, 1);
 
-    /*
-     * Restoring a target's settings chdir()s the process. A switch that
-     * fails afterwards must not leave the caller -- which keeps using the
-     * old session -- standing in the target's directory.
-     *
-     * Here the failure is provoked before any chdir (an undecodable log),
-     * which is the case that must clearly not move it.
-     */
     {
         char history_path[384];
         FILE *garbage;
@@ -528,10 +482,6 @@ TEST(a_switch_failing_after_the_target_cwd_is_applied_still_rolls_back) {
     CHECK(mkdir(start_dir, 0700) == 0 || errno == EEXIST);
     CHECK(mkdir(target_dir, 0700) == 0 || errno == EEXIST);
 
-    /*
-     * A session with a transition but no durable settings and no metadata
-     * cache, so both model and cwd resolve to the defaults passed in.
-     */
     {
         struct oi_cli_session_location location;
         struct oi_cli_history_store store;
@@ -559,13 +509,6 @@ TEST(a_switch_failing_after_the_target_cwd_is_applied_still_rolls_back) {
         oi_cli_session_location_free(&location);
     }
 
-    /*
-     * A default model longer than a durable setting value may be. Settings
-     * restoration chdir()s into the resolved cwd *first* and only then
-     * appends the model record, so this fails strictly after the working
-     * directory has already moved -- the case the earlier rollback test,
-     * which fails before any chdir, does not reach.
-     */
     oversized_model = malloc(OI_CLI_HISTORY_MAX_SETTING_VALUE + 2);
     CHECK(oversized_model != NULL);
     memset(oversized_model, 'm', OI_CLI_HISTORY_MAX_SETTING_VALUE + 1);
@@ -579,13 +522,11 @@ TEST(a_switch_failing_after_the_target_cwd_is_applied_still_rolls_back) {
              OI_OK);
     CHECK(result.outcome != OI_CLI_SESSION_SWITCH_OK);
     CHECK(result.session == NULL);
-    /* Rolled back out of target_dir, all the way to where we started. */
     {
         char now[512];
         CHECK(getcwd(now, sizeof now) != NULL);
         CHECK_STREQ(now, start_dir);
     }
-    /* And nothing was left registered. */
     CHECK_EQ(registry_size(registry, id), 0u);
     oi_cli_session_switch_result_free(&result);
 
@@ -616,8 +557,6 @@ TEST(switch_repairs_an_interrupted_turn_in_the_target) {
     char *id;
 
     CHECK(registry != NULL);
-    /* A session whose last turn has a user message and no reply -- exactly
-     * what a crash mid-turn leaves behind. */
     oi_cli_session_location_init(&location);
     CHECK_EQ(oi_cli_session_location_create(root, &location), OI_OK);
     CHECK_EQ(oi_sesslog_open(location.history_path, &log), OI_OK);
@@ -647,8 +586,6 @@ TEST(switch_repairs_an_interrupted_turn_in_the_target) {
                                    "gpt-default", cwd, NULL, &result),
              OI_OK);
     CHECK_EQ(result.outcome, OI_CLI_SESSION_SWITCH_OK);
-    /* The interrupted turn was repaired durably during the switch, so the
-     * replay state no longer asks for it. */
     CHECK(!result.state.needs_repair);
 
     CHECK_EQ(chdir(cwd), 0);
@@ -656,8 +593,6 @@ TEST(switch_repairs_an_interrupted_turn_in_the_target) {
     result.session = NULL;
     oi_cli_session_switch_result_free(&result);
 
-    /* Reopening sees the repair already on disk rather than needing it
-     * again -- the switch's appends were durable, not in-memory. */
     oi_cli_session_switch_result_init(&result);
     CHECK_EQ(oi_cli_session_switch(registry, root, NULL, id, strlen(id),
                                    "gpt-default", cwd, NULL, &result),
@@ -678,7 +613,6 @@ TEST(switch_repairs_an_interrupted_turn_in_the_target) {
 }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     RUN(switch_opens_replays_and_restores_the_target);
     RUN(switch_to_the_same_session_is_a_no_op);

@@ -107,15 +107,6 @@ static void advance_columns(struct cursor_position *position, size_t columns,
     }
 }
 
-/*
- * Advances by one code point's display width, treating it as atomic: a
- * wide (width 2) glyph is never split across a row boundary -- if it
- * doesn't fully fit in the columns remaining, wrap to a fresh row first,
- * then place it there. Unlike advance_columns (used for the "> " prompt's
- * byte-run, where splitting plain ASCII across a boundary is harmless),
- * this must never leave half a glyph's cells on one row and half on the
- * next.
- */
 static void advance_codepoint(struct cursor_position *position,
                               size_t columns, size_t width) {
     if (width == 0) {
@@ -313,15 +304,6 @@ static oi_status render_draw(
         status = write_all(render->output_fd, buffer.data, buffer.len);
     }
     if (status == OI_OK) {
-        /* The repositioning above always leaves the physical cursor at
-         * `cursor.row`, not `end.row` (which can be further down whenever
-         * a command menu is showing, or the edit cursor sits before
-         * wrapped trailing content) -- previous_rows must track where the
-         * cursor actually ends up, or the next draw's clear step
-         * overshoots past this frame's top row and erases real prior
-         * terminal content. header_count is a uniform offset added to
-         * every row position build_frame computed relative to the first
-         * editor row, so it's added in only here, once. */
         render->previous_rows = header_count + cursor.row + 1;
     }
     free(buffer.data);
@@ -387,10 +369,6 @@ oi_status oi_cli_render_draw_selector(
             status = buffer_append(&buffer, option_lines[i].text,
                                    option_lines[i].len);
         }
-        /* No trailing "\r\n" after the last option: the physical cursor
-         * must end up on the frame's last row (row_count - 1 once this
-         * loop finishes), matching what previous_rows below claims, so
-         * the next erase's cursor-up count is correct. */
         if (status == OI_OK && i + 1 < option_count) {
             status = buffer_append(&buffer, "\r\n", 2);
         }

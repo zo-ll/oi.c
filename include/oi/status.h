@@ -7,16 +7,16 @@
  */
 typedef enum oi_status {
     OI_OK = 0,
-    OI_ERR_INVAL,   /* invalid argument */
-    OI_ERR_NOMEM,   /* allocation failed */
+    OI_ERR_INVAL,
+    OI_ERR_NOMEM,
     OI_ERR_IO,      /* I/O error, see errno at the call site */
-    OI_ERR_AGAIN,   /* would block; retry later */
-    OI_ERR_PARSE,   /* malformed input */
-    OI_ERR_CLOSED,  /* peer/resource closed */
-    OI_ERR_EXISTS,  /* duplicate id/key */
-    OI_ERR_NOTFOUND, /* id/key not found */
+    OI_ERR_AGAIN,
+    OI_ERR_PARSE,
+    OI_ERR_CLOSED,
+    OI_ERR_EXISTS,
+    OI_ERR_NOTFOUND,
     OI_ERR_DENIED,  /* refused by caller-supplied policy, not a fault */
-    OI_ERR_TIMEOUT  /* operation exceeded its configured deadline */
+    OI_ERR_TIMEOUT
 } oi_status;
 
 /* Human-readable text for an oi_status, for diagnostic messages only --
@@ -49,4 +49,4 @@ static inline const char *oi_status_str(oi_status status) {
     return "unknown error";
 }
 
-#endif /* OI_STATUS_H */
+#endif

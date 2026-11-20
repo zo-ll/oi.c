@@ -6,11 +6,6 @@
 #include "oi/reactor.h"
 #include "oi/status.h"
 
-/*
- * "Sign in with ChatGPT" for open-source clients: authorization code with
- * PKCE and a loopback redirect. Tokens are bound to the Responses API.
- */
-
 #define OI_CLI_OAUTH_REDIRECT_PORT 1455
 #define OI_CLI_OAUTH_MAX_MODELS 32U
 
@@ -20,31 +15,22 @@ struct oi_cli_oauth_server {
     int use_tls;
 };
 
-/*
- * The production servers, unless OI_CHATGPT_TEST_BASE names one http(s)
- * loopback origin that replaces both; that variable exists only for tests,
- * and any other host in it is ignored.
- * `out_is_test` reports the override, which also disables opening a browser.
- */
 oi_status oi_cli_oauth_servers(struct oi_cli_oauth_server *out_auth,
                                struct oi_cli_oauth_server *out_api,
                                int *out_is_test);
 void oi_cli_oauth_server_free(struct oi_cli_oauth_server *server);
 
-/* 32 random bytes in unpadded base64url. */
 oi_status oi_cli_oauth_random_token(char **out_token);
-/* The S256 code_challenge of `verifier`. */
 oi_status oi_cli_oauth_challenge(const char *verifier, char **out_challenge);
-/* A fresh urn:uuid: host identifier. */
 oi_status oi_cli_oauth_host_id(char **out_host_id);
 
 struct oi_cli_oauth_authorize {
-    const char *client_id;     /* NULL for first registration */
+    const char *client_id;
     const char *host_id;
     const char *state;
     const char *nonce;
     const char *challenge;
-    const char *id_token_hint; /* NULL when none is saved */
+    const char *id_token_hint;
 };
 
 oi_status oi_cli_oauth_authorize_url(const struct oi_cli_oauth_server *auth,
@@ -52,14 +38,13 @@ oi_status oi_cli_oauth_authorize_url(const struct oi_cli_oauth_server *auth,
                                      char **out_url);
 
 struct oi_cli_oauth_callback {
-    int is_callback; /* the request named the callback path */
+    int is_callback;
     char *code;
     char *state;
     char *client_id;
     char *error;
 };
 
-/* Parses the head of one HTTP request received on the loopback listener. */
 oi_status oi_cli_oauth_parse_callback(const char *request,
                                       struct oi_cli_oauth_callback *out);
 void oi_cli_oauth_callback_free(struct oi_cli_oauth_callback *callback);
@@ -69,27 +54,16 @@ struct oi_cli_oauth_tokens {
     char *refresh_token;
     char *id_token;
     char *scope;
-    char *error; /* a machine-readable code; set when the server refused */
+    char *error;
     double expires_in;
 };
 
-/*
- * On OI_OK, either `access_token` or `error` is set. OI_ERR_PARSE means
- * the body was neither a token set nor a recognizable refusal.
- */
 oi_status oi_cli_oauth_parse_tokens(const char *body, size_t body_len,
                                     struct oi_cli_oauth_tokens *out);
 void oi_cli_oauth_tokens_free(struct oi_cli_oauth_tokens *tokens);
 
-/* True for the refusals that mean the saved refresh token can never work. */
 int oi_cli_oauth_error_is_terminal(const char *error);
 
-/*
- * Checks the claims of an ID token received directly from the token
- * endpoint over TLS: nonce (when `nonce` is non-NULL), audience, expiry,
- * and subject. Does not verify the JWKS signature. OI_ERR_DENIED means a
- * claim did not match. `*out_email` is NULL when the token has none.
- */
 oi_status oi_cli_oauth_check_id_token(const char *id_token, const char *nonce,
                                       const char *client_id, double now,
                                       char **out_email);
@@ -104,17 +78,10 @@ struct oi_cli_oauth_models {
     size_t count;
 };
 
-/* Keeps only models with visibility "list". */
 oi_status oi_cli_oauth_parse_models(const char *body, size_t body_len,
                                     struct oi_cli_oauth_models *out);
 void oi_cli_oauth_models_free(struct oi_cli_oauth_models *models);
 
-/*
- * One blocking HTTP exchange on a private reactor, so that it is safe from
- * inside another reactor's callback. `bearer` and `form` are optional; a
- * `form` body makes the Content-Type form-encoded. Non-2xx responses still
- * return OI_OK with *out_http_status set. The caller frees *out_body.
- */
 oi_status oi_cli_oauth_http(const struct oi_cli_oauth_server *server,
                             const char *ca_file, const char *method,
                             const char *path, const char *bearer,
@@ -133,14 +100,6 @@ oi_status oi_cli_oauth_refresh(const struct oi_cli_oauth_server *auth,
                                const char *refresh_token,
                                struct oi_cli_oauth_tokens *out);
 
-/*
- * oi_cli_oauth_refresh without blocking: the exchange runs on `reactor`,
- * and `done` fires once with the result. `done` owns `*tokens` (free them
- * with oi_cli_oauth_tokens_free; all members are NULL unless the status is
- * OI_OK), and the call handle is already freed when `done` runs. The
- * exchange times out after 20 seconds. oi_cli_oauth_refresh_cancel stops
- * it without calling `done`; NULL-safe.
- */
 struct oi_cli_oauth_refresh_call;
 typedef void (*oi_cli_oauth_tokens_cb)(oi_status status,
                                        struct oi_cli_oauth_tokens *tokens,
@@ -152,11 +111,6 @@ oi_status oi_cli_oauth_refresh_start(
     struct oi_cli_oauth_refresh_call **out_call);
 void oi_cli_oauth_refresh_cancel(struct oi_cli_oauth_refresh_call *call);
 
-/*
- * True once the refresh request is queued on the connection. From then
- * on the server can rotate the refresh token, so a cancel can lose the
- * only copy of the new one: let such a call finish instead.
- */
 int oi_cli_oauth_refresh_sent(const struct oi_cli_oauth_refresh_call *call);
 
 oi_status oi_cli_oauth_fetch_models(const struct oi_cli_oauth_server *api,

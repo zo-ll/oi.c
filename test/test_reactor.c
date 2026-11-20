@@ -20,16 +20,12 @@ static void make_socketpair(int fds[2]) {
     set_nonblocking(fds[1]);
 }
 
-/* --- create/destroy --- */
-
 TEST(create_destroy) {
     oi_reactor *r = oi_reactor_create();
     CHECK(r != NULL);
     oi_reactor_destroy(r);
-    oi_reactor_destroy(NULL); /* NULL-safe */
+    oi_reactor_destroy(NULL);
 }
-
-/* --- add validates args --- */
 
 static void noop_cb(oi_reactor *r, int fd, int revents, void *ud) {
     (void)r;
@@ -54,8 +50,6 @@ TEST(add_rejects_bad_args) {
     oi_reactor_destroy(r);
 }
 
-/* --- duplicate add rejected --- */
-
 TEST(add_duplicate_fails) {
     oi_reactor *r = oi_reactor_create();
     int fds[2];
@@ -68,24 +62,18 @@ TEST(add_duplicate_fails) {
     CHECK_EQ(oi_reactor_remove(r, fds[0]), OI_OK);
     CHECK_EQ(oi_reactor_remove(r, fds[0]), OI_ERR_NOTFOUND);
 
-    /* A valid, open fd that was simply never registered: ENOENT from the
-     * backend, not EBADF, so it must map to OI_ERR_NOTFOUND too. */
     int unreg[2];
     make_socketpair(unreg);
     CHECK_EQ(oi_reactor_remove(r, unreg[0]), OI_ERR_NOTFOUND);
     close(unreg[0]);
     close(unreg[1]);
 
-    /* A completely invalid fd (never opened) is a different backend
-     * failure (EBADF), reported as an I/O error rather than NOTFOUND. */
     CHECK_EQ(oi_reactor_remove(r, 99999), OI_ERR_IO);
 
     close(fds[0]);
     close(fds[1]);
     oi_reactor_destroy(r);
 }
-
-/* --- readiness dispatch --- */
 
 struct capture {
     int fired;
@@ -109,7 +97,6 @@ TEST(dispatches_on_readable) {
 
     CHECK_EQ(oi_reactor_add(r, fds[0], OI_EV_READ, capture_cb, &cap), OI_OK);
 
-    /* fds[0] not readable yet: a bounded step should time out with 0. */
     oi_status st;
     int n = oi_reactor_step(r, 10, &st);
     CHECK_EQ(st, OI_OK);
@@ -136,8 +123,6 @@ TEST(dispatches_on_writable) {
     make_socketpair(fds);
     struct capture cap = {0};
 
-    /* A fresh socket's send buffer is empty, so it should be immediately
-     * writable. */
     CHECK_EQ(oi_reactor_add(r, fds[0], OI_EV_WRITE, capture_cb, &cap), OI_OK);
 
     oi_status st;
@@ -151,8 +136,6 @@ TEST(dispatches_on_writable) {
     oi_reactor_destroy(r);
 }
 
-/* --- modify changes interest --- */
-
 TEST(modify_changes_interest) {
     oi_reactor *r = oi_reactor_create();
     int fds[2];
@@ -162,7 +145,6 @@ TEST(modify_changes_interest) {
     CHECK_EQ(oi_reactor_add(r, fds[0], OI_EV_WRITE, capture_cb, &cap), OI_OK);
     CHECK_EQ(oi_reactor_modify(r, fds[0], OI_EV_READ), OI_OK);
 
-    /* Now only interested in READ; fds[0] has nothing to read. */
     oi_status st;
     int n = oi_reactor_step(r, 10, &st);
     CHECK_EQ(st, OI_OK);
@@ -182,7 +164,6 @@ TEST(modify_changes_interest) {
     oi_reactor_destroy(r);
 }
 
-/* The test links with -Wl,--wrap=epoll_ctl to count the system calls. */
 static int epoll_mod_calls;
 
 int __real_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
@@ -209,7 +190,6 @@ TEST(modify_to_the_same_interest_makes_no_system_call) {
     CHECK_EQ(oi_reactor_modify(r, fds[0], OI_EV_READ | OI_EV_WRITE), OI_OK);
     CHECK_EQ(epoll_mod_calls, 1);
 
-    /* The new interest is in effect: the socket is writable now. */
     oi_status st;
     CHECK_EQ(oi_reactor_step(r, 10, &st), 1);
     CHECK(cap.revents & OI_EV_WRITE);
@@ -218,8 +198,6 @@ TEST(modify_to_the_same_interest_makes_no_system_call) {
     close(fds[1]);
     oi_reactor_destroy(r);
 }
-
-/* --- remove during dispatch (safe reentrancy) --- */
 
 struct remove_ctx {
     oi_reactor *r;
@@ -251,8 +229,6 @@ TEST(remove_during_dispatch_is_safe) {
     struct remove_ctx ctx_a = {r, b[0], 0};
     struct remove_ctx ctx_b = {r, a[0], 0};
 
-    /* Both a[0] and b[0] become readable; a's callback removes b before
-     * b's callback would run. Must not crash or double-dispatch. */
     CHECK_EQ(write(a[1], "x", 1), 1);
     CHECK_EQ(write(b[1], "x", 1), 1);
 
@@ -264,8 +240,6 @@ TEST(remove_during_dispatch_is_safe) {
     oi_status st;
     int n = oi_reactor_step(r, 1000, &st);
     CHECK_EQ(st, OI_OK);
-    /* Either 1 (b already removed before its turn) or 2 (b's turn came
-     * first) is acceptable; what must not happen is a crash. */
     CHECK(n == 1 || n == 2);
 
     close(a[0]);
@@ -327,8 +301,6 @@ TEST(stale_event_does_not_target_reused_fd) {
               OI_OK);
     CHECK_EQ(oi_reactor_add(r, victim[0], OI_EV_READ, old_victim_cb, &ctx),
               OI_OK);
-    /* Readiness transitions are queued in this order on epoll, making the
-     * controller replace the victim while its old event is in the batch. */
     CHECK_EQ(write(controller[1], "c", 1), 1);
     CHECK_EQ(write(victim[1], "v", 1), 1);
 
@@ -350,8 +322,6 @@ TEST(stale_event_does_not_target_reused_fd) {
     oi_reactor_destroy(r);
 }
 
-/* --- HUP detection --- */
-
 TEST(reports_hup_on_peer_close) {
     oi_reactor *r = oi_reactor_create();
     int fds[2];
@@ -370,8 +340,6 @@ TEST(reports_hup_on_peer_close) {
     close(fds[0]);
     oi_reactor_destroy(r);
 }
-
-/* --- run/stop --- */
 
 struct stop_ctx {
     oi_reactor *r;
@@ -480,10 +448,9 @@ TEST(timers_fire_in_deadline_order_and_cancel_from_the_middle) {
                                          &entries[i], &timers[i]),
                  OI_OK);
     }
-    oi_reactor_timer_cancel(timers[3]); /* the 20 ms timer */
+    oi_reactor_timer_cancel(timers[3]);
     timers[3] = NULL;
 
-    /* oi_reactor_run returns when no timer is left. */
     CHECK_EQ(oi_reactor_run(r), OI_OK);
     CHECK_EQ(ctx.count, 4);
     CHECK_EQ(ctx.fired[0], 10);
@@ -526,7 +493,6 @@ TEST(timer_started_in_a_timer_callback_fires_in_a_later_step) {
     CHECK_EQ(oi_reactor_step(r, -1, &st), 1);
     CHECK_EQ(ctx.first_fired, 1);
     CHECK_EQ(ctx.second_fired, 0);
-    /* step(-1) must still return: the next deadline bounds the wait. */
     CHECK_EQ(oi_reactor_step(r, -1, &st), 1);
     CHECK_EQ(ctx.second_fired, 1);
     oi_reactor_timer_cancel(first);
@@ -559,8 +525,6 @@ TEST(timers_use_no_file_descriptor) {
     oi_reactor_destroy(r);
 }
 
-/* --- an outside poll() can wait for the reactor's work --- */
-
 TEST(reactor_fd_and_timeout_let_an_outside_poll_drive_the_reactor) {
     oi_reactor *r = oi_reactor_create();
     CHECK_EQ(oi_reactor_timeout_ms(r), -1);
@@ -572,7 +536,6 @@ TEST(reactor_fd_and_timeout_let_an_outside_poll_drive_the_reactor) {
     int left = oi_reactor_timeout_ms(r);
     CHECK(left > 0 && left <= 30);
 
-    /* Wait the way a caller with its own poll() does. */
     struct pollfd pfd = {oi_reactor_fd(r), POLLIN, 0};
     CHECK_EQ(poll(&pfd, 1, oi_reactor_timeout_ms(r)), 0);
     CHECK_EQ(oi_reactor_timeout_ms(r), 0);
@@ -582,7 +545,6 @@ TEST(reactor_fd_and_timeout_let_an_outside_poll_drive_the_reactor) {
     CHECK_EQ(oi_reactor_timeout_ms(r), -1);
     oi_reactor_timer_cancel(timer);
 
-    /* A ready fd makes the reactor fd readable. */
     int fds[2];
     make_socketpair(fds);
     struct capture cap = {0};
@@ -597,8 +559,6 @@ TEST(reactor_fd_and_timeout_let_an_outside_poll_drive_the_reactor) {
     close(fds[1]);
     oi_reactor_destroy(r);
 }
-
-/* --- many fds (exercises fd-table growth) --- */
 
 TEST(many_fds_grow_table) {
     oi_reactor *r = oi_reactor_create();

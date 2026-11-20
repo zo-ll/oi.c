@@ -1,10 +1,3 @@
-/*
- * Exercises the actual compiled `oi` binary (build/oi) as a subprocess
- * rather than any library code directly -- this is the one test in the
- * suite whose job is to prove the CLI wrapper itself works, not just
- * the pieces it's built from. Assumes CWD is the repo root, matching
- * how `make test` invokes every test binary.
- */
 #include "test.h"
 
 #include <arpa/inet.h>
@@ -32,20 +25,10 @@
 
 #include "oi/sesslog.h"
 
-/* The Makefile defines OI_CLI_BIN to match whatever $(BUILD) directory
- * this test binary itself was compiled into (build/, build-asan/, ...)
- * -- hardcoding "build/oi" here caused a real hang: under `make asan`,
- * the plain build/oi didn't exist (a stale/absent path after `make
- * clean`), execv() failed, and the orphaned mock-server helper below
- * was left blocked in accept() forever with nothing to ever connect to
- * it, which then hung this test's waitpid() indefinitely. Falls back to
- * "build/oi" only for a manual/non-Makefile compile. */
 #ifndef OI_CLI_BIN
 #define OI_CLI_BIN "build/oi"
 #endif
 #define OI_BIN OI_CLI_BIN
-
-/* --- mock SSE server, same shape as test_llm.c's --- */
 
 static void drain_request(int cfd, int capture_fd) {
     char buf[8192];
@@ -127,10 +110,6 @@ static pid_t start_mock_server_turns_capture(
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
-        /* Bounded, not accept() outright: if the CLI process we expect
-         * to connect never does (e.g. it failed to even start), this
-         * must not hang forever -- see the OI_CLI_BIN comment above for
-         * exactly the incident that motivated this. */
         for (size_t turn = 0; turn < response_count; turn++) {
             fd_set rfds;
             FD_ZERO(&rfds);
@@ -190,53 +169,15 @@ static pid_t start_mock_server(const char *response, size_t response_len,
 struct slow_mock_turn {
     const char *response;
     size_t response_len;
-    /*
-     * When set, the server accepts and drains the request, announces that on
-     * the control channel, and then holds the response until the test
-     * explicitly releases it. Tests that need a request to still be in flight
-     * -- every cancellation and queueing test here -- use this instead of
-     * guessing how long "in flight" lasts.
-     */
     int hold;
 };
 
-/*
- * Two pipes joining a test to its mock server, replacing what used to be a
- * per-turn sleep.
- *
- * `accepted` carries one byte per held request the server has accepted and
- * fully read, so a test can know that request is genuinely in flight rather
- * than assuming it is by then. `release` carries one byte per held turn,
- * letting the test decide exactly when the response is allowed to go out.
- *
- * Together these make the previously timing-dependent moment -- "the CLI is
- * mid-request" -- an observed fact on both sides.
- */
 struct slow_mock_control {
-    int accepted; /* read end */
-    int release;  /* write end */
-    /*
-     * Held requests observed via slow_mock_wait_accepted that have not yet
-     * been paired with a slow_mock_release call. Unheld requests never enter
-     * this count, so every credit corresponds to exactly one response blocked
-     * on the release pipe.
-     */
+    int accepted;
+    int release;
     size_t accepted_unreleased;
 };
 
-/*
- * Blocks until the server reports `count` more accepted requests.
- *
- * This is the barrier that makes a held turn mean anything. Terminal output
- * such as the "\r\n" a submission echoes only proves the CLI rendered
- * something; it says nothing about whether the HTTP request has reached the
- * server. Releasing before that point is a silent no-op -- the byte waits in
- * the pipe and the server consumes it the moment it accepts, holding
- * nothing -- so every held turn must be waited for here first.
- *
- * Bounded, and fails the test rather than hanging the suite if the request
- * never arrives.
- */
 static void slow_mock_wait_accepted(struct slow_mock_control *control,
                                     size_t count) {
     size_t received = 0;
@@ -273,15 +214,6 @@ static void slow_mock_wait_accepted(struct slow_mock_control *control,
     }
 }
 
-/*
- * Lets one held turn send its response.
- *
- * Requires a prior slow_mock_wait_accepted to have observed the request this
- * release is meant to unblock. Without that ordering the release byte would
- * simply sit in the pipe and be consumed the instant the server accepts,
- * holding nothing -- so this asserts the credit exists instead of allowing
- * that silent no-op.
- */
 static void slow_mock_release(struct slow_mock_control *control) {
     ssize_t n;
 
@@ -307,34 +239,10 @@ static void slow_mock_control_free(struct slow_mock_control *control) {
     }
 }
 
-/*
- * A standalone mock server (not the shared start_mock_server_turns_capture
- * used everywhere else) that can hold a turn's response open indefinitely,
- * so a Ctrl+C-during-a-turn test reaches the CLI while a request is genuinely
- * still in flight rather than racing a same-host loopback round trip.
- *
- * This used to sleep for a fixed number of seconds per turn, which was both a
- * guess and expensive -- 28 s of the 34 s this file took to run. The response
- * is now held until the test releases it, which is exact rather than
- * approximate: the window cannot close early on a slow machine, and costs
- * nothing on a fast one. Turns with `hold` unset respond immediately, which
- * is how the "REPL still works after a cancel" half of these tests runs.
- *
- * The wait is bounded so a test that forgets to release fails on the usual
- * 20 s test timeout instead of hanging the suite forever.
- */
-/* Distinct exit codes so a control-channel failure inside the forked server
- * reaches the test as a real failure rather than a warning nobody reads. */
 #define SLOW_MOCK_EXIT_OK 0
 #define SLOW_MOCK_EXIT_NO_CONNECTION 2
 #define SLOW_MOCK_EXIT_CONTROL 3
 
-/*
- * Waits for exactly one release byte. Fails closed: a timeout, an EOF (the
- * parent closed its end, usually because the test died), a read error, or a
- * short read all mean "do not send this response". Sending it anyway would
- * turn a broken control channel into a passing test.
- */
 static int slow_mock_await_release(int release_fd, size_t turn) {
     fd_set release_set;
     struct timeval timeout = {20, 0};
@@ -363,32 +271,6 @@ static int slow_mock_await_release(int release_fd, size_t turn) {
     return 1;
 }
 
-/*
- * A standalone mock server (not the shared start_mock_server_turns_capture
- * used everywhere else) that can hold a turn's response open indefinitely, so
- * a Ctrl+C-during-a-turn test reaches the CLI while a request is genuinely
- * still in flight rather than racing a same-host loopback round trip.
- *
- * This used to sleep a fixed number of seconds per turn, which was both a
- * guess and expensive -- 28 s of the 34 s this file took to run. Two pipes
- * replace it:
- *
- *   accepted -- one byte per held request the server has accepted and fully
- *               read, so a test can wait until that request really is in
- *               flight;
- *   release  -- one byte per held turn, letting the test say when the
- *               response may go out.
- *
- * Both are needed. Releasing without first waiting on `accepted` is a silent
- * no-op: the byte simply sits in the pipe, and the server consumes it the
- * instant it accepts, holding nothing. slow_mock_wait_accepted exists so that
- * ordering is explicit at every call site.
- *
- * The parent keeps accepted[0] and release[1]; the child keeps accepted[1]
- * and release[0]. Each side closes the two ends it does not own, so a dead
- * peer shows up as EOF instead of a descriptor kept alive by the other
- * process.
- */
 static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
                                     size_t turn_count,
                                     unsigned short *out_port,
@@ -422,9 +304,6 @@ static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
     if (pid == 0) {
         int exit_code = SLOW_MOCK_EXIT_OK;
 
-        /* Ends the child does not own. Without this the child would keep the
-         * release *writer* alive, so the parent closing its end would never
-         * produce EOF. */
         close(accepted_pipe[0]);
         close(release_pipe[1]);
 
@@ -481,7 +360,6 @@ static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
         _exit(exit_code);
     }
 
-    /* Ends the parent does not own, for the same reason. */
     close(accepted_pipe[1]);
     close(release_pipe[0]);
     close(listen_fd);
@@ -490,10 +368,6 @@ static pid_t start_slow_mock_server(const struct slow_mock_turn *turns,
     return pid;
 }
 
-/*
- * Reaps a server that should have served every turn and exited on its own.
- * A control-channel failure inside the child surfaces here.
- */
 static void slow_mock_server_expect_clean_exit(pid_t server) {
     int status = 0;
 
@@ -502,15 +376,6 @@ static void slow_mock_server_expect_clean_exit(pid_t server) {
     CHECK_EQ(WEXITSTATUS(status), SLOW_MOCK_EXIT_OK);
 }
 
-/*
- * Reaps a server the test deliberately terminates during cleanup, typically
- * because turns were left unserved. Dying by our own SIGTERM is expected and
- * fine; a clean exit is only fine if it reports SLOW_MOCK_EXIT_OK. Any other
- * outcome -- exiting with a failure code, or dying from a different signal
- * such as SIGSEGV or SIGABRT because the child had already crashed -- is a
- * real failure and must not be waved through just because the process is
- * gone.
- */
 static void slow_mock_server_terminate(pid_t server) {
     int status = 0;
 
@@ -524,16 +389,6 @@ static void slow_mock_server_terminate(pid_t server) {
     }
 }
 
-/*
- * A single-turn mock server that writes `response` in two pieces (the
- * first `split_at` bytes, a pause, then the rest) over the same
- * connection -- unlike start_slow_mock_server's one-sleep-then-write-it-
- * all shape, this puts a real mid-stream gap *inside* the SSE body itself,
- * so a client is genuinely still assembling a partial assistant delta (not
- * just waiting for the first byte) when the pause happens. Used to
- * exercise typing concurrently with an in-flight, partially-delivered
- * response.
- */
 static pid_t start_split_response_mock_server(const char *response,
                                               size_t response_len,
                                               size_t split_at,
@@ -609,8 +464,6 @@ static pid_t start_split_response_mock_server(const char *response,
     return pid;
 }
 
-/* --- run the built oi binary, capturing stdout+stderr --- */
-
 struct run_result {
     char output[4096];
     size_t output_len;
@@ -640,10 +493,6 @@ static int interactive_wait_for(int master_fd,
                                 const char *text, size_t minimum_count) {
     while (result->output_len < sizeof result->output - 1) {
         fd_set reads;
-        /* Bounded, not a real deadline: a slower CI runner under
-         * asan/tsan can legitimately take longer than a quiet local
-         * machine for one round trip. Each read-to-read gap gets its own
-         * fresh window, so this only matters when data genuinely stalls. */
         struct timeval timeout = {20, 0};
         ssize_t len;
 
@@ -692,12 +541,6 @@ static int write_interactive(int fd, const char *data, size_t len) {
     return 1;
 }
 
-/*
- * Starts a tool-denying interactive CLI against a caller-chosen API key.
- * Parameterized because the /status tests need a distinctive sentinel key to
- * assert its absence from the terminal; the shared "test-key" below is too
- * plausible a substring to prove anything.
- */
 static pid_t start_interactive_cli_with_api_key(unsigned short port,
                                                 int slave_fd,
                                                 const char *session_root,
@@ -709,10 +552,6 @@ static pid_t start_interactive_cli_with_api_key(unsigned short port,
         char port_text[16];
         char *argv[13];
 
-        /* A plain fork() inherits the test harness's own session/process
-         * group, not one attached to this pty -- a resize test's
-         * TIOCSWINSZ-triggered SIGWINCH has nowhere to go without a real
-         * controlling terminal established here first. */
         if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
             _exit(126);
         }
@@ -749,9 +588,6 @@ static pid_t start_interactive_cli(unsigned short port, int slave_fd,
                                               "test-key");
 }
 
-/* Same as start_interactive_cli, but allows tools to run without prompting
- * -- needed for tests that cancel a genuinely-running tool subprocess,
- * where --deny-tools would never let one start at all. */
 static pid_t start_interactive_cli_allowing_tools(unsigned short port,
                                                   int slave_fd,
                                                   const char *session_root) {
@@ -792,10 +628,6 @@ static pid_t start_interactive_cli_allowing_tools(unsigned short port,
     return pid;
 }
 
-/* Same as start_interactive_cli, but with neither --allow-tools nor
- * --deny-tools: the default `ask` policy, which now (issue #26) routes
- * through the REPL's own permission selector instead of blocking on
- * /dev/tty -- needed for tests exercising that selector directly. */
 static pid_t start_interactive_cli_asking_tools(unsigned short port,
                                                 int slave_fd,
                                                 const char *session_root) {
@@ -835,11 +667,6 @@ static pid_t start_interactive_cli_asking_tools(unsigned short port,
     return pid;
 }
 
-/* Same as start_interactive_cli, but against an explicit --session ID
- * rather than a fresh automatic session directory -- needed to actually
- * resume the same durable log across two separate process lifetimes (an
- * automatic session's directory is always brand new, so it can never be
- * resumed this way). */
 static pid_t start_interactive_cli_with_session(unsigned short port,
                                                 int slave_fd,
                                                 const char *session_dir,
@@ -914,11 +741,6 @@ static void run_cli(char *const argv[], struct run_result *out) {
     out->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-/*
- * Same as run_cli, but with `input` piped in as stdin -- the shape every
- * documented `... | oi` example has, and the only way to exercise the
- * read-all-of-stdin prompt path.
- */
 static void run_cli_with_stdin(char *const argv[], const char *input,
                                struct run_result *out) {
     size_t input_len = strlen(input);
@@ -945,9 +767,6 @@ static void run_cli_with_stdin(char *const argv[], const char *input,
     close(in_pipe[0]);
     close(out_pipe[1]);
 
-    /* SIGPIPE is possible if the child never reads stdin (a prompt argument
-     * was given); ignoring the write result is deliberate, the child's own
-     * behavior is what the assertions are about. */
     {
         void (*previous)(int) = signal(SIGPIPE, SIG_IGN);
         size_t written = 0;
@@ -978,8 +797,6 @@ static void run_cli_with_stdin(char *const argv[], const char *input,
     out->exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-/* --- tests requiring no network --- */
-
 TEST(help_exits_zero) {
     char *argv[] = {(char *)OI_BIN, (char *)"--help", NULL};
     struct run_result r;
@@ -988,16 +805,6 @@ TEST(help_exits_zero) {
     CHECK(strstr(r.output, "usage:") != NULL);
 }
 
-/*
- * Documentation drift guard for the flag list, the counterpart to
- * test_cli_docs' registry check: every long flag `oi --help` prints must
- * appear in docs/CLI.md, so adding a flag fails the suite until the guide
- * lists it. Lives here rather than in test_cli_docs because the usage text
- * belongs to cli.c, which is deliberately not linked into the private-module
- * test archive -- running the real binary is the only way to read it.
- *
- * The path is repository-relative, like OI_BIN itself.
- */
 TEST(help_flags_are_documented_in_the_guide) {
     static const char guide_path[] = "docs/CLI.md";
     char *argv[] = {(char *)OI_BIN, (char *)"--help", NULL};
@@ -1013,12 +820,6 @@ TEST(help_flags_are_documented_in_the_guide) {
     if (file == NULL) {
         return;
     }
-    /*
-     * Read to real EOF rather than into a fixed buffer: a silently truncated
-     * guide would make every strstr() below pass for the wrong reason, and a
-     * "did it fit" check after the fact cannot tell a file that ended from
-     * one that filled the buffer.
-     */
     for (;;) {
         size_t n;
 
@@ -1042,7 +843,6 @@ TEST(help_flags_are_documented_in_the_guide) {
         }
     }
     guide[guide_len] = '\0';
-    /* Distinguish "the whole file is here" from "the read gave up early". */
     CHECK(ferror(file) == 0);
     CHECK(feof(file) != 0);
     CHECK(guide_len > 0);
@@ -1072,20 +872,10 @@ TEST(help_flags_are_documented_in_the_guide) {
             CHECK(0);
         }
     }
-    /* Guards against the loop silently matching nothing at all. */
     CHECK(flags_seen >= 10);
     free(guide);
 }
 
-/*
- * Guards the documented piped-input shape, which is easy to get subtly
- * wrong: a prompt argument wins over stdin outright, so
- * `git diff | oi "Review this diff"` sends only the argument and silently
- * drops the diff. README.md and docs/CLI.md therefore show
- * `{ printf 'Review this diff:\n'; git diff; } | oi` instead, and this test
- * asserts both halves of why -- the piped form carries the whole stream into
- * the request, and the argument form does not read stdin at all.
- */
 TEST(piped_prompt_carries_stdin_into_the_request) {
     static const char piped_input[] =
         "Review this diff:\n"
@@ -1100,7 +890,6 @@ TEST(piped_prompt_carries_stdin_into_the_request) {
     CHECK(strstr(r.output, "Review this diff:") != NULL);
     CHECK(strstr(r.output, "oi-stdin-sentinel-line") != NULL);
 
-    /* The mistake the documented example avoids. */
     run_cli_with_stdin(argument_argv, piped_input, &r);
     CHECK_EQ(r.exit_code, 0);
     CHECK(strstr(r.output, "Review this diff") != NULL);
@@ -1115,8 +904,6 @@ TEST(missing_api_key_fails) {
     CHECK(strstr(r.output, "API key") != NULL);
 }
 
-/* Other users can read /proc/PID/cmdline. When the request reaches the
- * server, the key must be gone from it. */
 TEST(api_key_flag_is_removed_from_the_command_line) {
     static const char key[] = "sk-cmdline-secret";
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1308,8 +1095,6 @@ TEST(unsafe_session_id_fails_without_creating_a_file) {
     rmdir(root);
 }
 
-/* --- end-to-end streaming through a mock server --- */
-
 TEST(end_to_end_streaming_reply) {
     const char *sse_body =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -1467,12 +1252,6 @@ TEST(tool_denial_stops_loop) {
 }
 
 TEST(default_ask_policy_denies_safely_without_a_controlling_terminal) {
-    /* The one-shot loop is only ever reached when stdin/stdout aren't
-     * both a tty (cli.c's own `interactive` gate) -- exactly the case
-     * this test exercises via run_cli's plain pipe/fork setup, with no
-     * --allow-tools/--deny-tools flag at all, so the default policy is
-     * `ask`. It must deny promptly rather than hang forever waiting for
-     * a decision nothing can ever supply. */
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_ask\",\"type\":\"function\",\"function\":{"
@@ -1598,16 +1377,13 @@ TEST(tool_subprocess_does_not_inherit_the_api_key) {
             fclose(capture);
         }
         requests[request_len] = '\0';
-        /* The key still authenticates the requests... */
         CHECK(strstr(requests, "Bearer sk-env-secret") != NULL);
-        /* ...but the tool saw an empty variable. */
         CHECK(strstr(requests, "key=.") != NULL);
         CHECK(strstr(requests, "key=sk-env-secret") == NULL);
     }
     unlink(capture_path);
 }
 
-/* The argument is larger than the 64 KiB default arena block. */
 TEST(tool_argument_larger_than_an_arena_block_runs) {
     enum { LARGE = 70000 };
     char *filler = malloc(LARGE + 1);
@@ -1662,7 +1438,6 @@ TEST(resume_replays_prior_exchange) {
              session_name);
     unlink(log_path);
 
-    /* first exchange */
     const char *sse1 = "data: {\"choices\":[{\"index\":0,\"delta\":{"
                         "\"content\":\"first-reply\"}}]}\n\ndata: "
                         "[DONE]\n\n";
@@ -1694,7 +1469,6 @@ TEST(resume_replays_prior_exchange) {
     CHECK_EQ(r1.exit_code, 0);
     waitpid(child1, NULL, 0);
 
-    /* second run against the same session: must replay the first */
     const char *sse2 = "data: {\"choices\":[{\"index\":0,\"delta\":{"
                         "\"content\":\"second-reply\"}}]}\n\ndata: "
                         "[DONE]\n\n";
@@ -1890,10 +1664,6 @@ TEST(interactive_model_command_changes_the_live_model) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "/model changed-model\r", 21));
     CHECK(interactive_wait_for(master_fd, &result, "Model: changed-model", 1));
-    /* Raw mode now spans the whole session (oi_cli_terminal_enable's
-     * tcsetattr(TCSAFLUSH) only ever runs once, at startup -- see
-     * cli_composer.c), so there is no more per-command discard race here:
-     * the next line can be written as soon as the confirmation is seen. */
     CHECK(write_interactive(master_fd, "a prompt\r", 9));
     CHECK(interactive_wait_for(master_fd, &result, "changed-reply", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -2008,28 +1778,10 @@ TEST(sigint_cancels_an_in_flight_request_and_returns_to_the_prompt) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    /* Wait for the "\r\n" oi_cli_composer_wait_submit's cleanup
-     * unconditionally emits (render_finish) right before it returns:
-     * without this, a SIGINT sent immediately after write_interactive can
-     * race the idle-prompt's own poll() loop, which still has signal_fd
-     * registered until the read actually returns -- if both input_fd and
-     * signal_fd become readable in the same poll() call, the signal
-     * branch is checked first and the submission is never even read.
-     * Raw mode now spans the whole session (no more per-cycle
-     * tcsetattr(TCSAFLUSH)), so once this is seen there is no further
-     * race and no further discard risk -- the mock server's 3s delay only
-     * needs to outlast the turn's own setup, not this wait. */
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     CHECK_EQ(kill(cli, SIGINT), 0);
     CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
-    /* Released only now. Writing the keystroke or signal above does not
-     * mean the CLI has acted on it -- releasing then lets the response
-     * win the race and the turn completes instead of cancelling. The
-     * observed effect is the barrier. */
     slow_mock_release(&control);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
@@ -2121,13 +1873,6 @@ TEST(sigint_cancels_a_running_tool_and_returns_to_the_prompt) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    /* The interactive present layer only ever prints a "running tool"
-     * status line, never the tool's own raw stdout -- there is no
-     * terminal-visible marker for "the shell command has actually
-     * produced output" to wait for. Wait for the status line, then give
-     * the forked child a short, generous fixed window to actually start
-     * running (fork+exec completing in a few milliseconds, in practice)
-     * well before its own 3-second sleep would complete on its own. */
     CHECK(interactive_wait_for(master_fd, &result, "running tool shell", 1));
     {
         struct timespec delay = {0, 300000000L};
@@ -2184,10 +1929,6 @@ TEST(sigint_cancels_a_running_tool_and_returns_to_the_prompt) {
 }
 
 TEST(recoverable_turn_error_returns_to_the_prompt) {
-    /* --deny-tools rejects this tool call, producing OI_ERR_DENIED -- a
-     * genuine turn failure, but not a durable-storage failure, so the REPL
-     * must print a message and return to a working prompt rather than
-     * exit. */
     const char *denied_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_denied\",\"type\":\"function\","
@@ -2277,44 +2018,6 @@ TEST(recoverable_turn_error_returns_to_the_prompt) {
 }
 
 TEST(ctrl_d_during_a_turn_has_no_effect) {
-    /* Raw mode now spans the whole session, and input_fd is read live
-     * during a turn (see handle_turn_input in cli_repl.c), so Ctrl+D is
-     * actually decoded here, not just sitting unread -- but with the
-     * editor empty, it classifies as an EXIT action, and EXIT (like
-     * SUBMIT) is a deliberate no-op while busy: there is no queue or
-     * "exit at the next safe boundary" logic wired up yet to act on it.
-     * The turn completes normally and the REPL is left exactly as if
-     * Ctrl+D had never been sent.
-     *
-     * Writing Ctrl+D to the PTY only proves the byte reached the kernel,
-     * not that the CLI's busy input loop actually processed it -- a
-     * response released immediately afterward could still win that race
-     * and pass without exercising the intended behavior. Worse, a second
-     * write issued too soon after Ctrl+D can land in the same read() burst
-     * as the Ctrl+D byte itself: oi_cli_composer_feed decodes one decisive
-     * action per read() and stops there, so if Ctrl+D and a follow-up both
-     * arrive before the CLI's next read(), the follow-up's bytes are left
-     * sitting in the composer's buffer, unprocessed, until unrelated
-     * further input happens to arrive -- silently testing nothing.
-     *
-     * handle_turn_input sets context->dirty = 1 unconditionally, before
-     * looking at what it decoded, and the turn-stepping loop erases and
-     * redraws the composer whenever a step touched it -- so even Ctrl+D's
-     * no-op still produces a fresh "\x1b[J" erase on screen. While this
-     * turn is held, no other reactor-registered source can fire (no new
-     * HTTP bytes, no pending resize), so a new erase can only mean the
-     * pty input was just read. Waiting for one more erase than had already
-     * appeared before the Ctrl+D write, before sending anything else, is
-     * what proves the CLI's own read() already consumed the Ctrl+D byte --
-     * making it impossible for the follow-up to land in the same read().
-     *
-     * With that established, submitting a visible follow-up ("world")
-     * while the turn is still held and waiting for "oi: queued" proves the
-     * busy input loop kept running afterward rather than exiting or
-     * otherwise breaking out of it. Releasing then lets both the current
-     * turn and the queued one complete normally, matching
-     * queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids's
-     * two-turn shape. */
     const char *first_reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
         "\"recovered\"}}]}\n\n"
@@ -2357,13 +2060,7 @@ TEST(ctrl_d_during_a_turn_has_no_effect) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    /* "\r\n" (render_finish, emitted right before oi_cli_composer_wait_submit
-     * returns) proves the turn has actually started before sending Ctrl+D
-     * mid-turn, matching the same reasoning used for SIGINT above. */
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     {
         size_t erases_before_ctrl_d = count_text(result.output, "\x1b[J");
@@ -2372,17 +2069,10 @@ TEST(ctrl_d_during_a_turn_has_no_effect) {
         CHECK(interactive_wait_for(master_fd, &result, "\x1b[J",
                                    erases_before_ctrl_d + 1));
     }
-    /* If Ctrl+D had exited or otherwise broken the busy input loop, this
-     * submission would never be observed and the wait below would time
-     * out -- that is the observable consequence proving Ctrl+D was
-     * processed mid-turn rather than merely written. */
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
     slow_mock_release(&control);
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
-    /* The queued message runs immediately once the first turn finishes,
-     * with no further input from us -- confirming normal completion and
-     * queued-turn behavior, not just that the queue slot was reached. */
     CHECK(interactive_wait_for(master_fd, &result, "secondreply", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
@@ -2434,12 +2124,6 @@ TEST(ctrl_d_during_a_turn_has_no_effect) {
 }
 
 TEST(typing_during_a_turn_does_not_corrupt_the_display) {
-    /* The response is written in two pieces with a real pause between
-     * them (not just a delay before the first byte), so the client is
-     * still assembling a partial assistant delta -- with its own composer
-     * frame erased/redrawn around every reactor step in between (see
-     * cli_repl.c) -- when the second piece and further keystrokes both
-     * land in the same window. */
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
         "\"recov\"}}]}\n\n"
@@ -2449,8 +2133,6 @@ TEST(typing_during_a_turn_does_not_corrupt_the_display) {
     size_t reply_len;
     char *built = build_chunked_response(reply_sse, strlen(reply_sse),
                                          "HTTP/1.1 200 OK", &reply_len);
-    /* On the stack: the server child below holds no heap block of this
-     * test, which valgrind's leak check in that child would report. */
     char reply[512];
     CHECK(reply_len <= sizeof reply);
     memcpy(reply, built, reply_len);
@@ -2463,9 +2145,6 @@ TEST(typing_during_a_turn_does_not_corrupt_the_display) {
     struct interactive_result result;
     char session_root[128];
 
-    /* Split partway through the SSE body (well past the HTTP header and
-     * first delta), so the first write already reached the client as a
-     * real in-flight, partially-received response. */
     server = start_split_response_mock_server(reply, reply_len, reply_len / 2,
                                               300, &port);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
@@ -2478,22 +2157,9 @@ TEST(typing_during_a_turn_does_not_corrupt_the_display) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    /* Type while the turn is genuinely in flight (mid-response, per the
-     * server-side pause above). Enter is deliberately not sent -- SUBMIT
-     * while busy is still a documented no-op as of this commit (the
-     * one-slot queue lands in a later commit), so this only exercises
-     * that the keystrokes are decoded and redrawn without corrupting the
-     * turn's own streamed output. */
     CHECK(write_interactive(master_fd, "world", 5));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
-    /* The typed text is echoed as an uninterrupted run: if the composer's
-     * erase/redraw around each reactor step failed to coordinate with the
-     * turn's own streamed writes, the two would interleave and this exact
-     * substring would not appear intact. */
     CHECK(strstr(result.output, "world") != NULL);
-    /* Nothing submitted it (no Enter), so it carries over as the next
-     * prompt's draft exactly as typed -- clear it with Ctrl+C before
-     * exiting cleanly. */
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
@@ -2542,10 +2208,6 @@ TEST(typing_during_a_turn_does_not_corrupt_the_display) {
 }
 
 TEST(typed_ctrl_c_during_a_turn_cancels_it) {
-    /* Unlike the existing sigint_cancels_* tests (an external kill(SIGINT)
-     * on the process), this sends the raw Ctrl+C byte (0x03) through the
-     * pty as a real keystroke, exercising the composer's own decoded-
-     * CTRL_C path in handle_turn_input rather than the signalfd path. */
     const char *reply_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
         "\"recovered\"}}]}\n\n"
@@ -2580,16 +2242,9 @@ TEST(typed_ctrl_c_during_a_turn_cancels_it) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
-    /* Released only now. Writing the keystroke or signal above does not
-     * mean the CLI has acted on it -- releasing then lets the response
-     * win the race and the turn completes instead of cancelling. The
-     * observed effect is the barrier. */
     slow_mock_release(&control);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
@@ -2674,39 +2329,21 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
 
-    /* First submission while busy: accepted into the one pending slot. */
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
 
-    /* /help and /status are read-only: they dispatch immediately
-     * regardless of the occupied slot, and don't themselves get queued.
-     * Checked before the refused submission below, since a refusal
-     * deliberately leaves its draft uncommitted -- typing more after it
-     * would land in the same still-open draft rather than starting fresh. */
     CHECK(write_interactive(master_fd, "/help\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "Commands:", 1));
     CHECK(write_interactive(master_fd, "/status\r", 8));
     CHECK(interactive_wait_for(master_fd, &result, "Model:", 1));
 
-    /* Second submission while the slot is still occupied: refused, not
-     * silently dropped and not overwriting the first. */
     CHECK(write_interactive(master_fd, "another\r", 8));
     CHECK(interactive_wait_for(
         master_fd, &result, "oi: a message is already queued", 1));
-        /* Everything that needed the slot occupied has now been observed. */
         slow_mock_release(&control);
 
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
-    /* "another" is still sitting in the draft (the refusal above left it
-     * uncommitted, and busy/idle share the same editor state) -- clear it
-     * before Ctrl+D, which otherwise deletes forward instead of exiting
-     * when the draft isn't empty. The turn has already finished by this
-     * point (recovered arrived), so Ctrl+C here only clears the draft,
-     * it has no turn left to cancel. */
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
@@ -2748,9 +2385,6 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
         }
         CHECK_EQ(sessions_found, 1);
 
-        /* The accepted message ("world") was durably persisted as a
-         * QUEUED_INPUT record; the refused one ("another") never reached
-         * persist_queued_input at all. */
         {
             FILE *history = fopen(history_path, "r");
             unsigned char contents[8192];
@@ -2762,16 +2396,6 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
             CHECK(history != NULL);
             len = fread(contents, 1, sizeof contents, history);
             fclose(history);
-            /* oi_sesslog's own file format is a 12-byte binary header
-             * ("OISESLOG" + a little-endian u32 version) followed by a
-             * sequence of [4-byte little-endian length][4-byte CRC-32]
-             * [JSON bytes] records -- both the header and each record's
-             * own head
-             * prefix contain embedded NUL/non-ASCII bytes, so treating the
-             * whole file as one C string (strstr from the start) stops
-             * almost immediately. Walk the length-prefixed records
-             * individually instead, each of which *is* a plain, NUL-free
-             * JSON string safe to strstr on its own. */
             CHECK(len > 12);
             CHECK_EQ(contents[8], 2);
             offset = 12;
@@ -2807,13 +2431,6 @@ TEST(busy_submit_is_queued_and_a_second_one_is_refused) {
     }
 }
 
-/*
- * Loads oi_sesslog's length-prefixed records (see the file-format comment
- * in busy_submit_is_queued_and_a_second_one_is_refused above) as an array
- * of NUL-terminated JSON strings, one per record -- for tests that need to
- * check more than one record's presence, or the relative order/turn_ids
- * between several of them.
- */
 struct oilog_records {
     char **items;
     size_t count;
@@ -2850,7 +2467,7 @@ static void oilog_records_load(const char *path, struct oilog_records *out) {
             ((uint32_t)contents[offset + 3] << 24);
         char *record;
 
-        offset += 8; /* length and CRC-32 */
+        offset += 8;
         CHECK(offset + record_len <= len);
         record = malloc(record_len + 1);
         CHECK(record != NULL);
@@ -2877,8 +2494,6 @@ static void oilog_records_free(struct oilog_records *records) {
     free(records->items);
 }
 
-/* Finds the first record at or after start_index containing every needle;
- * returns its index, or SIZE_MAX if none match. */
 static size_t oilog_find(const struct oilog_records *records,
                          size_t start_index, const char *const *needles,
                          size_t needle_count) {
@@ -2899,8 +2514,6 @@ static size_t oilog_find(const struct oilog_records *records,
     return SIZE_MAX;
 }
 
-/* Every history record's turn_id is written as a JSON string, e.g.
- * "turn_id":"2" -- extracts its numeric value. */
 static uint64_t oilog_record_turn_id(const char *record) {
     const char *marker = strstr(record, "\"turn_id\":\"");
 
@@ -2908,9 +2521,6 @@ static uint64_t oilog_record_turn_id(const char *record) {
     return (uint64_t)strtoull(marker + strlen("\"turn_id\":\""), NULL, 10);
 }
 
-/* Counts every record containing all of the given needles -- used where
- * oilog_find's "first match" isn't enough, e.g. asserting a crash-recovery
- * pass ran exactly once, not zero or twice. */
 static size_t oilog_count(const struct oilog_records *records,
                           const char *const *needles, size_t needle_count) {
     size_t count = 0;
@@ -2958,10 +2568,6 @@ TEST(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids) {
     struct interactive_result result;
     char session_root[128];
 
-    /* The first turn's 2s delay keeps it reliably busy long enough to
-     * submit "world" while it's still in flight; the second turn (no
-     * delay) is the queued message's own resumed turn, run automatically
-     * once the first reaches its safe boundary. */
     turns[0].response = first_reply;
     turns[0].response_len = first_len;
     turns[0].hold = 1;
@@ -2980,18 +2586,12 @@ TEST(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids) {
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
 
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
-    /* Queued while busy; the turn may now complete and drain it. */
     slow_mock_release(&control);
 
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
-    /* The queued message runs immediately once the first turn finishes,
-     * with no further input from us. */
     CHECK(interactive_wait_for(master_fd, &result, "secondreply", 1));
 
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -3066,9 +2666,6 @@ TEST(queued_message_resumes_at_the_safe_boundary_with_correct_turn_ids) {
             oilog_find(&records, resolved_index + 1, resumed_needles, 3);
         CHECK(resumed_index != SIZE_MAX);
 
-        /* The core correctness property: the queued item, the record that
-         * resolves it, and the turn it becomes must all share one turn_id,
-         * distinct from (and later than) the first turn's. */
         hello_turn_id = oilog_record_turn_id(records.items[hello_index]);
         queued_turn_id = oilog_record_turn_id(records.items[queued_index]);
         CHECK(queued_turn_id > hello_turn_id);
@@ -3119,22 +2716,12 @@ TEST(queued_command_while_busy_resolves_discarded_and_dispatches_live) {
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
 
-    /* /model is not read-only (unlike /help and /status): it queues like
-     * any plain message while busy, per the schema-forced rule that a
-     * queued command can only ever resolve DISCARDED, then dispatch live. */
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "/model gpt-test\r", 17));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
-    /* Queued while busy; the turn may now complete and drain it. */
     slow_mock_release(&control);
 
     CHECK(interactive_wait_for(master_fd, &result, "recovered", 1));
-    /* Once the turn reaches its safe boundary, the queued command
-     * dispatches live -- its own confirmation text proves this ran through
-     * dispatch_model, not as a new conversation turn. */
     CHECK(interactive_wait_for(master_fd, &result, "Model: gpt-test", 1));
 
     CHECK(write_interactive(master_fd, "/status\r", 8));
@@ -3224,8 +2811,6 @@ TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
     struct interactive_result result;
     char session_root[128];
 
-    /* A generous delay: Ctrl+C only needs to land while the turn is
-     * genuinely still in flight, not for the full delay to elapse. */
     turns[0].response = reply;
     turns[0].response_len = reply_len;
     turns[0].hold = 1;
@@ -3241,39 +2826,17 @@ TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
 
-    /* The composer only redraws once per reactor step, after any decoded
-     * SUBMIT has already been handled -- since handle_busy_submit commits
-     * and clears the draft before that redraw fires, "world" is never
-     * actually echoed while being typed here (the whole "world\r" is
-     * decoded and submitted within a single step). It only appears once
-     * it's restored below. */
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
 
-    /* Ctrl+C cancels the turn AND discards the queued item -- restoring it
-     * as a live, editable draft rather than either silently running it or
-     * dropping it. */
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(interactive_wait_for(
         master_fd, &result, "oi: queued input discarded", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
-    /* Released only now. Writing the keystroke or signal above does not
-     * mean the CLI has acted on it -- releasing then lets the response
-     * win the race and the turn completes instead of cancelling. The
-     * observed effect is the barrier. */
     slow_mock_release(&control);
-    /* "world" is echoed here for the only time in this whole session, as
-     * the restored draft is redrawn -- proving it came back rather than
-     * being dropped. */
     CHECK(interactive_wait_for(master_fd, &result, "world", 1));
 
-    /* The restored draft is a normal, still-open line: clear it (Ctrl+C is
-     * safe now, no turn left to cancel) before Ctrl+D, which otherwise
-     * deletes forward instead of exiting when the draft isn't empty. */
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
@@ -3336,8 +2899,6 @@ TEST(ctrl_c_with_a_pending_item_discards_it_and_restores_the_draft) {
         CHECK_EQ(oilog_record_turn_id(records.items[queued_index]),
                  oilog_record_turn_id(records.items[resolved_index]));
 
-        /* The discarded item must never actually run as a real turn -- no
-         * matching user message record should exist anywhere in the log. */
         resumed_index = oilog_find(&records, 0, resumed_needles, 3);
         CHECK(resumed_index == SIZE_MAX);
 
@@ -3376,8 +2937,6 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
              session_name);
     unlink(log_path);
 
-    /* First "life": queue something, then simulate a hard crash (SIGKILL,
-     * no graceful shutdown at all) while it's still sitting unresolved. */
     turns[0].response = reply;
     turns[0].response_len = reply_len;
     turns[0].hold = 1;
@@ -3391,15 +2950,11 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
 
     CHECK_EQ(kill(cli, SIGKILL), 0);
-    /* The CLI is gone; release so the server loop can finish. */
     slow_mock_release(&control);
     waitpid(cli, NULL, 0);
     close(master_fd);
@@ -3407,10 +2962,6 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
     slow_mock_server_terminate(server);
     free(reply);
 
-    /* Second "life": same session, fresh process -- the crash-recovery
-     * window must be closed durably and the queued text handed back as a
-     * plain, editable startup draft, never auto-run. No mock server is
-     * needed: nothing here ever submits a message. */
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     cli = start_interactive_cli_with_session(1, slave_fd, session_dir,
@@ -3420,9 +2971,6 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(interactive_wait_for(master_fd, &result, "world", 1));
 
-    /* Clear the restored draft (Ctrl+C is safe here -- no turn is active)
-     * before Ctrl+D, which otherwise deletes forward rather than exiting
-     * when the draft isn't empty. */
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
@@ -3454,9 +3002,6 @@ TEST(crash_with_a_pending_item_restores_it_as_a_startup_draft) {
         oilog_records_free(&records);
     }
 
-    /* Third "life": restart again immediately. The crash window is already
-     * closed (has_pending_input is now false), so this must not seed a
-     * draft again or append a second resolution record -- no duplication. */
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     cli = start_interactive_cli_with_session(1, slave_fd, session_dir,
@@ -3533,7 +3078,6 @@ TEST(permission_ask_allow_once_lets_the_tool_run) {
     CHECK(interactive_wait_for(master_fd, &result, "Allow once", 1));
     CHECK(interactive_wait_for(master_fd, &result, "Deny", 1));
 
-    /* Digit shortcut '1' -> "Allow once"; the default is Deny. */
     CHECK(write_interactive(master_fd, "1", 1));
     CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
 
@@ -3594,8 +3138,6 @@ TEST(permission_ask_shows_the_full_decoded_command_and_enter_denies) {
 
     memset(padding, 'x', sizeof padding - 1);
     padding[sizeof padding - 1] = '\0';
-    /* Two JSON layers: the SSE string holds the arguments JSON, whose
-     * command holds the A escape. */
     snprintf(tool_sse, sizeof tool_sse,
              "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
              "\"index\":0,\"id\":\"call_long\",\"type\":\"function\","
@@ -3625,10 +3167,8 @@ TEST(permission_ask_shows_the_full_decoded_command_and_enter_denies) {
     CHECK(strstr(result.output, expected) != NULL);
     CHECK(strstr(result.output, "\\u0041") == NULL);
 
-    /* Enter on a fresh prompt confirms the default, which is Deny. */
     CHECK(write_interactive(master_fd, "\r", 1));
     CHECK(interactive_wait_for(master_fd, &result, "shell: denied", 1));
-    /* Only the approval request shows it: the command never ran. */
     CHECK_EQ(count_text(result.output, "ABC"), 1);
 
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -3670,8 +3210,6 @@ TEST(permission_ask_deny_ends_the_turn) {
     CHECK(write_interactive(master_fd, "run it\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
 
-    /* Digit shortcut: '3' jumps directly to and confirms the third option
-     * (Deny) without needing arrow keys. */
     CHECK(write_interactive(master_fd, "3", 1));
     CHECK(interactive_wait_for(master_fd, &result, "shell: denied", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
@@ -3736,15 +3274,12 @@ TEST(permission_ask_allow_for_process_elevates_policy) {
     CHECK(write_interactive(master_fd, "run it\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
 
-    /* Digit shortcut '2' -> "Allow for process". */
     CHECK(write_interactive(master_fd, "2", 1));
     CHECK(interactive_wait_for(
         master_fd, &result,
         "oi: tool policy set to allow for the rest of this process", 1));
     CHECK(interactive_wait_for(master_fd, &result, "first done", 1));
 
-    /* A second tool call in a later turn must not prompt again -- the
-     * process-wide policy is now allow. */
     CHECK(write_interactive(master_fd, "run it again\r", 13));
     CHECK(interactive_wait_for(master_fd, &result, "second done", 1));
     CHECK_EQ(count_text(result.output, "Tool: shell"), 1);
@@ -3786,8 +3321,6 @@ TEST(permission_ask_ctrl_c_while_awaiting_denies_without_hanging) {
     CHECK(write_interactive(master_fd, "run it\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
 
-    /* Dismissing the selector via Ctrl+C must resolve as a deny, not hang
-     * waiting for a decision that will never come. */
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
                                1));
@@ -3840,9 +3373,6 @@ TEST(permission_ask_resize_redraws_the_selector) {
     CHECK(write_interactive(master_fd, "run it\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
 
-    /* A fresh "\x1b[J" appearing with no further keystroke proves the
-     * redraw was driven by the resize signal, not by typing -- same
-     * technique as the composer-level resize test. */
     result.output_len = 0;
     resized.ws_row = 24;
     resized.ws_col = 100;
@@ -3899,18 +3429,10 @@ TEST(permission_ask_typing_does_not_leak_into_the_draft) {
     CHECK(write_interactive(master_fd, "run it\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
 
-    /* Plain letters are not digit shortcuts -- they must have no visible
-     * effect on the selector and must never reach the editor. */
     CHECK(write_interactive(master_fd, "xyz", 3));
-    /* Confirms at the default selection ("Deny"): if any of "xyz" had
-     * leaked into the editor instead, this "\r" would submit garbage as a
-     * new message rather than confirming the selector. */
     CHECK(write_interactive(master_fd, "\r", 1));
     CHECK(interactive_wait_for(master_fd, &result, "shell: denied", 1));
 
-    /* Back at an idle prompt: if "xyz" had leaked into the draft, Ctrl+D
-     * would delete forward instead of exiting (same technique used
-     * elsewhere in this file to prove a draft is empty). */
     CHECK(write_interactive(master_fd, "\x04", 1));
     {
         int status = 0;
@@ -3942,13 +3464,10 @@ TEST(permissions_allow_requires_confirmation_and_can_be_cancelled) {
                                "Cancel (keep current policy)", 1));
     CHECK(interactive_wait_for(master_fd, &result, "Allow all tools", 1));
 
-    /* Confirms at the default selection (index 0, "Cancel"). */
     CHECK(write_interactive(master_fd, "\r", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: permissions unchanged",
                                1));
 
-    /* Policy is genuinely unchanged -- still `ask`, not silently
-     * elevated. */
     CHECK(write_interactive(master_fd, "/status\r", 8));
     CHECK(interactive_wait_for(master_fd, &result, "Permissions: ask", 1));
 
@@ -3962,7 +3481,6 @@ TEST(permissions_allow_requires_confirmation_and_can_be_cancelled) {
     close(master_fd);
 }
 
-/* Sends one GET to the OAuth loopback listener; copies the reply. */
 static int send_oauth_callback(const char *query, char *reply,
                                size_t reply_size) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -3998,12 +3516,6 @@ static int send_oauth_callback(const char *query, char *reply,
     return used > 0;
 }
 
-/* --- a renewal on the reactor, with a turn that does not wait for it --- */
-
-/* Serves each connection in its own process: the token endpoint answers
- * with a new token after `token_delay_ms`; /v1/responses answers after
- * 300 ms with "ok". Each request appends "<path> <Authorization value>"
- * to `log_path`. */
 static pid_t start_renewal_mock(unsigned short *out_port,
                                 const char *log_path, int token_delay_ms) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -4026,7 +3538,7 @@ static pid_t start_renewal_mock(unsigned short *out_port,
         close(listen_fd);
         return server;
     }
-    signal(SIGCHLD, SIG_IGN); /* handlers are reaped by the kernel */
+    signal(SIGCHLD, SIG_IGN);
     for (;;) {
         int cfd = accept(listen_fd, NULL, NULL);
         if (cfd < 0) {
@@ -4109,7 +3621,6 @@ TEST(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it) {
     snprintf(log_path, sizeof log_path, "%s/requests.log", config_root);
     pid_t server = start_renewal_mock(&port, log_path, 0);
     snprintf(base, sizeof base, "http://127.0.0.1:%u", (unsigned)port);
-    /* Inside the 300 s renewal margin, but still usable for this turn. */
     int credentials_len = snprintf(
         credentials, sizeof credentials,
         "{\"version\":1,\"active\":\"openai\",\"openai\":{"
@@ -4154,8 +3665,6 @@ TEST(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it) {
         CHECK(n > 0);
         log[n > 0 ? n : 0] = '\0';
     }
-    /* Run 1 renewed beside its turn, which kept the old token; run 2 read
-     * the renewed token from the file and did not renew again. */
     CHECK_EQ(count_text(log, "/api/accounts/oauth/token"), (size_t)1);
     CHECK_EQ(count_text(log, "/v1/responses old\n"), (size_t)1);
     CHECK_EQ(count_text(log, "/v1/responses fresh\n"), (size_t)1);
@@ -4178,11 +3687,6 @@ TEST(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it) {
     rmdir(config_root);
 }
 
-/* The token server rotates the refresh token when it gets the request, and
- * answers only after the turn has ended. The renewal must survive the turn
- * end and save the rotated token, or the next renewal would send a refresh
- * token that the server has already used. It must also finish while the
- * prompt is idle, and so release the credentials lock. */
 TEST(sent_renewal_survives_the_turn_end_and_finishes_while_idle) {
     char config_root[] = "/tmp/oi-cli-renewal-lock-XXXXXX";
     char session_root[128];
@@ -4244,11 +3748,7 @@ TEST(sent_renewal_survives_the_turn_end_and_finishes_while_idle) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    /* The turn used the old token and ended; the prompt is back. */
     CHECK(interactive_wait_for(master_fd, &result, "ok\n\r\x1b[J> ", 1));
-    /* The prompt stays idle. The idle wait runs the reactor, so the
-     * renewal finishes on its own: within 3 s after the server answers,
-     * the rotated token is saved and the lock is free. */
     {
         int saved_rotated = 0;
         int lock_free = 0;
@@ -4315,9 +3815,6 @@ TEST(sent_renewal_survives_the_turn_end_and_finishes_while_idle) {
     rmdir(config_root);
 }
 
-/* A sent token renewal waits 10 s for its answer, at the exit or at
- * /login. The wait is reported, Ctrl+C ends it in under 1 s, and the
- * credentials file keeps the tokens it had. */
 static void ctrl_c_ends_the_renewal_wait(int at_login) {
     char config_root[] = "/tmp/oi-cli-renewal-exit-XXXXXX";
     char session_root[128];
@@ -4445,8 +3942,6 @@ TEST(login_wait_for_a_token_renewal_is_reported_and_ctrl_c_ends_it) {
     ctrl_c_ends_the_renewal_wait(1);
 }
 
-/* A token renewal waits for a server that accepts and never answers. The
- * turn that needs the renewal must still cancel at once on Ctrl+C. */
 TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
     char config_root[] = "/tmp/oi-cli-renewal-XXXXXX";
     char session_root[128];
@@ -4461,8 +3956,6 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
         "\"access_token\":\"expired\",\"refresh_token\":\"refresh\","
         "\"expires_at\":1,\"welcome_shown\":true}}";
 
-    /* The listener never calls accept(): the kernel completes the TCP
-     * handshake from its backlog, and no byte ever comes back. */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
@@ -4503,7 +3996,6 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
         setenv("OI_CHATGPT_TEST_BASE", base, 1);
         setenv("XDG_CONFIG_HOME", config_root, 1);
         unsetenv("OI_API_KEY");
-        /* No endpoint flag: saved credentials apply to the default one. */
         char *argv[] = {(char *)OI_BIN, (char *)"--deny-tools",
                         (char *)"--session-dir", session_root, NULL};
         execv(OI_BIN, argv);
@@ -4514,7 +4006,6 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    /* Give the turn time to reach the renewal wait. */
     struct timespec pause = {0, 300 * 1000 * 1000};
     nanosleep(&pause, NULL);
 
@@ -4526,7 +4017,6 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
     clock_gettime(CLOCK_MONOTONIC, &after);
     double waited = (double)(after.tv_sec - before.tv_sec) +
                     (double)(after.tv_nsec - before.tv_nsec) / 1e9;
-    /* The renewal itself can take 20 s to time out. */
     CHECK(waited < 5.0);
 
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -4537,7 +4027,6 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
     }
     CHECK_EQ(result.exit_code, 0);
 
-    /* The unfinished renewal changed nothing on disk. */
     {
         char saved[1024];
         int fd = open(path, O_RDONLY);
@@ -4575,7 +4064,6 @@ TEST(oauth_callback_with_a_wrong_state_does_not_end_the_login) {
              "/tmp/oi-cli-oauth-state-sessions-%d", (int)getpid());
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
-    /* The loopback test base also stops oi from opening a browser. */
     setenv("OI_CHATGPT_TEST_BASE", "http://127.0.0.1:9", 1);
     setenv("XDG_CONFIG_HOME", config_root, 1);
     cli = start_interactive_cli(9, slave_fd, session_root);
@@ -4613,8 +4101,6 @@ TEST(oauth_callback_with_a_wrong_state_does_not_end_the_login) {
     CHECK(send_oauth_callback("code=x", reply, sizeof reply));
     CHECK(strstr(reply, "400 Bad Request") != NULL);
 
-    /* A client that sends nothing must not stop the keyboard: Esc during
-     * its read cancels the login. */
     {
         struct sockaddr_in addr;
         int silent = socket(AF_INET, SOCK_STREAM, 0);
@@ -4632,7 +4118,6 @@ TEST(oauth_callback_with_a_wrong_state_does_not_end_the_login) {
     }
     CHECK(strstr(result.output, "did not match") == NULL);
 
-    /* A second attempt gets a new state; the first one is now wrong. */
     {
         size_t waits =
             count_text(result.output, "Waiting for the browser sign-in");
@@ -4723,12 +4208,9 @@ TEST(permissions_allow_confirmed_elevates_policy) {
     CHECK(write_interactive(master_fd, "/permissions allow\r", 20));
     CHECK(interactive_wait_for(master_fd, &result, "Allow all tools", 1));
 
-    /* Digit shortcut '2' -> the second option, "Allow...". */
     CHECK(write_interactive(master_fd, "2", 1));
     CHECK(interactive_wait_for(master_fd, &result, "Permissions: allow", 1));
 
-    /* A subsequent tool call must run immediately -- no selector, no
-     * further prompt. */
     CHECK(write_interactive(master_fd, "run it\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
     CHECK(strstr(result.output, "Tool: shell") == NULL);
@@ -4760,7 +4242,6 @@ TEST(permissions_allow_when_already_allowed_skips_confirmation) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "/permissions allow\r", 20));
-    /* Dispatches immediately: no confirm selector at all. */
     CHECK(interactive_wait_for(master_fd, &result, "Permissions: allow", 1));
     CHECK(strstr(result.output, "Cancel (keep current policy)") == NULL);
 
@@ -4869,8 +4350,6 @@ TEST(tool_panel_survives_malicious_escape_bytes_in_output) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    /* The tool prints raw CSI-colored "red" -- sanitized down to plain
-     * text by the panel; the process must not hang or crash regardless. */
     CHECK(interactive_wait_for(master_fd, &result, "red", 1));
     CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
 
@@ -4913,11 +4392,6 @@ TEST(tool_panel_coexists_with_resize_and_queued_input) {
     struct winsize resized = {0};
     char session_root[128];
 
-    /* Only 2 mock turns: queuing "queue this" sets steering immediately,
-     * which (per issue #25's own design) also blocks the follow-up model
-     * round that would otherwise reply to the tool's result -- once the
-     * tool finishes, this turn ends right away with no assistant reply of
-     * its own, and the queued message resumes as its own fresh turn. */
     server = start_mock_server_turns(responses, lengths, 2, &port);
     free(tool_response);
     free(answer_response);
@@ -4932,24 +4406,15 @@ TEST(tool_panel_coexists_with_resize_and_queued_input) {
     CHECK(write_interactive(master_fd, "run it\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "shell: running", 1));
 
-    /* Resize while the tool panel is showing: must redraw cleanly, not
-     * crash or corrupt the display. */
     result.output_len = 0;
     resized.ws_row = 24;
     resized.ws_col = 100;
     CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &resized), 0);
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[J", 1));
 
-    /* Queue a message while the tool is still running. */
     CHECK(write_interactive(master_fd, "queue this\r", 11));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
 
-    /* The tool finishing and steering ending the turn both happen within
-     * the same reactor step, so the turn loop's own "don't redraw once
-     * present.done is true" rule (needed to avoid corrupting a final
-     * streamed reply) means the panel's "completed" frame is never drawn
-     * here -- only its earlier "running" state was. The queued message
-     * resumes automatically at the safe boundary regardless. */
     CHECK(interactive_wait_for(master_fd, &result, "second done", 1));
 
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -4981,9 +4446,6 @@ TEST(sigterm_during_a_turn_terminates_cleanly) {
     struct interactive_result result;
     char session_root[128];
 
-    /* A generous delay: the turn only needs to still be in flight by the
-     * time SIGTERM is sent below, not for the full delay to elapse -- the
-     * mock server is killed once the test is done with it regardless. */
     turns[0].response = reply;
     turns[0].response_len = reply_len;
     turns[0].hold = 1;
@@ -4997,27 +4459,13 @@ TEST(sigterm_during_a_turn_terminates_cleanly) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    /* Wait for "\r\n" (render_finish) before signalling, matching the
-     * SIGINT tests above: it proves oi_cli_composer_wait_submit has
-     * already returned and cli_repl.c's own turn setup (including
-     * registering signal_fd on the reactor) has already run, so the
-     * signal is guaranteed to be handled by the turn-time reactor
-     * callback rather than raced against the idle-prompt's own signal
-     * draining. */
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     CHECK_EQ(kill(cli, SIGTERM), 0);
 
     {
         int status = 0;
         CHECK_EQ(waitpid(cli, &status, 0), cli);
-        /* Released only now. Writing the keystroke or signal above does not
-         * mean the CLI has acted on it -- releasing then lets the response
-         * win the race and the turn completes instead of cancelling. The
-         * observed effect is the barrier. */
         slow_mock_release(&control);
         result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     }
@@ -5076,8 +4524,6 @@ TEST(interactive_cwd_command_changes_the_process_directory) {
     snprintf(target_dir, sizeof target_dir, "/tmp/oi-cli-cwd-target-%d",
              (int)getpid());
     CHECK_EQ(mkdir(target_dir, 0700), 0);
-    /* /cwd and /status never submit a model message, so this server is
-     * never actually queried -- a harmless placeholder response. */
     server = start_mock_server("data: [DONE]\n\n", 14, &port);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
@@ -5090,19 +4536,10 @@ TEST(interactive_cwd_command_changes_the_process_directory) {
     snprintf(cwd_command, sizeof cwd_command, "/cwd %s\r", target_dir);
     CHECK(write_interactive(master_fd, cwd_command, strlen(cwd_command)));
     CHECK(interactive_wait_for(master_fd, &result, "CWD:", 1));
-    /* Raw mode now spans the whole session (only one tcsetattr(TCSAFLUSH)
-     * call ever, at startup), so there is no more per-command discard
-     * race here: the next line can be written as soon as the confirmation
-     * is seen. */
     CHECK(write_interactive(master_fd, "/status\r", 8));
     {
         char expected[192];
         snprintf(expected, sizeof expected, "CWD: %s", target_dir);
-        /* The /cwd confirmation above already printed this exact text once;
-         * /status's own CWD line is the second occurrence. Waiting for
-         * count 1 here would be satisfied instantly without draining the
-         * PTY, leaving /status's real response unread and deadlocking the
-         * child once its output fills the PTY buffer. */
         CHECK(interactive_wait_for(master_fd, &result, expected, 2));
     }
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -5117,8 +4554,6 @@ TEST(interactive_cwd_command_changes_the_process_directory) {
     kill(server, SIGTERM);
     waitpid(server, NULL, 0);
 
-    /* No session was ever created: /cwd alone doesn't submit a model
-     * message, matching interactive_exit_before_submission_creates_no_session. */
     {
         DIR *directory = opendir(session_root);
         struct dirent *entry;
@@ -5139,15 +4574,9 @@ TEST(interactive_cwd_command_changes_the_process_directory) {
     rmdir(target_dir);
 }
 
-/*
- * A distinctive sentinel, so "the key never reached the terminal" is a real
- * assertion rather than a coincidence about a plausible substring.
- */
 static const char status_sentinel_api_key[] =
     "sk-oi-status-sentinel-MUST-NOT-BE-PRINTED";
 
-/* Removes whichever sessions a /status test left behind, without the test
- * needing to learn the generated id. */
 static void remove_sessions_under(const char *root) {
     DIR *directory = opendir(root);
     struct dirent *entry;
@@ -5177,10 +4606,6 @@ static void remove_sessions_under(const char *root) {
     rmdir(root);
 }
 
-/*
- * The pre-session report: every contracted field is present, the endpoint is
- * the one actually configured, and the API key is nowhere in the output.
- */
 TEST(status_reports_every_field_before_a_session_exists) {
     unsigned short port;
     pid_t server;
@@ -5191,7 +4616,6 @@ TEST(status_reports_every_field_before_a_session_exists) {
     char session_root[128];
     char expected_endpoint[64];
 
-    /* Never queried: /status submits no model message. */
     server = start_mock_server("data: [DONE]\n\n", 14, &port);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
@@ -5205,11 +4629,6 @@ TEST(status_reports_every_field_before_a_session_exists) {
     CHECK(write_interactive(master_fd, "/status\r", 8));
     CHECK(interactive_wait_for(master_fd, &result, "Context: not compacted",
                                1));
-    /* A process-scoped permission change is reflected immediately: the
-     * snapshot reads the live policy rather than one captured at startup.
-     * "ask" needs no confirmation, unlike an elevation to "allow". Waiting
-     * for the second report's last line drains it completely, so the count
-     * below sees both /permissions' own echo and the report's line. */
     CHECK(write_interactive(master_fd, "/permissions ask\r", 17));
     CHECK(interactive_wait_for(master_fd, &result, "Permissions: ask", 1));
     CHECK(write_interactive(master_fd, "/status\r", 8));
@@ -5228,8 +4647,6 @@ TEST(status_reports_every_field_before_a_session_exists) {
     kill(server, SIGTERM);
     waitpid(server, NULL, 0);
 
-    /* An automatic session is created lazily on the first message, so
-     * nothing durable exists yet and /status must say exactly that. */
     CHECK(strstr(result.output, "Session: (not created)") != NULL);
     CHECK(strstr(result.output, "Model: ") != NULL);
     snprintf(expected_endpoint, sizeof expected_endpoint,
@@ -5245,7 +4662,6 @@ TEST(status_reports_every_field_before_a_session_exists) {
     CHECK(strstr(result.output, "Checkpoint: none") != NULL);
     CHECK(strstr(result.output, "Context: not compacted") != NULL);
 
-    /* No secret, and none of the header shapes one would arrive in. */
     CHECK(strstr(result.output, status_sentinel_api_key) == NULL);
     CHECK(strstr(result.output, "sk-oi-status-sentinel") == NULL);
     CHECK(strstr(result.output, "Authorization") == NULL);
@@ -5254,11 +4670,6 @@ TEST(status_reports_every_field_before_a_session_exists) {
     remove_sessions_under(session_root);
 }
 
-/*
- * The mid-turn report, which is the whole point of /status being read-only:
- * it must answer while the model is streaming, must see a queued message,
- * and must not itself take the single pending slot.
- */
 TEST(status_reports_streaming_and_queue_state_during_a_turn) {
     const char *first_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
@@ -5301,29 +4712,15 @@ TEST(status_reports_streaming_and_queue_state_during_a_turn) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    /* The request is genuinely on the wire, not merely rendered, so the
-     * conversation really is streaming when /status answers below. */
     slow_mock_wait_accepted(&control, 1);
 
     CHECK(write_interactive(master_fd, "/status\r", 8));
-    /*
-     * Waits for the report's *last* line before inspecting earlier ones. A
-     * needle in the middle only proves the bytes up to it arrived, so
-     * asserting on a later field right after it is a race that a slower
-     * build (a sanitizer run, a loaded machine) genuinely loses.
-     */
     CHECK(interactive_wait_for(master_fd, &result, "Context: not compacted",
                                1));
     CHECK(strstr(result.output, "Conversation: model streaming") != NULL);
     CHECK(strstr(result.output, "Queue: empty") != NULL);
-    /* The session now exists: it was created by the submission above, and
-     * the report tracked that change. */
     CHECK(strstr(result.output, "Session: (not created)") == NULL);
 
-    /* Queue a message, then ask again: the queue line changes, the slot is
-     * still held by "world" rather than by /status, and the turn reports
-     * that it is steering to a safe boundary. Waited for as one whole line,
-     * for the same reason. */
     CHECK(write_interactive(master_fd, "world\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
     CHECK(write_interactive(master_fd, "/status\r", 8));
@@ -5332,7 +4729,6 @@ TEST(status_reports_streaming_and_queue_state_during_a_turn) {
                                "to a safe boundary)",
                                1));
 
-    /* Still refused, which proves /status never occupied the slot. */
     CHECK(write_interactive(master_fd, "another\r", 8));
     CHECK(interactive_wait_for(master_fd, &result,
                                "oi: a message is already queued", 1));
@@ -5340,8 +4736,6 @@ TEST(status_reports_streaming_and_queue_state_during_a_turn) {
 
     CHECK(interactive_wait_for(master_fd, &result, "first reply", 1));
     CHECK(interactive_wait_for(master_fd, &result, "second reply", 1));
-    /* "another" was refused, so its text is still an uncommitted draft;
-     * clear it before Ctrl+D, which would otherwise delete forward. */
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
 
@@ -5357,8 +4751,6 @@ TEST(status_reports_streaming_and_queue_state_during_a_turn) {
     free(first);
     free(second);
 
-    /* Neither queued message's text was echoed by a queue line. The queue
-     * report is a kind and a byte count by design. */
     CHECK(strstr(result.output, "queued (5 bytes)") != NULL);
     CHECK(strstr(result.output, "queued: world") == NULL);
     CHECK(strstr(result.output, status_sentinel_api_key) == NULL);
@@ -5366,13 +4758,6 @@ TEST(status_reports_streaming_and_queue_state_during_a_turn) {
     remove_sessions_under(session_root);
 }
 
-/*
- * A tool is a distinct in-flight kind, and the report has to name it rather
- * than collapse it into "streaming". Cancelling it then returns the report to
- * idle: a user cancel is a fully-recovered outcome, so calling the prompt
- * "failed" afterwards -- which the cancel's own OI_ERR_CLOSED would suggest
- * -- would describe a working REPL as broken.
- */
 TEST(status_reports_a_running_tool_then_returns_to_idle_after_a_cancel) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
@@ -5412,31 +4797,18 @@ TEST(status_reports_a_running_tool_then_returns_to_idle_after_a_cancel) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    /*
-     * "running tool shell" is written from the synchronous TOOL_STARTING
-     * callback, and the REPL installs conversation->tool the moment that
-     * callback returns -- both inside one reactor step, before any terminal
-     * input can be read again. So seeing that line is already the barrier:
-     * no sleep is needed to know the tool is installed by the time /status
-     * below is processed.
-     */
     CHECK(interactive_wait_for(master_fd, &result, "running tool shell", 1));
     CHECK(write_interactive(master_fd, "/status\r", 8));
     CHECK(interactive_wait_for(master_fd, &result, "Conversation: tool "
                                                   "running",
                                1));
 
-    /* Cancel the running tool, then ask again. The report above already
-     * proved the tool is installed, so this cancel needs no timing window
-     * of its own either. */
     CHECK_EQ(kill(cli, SIGINT), 0);
     CHECK(interactive_wait_for(master_fd, &result, "oi: cancelled", 1));
     CHECK(write_interactive(master_fd, "/status\r", 8));
     CHECK(interactive_wait_for(master_fd, &result, "Conversation: idle", 1));
     CHECK(strstr(result.output, "Conversation: failed") == NULL);
 
-    /* Consume the second prepared response so the mock server exits having
-     * served every turn it was given. */
     CHECK(write_interactive(master_fd, "and again\r", 10));
     CHECK(interactive_wait_for(master_fd, &result, "done here", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -5452,13 +4824,7 @@ TEST(status_reports_a_running_tool_then_returns_to_idle_after_a_cancel) {
     remove_sessions_under(session_root);
 }
 
-/*
- * A failed turn stays visible in the report after the prompt comes back, and
- * a /model change is reflected in both the name and its provenance.
- */
 TEST(status_reports_a_failed_turn_and_a_model_change) {
-    /* --deny-tools refuses this call: a real turn failure (OI_ERR_DENIED)
-     * that still returns to a working prompt. */
     const char *denied_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_denied\",\"type\":\"function\","
@@ -5495,8 +4861,6 @@ TEST(status_reports_a_failed_turn_and_a_model_change) {
     CHECK(write_interactive(master_fd, "/status\r", 8));
     CHECK(interactive_wait_for(master_fd, &result, "Conversation: failed", 1));
 
-    /* /model changes both the active name and where /status says it came
-     * from -- a restored or default value must not keep being claimed. */
     CHECK(write_interactive(master_fd, "/model status-model\r", 20));
     CHECK(interactive_wait_for(master_fd, &result, "Model: status-model", 1));
     CHECK(write_interactive(master_fd, "/status\r", 8));
@@ -5530,7 +4894,6 @@ TEST(model_override_persists_across_a_restart) {
              session_name);
     unlink(log_path);
 
-    /* Run 1: create the session with the default model. */
     {
         size_t total;
         char *response =
@@ -5561,7 +4924,6 @@ TEST(model_override_persists_across_a_restart) {
         waitpid(child, NULL, 0);
     }
 
-    /* Run 2: pass --model explicitly; the override must win and persist. */
     {
         size_t total;
         char *response =
@@ -5594,7 +4956,6 @@ TEST(model_override_persists_across_a_restart) {
         waitpid(child, NULL, 0);
     }
 
-    /* Run 3: no --model given; the overridden value must still apply. */
     {
         size_t total;
         char *response =
@@ -5659,9 +5020,6 @@ TEST(model_override_persists_across_a_restart) {
     }
 }
 
-/* Every history record's record_id (and the checkpoint-specific
- * source_first_record_id/source_last_record_id) are written as JSON
- * strings, e.g. "record_id":"3" -- extracts one's numeric value. */
 static uint64_t oilog_record_u64_field(const char *record, const char *key) {
     char needle[64];
     const char *marker;
@@ -5672,11 +5030,6 @@ static uint64_t oilog_record_u64_field(const char *record, const char *key) {
     return (uint64_t)strtoull(marker + strlen(needle), NULL, 10);
 }
 
-/* Isolates the last captured HTTP request in a multi-turn capture file
- * (start_mock_server_turns_capture appends every turn's raw request bytes
- * back-to-back with no delimiter) by finding the last occurrence of the
- * request line every chat-completion request starts with. `buffer` must
- * outlive the returned pointer, which points into it. */
 static const char *last_request_text(const char *capture_path, char *buffer,
                                      size_t buffer_len) {
     static const char needle[] = "POST /v1/chat/completions";
@@ -5792,9 +5145,6 @@ TEST(compact_replaces_older_turns_with_a_checkpoint) {
     CHECK(interactive_wait_for(
         master_fd, &result, "oi: compacted 1 turn into a checkpoint", 1));
 
-    /* The report tracks the compaction: a durable checkpoint with its own
-     * source range, and an active context that now starts from a summary.
-     * The exact range is cross-checked against the log below. */
     CHECK(write_interactive(master_fd, "/status\r", 8));
     CHECK(interactive_wait_for(master_fd, &result, "Context: compacted", 1));
     CHECK(strstr(result.output, "Checkpoint: records ") != NULL);
@@ -5850,9 +5200,6 @@ TEST(compact_replaces_older_turns_with_a_checkpoint) {
                                         "source_last_record_id"),
                  oilog_record_u64_field(records.items[assistant1_index],
                                         "record_id"));
-        /* /status reported that same range, read back off the replay state
-         * rather than recomputed -- so the report and the durable record
-         * cannot disagree. */
         {
             char expected[64];
             snprintf(expected, sizeof expected,
@@ -5898,17 +5245,14 @@ TEST(compact_reports_usage_error_and_nothing_to_compact) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
 
-    /* No conversation exists yet. */
     CHECK(write_interactive(master_fd, "/compact\r", 9));
     CHECK(interactive_wait_for(master_fd, &result,
                                "oi: nothing to compact yet", 1));
 
-    /* Malformed argument, still before any real turn. */
     CHECK(write_interactive(master_fd, "/compact abc\r", 13));
     CHECK(interactive_wait_for(master_fd, &result,
                                "oi: usage: /compact [turns]", 1));
 
-    /* One real turn; the default keep_turns=8 leaves nothing to compact. */
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "ok", 1));
     CHECK(write_interactive(master_fd, "/compact\r", 9));
@@ -5977,12 +5321,6 @@ TEST(compact_typed_while_a_turn_is_active_queues_and_runs_next) {
     struct interactive_result result;
     char session_root[128];
 
-    /* The only real turn is the slow one, so this races the queue against
-     * the very first submission in the whole test -- avoiding any
-     * ambiguity from an earlier "\r\n" already sitting in the buffer (see
-     * queued_command_while_busy_resolves_discarded_and_dispatches_live's
-     * identical "hello\r" / wait-for-"\r\n" / queue-behind-it shape,
-     * which relies on the same "first ever submission" property). */
     turns[0].response = first;
     turns[0].response_len = first_len;
     turns[0].hold = 1;
@@ -6002,16 +5340,9 @@ TEST(compact_typed_while_a_turn_is_active_queues_and_runs_next) {
     CHECK(write_interactive(master_fd, "first message\r", 14));
     CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
 
-    /* Queues /compact while the only turn so far is still in flight --
-     * once it completes there's exactly 1 turn, so /compact 0 (compact
-     * everything) is what actually has something to do. */
-    /* The request is on the wire, not merely rendered: without this
-     * barrier the release below would be consumed the instant the
-     * server accepts, holding nothing. */
     slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "/compact 0\r", 11));
     CHECK(interactive_wait_for(master_fd, &result, "oi: queued", 1));
-    /* /compact queued while busy; the turn may now complete. */
     slow_mock_release(&control);
 
     CHECK(interactive_wait_for(master_fd, &result, "first reply", 1));
@@ -6143,8 +5474,6 @@ TEST(compact_failure_leaves_durable_and_live_state_untouched) {
         const char *last =
             last_request_text(capture_path, buffer, sizeof buffer);
 
-        /* Nothing was compacted: the third turn's own request still
-         * carries the original first turn's content in full. */
         CHECK(strstr(last, "first message") != NULL);
         CHECK(strstr(last, "first reply") != NULL);
         CHECK(strstr(last, "second reply") != NULL);
@@ -6217,16 +5546,11 @@ TEST(typed_ctrl_c_cancels_compaction_and_returns_to_the_prompt) {
     CHECK(interactive_wait_for(master_fd, &result, "second reply", 1));
 
     CHECK(write_interactive(master_fd, "/compact 1\r", 11));
-    /* Only held requests produce acceptance credits. The two completed
-     * ordinary turns cannot accidentally authorize this release; this credit
-     * belongs specifically to the in-flight compaction request. */
     slow_mock_wait_accepted(&control, 1);
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(interactive_wait_for(master_fd, &result,
                                "oi: compaction cancelled", 1));
 
-    /* Cancelled, so its response is moot -- but the server serves turns in
-     * order and the next message needs the one after it. */
     slow_mock_release(&control);
     CHECK(write_interactive(master_fd, "third message\r", 14));
     CHECK(interactive_wait_for(master_fd, &result, "third reply", 1));
@@ -6288,7 +5612,6 @@ TEST(compact_survives_restart_and_replay_shows_the_checkpoint) {
              session_name);
     unlink(log_path);
 
-    /* First "life": two turns, then compact the first one. */
     server = start_mock_server_turns(first_life_responses,
                                      first_life_lengths, 3, &port);
     free(first);
@@ -6320,10 +5643,6 @@ TEST(compact_survives_restart_and_replay_shows_the_checkpoint) {
     close(master_fd);
     waitpid(server, NULL, 0);
 
-    /* Second "life": restart against the same session, then send one more
-     * message -- its outgoing request is the proof replay reconstructed
-     * the checkpoint correctly, not just that the live process remembered
-     * it. */
     {
         size_t restart_len;
         char *restart_reply = build_chunked_response(
@@ -6395,9 +5714,6 @@ TEST(resize_redraws_the_live_prompt_at_the_new_width) {
     ws.ws_col = 30;
     CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &ws), 0);
     memset(&result, 0, sizeof result);
-    /* Never submits a prompt, so the mock-server port is never actually
-     * connected to -- matching interactive_exit_before_submission_creates_
-     * no_session's use of an arbitrary unused port below. */
     cli = start_interactive_cli(9, slave_fd, session_root);
     close(slave_fd);
 
@@ -6405,10 +5721,6 @@ TEST(resize_redraws_the_live_prompt_at_the_new_width) {
     CHECK(write_interactive(master_fd, "hello", 5));
     CHECK(interactive_wait_for(master_fd, &result, "hello", 1));
 
-    /* Resize mid-edit, without any further keystroke: a fresh "\x1b[J"
-     * clear sequence appearing proves the redraw was driven by the
-     * SIGWINCH/signalfd path added in cli_repl.c, not by continued
-     * typing. */
     clears_before_resize = count_text(result.output, "\x1b[J");
     ws.ws_col = 10;
     CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &ws), 0);
@@ -6453,17 +5765,6 @@ TEST(interactive_exit_before_submission_creates_no_session) {
     close(master_fd);
 }
 
-/*
- * The REPL puts the pty into raw mode and enables bracketed paste when it
- * starts; every exit path must undo both before the process goes away, or a
- * shell resuming on that terminal is left with echo and line editing off.
- * test_cli_terminal.c proves the terminal module restores a single struct;
- * this proves the real process reaches that restore on each exit path and
- * emits the matching bracketed-paste disable, by keeping the parent's own
- * slave descriptor open and inspecting the shared tty state after the child
- * has gone. Raw mode clears ICANON|ECHO|ISIG (cli_terminal.c), so their
- * presence after exit is the cooked-mode signal.
- */
 static int termios_is_cooked(int fd) {
     struct termios attributes;
 
@@ -6499,10 +5800,6 @@ static int exit_path_restores_terminal(int master_fd, int slave_fd,
         fflush(stderr);
         return 0;
     }
-    /* Drain what the child flushed before exiting: the disable sequence was
-     * written before the process ended, so it is already in the master's
-     * buffer. The parent's open slave descriptor means the master never
-     * reaches EOF, so read nonblocking until EAGAIN rather than block. */
     {
         int flags = fcntl(master_fd, F_GETFL, 0);
         char buffer[256];
@@ -6570,9 +5867,6 @@ TEST(repl_restores_terminal_state_on_every_exit_path) {
         snprintf(session_root, sizeof session_root,
                  "/tmp/oi-cli-restore-%d-%zu", (int)getpid(), i);
         CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
-        /* Keep slave_fd: it is the parent's window onto the tty state once
-         * the child's descriptor is gone, and holds the pty alive so the
-         * drain above sees buffered output instead of EOF. */
         CHECK(exit_path_restores_terminal(master_fd, slave_fd, session_root,
                                           paths[i].trigger));
         close(master_fd);
@@ -6608,14 +5902,6 @@ TEST(interactive_help_and_exit_are_dispatched_without_a_session) {
     close(master_fd);
 }
 
-/* --- /session lifecycle through the real REPL --- */
-
-/*
- * Returns the ids of every session directory under `root`, sorted, so a test
- * can name a session created by an earlier process run. An automatic session
- * always gets a fresh timestamped directory, so running `oi` twice is how a
- * second switchable session comes to exist.
- */
 struct session_ids {
     char items[8][64];
     size_t count;
@@ -6631,8 +5917,6 @@ static void collect_session_ids(const char *root, struct session_ids *out) {
         if (entry->d_name[0] == '.' || out->count >= 8) {
             continue;
         }
-        /* d_name can exceed the row; a session id never does, and a
-         * longer name is not one. */
         if (strlen(entry->d_name) >= sizeof out->items[0]) {
             continue;
         }
@@ -6643,8 +5927,6 @@ static void collect_session_ids(const char *root, struct session_ids *out) {
     if (directory != NULL) {
         closedir(directory);
     }
-    /* Ids embed a timestamp and a counter, so lexical order is creation
-     * order -- enough to say "the first session" deterministically. */
     for (size_t i = 0; i + 1 < out->count; i++) {
         for (size_t j = i + 1; j < out->count; j++) {
             if (strcmp(out->items[j], out->items[i]) < 0) {
@@ -6669,11 +5951,6 @@ static void remove_session_tree(const char *root, const char *id) {
     rmdir(path);
 }
 
-/*
- * Runs one interactive session that sends `message`, waits for `reply_text`
- * in the transcript, and exits cleanly. Used to leave a real session with
- * real content behind for a later run to switch into.
- */
 static void run_one_interactive_turn(const char *session_root,
                                      const char *message,
                                      const char *reply_text) {
@@ -6789,7 +6066,6 @@ TEST(interactive_session_list_and_current_describe_the_active_session) {
 
     snprintf(session_root, sizeof session_root,
              "/tmp/oi-cli-session-list-%d", (int)getpid());
-    /* A prior run leaves one real session behind to list. */
     run_one_interactive_turn(session_root, "first message", "first-reply");
 
     reply = build_chunked_response(reply_sse, strlen(reply_sse),
@@ -6804,22 +6080,12 @@ TEST(interactive_session_list_and_current_describe_the_active_session) {
     close(slave_fd);
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
 
-    /*
-     * An automatic session is created lazily on the first message, so before
-     * one is sent this process genuinely has no session -- worth asserting,
-     * since /session current has to say so rather than inventing one.
-     */
     CHECK(write_interactive(master_fd, "/session current\r", 17));
     CHECK(interactive_wait_for(master_fd, &result, "Session: (not created)",
                                1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "list-reply", 1));
 
-    /*
-     * Both sessions exist now. Ids embed a timestamp and counter, so the
-     * later one is this process's own -- which is the row that must carry
-     * the current marker.
-     */
     collect_session_ids(session_root, &ids);
     CHECK_EQ(ids.count, 2);
     CHECK(write_interactive(master_fd, "/session list\r", 14));
@@ -6839,7 +6105,6 @@ TEST(interactive_session_list_and_current_describe_the_active_session) {
         CHECK(interactive_wait_for(master_fd, &result, expected_path, 1));
     }
 
-    /* Renaming the *other* session shows up in the listing. */
     {
         char line[160];
         snprintf(line, sizeof line, "/session rename %s my old work\r",
@@ -6850,7 +6115,6 @@ TEST(interactive_session_list_and_current_describe_the_active_session) {
     CHECK(write_interactive(master_fd, "/session list\r", 14));
     CHECK(interactive_wait_for(master_fd, &result, "\"my old work\"", 1));
 
-    /* Trashing the session you are sitting in is refused. */
     CHECK(write_interactive(master_fd, "/session trash ", 15));
     {
         char tail[128];
@@ -6900,9 +6164,6 @@ TEST(interactive_session_switch_restores_context_and_offers_replay) {
              "/tmp/oi-cli-session-switch-req-%d", (int)getpid());
     unlink(capture_path);
 
-    /* Session A, with a real tool-using exchange in it, from an earlier
-     * process. This also makes the visible replay prove that it does not
-     * collapse model-visible tool details into a mere count. */
     run_one_interactive_tool_turn(session_root);
     collect_session_ids(session_root, &ids);
     CHECK_EQ(ids.count, 1);
@@ -6920,7 +6181,6 @@ TEST(interactive_session_switch_restores_context_and_offers_replay) {
     close(slave_fd);
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
 
-    /* Switch into A. */
     {
         char line[128];
         snprintf(line, sizeof line, "/session switch %s\r", ids.items[0]);
@@ -6928,7 +6188,6 @@ TEST(interactive_session_switch_restores_context_and_offers_replay) {
     }
     CHECK(interactive_wait_for(master_fd, &result, "switched to session", 1));
 
-    /* The replay offer appears; choosing it prints the restored exchange. */
     CHECK(interactive_wait_for(master_fd, &result,
                                "Show the restored conversation", 1));
     CHECK(write_interactive(master_fd, "2", 1));
@@ -6944,7 +6203,6 @@ TEST(interactive_session_switch_restores_context_and_offers_replay) {
     CHECK(interactive_wait_for(master_fd, &result,
                                "tool [call_replay]: replay-tool-result", 1));
 
-    /* /session current now reports A. */
     CHECK(write_interactive(master_fd, "/session current\r", 17));
     {
         char expected[128];
@@ -6958,8 +6216,6 @@ TEST(interactive_session_switch_restores_context_and_offers_replay) {
         CHECK(interactive_wait_for(master_fd, &result, expected, 1));
     }
 
-    /* A follow-up message lands in A's log, and carries A's restored
-     * context to the model rather than starting over. */
     CHECK(write_interactive(master_fd, "follow up\r", 10));
     CHECK(interactive_wait_for(master_fd, &result, "second-reply", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -6983,14 +6239,11 @@ TEST(interactive_session_switch_restores_context_and_offers_replay) {
             fclose(capture);
         }
         requests[request_len] = '\0';
-        /* The restored context really went to the model. */
         CHECK(strstr(requests, "remembered question") != NULL);
         CHECK(strstr(requests, "follow up") != NULL);
     }
     unlink(capture_path);
 
-    /* And the durable record of the follow-up is in A's log, not the
-     * session this process started in. */
     {
         char history_path[640];
         struct oilog_records records;
@@ -7042,21 +6295,17 @@ TEST(interactive_session_switch_reports_a_missing_target_and_keeps_working) {
     close(slave_fd);
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
 
-    /* Send a message first, so there is a live conversation to preserve. */
     CHECK(write_interactive(master_fd, "hello\r", 6));
     CHECK(interactive_wait_for(master_fd, &result, "still-here", 1));
 
-    /* A failed switch must leave the REPL working, not end it. */
     CHECK(write_interactive(master_fd, "/session switch nosuchsession\r", 30));
     CHECK(interactive_wait_for(master_fd, &result, "no such session", 1));
-    /* Bad syntax and unsafe ids are refused the same way. */
     CHECK(write_interactive(master_fd, "/session switch\r", 16));
     CHECK(interactive_wait_for(master_fd, &result,
                                "usage: /session switch ID", 1));
     CHECK(write_interactive(master_fd, "/session switch ../escape\r", 26));
     CHECK(interactive_wait_for(master_fd, &result, "invalid session id", 1));
 
-    /* Still alive and still the original session. */
     CHECK(write_interactive(master_fd, "/session current\r", 17));
     CHECK(interactive_wait_for(master_fd, &result, "Status: healthy", 1));
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -7093,8 +6342,6 @@ TEST(interactive_session_trash_restore_and_confirmed_delete) {
 
     snprintf(session_root, sizeof session_root,
              "/tmp/oi-cli-session-trash-%d", (int)getpid());
-    /* An earlier session to operate on, so the active one is never the
-     * target. */
     run_one_interactive_turn(session_root, "old work", "old-reply");
     collect_session_ids(session_root, &ids);
     CHECK_EQ(ids.count, 1);
@@ -7110,7 +6357,6 @@ TEST(interactive_session_trash_restore_and_confirmed_delete) {
     close(slave_fd);
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
 
-    /* Trash, and confirm it moved on disk. */
     {
         char line[128];
         snprintf(line, sizeof line, "/session trash %s\r", ids.items[0]);
@@ -7120,12 +6366,10 @@ TEST(interactive_session_trash_restore_and_confirmed_delete) {
     CHECK(access(trashed_dir, F_OK) == 0);
     CHECK(access(live_dir, F_OK) != 0);
 
-    /* It shows in the trash listing and not the live one. */
     CHECK(write_interactive(master_fd, "/session trash-list\r", 20));
     CHECK(interactive_wait_for(master_fd, &result, "Trashed sessions (1):",
                                1));
 
-    /* Restore, and confirm it came back. */
     {
         char line[128];
         snprintf(line, sizeof line, "/session restore %s\r", ids.items[0]);
@@ -7134,7 +6378,6 @@ TEST(interactive_session_trash_restore_and_confirmed_delete) {
     CHECK(interactive_wait_for(master_fd, &result, "Restored session", 1));
     CHECK(access(live_dir, F_OK) == 0);
 
-    /* Deleting a live session is refused: it must be trashed first. */
     {
         char line[128];
         snprintf(line, sizeof line, "/session delete %s\r", ids.items[0]);
@@ -7147,12 +6390,10 @@ TEST(interactive_session_trash_restore_and_confirmed_delete) {
                  ids.items[0]);
         CHECK(interactive_wait_for(master_fd, &result, confirmation, 1));
     }
-    /* Cancel at the default selection first -- nothing may be removed. */
     CHECK(write_interactive(master_fd, "\r", 1));
     CHECK(interactive_wait_for(master_fd, &result, "deletion cancelled", 1));
     CHECK(access(live_dir, F_OK) == 0);
 
-    /* Trash it, then confirm the deletion for real. */
     {
         char line[128];
         snprintf(line, sizeof line, "/session trash %s\r", ids.items[0]);
@@ -7217,7 +6458,6 @@ TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
              (int)getpid());
     unlink(source_path);
 
-    /* A legacy log: raw alternating payloads, no transition record. */
     {
         oi_sesslog *log = NULL;
         CHECK_EQ(oi_sesslog_open(source_path, &log), OI_OK);
@@ -7246,7 +6486,6 @@ TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
     close(slave_fd);
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
 
-    /* Cancel first: nothing may be imported. */
     {
         char line[256];
         snprintf(line, sizeof line, "/session import %s\r", source_path);
@@ -7260,12 +6499,9 @@ TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
     }
     CHECK(write_interactive(master_fd, "\r", 1));
     CHECK(interactive_wait_for(master_fd, &result, "import cancelled", 1));
-    /* No message has been sent, so this process has no session of its own
-     * yet and a cancelled import created nothing. */
     CHECK(write_interactive(master_fd, "/session list\r", 14));
     CHECK(interactive_wait_for(master_fd, &result, "Sessions: none", 1));
 
-    /* Now confirm. */
     {
         char line[256];
         snprintf(line, sizeof line, "/session import %s\r", source_path);
@@ -7279,7 +6515,6 @@ TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
     }
     CHECK(write_interactive(master_fd, "2", 1));
     CHECK(interactive_wait_for(master_fd, &result, "imported as session", 1));
-    /* The imported session is now selectable. */
     CHECK(write_interactive(master_fd, "/session list\r", 14));
     CHECK(interactive_wait_for(master_fd, &result, "Sessions (1):", 1));
 
@@ -7293,7 +6528,6 @@ TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
     close(master_fd);
     waitpid(server, NULL, 0);
 
-    /* The source file is byte-for-byte what it was. */
     {
         FILE *source = fopen(source_path, "rb");
         char *after;
@@ -7324,10 +6558,6 @@ TEST(interactive_session_import_requires_confirmation_and_keeps_the_source) {
     rmdir(session_root);
 }
 
-/* --- the mock server's own control channel --- */
-
-/* Opens a connection to the mock server and sends a minimal request, so a
- * test can exercise the hold/release handshake without a CLI in the way. */
 static int slow_mock_client_request(unsigned short port) {
     struct sockaddr_in addr;
     static const char request[] = "POST /v1/chat/completions HTTP/1.1\r\n\r\n";
@@ -7370,10 +6600,7 @@ TEST(mock_control_holds_a_response_until_it_is_released) {
     server = start_slow_mock_server(turns, 1, &port, &control);
     client = slow_mock_client_request(port);
 
-    /* Accepted and fully read, so the request really is in flight. */
     slow_mock_wait_accepted(&control, 1);
-    /* ...and nothing comes back while the turn is held. This is the property
-     * the cancellation tests depend on. */
     CHECK(!slow_mock_readable_within(client, 300));
 
     slow_mock_release(&control);
@@ -7405,29 +6632,10 @@ TEST(mock_control_release_before_acceptance_is_rejected) {
     turns[1].hold = 1;
     server = start_slow_mock_server(turns, 2, &port, &control);
 
-    /*
-     * Complete an unheld request first. It must not create a release credit:
-     * only requests whose responses are actually blocked can authorize a
-     * slow_mock_release call.
-     */
     client = slow_mock_client_request(port);
     CHECK(slow_mock_readable_within(client, 20000));
     close(client);
 
-    /*
-     * Releasing before the server has reported a held acceptance used to be a
-     * silent no-op: the byte would simply wait in the pipe and be consumed the
-     * moment a held request arrived, holding nothing. slow_mock_release now
-     * refuses to write a release credit without a matching held notification,
-     * turning that silent no-op into a CHECK failure. The completed unheld
-     * request above must not satisfy that contract either.
-     *
-     * Triggering that CHECK directly in this process would corrupt this
-     * binary's own pass/fail signal, so the violation runs in a throwaway
-     * child instead: the child's local oi_test_failures counter (a copy
-     * made at fork) shows whether the CHECK fired, and its exit code
-     * reports that back to the parent without touching the real count.
-     */
     checker = fork();
     CHECK(checker >= 0);
     if (checker < 0) {
@@ -7448,12 +6656,6 @@ TEST(mock_control_release_before_acceptance_is_rejected) {
         CHECK_EQ(WEXITSTATUS(status), 42);
     }
 
-    /*
-     * Prove the rejected call did not merely report a CHECK and then leak a
-     * release byte anyway: when a real request now arrives, its response must
-     * remain held until the parent observes acceptance and explicitly
-     * releases it.
-     */
     client = slow_mock_client_request(port);
     slow_mock_wait_accepted(&control, 1);
     CHECK(!slow_mock_readable_within(client, 300));
@@ -7486,23 +6688,12 @@ TEST(mock_control_closing_the_release_end_fails_the_server_promptly) {
     client = slow_mock_client_request(port);
     slow_mock_wait_accepted(&control, 1);
 
-    /*
-     * A vanished parent must be noticed, not waited out. Closing the release
-     * end gives the server EOF rather than silence, so it fails closed
-     * immediately instead of burning the full 20 s timeout and then sending
-     * the response anyway.
-     */
     started = time(NULL);
     slow_mock_control_free(&control);
     CHECK_EQ(waitpid(server, &status, 0), server);
     CHECK(time(NULL) - started < 10);
     CHECK(WIFEXITED(status));
     CHECK_EQ(WEXITSTATUS(status), SLOW_MOCK_EXIT_CONTROL);
-    /*
-     * Fail closed: the held response was never sent. The socket does become
-     * readable, because the server closed it -- so the check is that reading
-     * yields EOF rather than response bytes.
-     */
     {
         char leftover[64];
         ssize_t got;
@@ -7516,7 +6707,6 @@ TEST(mock_control_closing_the_release_end_fails_the_server_promptly) {
 }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     signal(SIGCHLD, SIG_DFL);
     RUN(help_exits_zero);

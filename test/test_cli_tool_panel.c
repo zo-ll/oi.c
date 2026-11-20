@@ -60,8 +60,6 @@ TEST(malicious_escape_sequences_are_stripped_from_displayed_output) {
 
     count = oi_cli_tool_panel_lines(&panel, lines, 3);
     CHECK_EQ(count, 2);
-    /* The CSI sequences are stripped entirely; only the plain text
-     * survives, with no raw ESC byte anywhere in the output. */
     CHECK_EQ(lines[1].len, 3);
     CHECK(memcmp(lines[1].text, "red", 3) == 0);
     CHECK(memchr(lines[1].text, '\x1b', lines[1].len) == NULL);
@@ -78,19 +76,14 @@ TEST(output_is_bounded_and_trims_whole_lines_from_the_front) {
     oi_cli_tool_panel_init(&panel);
     CHECK_EQ(oi_cli_tool_panel_start(&panel, "call-1", 6, "shell", 5),
              OI_OK);
-    /* Each fed line is ~11 bytes; feed enough of them to comfortably
-     * exceed OI_CLI_TOOL_PANEL_MAX_BYTES (4096). */
     for (i = 0; i < 600; i++) {
         int len = snprintf(line, sizeof line, "line%04d\n", i);
         CHECK_EQ(oi_cli_tool_panel_feed(&panel, line, (size_t)len), OI_OK);
     }
     CHECK(panel.tail.len <= OI_CLI_TOOL_PANEL_MAX_BYTES);
-    /* Only whole lines were ever dropped: the buffer's first byte must be
-     * the start of a clean "lineNNNN" entry, never a fragment. */
     CHECK(panel.tail.len >= 4);
     CHECK(memcmp(panel.tail.data, "line", 4) == 0);
 
-    /* The most recent line fed is still present. */
     CHECK_EQ(oi_cli_tool_panel_lines(&panel, lines, 2), 2);
     CHECK_EQ(lines[1].len, 8);
     CHECK(memcmp(lines[1].text, "line0599", 8) == 0);
@@ -107,8 +100,6 @@ TEST(lines_keeps_only_the_most_recent_within_max_lines) {
              OI_OK);
     CHECK_EQ(oi_cli_tool_panel_feed(&panel, "one\ntwo\nthree\n", 14), OI_OK);
 
-    /* max_lines=3 -> header + last 2 content lines ("two", "three"), not
-     * "one". */
     CHECK_EQ(oi_cli_tool_panel_lines(&panel, lines, 3), 3);
     CHECK_EQ(lines[1].len, 3);
     CHECK(memcmp(lines[1].text, "two", 3) == 0);

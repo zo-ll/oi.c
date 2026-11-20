@@ -36,16 +36,12 @@ static void collect_cb(const void *data, size_t len, void *ud) {
     c->count++;
 }
 
-/* --- basic create/append/replay/reopen --- */
-
 TEST(create_open_reopen) {
     const char *path = fresh_path();
     oi_sesslog *log;
     CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
     oi_sesslog_close(log);
 
-    /* Reopening an existing (empty-of-records, header-only) log must
-     * succeed and not misinterpret the header as corrupt. */
     CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
     oi_sesslog_close(log);
     unlink(path);
@@ -71,7 +67,7 @@ TEST(append_and_replay_round_trip) {
 
     CHECK_EQ(oi_sesslog_append(log, "first", 5), OI_OK);
     CHECK_EQ(oi_sesslog_append(log, "second-record", 13), OI_OK);
-    CHECK_EQ(oi_sesslog_append(log, "", 0), OI_OK); /* empty record */
+    CHECK_EQ(oi_sesslog_append(log, "", 0), OI_OK);
     CHECK_EQ(oi_sesslog_append(log, "third", 5), OI_OK);
 
     struct collected c = {0};
@@ -97,9 +93,6 @@ TEST(records_persist_across_reopen) {
     CHECK_EQ(oi_sesslog_append(log, "persisted-two", 13), OI_OK);
     oi_sesslog_close(log);
 
-    /* Simulates a process restart: a fresh open() must replay what was
-     * written before, exercising the "resume mid-conversation" use
-     * case from PLAN.md. */
     CHECK_EQ(oi_sesslog_open(path, &log), OI_OK);
     struct collected c = {0};
     CHECK_EQ(oi_sesslog_replay(log, collect_cb, &c), OI_OK);
@@ -107,8 +100,6 @@ TEST(records_persist_across_reopen) {
     CHECK(memcmp(c.records[0], "persisted-one", 13) == 0);
     CHECK(memcmp(c.records[1], "persisted-two", 13) == 0);
 
-    /* Further appends after reopening must land after the replayed
-     * data, not clobber it. */
     CHECK_EQ(oi_sesslog_append(log, "after-reopen", 12), OI_OK);
     struct collected c2 = {0};
     CHECK_EQ(oi_sesslog_replay(log, collect_cb, &c2), OI_OK);
@@ -140,8 +131,6 @@ TEST(replay_with_null_callback_is_safe) {
     unlink(path);
 }
 
-/* --- recovery from a truncated trailing record --- */
-
 TEST(recovery_discards_truncated_length_prefix) {
     const char *path = fresh_path();
     oi_sesslog *log;
@@ -149,8 +138,6 @@ TEST(recovery_discards_truncated_length_prefix) {
     CHECK_EQ(oi_sesslog_append(log, "good-record", 11), OI_OK);
     oi_sesslog_close(log);
 
-    /* Simulate a crash mid-write: append only 2 of the 4 length-prefix
-     * bytes for what would have been the next record. */
     int fd = open(path, O_WRONLY | O_APPEND);
     CHECK(fd >= 0);
     unsigned char partial[2] = {0x05, 0x00};
@@ -163,9 +150,6 @@ TEST(recovery_discards_truncated_length_prefix) {
     CHECK_EQ(c.count, 1);
     CHECK(memcmp(c.records[0], "good-record", 11) == 0);
 
-    /* The truncated bytes must have been physically discarded (not
-     * just skipped in memory), so a subsequent append lands cleanly
-     * and a later replay doesn't see phantom data. */
     CHECK_EQ(oi_sesslog_append(log, "next", 4), OI_OK);
     struct collected c2 = {0};
     CHECK_EQ(oi_sesslog_replay(log, collect_cb, &c2), OI_OK);
@@ -183,8 +167,6 @@ TEST(recovery_discards_truncated_payload) {
     CHECK_EQ(oi_sesslog_append(log, "good", 4), OI_OK);
     oi_sesslog_close(log);
 
-    /* A complete length prefix claiming 100 bytes, but only 3 bytes of
-     * payload actually written before the simulated crash. */
     int fd = open(path, O_WRONLY | O_APPEND);
     CHECK(fd >= 0);
     unsigned char prefix[4] = {100, 0, 0, 0};
@@ -209,8 +191,6 @@ TEST(recovery_discards_implausible_length_prefix) {
     CHECK_EQ(oi_sesslog_append(log, "good", 4), OI_OK);
     oi_sesslog_close(log);
 
-    /* A length prefix (0xFFFFFFFF) that could never be a real record:
-     * corruption, not a legitimate in-progress write. */
     int fd = open(path, O_WRONLY | O_APPEND);
     CHECK(fd >= 0);
     unsigned char head[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0};
@@ -230,8 +210,6 @@ TEST(recovery_discards_implausible_length_prefix) {
     CHECK_EQ(unlink(copy_path), 0);
     unlink(path);
 }
-
-/* --- checksums and damage --- */
 
 static size_t read_file(const char *path, unsigned char *buf, size_t cap) {
     int fd = open(path, O_RDONLY);
@@ -257,9 +235,9 @@ TEST(new_record_carries_its_crc32) {
     unsigned char bytes[64];
     size_t n = read_file(path, bytes, sizeof bytes);
     CHECK_EQ(n, (size_t)(12 + 8 + 9));
-    CHECK_EQ(u32le(bytes + 8), 2u);           /* log version */
-    CHECK_EQ(u32le(bytes + 12), 9u);          /* payload length */
-    CHECK_EQ(u32le(bytes + 16), 0xCBF43926u); /* CRC-32("123456789") */
+    CHECK_EQ(u32le(bytes + 8), 2u);
+    CHECK_EQ(u32le(bytes + 12), 9u);
+    CHECK_EQ(u32le(bytes + 16), 0xCBF43926u);
     CHECK(memcmp(bytes + 20, "123456789", 9) == 0);
     unlink(path);
 }
@@ -278,7 +256,6 @@ TEST(flipped_byte_cuts_the_log_and_keeps_a_copy) {
 
     unsigned char original[128];
     size_t size = read_file(path, original, sizeof original);
-    /* One byte inside the payload of "second", in the middle of the log. */
     off_t flip = 12 + 8 + 5 + 8 + 2;
     unsigned char byte = original[flip] ^ 0x20;
     int fd = open(path, O_WRONLY);
@@ -316,7 +293,6 @@ TEST(crash_tail_is_cut_without_a_copy) {
     CHECK_EQ(oi_sesslog_append(log, "good", 4), OI_OK);
     oi_sesslog_close(log);
 
-    /* A head that claims 100 bytes, then 3: a write a crash cut short. */
     int fd = open(path, O_WRONLY | O_APPEND);
     unsigned char head[8] = {100, 0, 0, 0, 1, 2, 3, 4};
     CHECK_EQ(write(fd, head, 8), 8);
@@ -340,7 +316,6 @@ TEST(failed_copy_keeps_the_log_unchanged) {
     CHECK_EQ(oi_sesslog_append(log, "second", 6), OI_OK);
     oi_sesslog_close(log);
 
-    /* A bad checksum on "first", and a directory where the copy goes. */
     unsigned char zero[4] = {0, 0, 0, 0};
     int fd = open(path, O_WRONLY);
     CHECK_EQ(pwrite(fd, zero, 4, 12 + 4), 4);
@@ -383,8 +358,6 @@ TEST(version_1_log_keeps_its_record_format) {
     unlink(path);
 }
 
-/* --- header validation --- */
-
 TEST(bad_magic_rejected) {
     const char *path = fresh_path();
     int fd = open(path, O_WRONLY | O_CREAT, 0600);
@@ -404,7 +377,7 @@ TEST(bad_version_rejected) {
     CHECK(fd >= 0);
     unsigned char header[12];
     memcpy(header, "OISESLOG", 8);
-    header[8] = 99; /* bogus version */
+    header[8] = 99;
     header[9] = 0;
     header[10] = 0;
     header[11] = 0;
@@ -428,8 +401,6 @@ TEST(file_shorter_than_header_rejected) {
     unlink(path);
 }
 
-/* --- locking --- */
-
 TEST(second_open_of_same_path_is_locked_out) {
     const char *path = fresh_path();
     oi_sesslog *log1;
@@ -440,14 +411,11 @@ TEST(second_open_of_same_path_is_locked_out) {
 
     oi_sesslog_close(log1);
 
-    /* Once released, a new open() must succeed. */
     oi_sesslog *log3;
     CHECK_EQ(oi_sesslog_open(path, &log3), OI_OK);
     oi_sesslog_close(log3);
     unlink(path);
 }
-
-/* --- append boundary --- */
 
 TEST(append_rejects_oversized_record) {
     const char *path = fresh_path();
@@ -460,7 +428,6 @@ TEST(append_rejects_oversized_record) {
     CHECK_EQ(oi_sesslog_append(log, buf, big), OI_ERR_INVAL);
     free(buf);
 
-    /* The rejected append must not have written anything. */
     struct collected c = {0};
     CHECK_EQ(oi_sesslog_replay(log, collect_cb, &c), OI_OK);
     CHECK_EQ(c.count, 0);

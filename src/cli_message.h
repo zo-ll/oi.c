@@ -17,7 +17,6 @@ struct oi_cli_string {
     size_t len;
 };
 
-/* `string` must be zero-initialized or previously managed by these helpers. */
 oi_status oi_cli_string_set(struct oi_cli_string *string, const char *data,
                             size_t len);
 void oi_cli_string_free(struct oi_cli_string *string);
@@ -28,10 +27,6 @@ struct oi_cli_tool_call_value {
     struct oi_cli_string arguments;
 };
 
-/*
- * Heap-owned model-visible message. Strings carry explicit lengths and also
- * have a trailing NUL for APIs that accept ordinary C strings.
- */
 struct oi_cli_message {
     enum oi_cli_message_role role;
     struct oi_cli_string content;
@@ -71,10 +66,6 @@ void oi_cli_message_list_init(struct oi_cli_message_list *list);
 void oi_cli_message_list_free(struct oi_cli_message_list *list);
 oi_status oi_cli_message_list_append_clone(
     struct oi_cli_message_list *list, const struct oi_cli_message *message);
-/*
- * On success ownership moves into the list and `message` is reset. On
- * failure the caller retains ownership.
- */
 oi_status oi_cli_message_list_append_take(struct oi_cli_message_list *list,
                                            struct oi_cli_message *message);
 

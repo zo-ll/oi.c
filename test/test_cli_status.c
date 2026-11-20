@@ -23,11 +23,6 @@ static char *read_stream(FILE *stream) {
     return text;
 }
 
-/*
- * Renders `snapshot` into a fresh temporary stream and returns the text. The
- * report never contains a NUL byte, so reading it back as a C string loses
- * nothing -- the sanitize pass strips NUL along with every other C0 control.
- */
 static char *render(const struct oi_cli_status_snapshot *snapshot) {
     FILE *out = tmpfile();
     char *text;
@@ -53,13 +48,8 @@ static size_t count_lines(const char *text) {
     return lines;
 }
 
-/* The report's fixed line count: one per contracted field, with Checkpoint
- * and Context counted separately. */
 #define STATUS_REPORT_LINES 11u
 
-/* A fully-populated snapshot, so each test can vary one field and leave the
- * rest realistic rather than unknown. Built on the real initializer, which is
- * what every assembler must do. */
 static void init_active(struct oi_cli_status_snapshot *snapshot) {
     oi_cli_status_snapshot_init(snapshot);
     snapshot->session_state = OI_CLI_STATUS_SESSION_ACTIVE;
@@ -87,7 +77,6 @@ TEST(rejects_missing_arguments) {
     CHECK(out != NULL);
     CHECK_EQ(oi_cli_status_write(NULL, out), OI_ERR_INVAL);
     CHECK_EQ(oi_cli_status_write(&snapshot, NULL), OI_ERR_INVAL);
-    /* NULL-safe, so a caller cannot be punished for initializing early. */
     oi_cli_status_snapshot_init(NULL);
     fclose(out);
 }
@@ -119,11 +108,6 @@ TEST(reports_every_required_field) {
     free(text);
 }
 
-/*
- * The order is part of the contract: a redirected /status is something
- * scripts and tests read, and reordering the report would break them
- * silently. Asserted as one exact string rather than field by field.
- */
 TEST(output_is_deterministic_and_ordered) {
     struct oi_cli_status_snapshot snapshot;
     char *text;
@@ -150,13 +134,6 @@ TEST(output_is_deterministic_and_ordered) {
     free(text);
 }
 
-/*
- * What dispatch hands a callback that fills nothing in. Every field must read
- * as explicitly unknown -- not as a guessed default, and not as a
- * dereferenced NULL. This is the whole reason the initializer exists rather
- * than a memset: a zeroed struct would claim no session, ask, disabled
- * deadlines, idle, and an empty queue, none of which anyone asserted.
- */
 TEST(initialized_snapshot_reports_everything_as_unknown) {
     struct oi_cli_status_snapshot snapshot;
     char *text;
@@ -182,11 +159,6 @@ TEST(initialized_snapshot_reports_everything_as_unknown) {
     free(text);
 }
 
-/*
- * The states a zeroed snapshot used to claim are all real, observable states
- * an assembler does report -- so the initializer must not have made them
- * unreachable. This is the other half of the test above.
- */
 TEST(really_observed_zero_like_states_still_report_themselves) {
     struct oi_cli_status_snapshot snapshot;
     char *text;
@@ -237,8 +209,6 @@ TEST(missing_optional_strings_are_named) {
     free(text);
 }
 
-/* An endpoint with no path is still a usable report, and must not print a
- * stray "(null)" from a NULL passed to printf. */
 TEST(endpoint_without_a_path_still_renders) {
     struct oi_cli_status_snapshot snapshot;
     char *text;
@@ -266,8 +236,6 @@ TEST(every_session_state_is_reported) {
     snapshot.session_state = OI_CLI_STATUS_SESSION_UNKNOWN;
     text = render(&snapshot);
     CHECK(text != NULL && strstr(text, "Session: (unknown)\n") != NULL);
-    /* The id is deliberately not printed for a state that has no session,
-     * even when the assembler left one behind. */
     CHECK(text != NULL && strstr(text, "20260731-100000") == NULL);
     free(text);
 
@@ -296,8 +264,6 @@ TEST(every_session_state_is_reported) {
               NULL);
     free(text);
 
-    /* An assembler bug -- an active state with no id -- must degrade to a
-     * named unknown rather than to an invalid pointer. */
     snapshot.session_state = OI_CLI_STATUS_SESSION_ACTIVE;
     snapshot.session_id = NULL;
     text = render(&snapshot);
@@ -359,8 +325,6 @@ TEST(every_permission_state_is_reported) {
     }
 }
 
-/* Every real policy maps to a reportable value, and none of them maps to
- * unknown -- a live policy is always one of the three. */
 TEST(policy_conversion_never_yields_unknown) {
     CHECK_EQ(oi_cli_status_permission_from_policy(OI_CLI_TOOLS_ASK),
              OI_CLI_STATUS_PERMISSION_ASK);
@@ -400,8 +364,6 @@ TEST(every_conversation_state_is_reported) {
     }
 }
 
-/* FAILED names the cause, since "failed" alone tells the user nothing about
- * whether to retry. A failure with no status still renders. */
 TEST(failed_conversation_names_its_cause) {
     struct oi_cli_status_snapshot snapshot;
     char *text;
@@ -420,11 +382,6 @@ TEST(failed_conversation_names_its_cause) {
     free(text);
 }
 
-/*
- * The queue reports a kind and a size. Content is structurally absent from
- * the snapshot, so this asserts what a caller can learn -- not that one
- * particular string was withheld.
- */
 TEST(queue_states_report_size_without_content) {
     struct oi_cli_status_snapshot snapshot;
     char *text;
@@ -451,8 +408,6 @@ TEST(queue_states_report_size_without_content) {
                        "safe boundary)\n") != NULL);
     free(text);
 
-    /* Steering with an empty slot is reachable: a queued item can be
-     * discarded by a cancel while the turn is still unwinding. */
     snapshot.queue = OI_CLI_STATUS_QUEUE_EMPTY;
     snapshot.queue_bytes = 0;
     text = render(&snapshot);
@@ -460,8 +415,6 @@ TEST(queue_states_report_size_without_content) {
           strstr(text, "Queue: empty (steering to a safe boundary)\n") != NULL);
     free(text);
 
-    /* An unknown queue still reports steering, which is independently
-     * observable. */
     snapshot.queue = OI_CLI_STATUS_QUEUE_UNKNOWN;
     text = render(&snapshot);
     CHECK(text != NULL &&
@@ -491,8 +444,6 @@ TEST(checkpoint_states_are_reported) {
               NULL);
     free(text);
 
-    /* Live-only compaction: a session with no durable storage still has a
-     * spliced active context, and "none" would misreport it. */
     snapshot.checkpoint.has_durable_checkpoint = 0;
     text = render(&snapshot);
     CHECK(text != NULL &&
@@ -501,14 +452,12 @@ TEST(checkpoint_states_are_reported) {
     CHECK(text != NULL && strstr(text, "Context: compacted\n") != NULL);
     free(text);
 
-    /* Nobody looked: distinct from "there is none". */
     snapshot.checkpoint.known = 0;
     text = render(&snapshot);
     CHECK(text != NULL && strstr(text, "Checkpoint: (unknown)\n") != NULL);
     CHECK(text != NULL && strstr(text, "Context: (unknown)\n") != NULL);
     free(text);
 
-    /* Full record-id range, so a 64-bit id is not truncated to int. */
     init_active(&snapshot);
     snapshot.checkpoint.has_durable_checkpoint = 1;
     snapshot.checkpoint.source_first_record_id = 1;
@@ -519,17 +468,6 @@ TEST(checkpoint_states_are_reported) {
     free(text);
 }
 
-/* --- sanitization of untrusted borrowed strings --- */
-
-/*
- * The renderer's terminal-safety contract holds for values it cannot vet:
- * a model name from a tampered session log, a working directory containing
- * whatever a filesystem accepted, a session id straight off the command
- * line. Each case below puts the hostile value in every untrusted field at
- * once and then asserts the two properties that matter -- the report is
- * still exactly its contracted number of lines, and not one raw control byte
- * or escape sequence reached the stream.
- */
 static char *render_with_untrusted(const char *value) {
     struct oi_cli_status_snapshot snapshot;
 
@@ -542,13 +480,11 @@ static char *render_with_untrusted(const char *value) {
     return render(&snapshot);
 }
 
-/* No ESC, no CSI/OSC introducer, and no C0 control or DEL other than the
- * report's own line terminators. */
 static void check_no_terminal_controls(const char *text) {
     size_t index;
 
     CHECK(strchr(text, '\x1b') == NULL);
-    CHECK(strstr(text, "\x9b") == NULL); /* 8-bit CSI, as raw byte */
+    CHECK(strstr(text, "\x9b") == NULL);
     for (index = 0; text[index] != '\0'; index++) {
         unsigned char byte = (unsigned char)text[index];
 
@@ -566,9 +502,6 @@ TEST(newlines_and_carriage_returns_cannot_forge_a_line) {
     if (text == NULL) {
         return;
     }
-    /* The forged key survives as *text inside a value*, but it cannot start
-     * a line of its own: the line count is unchanged, and no line begins
-     * with the forged key. */
     CHECK_EQ(count_lines(text), (size_t)STATUS_REPORT_LINES);
     CHECK(strstr(text, "\nSession: FORGED") == NULL);
     CHECK(strncmp(text, "Session: FORGED", 15) != 0);
@@ -577,8 +510,6 @@ TEST(newlines_and_carriage_returns_cannot_forge_a_line) {
 }
 
 TEST(csi_sequences_are_stripped) {
-    /* Colour, cursor movement, and a screen clear -- all CSI, all removed
-     * with their parameters, leaving the surrounding text. */
     char *text = render_with_untrusted("x\x1b[31mred\x1b[0m\x1b[2J\x1b[10;10Hy");
 
     CHECK(text != NULL);
@@ -587,7 +518,6 @@ TEST(csi_sequences_are_stripped) {
     }
     CHECK_EQ(count_lines(text), (size_t)STATUS_REPORT_LINES);
     check_no_terminal_controls(text);
-    /* The parameters do not leak as literal text either. */
     CHECK(strstr(text, "[31m") == NULL);
     CHECK(strstr(text, "[2J") == NULL);
     CHECK(strstr(text, "10;10H") == NULL);
@@ -596,8 +526,6 @@ TEST(csi_sequences_are_stripped) {
 }
 
 TEST(osc_sequences_including_clipboard_writes_are_stripped) {
-    /* OSC 52 is the one that matters most: it writes the user's clipboard.
-     * Both terminators are exercised -- BEL and ST (ESC backslash). */
     char *bel = render_with_untrusted("p\x1b]52;c;cGF5bG9hZA==\x07q");
     char *st = render_with_untrusted("p\x1b]52;c;cGF5bG9hZA==\x1b\\q");
     char *title = render_with_untrusted("p\x1b]0;window title\x07q");
@@ -615,7 +543,6 @@ TEST(osc_sequences_including_clipboard_writes_are_stripped) {
     check_no_terminal_controls(bel);
     check_no_terminal_controls(st);
     check_no_terminal_controls(title);
-    /* The payload is gone, not merely defanged. */
     CHECK(strstr(bel, "cGF5bG9hZA==") == NULL);
     CHECK(strstr(st, "cGF5bG9hZA==") == NULL);
     CHECK(strstr(bel, "52;c") == NULL);
@@ -628,9 +555,6 @@ TEST(osc_sequences_including_clipboard_writes_are_stripped) {
 }
 
 TEST(tabs_and_other_control_bytes_are_replaced) {
-    /* A tab would shift a value into another column; the C1 range encoded as
-     * UTF-8 carries an 8-bit CSI. Both are removed or replaced, never
-     * passed. */
     char *text =
         render_with_untrusted("a\tb\x01\x1f\x7f" "\xc2\x9b" "c");
 
@@ -641,17 +565,12 @@ TEST(tabs_and_other_control_bytes_are_replaced) {
     CHECK_EQ(count_lines(text), (size_t)STATUS_REPORT_LINES);
     CHECK(strchr(text, '\t') == NULL);
     check_no_terminal_controls(text);
-    /* The tab became the replacement character; the rest was dropped
-     * outright by the shared sanitize pass. */
     CHECK(strstr(text, "a\xEF\xBF\xBD" "b") != NULL);
     CHECK(strstr(text, "bc") != NULL);
     free(text);
 }
 
 TEST(invalid_utf8_becomes_replacement_characters) {
-    /* A lone continuation byte, a truncated three-byte lead, an overlong
-     * encoding, and a surrogate -- each becomes U+FFFD rather than reaching
-     * the terminal as an undecodable byte. */
     char *text = render_with_untrusted("\x80" "a" "\xe2\x82" "b" "\xc0\xaf"
                                        "c" "\xed\xa0\x80" "d");
 
@@ -661,15 +580,11 @@ TEST(invalid_utf8_becomes_replacement_characters) {
     }
     CHECK_EQ(count_lines(text), (size_t)STATUS_REPORT_LINES);
     check_no_terminal_controls(text);
-    /* Every byte of the report is now well-formed UTF-8, and the legible
-     * characters between the bad sequences survived. */
     CHECK(strstr(text, "\xEF\xBF\xBD" "a") != NULL);
     CHECK(strstr(text, "b") != NULL);
     CHECK(strstr(text, "c") != NULL);
     CHECK(strstr(text, "d") != NULL);
     {
-        /* No raw 0x80-0xBF continuation byte stands alone, and no 0xC0/0xC1
-         * overlong lead survives. */
         size_t index;
         for (index = 0; text[index] != '\0'; index++) {
             unsigned char byte = (unsigned char)text[index];
@@ -680,8 +595,6 @@ TEST(invalid_utf8_becomes_replacement_characters) {
     free(text);
 }
 
-/* Ordinary text must not be collateral damage: the point is a readable
- * report, not an escaped one. */
 TEST(ordinary_utf8_survives_sanitization) {
     char *text = render_with_untrusted("caf\xc3\xa9-\xe6\xa8\xa1\xe5\x9e\x8b");
 
@@ -695,8 +608,6 @@ TEST(ordinary_utf8_survives_sanitization) {
     free(text);
 }
 
-/* No single field can produce an unbounded line, however long the borrowed
- * string is. */
 TEST(an_overlong_field_is_bounded_and_marked) {
     size_t oversized = OI_CLI_STATUS_MAX_FIELD_BYTES + 500u;
     char *value = malloc(oversized + 1);
@@ -713,21 +624,12 @@ TEST(an_overlong_field_is_bounded_and_marked) {
     if (text != NULL) {
         CHECK_EQ(count_lines(text), (size_t)STATUS_REPORT_LINES);
         CHECK(strstr(text, "x...") != NULL);
-        /* Bounded per field, so the whole report stays proportionate. */
         CHECK(strlen(text) < 6u * OI_CLI_STATUS_MAX_FIELD_BYTES);
     }
     free(text);
     free(value);
 }
 
-/*
- * Secrets are kept out of /status structurally -- the snapshot simply has no
- * field for one -- so the thing worth asserting here is the inventory: the
- * report is exactly the eleven contracted lines, with nothing extra that a
- * later change could have quietly started emitting. (That a real API key
- * never reaches the terminal is asserted end to end against the actual CLI,
- * with a sentinel key, in test_cli.c.)
- */
 TEST(report_is_exactly_the_contracted_lines) {
     static const char *const keys[] = {
         "Session: ",  "Model: ",        "Endpoint: ",
@@ -751,7 +653,6 @@ TEST(report_is_exactly_the_contracted_lines) {
     for (index = 0; index < key_count; index++) {
         CHECK(strstr(text, keys[index]) != NULL);
     }
-    /* No credential-shaped line, however the snapshot was filled in. */
     CHECK(strstr(text, "Authorization") == NULL);
     CHECK(strstr(text, "Bearer") == NULL);
     CHECK(strstr(text, "api_key") == NULL);

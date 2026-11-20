@@ -66,11 +66,6 @@ TEST(multiline_redraw_clears_the_previous_frame) {
 }
 
 TEST(ascii_wraps_at_the_exact_column_boundary) {
-    /* columns=4: "> " occupies col 0-1, leaving 2 columns of content per
-     * row. "abc" fills "a","b" on row 0 (cols 2,3) and wraps "c" to row 1
-     * (col 0) purely via the terminal's own line-wrap -- no explicit
-     * escape is emitted for a natural wrap, only the internal cursor
-     * bookkeeping changes. */
     static const char expected[] = "\r\x1b[J> abc";
     struct oi_cli_editor editor;
     struct oi_cli_render render;
@@ -94,10 +89,6 @@ TEST(ascii_wraps_at_the_exact_column_boundary) {
 }
 
 TEST(a_wide_code_point_wraps_whole_rather_than_splitting) {
-    /* columns=5: "> " leaves 3 content columns on row 0. "a","b" use 2 of
-     * them; the wide (2-column) CJK glyph U+4E2D only has 1 column left,
-     * so it must wrap to row 1 whole rather than splitting its cells
-     * across the boundary. */
     static const char expected[] = "\r\x1b[J> ab\xe4\xb8\xad";
     struct oi_cli_editor editor;
     struct oi_cli_render render;
@@ -113,7 +104,6 @@ TEST(a_wide_code_point_wraps_whole_rather_than_splitting) {
     len = read_available(pipe_fds[0], output, sizeof output);
     CHECK_EQ(len, sizeof expected - 1);
     CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
-    /* Cursor ends on row 1 (after the wide glyph wrapped there whole). */
     CHECK_EQ(render.previous_rows, 2);
 
     close(pipe_fds[0]);
@@ -122,8 +112,6 @@ TEST(a_wide_code_point_wraps_whole_rather_than_splitting) {
 }
 
 TEST(a_combining_mark_does_not_advance_the_column) {
-    /* U+0301 COMBINING ACUTE ACCENT stacks onto the preceding "a" and must
-     * not itself occupy a column. */
     static const char expected[] = "\r\x1b[J> a\xcc\x81";
     struct oi_cli_editor editor;
     struct oi_cli_render render;
@@ -185,10 +173,6 @@ TEST(command_menu_is_rendered_below_the_prompt) {
     output[len] = '\0';
     CHECK(strstr(output, "\r\n  /session") != NULL);
     CHECK(strstr(output, "\r\n> /status") != NULL);
-    /* The physical cursor is repositioned back up to the prompt row (row
-     * 0 here) before this call returns, not left on the menu's last row --
-     * previous_rows must track where the cursor actually ends up, not the
-     * frame's total height, or the next draw's clear step overshoots. */
     CHECK_EQ(render.previous_rows, 1);
 
     close(pipe_fds[0]);
@@ -225,12 +209,6 @@ TEST(second_draw_after_menu_does_not_overshoot_the_clear) {
                                          match_count, 0),
              OI_OK);
     len = read_available(pipe_fds[0], output, sizeof output);
-    /* previous_rows was 1 (not > 1) after the first draw, so this clear
-     * prefix must be exactly "\r" + "\x1b[J" -- no cursor-up escape at
-     * all. Before the previous_rows fix, the first draw would have
-     * (wrongly) stored 3, and this clear would have emitted
-     * "\r\x1b[2A\x1b[J", moving two rows above this frame's actual top
-     * and erasing whatever preceded it on a real terminal. */
     CHECK(len >= 4);
     CHECK(memcmp(output, "\r\x1b[J", 4) == 0);
 
@@ -264,8 +242,6 @@ TEST(erase_is_a_no_op_before_anything_is_drawn) {
     CHECK_EQ(oi_cli_render_init(&render, pipe_fds[1], 80), OI_OK);
     CHECK_EQ(oi_cli_render_erase(&render), OI_OK);
     CHECK_EQ(render.previous_rows, 0);
-    /* Confirm nothing was written: closing the write end and reading
-     * should immediately see EOF (0), not any bytes. */
     close(pipe_fds[1]);
     CHECK_EQ(read_available(pipe_fds[0], output, sizeof output), 0);
 
@@ -295,9 +271,6 @@ TEST(erase_clears_a_multiline_frame_and_resets_previous_rows) {
     CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
     CHECK_EQ(render.previous_rows, 0);
 
-    /* Erasing again immediately (nothing redrawn in between) is a no-op --
-     * previous_rows is already 0, matching the "already erased" case a
-     * caller hits if a turn produces no output between two reactor steps. */
     CHECK_EQ(oi_cli_render_erase(&render), OI_OK);
     close(pipe_fds[1]);
     CHECK_EQ(read_available(pipe_fds[0], output, sizeof output), 0);
@@ -325,7 +298,6 @@ TEST(panel_header_lines_are_drawn_above_the_prompt_and_counted) {
     len = read_available(pipe_fds[0], output, sizeof output);
     CHECK_EQ(len, sizeof expected - 1);
     CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
-    /* One header row plus one prompt row. */
     CHECK_EQ(render.previous_rows, 2);
 
     close(pipe_fds[0]);
@@ -401,7 +373,6 @@ TEST(selector_with_header_marks_the_selected_option) {
     len = read_available(pipe_fds[0], output, sizeof output);
     CHECK_EQ(len, sizeof expected - 1);
     CHECK(memcmp(output, expected, sizeof expected - 1) == 0);
-    /* One header row plus two option rows. */
     CHECK_EQ(render.previous_rows, 3);
 
     close(pipe_fds[0]);

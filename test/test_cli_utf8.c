@@ -123,9 +123,9 @@ TEST(lead_length_classifies_every_byte_class) {
 
 TEST(decode_reports_the_code_point_for_every_sequence_length) {
     static const unsigned char ascii[] = {'A'};
-    static const unsigned char two[] = {0xc2, 0xa2};        /* U+00A2 */
-    static const unsigned char three[] = {0xe4, 0xb8, 0xad}; /* U+4E2D */
-    static const unsigned char four[] = {0xf0, 0x9f, 0x98, 0x80}; /* U+1F600 */
+    static const unsigned char two[] = {0xc2, 0xa2};
+    static const unsigned char three[] = {0xe4, 0xb8, 0xad};
+    static const unsigned char four[] = {0xf0, 0x9f, 0x98, 0x80};
     uint32_t codepoint = 0;
 
     CHECK_EQ(oi_cli_utf8_decode((const char *)ascii, 1, &codepoint), OI_OK);
@@ -151,32 +151,26 @@ TEST(decode_rejects_bad_arguments) {
 }
 
 TEST(codepoint_width_follows_the_documented_policy) {
-    /* ASCII and other unremarkable code points default to width 1. */
     CHECK_EQ(oi_cli_utf8_codepoint_width('A'), 1U);
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0xa2), 1U); /* CENT SIGN */
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0xa2), 1U);
 
-    /* C0 controls and DEL never advance the column. */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0x09), 0U); /* TAB */
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0x09), 0U);
     CHECK_EQ(oi_cli_utf8_codepoint_width(0x1f), 0U);
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0x7f), 0U); /* DEL */
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0x7f), 0U);
 
-    /* Combining marks and zero-width formatting code points are width 0. */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0x0301), 0U); /* COMBINING ACUTE */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0x200d), 0U); /* ZWJ */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0xfe0f), 0U); /* VARIATION SEL-16 */
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0x0301), 0U);
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0x200d), 0U);
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0xfe0f), 0U);
 
-    /* CJK/Hangul code points are wide (width 2). */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0x4e2d), 2U); /* CJK 中 */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0xac00), 2U); /* HANGUL 가 */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0x30ab), 2U); /* KATAKANA KA */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0xff21), 2U); /* FULLWIDTH A */
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0x4e2d), 2U);
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0xac00), 2U);
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0x30ab), 2U);
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0xff21), 2U);
 
-    /* Boundaries of the documented ranges. */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0x4dff), 1U); /* just below CJK */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0x4e00), 2U); /* CJK block start */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0x9fff), 2U); /* CJK block end */
-    CHECK_EQ(oi_cli_utf8_codepoint_width(0xa4d0), 1U); /* between Yi and
-                                                          Hangul Syllables */
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0x4dff), 1U);
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0x4e00), 2U);
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0x9fff), 2U);
+    CHECK_EQ(oi_cli_utf8_codepoint_width(0xa4d0), 1U);
 }
 
 TEST(sequence_function_rejects_bad_arguments) {

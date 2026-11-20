@@ -1,22 +1,3 @@
-/*
- * libFuzzer harness for the JSON parser (oi/json.h).
- *
- * Checks more than "doesn't crash": oi/json.h promises that feed()
- * behaves identically regardless of how the input is chunked -- the
- * property the whole non-blocking-socket design rests on. Every input is
- * therefore parsed twice, once as a single feed and once one byte at a
- * time, and the two runs must agree on their terminal state and, when a
- * value was produced, on its serialization.
- *
- * Re-serializing the value tree also drags json_write.c into the fuzzed
- * surface, and comparing the two texts catches value-level divergence
- * (a dropped member, a mis-decoded escape) that comparing done/failed
- * flags alone would miss.
- *
- * json_internal.h is included because the public API can look up object
- * members by key but cannot enumerate them in order; walking the member
- * list directly is what makes the object comparison exact.
- */
 
 #include <assert.h>
 #include <stdint.h>
@@ -27,9 +8,6 @@
 #include "oi/arena.h"
 #include "oi/json.h"
 
-/* Bounds the byte-at-a-time run, which costs one feed() call per byte.
- * libFuzzer's own default max_len is well under this; the cap only stops
- * a hand-added corpus file from dominating the run. */
 #define FUZZ_MAX_INPUT (64u * 1024)
 
 static oi_status write_value(oi_json_writer *w, const oi_json_value *v) {
@@ -91,18 +69,11 @@ static oi_status write_value(oi_json_writer *w, const oi_json_value *v) {
 struct parse_result {
     int failed;
     int done;
-    /* Set when a resource limit (arena block size, writer growth) was
-     * hit. Those limits are allowed to depend on chunking, so the two
-     * runs are only compared when neither tripped one. */
     int nomem;
-    char *text; /* re-serialized root, NULL if none was produced */
+    char *text;
     size_t text_len;
 };
 
-/* Serializes `root` into a freshly malloc'd NUL-terminated buffer.
- * Ownership transfers to `out`; any failure leaves out->text NULL and
- * sets out->nomem, which suppresses the comparison rather than
- * reporting a bug. */
 static void capture_text(const oi_json_value *root, struct parse_result *out) {
     oi_json_writer *w = oi_json_writer_create();
     if (!w) {
@@ -151,16 +122,11 @@ static void run_parse(const uint8_t *data, size_t size, size_t chunk,
         if (st == OI_ERR_NOMEM) {
             out->nomem = 1;
         }
-        /* Parse errors are sticky, so stopping at the first one matches
-         * what the single-feed run reports after consuming the rest. */
         if (st != OI_OK) {
             break;
         }
     }
 
-    /* Deliberately called even on an already-failed parser: "finish
-     * after an error" is itself a path worth fuzzing, and both runs
-     * reach it identically. */
     if (oi_json_parser_finish(p) == OI_ERR_NOMEM) {
         out->nomem = 1;
     }

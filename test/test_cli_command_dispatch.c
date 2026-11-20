@@ -86,12 +86,6 @@ struct status_cb_call {
     oi_status result;
 };
 
-/*
- * Stands in for cli_repl's assembler. The strings handed back are static, so
- * the borrowed-pointer contract ("valid until the next call through the same
- * callback") holds trivially -- which is the point: dispatch must not need to
- * copy anything.
- */
 static oi_status fake_status(void *user_data,
                              struct oi_cli_status_snapshot *out_snapshot) {
     struct status_cb_call *call = user_data;
@@ -119,7 +113,6 @@ static oi_status fake_status(void *user_data,
     return OI_OK;
 }
 
-/* Fills in nothing at all, to prove what dispatch hands a callback. */
 static oi_status silent_status(void *user_data,
                               struct oi_cli_status_snapshot *out_snapshot) {
     struct status_cb_call *call = user_data;
@@ -134,11 +127,6 @@ TEST(status_reports_the_assembled_snapshot) {
     FILE *err = tmpfile();
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
     struct status_cb_call call = {0, OI_OK};
-    /*
-     * `model`, `session_id`, and `permission` are deliberately set to values
-     * the snapshot contradicts: /status must report the snapshot and nothing
-     * else, so a stale context field cannot leak into the report.
-     */
     struct oi_cli_command_context context = {
         .out = out,
         .err = err,
@@ -166,7 +154,6 @@ TEST(status_reports_the_assembled_snapshot) {
     CHECK(strstr(output, "Queue: 1 message queued (11 bytes)") != NULL);
     CHECK(strstr(output, "Checkpoint: none") != NULL);
     CHECK(strstr(output, "Context: not compacted") != NULL);
-    /* Neither the contradicted context values nor any queued text. */
     CHECK(strstr(output, "context-model") == NULL);
     CHECK(strstr(output, "context-session") == NULL);
     free(output);
@@ -174,12 +161,6 @@ TEST(status_reports_the_assembled_snapshot) {
     fclose(err);
 }
 
-/*
- * Dispatch must hand the callback an honestly-unknown snapshot, not a zeroed
- * one: a callback that reports nothing must produce a report that claims
- * nothing. Asserted here, at the boundary that owns the initialization, and
- * not only in the renderer's own tests.
- */
 TEST(status_reports_unknown_for_everything_a_callback_leaves_alone) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
@@ -233,17 +214,13 @@ TEST(status_rejects_arguments_and_survives_an_unavailable_snapshot) {
     enum oi_cli_command_result result;
     char *errors;
 
-    /* An assembler failure is reported and stays in the REPL, like every
-     * other recoverable command failure. */
     CHECK_EQ(dispatch("/status", &context, &result), OI_OK);
     CHECK_EQ(result, OI_CLI_COMMAND_CONTINUE);
     CHECK_EQ(call.call_count, 1);
 
-    /* No callback at all: say so rather than reporting a made-up snapshot. */
     context.status = NULL;
     CHECK_EQ(dispatch("/status", &context, &result), OI_OK);
 
-    /* Arguments are a usage error, and must not reach the assembler. */
     CHECK_EQ(dispatch("/status extra", &context, &result), OI_OK);
     CHECK_EQ(call.call_count, 1);
 
@@ -508,9 +485,6 @@ TEST(cwd_callback_failure_is_reported_and_stays_in_the_repl) {
     fclose(err);
 }
 
-/* --- /session grammar --- */
-
-/* Records what the session ops were asked to do, and what to answer. */
 struct session_cb_state {
     char id[128];
     size_t id_len;
@@ -520,7 +494,6 @@ struct session_cb_state {
     int call_count;
     oi_status result;
     const char *detail;
-    /* Entries the list callback should hand back. */
     int entry_count;
     int list_result_error;
 };
@@ -554,7 +527,6 @@ static oi_status fake_list(void *user_data,
             entry.degraded = 1;
             oi_cli_string_free(&entry.model);
         }
-        /* Grow through the same shape oi_cli_sessions_enumerate produces. */
         {
             struct oi_cli_session_list_entry *grown =
                 realloc(out_list->entries,
@@ -647,29 +619,21 @@ TEST(session_list_renders_every_entry_state) {
     state.entry_count = 3;
     context.session = wired_ops(&state);
 
-    /* Bare /session means "show me what I can pick from". */
     CHECK_EQ(dispatch("/session", &context, &result), OI_OK);
     CHECK_EQ(result, OI_CLI_COMMAND_CONTINUE);
     CHECK_STREQ(state.last_operation, "list");
     output = read_stream(out);
     CHECK(strstr(output, "Sessions (3):") != NULL);
-    /* The active session is marked, the others are not. */
     CHECK(strstr(output, "* sess-0") != NULL);
     CHECK(strstr(output, "  sess-1") != NULL);
-    /* A named session shows its name; a busy one says so; a rebuilt one
-     * says that instead of pretending its metadata was authoritative. */
     CHECK(strstr(output, "\"named one\"") != NULL);
     CHECK(strstr(output, "[open elsewhere]") != NULL);
     CHECK(strstr(output, "[metadata rebuilt]") != NULL);
     CHECK(strstr(output, "model gpt-test") != NULL);
-    /* The degraded entry has no model at all, and says so rather than
-     * printing nothing. */
     CHECK(strstr(output, "model unknown") != NULL);
     free(output);
 
-    /* /session list is the same thing spelled out. */
     CHECK_EQ(dispatch("/session list", &context, &result), OI_OK);
-    /* ...and the trash has its own heading. */
     CHECK_EQ(dispatch("/session trash-list", &context, &result), OI_OK);
     output = read_stream(out);
     CHECK(strstr(output, "Trashed sessions (3):") != NULL);
@@ -698,8 +662,6 @@ TEST(session_list_reports_an_empty_directory_and_a_read_failure) {
     CHECK(strstr(text, "Sessions: none") != NULL);
     free(text);
 
-    /* A failing enumerate is reported, not propagated as a REPL-ending
-     * error. */
     state.list_result_error = 1;
     CHECK_EQ(dispatch("/session list", &context, &result), OI_OK);
     CHECK_EQ(result, OI_CLI_COMMAND_CONTINUE);
@@ -724,7 +686,7 @@ TEST(session_current_reports_health_live) {
     char *text;
 
     memset(&state, 0, sizeof state);
-    state.entry_count = 1; /* fake_current reports healthy */
+    state.entry_count = 1;
     context.session = wired_ops(&state);
 
     CHECK_EQ(dispatch("/session current", &context, &result), OI_OK);
@@ -734,8 +696,6 @@ TEST(session_current_reports_health_live) {
     CHECK(strstr(text, "Status: healthy") != NULL);
     free(text);
 
-    /* Degraded is named as such, and says the cache is rebuildable rather
-     * than implying history was lost. */
     state.entry_count = 0;
     CHECK_EQ(dispatch("/session current", &context, &result), OI_OK);
     text = read_stream(out);
@@ -761,8 +721,6 @@ TEST(session_rename_passes_exact_bytes_and_reports_details) {
     memset(&state, 0, sizeof state);
     context.session = wired_ops(&state);
 
-    /* The id is the first token; everything after it is the name, spaces
-     * included. */
     CHECK_EQ(dispatch("/session rename sess-7 my long name", &context,
                       &result),
              OI_OK);
@@ -772,7 +730,6 @@ TEST(session_rename_passes_exact_bytes_and_reports_details) {
     CHECK(strstr(text, "Renamed session sess-7") != NULL);
     free(text);
 
-    /* A failure surfaces the callback's own explanation verbatim. */
     state.result = OI_ERR_INVAL;
     state.detail = "a session name cannot contain control characters";
     CHECK_EQ(dispatch("/session rename sess-7 bad", &context, &result),
@@ -782,7 +739,6 @@ TEST(session_rename_passes_exact_bytes_and_reports_details) {
     CHECK(strstr(text, "control characters") != NULL);
     free(text);
 
-    /* Both operands are required. */
     state.call_count = 0;
     CHECK_EQ(dispatch("/session rename", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session rename only-an-id", &context, &result),
@@ -821,7 +777,6 @@ TEST(session_trash_and_restore_take_exactly_one_id) {
     CHECK(strstr(text, "Restored session sess-9") != NULL);
     free(text);
 
-    /* A refusal from the policy layer is shown with its reason. */
     state.result = OI_ERR_INVAL;
     state.detail = "cannot trash the active session -- switch away first";
     CHECK_EQ(dispatch("/session trash sess-9", &context, &result), OI_OK);
@@ -829,8 +784,6 @@ TEST(session_trash_and_restore_take_exactly_one_id) {
     CHECK(strstr(text, "switch away first") != NULL);
     free(text);
 
-    /* Missing or extra operands are named rather than silently ignored --
-     * an id is one bounded token. */
     state.call_count = 0;
     CHECK_EQ(dispatch("/session trash", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session trash sess-9 extra", &context, &result),
@@ -854,7 +807,6 @@ TEST(session_reports_unavailable_operations_and_bad_subcommands) {
     enum oi_cli_command_result result;
     char *text;
 
-    /* No ops wired at all: every subcommand says so instead of crashing. */
     CHECK_EQ(dispatch("/session list", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session current", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session rename a b", &context, &result), OI_OK);
@@ -869,11 +821,6 @@ TEST(session_reports_unavailable_operations_and_bad_subcommands) {
     CHECK(strstr(text, "/session restore is not available") != NULL);
     free(text);
 
-    /*
-     * switch/delete/import are intercepted by cli_repl.c before dispatch
-     * runs. Reaching here means there is no interactive REPL, so say that
-     * plainly rather than implying the subcommand does not exist.
-     */
     CHECK_EQ(dispatch("/session switch sess-1", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session delete sess-1", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session import /tmp/a.oilog", &context, &result),
@@ -887,7 +834,6 @@ TEST(session_reports_unavailable_operations_and_bad_subcommands) {
           NULL);
     free(text);
 
-    /* An unknown subcommand, and stray words after ones that take none. */
     CHECK_EQ(dispatch("/session frobnicate", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session current extra", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session list extra", &context, &result), OI_OK);

@@ -1,5 +1,3 @@
-/* Measures the actual request bytes oi sends when resuming a session,
- * using the integration test's capture mock server. Throwaway tool. */
 #include "mock_api.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +39,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "no request captured\n");
         return 1;
     }
-    /* strip headers; find the JSON body */
     body = strstr(req, "\r\n\r\n");
     if (body) {
         body += 4;

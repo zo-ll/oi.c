@@ -30,11 +30,6 @@ static int is_plain_passthrough(unsigned char byte) {
     return 1;
 }
 
-/*
- * Consumes one byte. Sets *reprocess when the byte was not consumed (a
- * held 0xC2 turned out not to be a C1 lead) -- the caller must call this
- * again with the same byte, now that state has advanced.
- */
 static oi_status feed_one(struct oi_cli_sanitize_state *state,
                           unsigned char byte, struct oi_cli_bytebuf *out,
                           int *reprocess) {
@@ -54,7 +49,7 @@ static oi_status feed_one(struct oi_cli_sanitize_state *state,
         if (is_plain_passthrough(byte)) {
             return oi_cli_bytebuf_append(out, &byte, 1);
         }
-        return OI_OK; /* stripped C0 control or DEL */
+        return OI_OK;
 
     case OI_CLI_SANITIZE_SAW_C2: {
         static const unsigned char lead_c2 = 0xc2U;
@@ -62,8 +57,6 @@ static oi_status feed_one(struct oi_cli_sanitize_state *state,
 
         state->phase = OI_CLI_SANITIZE_NORMAL;
         if (byte >= 0x80U && byte <= 0x9fU) {
-            /* C1 control encoded as UTF-8 (0xC2 0x80-0xC2 0x9F); drop
-             * both bytes. */
             return OI_OK;
         }
         status = oi_cli_bytebuf_append(out, &lead_c2, 1);
@@ -88,13 +81,10 @@ static oi_status feed_one(struct oi_cli_sanitize_state *state,
             return OI_OK;
         }
         if (byte >= 0x20U && byte <= 0x7eU) {
-            /* Simple two-byte escape (ESC c, ESC =, ...), consumed. */
             state->phase = OI_CLI_SANITIZE_NORMAL;
             state->sequence_bytes = 0;
             return OI_OK;
         }
-        /* Incomplete/malformed escape: drop the lone ESC and reprocess
-         * this byte from a clean state. */
         state->phase = OI_CLI_SANITIZE_NORMAL;
         state->sequence_bytes = 0;
         *reprocess = 1;

@@ -5,9 +5,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* UX-level bound for /model NAME, generous for any real model id -- on
- * top of the shared 4096-byte storage ceiling (OI_CLI_HISTORY_MAX_SETTING_VALUE)
- * enforced further down the stack. */
 #define OI_CLI_COMMAND_MODEL_MAX_LEN 256u
 
 static const char *permission_name(oi_cli_tool_policy policy) {
@@ -37,9 +34,6 @@ static oi_status print_help(FILE *out) {
             return OI_ERR_IO;
         }
     }
-    /* Deliberately the whole binding set, not a sample: /help is the only
-     * in-terminal reference, and docs/CLI.md's key table is checked against
-     * this list by test_cli_docs so the two cannot drift apart. */
     if (fputs("\nKeys:\n"
               "  Enter        submit (or complete the selected command)\n"
               "  Ctrl+J       newline\n"
@@ -59,14 +53,6 @@ static oi_status print_help(FILE *out) {
     return OI_OK;
 }
 
-/*
- * Every field comes from the one snapshot the owning modules assembled --
- * dispatch deliberately does not mix in `context->model`, `->session_id`, or
- * a getcwd() of its own, even though it has all three to hand. A report
- * stitched from two sources can disagree with itself (a /model change
- * applied to the conversation but not yet to this context, say), and there
- * would be no way to tell which half was right.
- */
 static oi_status print_status(struct oi_cli_command_context *context) {
     struct oi_cli_status_snapshot snapshot;
     oi_status status;
@@ -77,9 +63,6 @@ static oi_status print_status(struct oi_cli_command_context *context) {
                    ? OI_ERR_IO
                    : OI_OK;
     }
-    /* The semantic initializer, not a memset: a zeroed snapshot would claim
-     * a pile of real states (no session, ask, disabled deadlines, idle,
-     * empty queue) that the callee never asserted. */
     oi_cli_status_snapshot_init(&snapshot);
     status = context->status(context->status_user_data, &snapshot);
     if (status != OI_OK) {
@@ -152,17 +135,13 @@ static oi_status dispatch_model(
     status = context->set_model(context->set_model_user_data,
                                 command->arguments, command->arguments_len);
     if (status == OI_ERR_INVAL) {
-        /* A bad name is a user-input problem, not a structural failure:
-         * report it and stay in the REPL, matching /permissions'
-         * usage-error handling. */
         return fputs("oi: could not change the model\n", context->err) ==
                        EOF
                    ? OI_ERR_IO
                    : OI_OK;
     }
     if (status != OI_OK) {
-        return status; /* structural/storage failure: existing
-                        * session-failure path handles this */
+        return status;
     }
     return fprintf(context->out, "Model: %.*s\n", (int)command->arguments_len,
                    command->arguments) < 0 ||
@@ -201,20 +180,14 @@ static oi_status dispatch_cwd(const struct oi_cli_command_parse *command,
     status = context->set_cwd(context->set_cwd_user_data, command->arguments,
                               command->arguments_len);
     if (status == OI_ERR_INVAL) {
-        /* An invalid/missing/non-directory path is a user-input problem,
-         * not a structural failure: report it and stay in the REPL. */
         return fputs("oi: could not change the working directory\n",
                      context->err) == EOF
                    ? OI_ERR_IO
                    : OI_OK;
     }
     if (status != OI_OK) {
-        return status; /* structural/storage failure: existing
-                        * session-failure path handles this */
+        return status;
     }
-    /* A successful set_cwd always leaves the process's real cwd at the
-     * new canonical location, so getcwd() is always correct here --
-     * no display value needs threading through the callback. */
     return print_cwd(context->out);
 }
 
@@ -222,13 +195,6 @@ static int is_space(char value) {
     return value == ' ' || value == '\t' || value == '\r' || value == '\n';
 }
 
-/*
- * Splits `text` at its first run of whitespace into a leading token and a
- * left-trimmed remainder. `text` arrives already right-trimmed from
- * oi_cli_command_parse_text, so the remainder needs no further trimming --
- * which matters for /session import, whose argument is a path that may
- * legitimately contain spaces and must survive verbatim.
- */
 static void split_first_token(const char *text, size_t len,
                               const char **out_token, size_t *out_token_len,
                               const char **out_rest, size_t *out_rest_len) {
@@ -262,7 +228,6 @@ static oi_status print_session_usage(FILE *err) {
                : OI_OK;
 }
 
-/* Formats one epoch timestamp for a selector row; 0 means unknown. */
 static void format_timestamp(int64_t when, char *buffer, size_t capacity) {
     struct tm parts;
     time_t value = (time_t)when;
@@ -294,8 +259,6 @@ static oi_status print_session_list(struct oi_cli_command_context *context,
                          strcmp(context->session_id, entry->id) == 0;
 
         format_timestamp(entry->updated_at, updated, sizeof updated);
-        /* A leading marker beats a trailing "(current)": it lines the rows
-         * up so the ids stay scannable. */
         if (fprintf(context->out, "%s %s", is_current ? "*" : " ",
                     entry->id) < 0) {
             return OI_ERR_IO;
@@ -378,9 +341,6 @@ static oi_status dispatch_session_current(
                    ? OI_ERR_IO
                    : OI_OK;
     }
-    /* Health is resolved live on every call rather than cached from
-     * startup: metadata can be deleted or corrupted by something outside
-     * oi at any point during a long-running session. */
     return fprintf(context->out, "Session: %s\nPath: %s\nStatus: %s\n",
                    current.id,
                    current.path == NULL ? "(unknown)" : current.path,
@@ -393,7 +353,6 @@ static oi_status dispatch_session_current(
                : OI_OK;
 }
 
-/* Reports the outcome of a rename/trash/restore uniformly. */
 static oi_status report_session_operation(
     struct oi_cli_command_context *context, oi_status status,
     char *error_detail, const char *success_format, const char *id,
@@ -457,8 +416,6 @@ static oi_status dispatch_session_admin(
                    ? OI_ERR_IO
                    : OI_OK;
     }
-    /* An id is a single bounded token, so trailing words are a mistake
-     * worth naming rather than silently ignoring. */
     {
         const char *id;
         const char *extra;
@@ -492,7 +449,6 @@ static oi_status dispatch_session(const struct oi_cli_command_parse *command,
     size_t token_len;
     size_t rest_len;
 
-    /* Bare /session means "show me what I can pick from". */
     if (command->arguments_len == 0) {
         return dispatch_session_list(context, 0);
     }
@@ -524,13 +480,6 @@ static oi_status dispatch_session(const struct oi_cli_command_parse *command,
                                       context->session.restore,
                                       "Restored session %.*s\n");
     }
-    /*
-     * These three need the composer's confirmation flow or the live
-     * conversation, so cli_repl.c intercepts them before dispatch runs.
-     * Reaching here means no interactive REPL is present -- a
-     * non-interactive context or these unit tests -- so say so plainly
-     * rather than pretending the command does not exist.
-     */
     if (token_equals(token, token_len, "switch") ||
         token_equals(token, token_len, "delete") ||
         token_equals(token, token_len, "import")) {
@@ -590,16 +539,8 @@ oi_status oi_cli_command_dispatch(
     case OI_CLI_COMMAND_SESSION:
         return dispatch_session(command, context);
     case OI_CLI_COMMAND_COMPACT:
-        /* Never actually reached from the interactive REPL: cli_repl.c
-         * intercepts /compact at have_parsed_command: before dispatch is
-         * ever called, since this command needs the conversation, the
-         * durable history store, and the LLM client, none of which
-         * oi_cli_command_context has access to by design. Only reachable
-         * here via oi_cli_command_dispatch's own unit tests. */
         return print_deferred(command->command, context->err);
     case OI_CLI_COMMAND_LOGIN:
-        /* cli_repl.c intercepts /login: it needs the composer and the LLM
-         * client, which oi_cli_command_context does not carry. */
         return print_deferred(command->command, context->err);
     }
     return OI_ERR_INVAL;

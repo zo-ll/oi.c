@@ -1,17 +1,3 @@
-/*
- * libFuzzer harness for the SSE event splitter (src/llm_sse.h).
- *
- * The last framing layer between raw socket bytes and the JSON parser,
- * and the one most exposed to arbitrary server output. As with the HTTP
- * and JSON harnesses, the invariant under test is chunk-independence:
- * the same bytes split differently across feed() calls must yield the
- * same sequence of events.
- *
- * Events are captured length-prefixed so the comparison covers event
- * *boundaries*, not just the concatenated payload -- splitting one
- * event into two (or merging two into one) is exactly the kind of
- * framing bug a boundary-blind comparison would let through.
- */
 
 #include <assert.h>
 #include <stdint.h>
@@ -25,7 +11,7 @@
 
 struct sse_result {
     int event_count;
-    int nomem; /* a capture-side allocation failed; suppresses comparison */
+    int nomem;
     char *events;
     size_t len;
     size_t cap;

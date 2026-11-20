@@ -13,61 +13,30 @@
 struct login_renewal;
 
 struct oi_cli_login {
-    char *credentials_path;                 /* owned; NULL when no home */
-    oi_llm_client *client;                  /* borrowed */
-    struct oi_cli_status_endpoint *endpoint; /* borrowed; updated on login */
-    const char *ca_file;                    /* borrowed */
+    char *credentials_path;
+    oi_llm_client *client;
+    struct oi_cli_status_endpoint *endpoint;
+    const char *ca_file;
     int timeout_ms;
-    int key_from_environment;               /* OI_API_KEY or --api-key won */
+    int key_from_environment;
     FILE *err;
-    char *host; /* owned; what *endpoint points at after a login */
-    char *path; /* owned; what *endpoint points at after a login */
-    int oauth_active;       /* the client holds a short-lived access token */
-    double expires_at;      /* when that token expires, epoch seconds */
-    char *selected_model;   /* owned; set when a login chose a model */
-    oi_reactor *reactor;    /* borrowed; token renewal runs on it */
-    struct login_renewal *renewal; /* owned; a renewal and its result */
+    char *host;
+    char *path;
+    int oauth_active;
+    double expires_at;
+    char *selected_model;
+    oi_reactor *reactor;
+    struct login_renewal *renewal;
 };
 
-/*
- * Finishes a sent token renewal on `login->reactor`, so its rotated tokens
- * are saved, then frees what `login` owns. It prints a line while it waits
- * (at most 20 s), and Ctrl+C ends the wait with the credentials file
- * unchanged. The reactor must stay alive until this call returns.
- */
 void oi_cli_login_free(struct oi_cli_login *login);
 
-/*
- * Fills `cfg` from the saved credentials. A key already present in `cfg` wins.
- * Saved credentials apply only to the default endpoint: a --host or config
- * file pointing elsewhere must never receive a key saved for another server.
- * A missing file is normal; an unusable one is reported on `err` and ignored.
- */
 oi_status oi_cli_login_apply_saved(oi_config *cfg, const char *path,
                                    FILE *err, int *out_oauth,
                                    double *out_expires_at);
 
-/*
- * An oi_llm_before_request_cb. While an OAuth login is active and the
- * access token is close to expiry, starts a renewal on `reactor` and
- * returns at once; a later call adopts the new token. It returns
- * OI_ERR_AGAIN, so the request waits on the reactor and stays
- * cancellable, only when the token has less than 30 seconds left and a
- * renewal is still running. The renewal holds a file lock, because the
- * server rotates the refresh token and a second process must not reuse
- * the old one; a lock that another process holds means that process is
- * renewing. The renewal advances only while `reactor` runs, so a caller
- * that waits for input between turns must run it too (see the `reactor`
- * member of struct oi_cli_composer).
- */
 oi_status oi_cli_login_before_request(void *user_data);
 
-/*
- * Runs the /login dialog on an idle REPL: provider, then method, then the
- * details that method needs. A success updates the live client at once and
- * saves the credentials. Returns non-OK only for a structural failure; every
- * refusal a user can provoke is printed and leaves the REPL running.
- */
 oi_status oi_cli_login_run(struct oi_cli_login *login,
                            struct oi_cli_composer *composer, int signal_fd,
                            int *out_terminate_signal);

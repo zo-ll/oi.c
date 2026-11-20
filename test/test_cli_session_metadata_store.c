@@ -153,10 +153,6 @@ TEST(failed_rename_leaves_the_destination_untouched_and_cleans_up) {
     char *tmp_path = tmp_suffixed_path(path, ".tmp");
     oi_cli_session_metadata_init(&metadata);
 
-    /* Make the destination an existing directory: rename(2) of a regular
-     * file onto it fails with EISDIR, forcing a rename failure without
-     * ever affecting whether the temp file could be created (same
-     * directory, a distinct filename). */
     CHECK_EQ(mkdir(path, 0700), 0);
     CHECK_EQ(oi_cli_session_metadata_set(&metadata, "sess-1", 6, "gpt-test",
                                          8, "/tmp", 4, NULL, 0, 1, 1),

@@ -19,14 +19,6 @@
 #include "oi/reactor.h"
 #include "oi/session.h"
 
-/*
- * Thin standalone CLI: resolves config, opens (or resumes) a session,
- * sends a prompt argument (or stdin) through the CLI-owned model/tool
- * loop, and prints assistant replies as they stream. Configuration and
- * session lifecycle stay here; loop state and built-in tool policy live
- * in their own internal modules.
- */
-
 static void print_usage(void) {
     printf(
         "usage: oi [flags] [\"prompt\"]\n"
@@ -57,9 +49,6 @@ static void print_usage(void) {
         "  --dry-run            resolve config and print the request, don't send it\n"
         "  -h, --help           show this help\n"
         "\n"
-        /* A URL, not the repository-relative docs/CLI.md: `make install`
-         * installs the binary, the libraries, and the headers, so an
-         * installed `oi` has no docs directory to point anyone at. */
         "Interactive commands and key bindings: /help.\n"
         "Full guide, including session storage:\n"
         "https://github.com/zo-ll/oi.c/blob/main/docs/CLI.md\n");
@@ -115,10 +104,9 @@ static int strbuf_append(struct strbuf *b, const char *data, size_t len) {
     return 0;
 }
 
-/* Reads all of stdin. An empty stream yields a valid, empty buffer. */
 static char *read_stdin_all(oi_status *out_status) {
     struct strbuf b = {0};
-    if (strbuf_append(&b, "", 0) != 0) { /* ensure non-NULL even if EOF immediately */
+    if (strbuf_append(&b, "", 0) != 0) {
         *out_status = OI_ERR_NOMEM;
         return NULL;
     }
@@ -188,10 +176,10 @@ struct persistence_context {
     struct oi_cli_history_store *store;
     struct oi_cli_history_replay_state *state;
     uint64_t turn_id;
-    struct oi_cli_string model; /* owned; may be updated live by /model */
-    const char *session_path;   /* borrowed directory or explicit log path */
-    const char *metadata_path;  /* borrowed, stable for the process lifetime */
-    const char *session_id;    /* borrowed */
+    struct oi_cli_string model;
+    const char *session_path;
+    const char *metadata_path;
+    const char *session_id;
     oi_status last_error;
 };
 
@@ -208,12 +196,6 @@ struct automatic_session_context {
     FILE *diagnostics;
 };
 
-/*
- * Everything the /session lifecycle commands need in order to act on
- * main()'s own locals. Those locals are private to this translation unit, so
- * the policy lives in cli_sessions/cli_session_switch and only the adoption
- * of a new session happens here.
- */
 struct session_admin_context {
     oi_session_registry *registry;
     oi_session **session;
@@ -223,11 +205,7 @@ struct session_admin_context {
     struct oi_cli_history_store *store;
     struct oi_cli_history_replay_state *state;
     struct persistence_context *persistence;
-    /* Owned slot holding the metadata path of the most recently switched-to
-     * session. persistence->metadata_path points into it after a switch, so
-     * it must outlive every use and is freed once at cleanup. */
     char **switched_metadata_path;
-    /* Same ownership arrangement for the user-facing session directory. */
     char **switched_session_path;
 };
 
@@ -254,11 +232,6 @@ static oi_status admin_current_session(
     if (id == NULL || context->persistence->metadata_path == NULL) {
         return OI_OK;
     }
-    /*
-     * Resolved live on every call rather than cached from startup: the cache
-     * can be removed or corrupted by something outside oi at any point in a
-     * long-running session, and a single bounded read is cheap.
-     */
     {
         struct oi_cli_session_metadata metadata;
         oi_cli_session_metadata_init(&metadata);
@@ -287,8 +260,6 @@ static oi_status admin_trash_session(void *user_data, const char *id,
                                      size_t id_len,
                                      char **out_error_detail) {
     struct session_admin_context *context = user_data;
-    /* Passing the active id is what makes "cannot trash the session you are
-     * in" enforceable down in the policy layer. */
     return oi_cli_session_trash(context->root_override, id, id_len,
                                 oi_session_id(*context->session),
                                 out_error_detail);
@@ -318,15 +289,6 @@ static oi_status admin_import_session(void *user_data, const char *path,
                                  out_new_id, out_error_detail);
 }
 
-/*
- * Adopts a different session as the active one.
- *
- * oi_cli_session_switch does all the risky work and touches nothing that is
- * currently live, so by the time it returns OK the only thing left is an
- * ownership handover. Destroying the old session here is safe precisely
- * because cli_repl.c has already destroyed the conversation that was
- * allocating from its arena -- the precondition documented on the callback.
- */
 static oi_status admin_switch_session(
     void *user_data, const char *id, size_t id_len,
     struct oi_cli_session_switch_result *out_result) {
@@ -342,14 +304,10 @@ static oi_status admin_switch_session(
         return status;
     }
 
-    /* Commit point. NULL-safe: switching before the first message means
-     * there is no session or history to release yet. */
     oi_session_destroy(context->registry, *context->session);
     oi_cli_history_store_free(context->store);
     oi_cli_history_replay_state_free(context->state);
 
-    /* Move, rather than copy: the result's copies are re-inited so freeing it
-     * afterwards cannot double-free what was handed over. */
     *context->store = out_result->store;
     oi_cli_history_store_init(&out_result->store);
     *context->state = out_result->state;
@@ -417,13 +375,10 @@ static oi_status prepare_automatic_session(void *user_data,
         return status;
     }
 
-    /* Every automatic session is brand new: bare interactive startup
-     * always begins a fresh timestamped directory (docs/REPL_PLAN.md),
-     * so this always durably records its first-ever effective model/cwd. */
     oi_cli_session_restore_init(&restore);
     status = oi_cli_session_restore_settings(
         context->store, context->state, context->location->metadata_path,
-        context->location->id, /*is_new_session=*/1, /*explicit_model=*/NULL,
+        context->location->id, 1, NULL,
         context->pending_model->data, context->default_cwd,
         context->diagnostics, &restore);
     if (status == OI_OK) {
@@ -532,11 +487,6 @@ static oi_status persist_conversation_event(
     return st;
 }
 
-/* Durable persistence for a live /model or /cwd change -- cli_repl.c's
- * controller only requests the change; cli.c owns what persisting it
- * actually means (a durable history record plus a metadata.json
- * refresh). NULL `store` means no durable session exists yet (nothing
- * to persist to yet; the REPL's own live update already applied). */
 static oi_status persist_model_setting(void *user_data, const char *name,
                                        size_t name_len) {
     struct persistence_context *persistence = user_data;
@@ -563,21 +513,6 @@ static oi_status persist_cwd_setting(void *user_data, const char *path,
         path_len);
 }
 
-/*
- * Durable persistence for the one-slot queued-input mechanism. Unlike
- * persist_model_setting/persist_cwd_setting, these append a plain history
- * record directly (oi_cli_history_store_append), the same way
- * persist_conversation_event does -- there is no metadata.json refresh
- * involved. context->state->next_record_id/next_turn_id are exactly right
- * for a QUEUED_INPUT record (cli_history_replay.c requires its turn_id to
- * be the *next* turn, the one that hasn't started yet, not the currently
- * active one tracked by context->turn_id); a successful append then has
- * oi_cli_history_store_append itself replay context->state fresh, which is
- * what populates pending_input_turn_id below for the matching
- * QUEUE_RESOLVED record -- cli_repl.c never needs to track or pass a
- * turn_id itself, only the opaque record id persist_queued_input hands
- * back.
- */
 static oi_status persist_queued_input(void *user_data, const char *content,
                                       size_t content_len,
                                       uint64_t *out_record_id) {
@@ -632,14 +567,6 @@ static oi_status persist_queue_resolved(void *user_data,
     return st;
 }
 
-/*
- * `prefix_message_count` is a count into cli_repl.c's own live message
- * list, never a record id -- the source range recorded here is read
- * directly off replay_state->context[0..prefix_message_count-1]'s own
- * record_id fields (real, stored ids), never computed arithmetically from
- * the count itself, since a live index and a durable record id diverge
- * once any earlier checkpoint has already collapsed part of the history.
- */
 static oi_status persist_checkpoint(void *user_data,
                                     size_t prefix_message_count,
                                     const char *summary, size_t summary_len,
@@ -674,19 +601,6 @@ static oi_status persist_checkpoint(void *user_data,
     return st;
 }
 
-/*
- * Closes out a crash-recovery window found by replay (a QUEUED_INPUT record
- * with no matching QUEUE_RESOLVED, replay_state->has_pending_input):
- * persists QUEUE_RESOLVED(DISCARDED) for it immediately, before anything
- * else can run, so a second crash right after this restart can't re-litigate
- * it, then hands its exact text back as a plain editable draft -- never an
- * auto-resubmit, since nothing should silently run on the user's behalf
- * after a crash. A no-op (out_draft untouched) when there's nothing pending.
- * Only ever reachable for an explicit --session restore of a pre-existing
- * log: an automatic session's directory is always brand new (see
- * prepare_automatic_session's own comment), so it can never have a queued
- * item left over from before this process even started.
- */
 static oi_status seed_pending_draft_from_replay(
     struct oi_cli_history_store *store,
     struct oi_cli_history_replay_state *state,
@@ -697,10 +611,6 @@ static oi_status seed_pending_draft_from_replay(
     if (!state->has_pending_input) {
         return OI_OK;
     }
-    /* Copied before the append below: a successful append replays and
-     * replaces *state wholesale (see persist_queued_input's own comment),
-     * which frees state->pending_input as part of clearing has_pending_input
-     * back to 0. */
     st = oi_cli_string_set(out_draft, state->pending_input.data,
                            state->pending_input.len);
     if (st != OI_OK) {
@@ -720,17 +630,6 @@ static oi_status seed_pending_draft_from_replay(
     return st;
 }
 
-/*
- * Reports the durable checkpoint /status names. Read live off the replay
- * state rather than remembered from startup: oi_cli_history_store_append
- * republishes that state after every append, so a checkpoint written by a
- * /compact this run is visible here without any separate bookkeeping, and a
- * /session switch's adopted state is too.
- *
- * `applied_this_run` and `context_compacted` are deliberately left alone --
- * they are the REPL's to fill in, since only it knows what it spliced into a
- * live conversation that may have no durable storage behind it at all.
- */
 static void status_checkpoint(void *user_data,
                               struct oi_cli_status_checkpoint *out_checkpoint) {
     const struct persistence_context *persistence = user_data;
@@ -747,10 +646,6 @@ static void status_checkpoint(void *user_data,
         state->checkpoint_source_last_record_id;
 }
 
-/* Wired unconditionally into oi_cli_repl_config, even for an ephemeral
- * session with no durable persistence at all: persist_conversation_event
- * (the only writer of persistence->last_error) is then never registered as
- * on_event, so last_error naturally, permanently stays OI_OK. */
 static int persistence_has_failed(void *user_data) {
     const struct persistence_context *persistence = user_data;
     return persistence->last_error != OI_OK;
@@ -762,7 +657,7 @@ int main(int argc, char **argv) {
     const char *session_dir = ".";
     int session_dir_set = 0;
     const char *prompt = NULL;
-    int cli_use_tls = -1; /* -1 = not specified on the command line */
+    int cli_use_tls = -1;
     int dry_run = 0;
     int max_turns = 8;
     oi_cli_tool_policy tool_policy = OI_CLI_TOOLS_ASK;
@@ -830,8 +725,6 @@ int main(int argc, char **argv) {
                 return 1;
             }
             session_id = argv[i];
-            /* The ID becomes a file name under the session directory, so a
-             * separator or a traversal component must never reach it. */
             if (!oi_cli_session_id_is_safe(session_id, strlen(session_id))) {
                 fprintf(stderr,
                         "oi: invalid session ID '%s' (use letters, digits, "
@@ -899,16 +792,12 @@ int main(int argc, char **argv) {
         oi_config_free(&cfg);
         return 1;
     }
-    /* Tool subprocesses inherit this environment; a key left here is one
-     * `echo` away from the model and the session log. */
     unsetenv("OI_API_KEY");
 
     for (size_t i = 0; i < n_overrides; i++) {
         int secret = strcmp(overrides[i].key, "api_key") == 0;
         oi_status st = oi_config_set(&cfg, overrides[i].key, overrides[i].value);
         if (secret) {
-            /* Other users can read the argv strings in /proc/PID/cmdline
-             * and in `ps` for as long as the process runs. */
             oi_wipe((char *)overrides[i].value, strlen(overrides[i].value));
         }
         if (st != OI_OK) {
@@ -1023,11 +912,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* All of oi_reactor_destroy/oi_session_registry_destroy/
-     * oi_llm_client_destroy are documented NULL-safe, so a single
-     * cascading cleanup at the end handles every early-failure point
-     * below without each one needing its own partial-teardown code --
-     * whatever wasn't reached yet is just NULL and skipped. */
     oi_reactor *reactor = NULL;
     oi_session_registry *sessions = NULL;
     oi_llm_client *client = NULL;
@@ -1057,8 +941,6 @@ int main(int argc, char **argv) {
     struct oi_cli_string pending_model = {0};
     char *explicit_metadata_path = NULL;
     int model_flag_explicit = 0;
-    /* Refined below for an explicit --session, whose replayed history or
-     * metadata cache can outrank a plain default. */
     enum oi_cli_session_model_origin model_origin =
         OI_CLI_SESSION_MODEL_DEFAULT;
 
@@ -1120,9 +1002,6 @@ int main(int argc, char **argv) {
             exit_code = 1;
             goto cleanup;
         }
-        /* Captured before this run appends anything (including its own
-         * transition record below), so it reflects whether this ID had
-         * any pre-existing records at all. */
         int is_new_history = history_store.typed_history.len == 0;
         if (replay_state.needs_transition) {
             struct oi_cli_history_record transition;
@@ -1276,8 +1155,6 @@ int main(int argc, char **argv) {
         exit_code = 1;
         goto cleanup;
     }
-    /* cleanup destroys the client before the reactor, as keep-alive
-     * requires. */
     oi_llm_client_set_keep_alive(client, 1);
     login.client = client;
     login.reactor = reactor;
@@ -1296,10 +1173,6 @@ int main(int argc, char **argv) {
             .model = cfg.model,
             .max_turns = max_turns,
             .tool_timeout_ms = cfg.timeout_ms,
-            /* The same resolved values the client above was built from, so
-             * /status reports the endpoint requests actually go to. Only the
-             * non-secret fields are passed on: the API key and CA file stay
-             * in llm_cfg. */
             .endpoint = &status_endpoint,
             .login = &login,
             .request_timeout_ms = cfg.timeout_ms,

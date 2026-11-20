@@ -38,23 +38,23 @@ TEST(covers_rejects_gaps_overlaps_and_wrong_total) {
     oi_cli_md_span_list_init(&spans);
     CHECK_EQ(oi_cli_md_span_list_append(&spans, 0, 3, 0), OI_OK);
     CHECK_EQ(oi_cli_md_span_list_append(&spans, 5, 2, 0), OI_OK);
-    CHECK(!oi_cli_md_span_list_covers(&spans, 7)); /* gap between 3 and 5 */
+    CHECK(!oi_cli_md_span_list_covers(&spans, 7));
     oi_cli_md_span_list_free(&spans);
 
     oi_cli_md_span_list_init(&spans);
     CHECK_EQ(oi_cli_md_span_list_append(&spans, 0, 3, 0), OI_OK);
-    CHECK(!oi_cli_md_span_list_covers(&spans, 5)); /* short of text_len */
+    CHECK(!oi_cli_md_span_list_covers(&spans, 5));
     oi_cli_md_span_list_free(&spans);
 
     oi_cli_md_span_list_init(&spans);
     CHECK_EQ(oi_cli_md_span_list_append(&spans, 0, 3, 0), OI_OK);
     CHECK_EQ(oi_cli_md_span_list_append(&spans, 0, 3, 0), OI_OK);
-    CHECK(!oi_cli_md_span_list_covers(&spans, 6)); /* overlap: bad start */
+    CHECK(!oi_cli_md_span_list_covers(&spans, 6));
     oi_cli_md_span_list_free(&spans);
 
     oi_cli_md_span_list_init(&spans);
     CHECK_EQ(oi_cli_md_span_list_append(&spans, 0, 0, 0), OI_OK);
-    CHECK(!oi_cli_md_span_list_covers(&spans, 0)); /* zero-length run */
+    CHECK(!oi_cli_md_span_list_covers(&spans, 0));
     oi_cli_md_span_list_free(&spans);
 }
 

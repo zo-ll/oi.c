@@ -40,17 +40,11 @@ struct oi_cli_input_decoder {
 
 void oi_cli_input_decoder_init(struct oi_cli_input_decoder *decoder);
 
-/*
- * Decodes one event from the start of `data`. OI_ERR_AGAIN means the bytes are
- * a valid but incomplete sequence and must be retained for the next read.
- * Otherwise `out_consumed` is always positive.
- */
 oi_status oi_cli_input_decode(struct oi_cli_input_decoder *decoder,
                               const unsigned char *data, size_t len,
                               size_t *out_consumed,
                               struct oi_cli_input_event *out_event);
 
-/* Resolves a buffered lone Escape after the caller's input timeout. */
 oi_status oi_cli_input_decode_escape(size_t *out_consumed,
                                      struct oi_cli_input_event *out_event);
 

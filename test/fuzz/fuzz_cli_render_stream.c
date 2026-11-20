@@ -1,21 +1,3 @@
-/*
- * libFuzzer harness for cli_render_stream, the sanitized/styled output
- * pipeline (issue #22): incremental UTF-8 fixup -> control/escape
- * sanitization -> Markdown block/inline parsing + SGR styling.
- *
- * The property this whole pipeline exists to guarantee is that chunking
- * never changes the rendered output -- a split multi-byte UTF-8
- * sequence, a CSI/OSC sequence straddling a chunk boundary, or a
- * Markdown construct split mid-delimiter must all render identically to
- * the same bytes fed in one call. Each input is therefore fed twice:
- * once whole, once split into two feed() calls at an input-derived
- * offset (so the split point varies across the corpus rather than being
- * fixed), and the two runs' final output must be byte-identical.
- *
- * Output is captured via open_memstream rather than /dev/null because
- * the whole point is comparing the two runs' bytes, not just checking
- * for crashes (ASan/UBSan in the fuzz build cover that).
- */
 
 #include <assert.h>
 #include <stdint.h>
