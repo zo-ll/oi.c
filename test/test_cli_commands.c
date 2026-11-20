@@ -93,11 +93,15 @@ TEST(split_first_token_keeps_the_rest_verbatim) {
     CHECK_EQ(token_len, 4);
     CHECK_EQ(rest_len, 0);
 
-    oi_cli_command_split_first_token("rename\tid\r\nname", 17, &token,
-                                     &token_len, &rest, &rest_len);
-    CHECK_EQ(token_len, 6);
-    CHECK_EQ(rest_len, 7);
-    CHECK(memcmp(rest, "id\r\nname", 7) == 0);
+    {
+        static const char spaced[] = "rename\tid\r\nname";
+
+        oi_cli_command_split_first_token(spaced, sizeof spaced - 1, &token,
+                                         &token_len, &rest, &rest_len);
+        CHECK_EQ(token_len, 6);
+        CHECK_EQ(rest_len, 8);
+        CHECK(memcmp(rest, "id\r\nname", 8) == 0);
+    }
 }
 
 TEST(token_equals_compares_the_whole_token) {
