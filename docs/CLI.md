@@ -748,8 +748,10 @@ id.
 
 A relative `path` is relative to the session working directory. `edit` and
 `write` write a temporary file next to the target and rename it over the
-target, so a failed or interrupted write leaves the old file unchanged. The
-file keeps its mode, but a hard link to the old file keeps the old contents.
+target, so a failed or interrupted write leaves the old file unchanged. A
+file without write permission is refused. The file keeps its mode and, when
+`oi` may set them, its owner and group; a hard link to the old file keeps the
+old contents.
 The file tools do not need a shell: `oi` runs each tool call as a child
 process of its own binary (through `/proc/self/exe`), and only `bash` starts
 Bash. Command execution therefore

@@ -224,6 +224,9 @@ static int replace_file(const char *path, const struct stat *existing,
         strcpy(target, path);
     }
     if (existing != NULL) {
+        if (access(target, W_OK) != 0) {
+            return fail(out, "error: cannot open %s: %s\n", path);
+        }
         mode = existing->st_mode & 07777;
     } else {
         mode = umask(0);
@@ -239,6 +242,10 @@ static int replace_file(const char *path, const struct stat *existing,
         if (!write_all(fd, parts[i], lens[i])) {
             goto failed;
         }
+    }
+    if (existing != NULL &&
+        fchown(fd, existing->st_uid, existing->st_gid) != 0) {
+        (void)!fchown(fd, (uid_t)-1, existing->st_gid);
     }
     if (fchmod(fd, mode) != 0) {
         goto failed;

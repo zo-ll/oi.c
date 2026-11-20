@@ -206,6 +206,29 @@ TEST(edit_leaves_the_file_unchanged_when_the_text_is_absent_or_repeated) {
     free(content);
 }
 
+TEST(edit_and_write_refuse_a_read_only_file) {
+    char *text;
+    char *content;
+
+    put_file("locked.txt", "keep\n");
+    CHECK_EQ(chmod("locked.txt", 0444), 0);
+    CHECK_EQ(run("write", "{\"path\":\"locked.txt\",\"content\":\"y\"}",
+                 &text),
+             1);
+    CHECK(strstr(text, "error: cannot open locked.txt") != NULL);
+    free(text);
+    CHECK_EQ(run("edit",
+                 "{\"path\":\"locked.txt\",\"old_text\":\"keep\","
+                 "\"new_text\":\"lost\"}",
+                 &text),
+             1);
+    CHECK(strstr(text, "error: cannot open locked.txt") != NULL);
+    free(text);
+    content = get_file("locked.txt");
+    CHECK_STREQ(content, "keep\n");
+    free(content);
+}
+
 TEST(write_creates_and_replaces_files) {
     char *text;
     char *content;
@@ -240,6 +263,7 @@ int main(void) {
     RUN(edit_replaces_one_exact_block);
     RUN(edit_keeps_the_mode_and_follows_a_link);
     RUN(edit_leaves_the_file_unchanged_when_the_text_is_absent_or_repeated);
+    RUN(edit_and_write_refuse_a_read_only_file);
     RUN(write_creates_and_replaces_files);
     unlink("notes.txt");
     unlink("short.txt");
@@ -248,6 +272,7 @@ int main(void) {
     unlink("overlap.txt");
     unlink("new.txt");
     unlink("many.txt");
+    unlink("locked.txt");
     unlink("link.txt");
     unlink("target.txt");
     CHECK_EQ(chdir(previous), 0);
