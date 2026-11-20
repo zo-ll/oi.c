@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Starts a blocking echo server in a forked child, listening on
@@ -803,6 +804,20 @@ TEST(second_connection_reuses_the_context_and_resumes_the_session) {
 
 /* --- a shared address cache skips the second lookup --- */
 
+int __real_clock_gettime(clockid_t clock, struct timespec *now);
+
+/* Added to CLOCK_MONOTONIC for liboi, so a test can pass the address
+ * cache's lifetime without a wait. */
+static long monotonic_offset_s;
+
+int __wrap_clock_gettime(clockid_t clock, struct timespec *now) {
+    int rc = __real_clock_gettime(clock, now);
+    if (rc == 0 && clock == CLOCK_MONOTONIC) {
+        now->tv_sec += monotonic_offset_s;
+    }
+    return rc;
+}
+
 static void cache_on_connected(oi_llm_conn *c, void *ud) {
     struct echo_ctx *ctx = ud;
     ctx->connected = 1;
@@ -852,6 +867,59 @@ TEST(address_cache_resolves_once_for_two_connections) {
     close(listen_fd);
 }
 
+TEST(address_cache_resolves_again_after_60_seconds) {
+    /* Never accepts: the kernel completes both connections from the
+     * listen backlog. */
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, 4), 0);
+    socklen_t alen = sizeof addr;
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    unsigned short port = ntohs(addr.sin_port);
+    oi_reactor *r = oi_reactor_create();
+    oi_llm_addr_cache *cache = NULL;
+    CHECK_EQ(oi_llm_addr_cache_create(&cache), OI_OK);
+    struct oi_llm_conn_callbacks cbs = {cache_on_connected, echo_on_data,
+                                         echo_on_error};
+    getaddrinfo_calls = 0;
+
+    struct echo_ctx first = {0};
+    oi_llm_conn *conn = NULL;
+    CHECK_EQ(oi_llm_conn_connect(r, "localhost", port, NULL, cache, &cbs,
+                                  &first, &conn),
+             OI_OK);
+    run_until(r, &first.done, 100);
+    CHECK(first.connected);
+    CHECK_EQ(getaddrinfo_calls, 1);
+
+    monotonic_offset_s = 59;
+    struct echo_ctx second = {0};
+    CHECK_EQ(oi_llm_conn_connect(r, "localhost", port, NULL, cache, &cbs,
+                                  &second, &conn),
+             OI_OK);
+    run_until(r, &second.done, 100);
+    CHECK(second.connected);
+    CHECK_EQ(getaddrinfo_calls, 1);
+
+    monotonic_offset_s = 61;
+    struct echo_ctx third = {0};
+    CHECK_EQ(oi_llm_conn_connect(r, "localhost", port, NULL, cache, &cbs,
+                                  &third, &conn),
+             OI_OK);
+    run_until(r, &third.done, 100);
+    CHECK(third.connected);
+    CHECK_EQ(getaddrinfo_calls, 2);
+
+    monotonic_offset_s = 0;
+    oi_reactor_destroy(r);
+    oi_llm_addr_cache_destroy(cache);
+    close(listen_fd);
+}
+
 int main(void) {
     /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
@@ -870,5 +938,6 @@ int main(void) {
     RUN(tls_round_trip_sends_with_msg_nosignal);
     RUN(second_connection_reuses_the_context_and_resumes_the_session);
     RUN(address_cache_resolves_once_for_two_connections);
+    RUN(address_cache_resolves_again_after_60_seconds);
     return oi_test_report();
 }

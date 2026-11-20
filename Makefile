@@ -153,8 +153,10 @@ $(BUILD)/test_tool_exec: LDLIBS += -Wl,--wrap=kill
 # test_reactor counts the epoll_ctl calls that liboi makes.
 $(BUILD)/test_reactor: LDLIBS += -Wl,--wrap=epoll_ctl
 # test_llm_conn gives one host name a dead address and a live address,
-# counts the send() calls that carry MSG_NOSIGNAL, and counts SSL_CTX_new.
+# counts the send() calls that carry MSG_NOSIGNAL, counts SSL_CTX_new, and
+# moves the monotonic clock forward.
 $(BUILD)/test_llm_conn: LDLIBS += -Wl,--wrap=getaddrinfo -Wl,--wrap=send \
+	-Wl,--wrap=clock_gettime \
 	-Wl,--wrap=SSL_CTX_new
 
 $(BUILD)/test_cli: test/test_cli.c $(LIB) $(CLI_BIN) | $(BUILD)
