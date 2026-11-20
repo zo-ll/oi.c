@@ -165,7 +165,8 @@ $(BUILD)/test_cli: test/test_cli.c $(LIB) $(CLI_BIN) | $(BUILD)
 $(BUILD)/test_cli_%: test/test_cli_%.c $(CLI_TEST_LIB) $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) $< $(CLI_TEST_LIB) $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS)
 
-$(BUILD)/test_cli_terminal $(BUILD)/test_cli_composer: LDLIBS += $(PTY_LIBS)
+$(BUILD)/test_cli_terminal $(BUILD)/test_cli_composer $(BUILD)/test_cli_login: \
+	LDLIBS += $(PTY_LIBS)
 
 # Tests that touch no PTY, socket, fork, signal, or other global process
 # state, and so are safe to run as the routine edit-test loop (`make quick`).
@@ -194,7 +195,8 @@ PURE_TESTS = \
 # Slower and ordering-sensitive, so they stay out of `quick` and are not
 # candidates for blanket parallelism.
 IMPURE_TESTS = \
-	test_cli test_cli_composer test_cli_sessions test_cli_terminal \
+	test_cli test_cli_composer test_cli_login test_cli_sessions \
+	test_cli_terminal \
 	test_llm test_llm_conn test_tool_exec
 
 PURE_TEST_BINS = $(PURE_TESTS:%=$(BUILD)/%)
