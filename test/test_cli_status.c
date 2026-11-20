@@ -304,6 +304,12 @@ TEST(every_permission_state_is_reported) {
         {OI_CLI_STATUS_PERMISSION_ASK, "Permissions: ask\n"},
         {OI_CLI_STATUS_PERMISSION_ALLOW, "Permissions: allow\n"},
         {OI_CLI_STATUS_PERMISSION_DENY, "Permissions: deny\n"},
+        {OI_CLI_STATUS_PERMISSION_ASK_FILE_ACCESS_ALLOWED,
+         "Permissions: ask (file access allowed)\n"},
+        {OI_CLI_STATUS_PERMISSION_ASK_COMMANDS_ALLOWED,
+         "Permissions: ask (commands allowed)\n"},
+        {OI_CLI_STATUS_PERMISSION_ASK_BOTH_ALLOWED,
+         "Permissions: ask (file access and commands allowed)\n"},
     };
     size_t index;
 
@@ -320,11 +326,24 @@ TEST(every_permission_state_is_reported) {
 }
 
 TEST(policy_conversion_never_yields_unknown) {
-    CHECK_EQ(oi_cli_status_permission_from_policy(OI_CLI_TOOLS_ASK),
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
+
+    CHECK_EQ(oi_cli_status_permission_from(&permission),
              OI_CLI_STATUS_PERMISSION_ASK);
-    CHECK_EQ(oi_cli_status_permission_from_policy(OI_CLI_TOOLS_ALLOW),
+    permission.file_access_allowed = 1;
+    CHECK_EQ(oi_cli_status_permission_from(&permission),
+             OI_CLI_STATUS_PERMISSION_ASK_FILE_ACCESS_ALLOWED);
+    permission.commands_allowed = 1;
+    CHECK_EQ(oi_cli_status_permission_from(&permission),
+             OI_CLI_STATUS_PERMISSION_ASK_BOTH_ALLOWED);
+    permission.file_access_allowed = 0;
+    CHECK_EQ(oi_cli_status_permission_from(&permission),
+             OI_CLI_STATUS_PERMISSION_ASK_COMMANDS_ALLOWED);
+    permission.policy = OI_CLI_TOOLS_ALLOW;
+    CHECK_EQ(oi_cli_status_permission_from(&permission),
              OI_CLI_STATUS_PERMISSION_ALLOW);
-    CHECK_EQ(oi_cli_status_permission_from_policy(OI_CLI_TOOLS_DENY),
+    permission.policy = OI_CLI_TOOLS_DENY;
+    CHECK_EQ(oi_cli_status_permission_from(&permission),
              OI_CLI_STATUS_PERMISSION_DENY);
 }
 

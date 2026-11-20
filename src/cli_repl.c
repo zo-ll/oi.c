@@ -124,7 +124,7 @@ static oi_status repl_status_snapshot(
     out_snapshot->model_origin = context->setting->model_origin;
     out_snapshot->endpoint = *config->endpoint;
     out_snapshot->permission =
-        oi_cli_status_permission_from_policy(config->permission->policy);
+        oi_cli_status_permission_from(config->permission);
     out_snapshot->request_timeout_ms = config->request_timeout_ms;
     out_snapshot->tool_timeout_ms = config->tool_timeout_ms;
     out_snapshot->cwd = getcwd(context->cwd, sizeof context->cwd);
@@ -202,6 +202,7 @@ struct repl_turn_input_context {
     int dirty;
     int awaiting_permission;
     size_t permission_selected;
+    enum oi_cli_tool_category permission_category;
     struct oi_cli_bytebuf permission_tool_line;
     struct oi_cli_bytebuf permission_args_line;
     struct oi_cli_tool_panel panel;
@@ -282,6 +283,9 @@ static oi_status repl_conversation_event(
         }
         turn_input->awaiting_permission = 1;
         turn_input->permission_selected = PERMISSION_OPTION_DENY;
+        turn_input->permission_category = oi_cli_tool_category_of(
+            event->as.awaiting_permission.name->data,
+            event->as.awaiting_permission.parsed_arguments);
         turn_input->dirty = 1;
         break;
     }
@@ -329,11 +333,15 @@ static oi_status repl_conversation_event(
 }
 
 static const char permission_option_allow_once[] = "Allow once";
-static const char permission_option_allow_process[] =
-    "Allow for process (skip future prompts)";
+static const char permission_option_allow_files[] =
+    "Allow file access for process (skip future file prompts)";
+static const char permission_option_allow_commands[] =
+    "Allow commands for process (skip future command prompts)";
 static const char permission_option_deny[] = "Deny";
-static const char permission_allowed_for_process_text[] =
-    "oi: tool policy set to allow for the rest of this process\n";
+static const char permission_allowed_files_text[] =
+    "oi: file access allowed for the rest of this process\n";
+static const char permission_allowed_commands_text[] =
+    "oi: commands allowed for the rest of this process\n";
 
 static int permission_selector_key(const struct oi_cli_input_event *event,
                                    void *user_data) {
@@ -369,11 +377,14 @@ static int permission_selector_key(const struct oi_cli_input_event *event,
             return 1;
         }
         if (context->permission_selected == 1) {
-            context->config->permission->policy = OI_CLI_TOOLS_ALLOW;
+            oi_cli_permission_allow_category(context->config->permission,
+                                             context->permission_category);
             report_busy_io_error(
                 context,
-                fputs(permission_allowed_for_process_text,
-                     context->config->err) != EOF &&
+                fputs(context->permission_category == OI_CLI_TOOL_COMMAND
+                          ? permission_allowed_commands_text
+                          : permission_allowed_files_text,
+                      context->config->err) != EOF &&
                     fflush(context->config->err) == 0);
         }
         context->awaiting_permission = 0;
@@ -1671,11 +1682,17 @@ have_message:
 
                     if (turn_input_context.awaiting_permission) {
                         struct oi_cli_render_line header[2];
+                        int commands =
+                            turn_input_context.permission_category ==
+                            OI_CLI_TOOL_COMMAND;
                         struct oi_cli_render_line options[3] = {
                             {permission_option_allow_once,
                              sizeof permission_option_allow_once - 1},
-                            {permission_option_allow_process,
-                             sizeof permission_option_allow_process - 1},
+                            {commands ? permission_option_allow_commands
+                                      : permission_option_allow_files,
+                             commands
+                                 ? sizeof permission_option_allow_commands - 1
+                                 : sizeof permission_option_allow_files - 1},
                             {permission_option_deny,
                              sizeof permission_option_deny - 1},
                         };

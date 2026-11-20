@@ -12,6 +12,7 @@
 #include "cli_credentials.h"
 #include "cli_session_metadata.h"
 #include "cli_session_metadata_store.h"
+#include "cli_tool_run.h"
 #include "cli_tools.h"
 #include "oi/config.h"
 #include "oi/json.h"
@@ -652,6 +653,10 @@ static int persistence_has_failed(void *user_data) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "--run-tool") == 0) {
+        return oi_cli_tool_main(argv[2]);
+    }
+
     const char *config_path = NULL;
     const char *session_id = NULL;
     const char *session_dir = ".";
@@ -971,7 +976,7 @@ int main(int argc, char **argv) {
         exit_code = 1;
         goto cleanup;
     }
-    st = oi_cli_tools_register(tools);
+    st = oi_cli_tools_register(tools, "/proc/self/exe");
     if (st != OI_OK) {
         fprintf(stderr, "oi: failed to register built-in tools: %s\n",
                 oi_status_str(st));
@@ -1128,7 +1133,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    struct oi_cli_permission permission = {tool_policy};
+    struct oi_cli_permission permission = {.policy = tool_policy};
     struct oi_cli_loop_config loop_config = {
         .model = cfg.model,
         .max_turns = max_turns,

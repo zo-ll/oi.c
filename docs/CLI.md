@@ -304,7 +304,7 @@ $ oi
 `> ` is the prompt. Type a message and press Enter to send it; assistant
 output streams back as it arrives, rendered as incremental Markdown with
 terminal escapes stripped. Tool calls appear in a small live panel with a
-status line — `shell: running`, then `completed`, `failed`, `denied`, or
+status line — `bash: running`, then `completed`, `failed`, `denied`, or
 `cancelled` — that stays visible until the next tool call or the end of the
 turn.
 
@@ -394,11 +394,11 @@ Ctrl+C to cancel. Cancelling always picks the safe option — the first one
 for confirmations, and *deny* for a tool permission prompt.
 
 A tool permission prompt starts on *Deny*, so Enter alone never runs a tool.
-Before the prompt, `oi` prints the full request above it: for `shell`, the
+Before the prompt, `oi` prints the full request above it: for `bash`, the
 decoded `command` string with nothing cut off. A bidirectional control
 character shows as `<U+202E>` (with its own number), because it can make
-text show in a different order than the shell runs it. Read it there before you
-choose *Allow once* (`1`) or *Allow for process* (`2`).
+text show in a different order than Bash runs it. Read it there before you
+choose *Allow once* (`1`) or the *Allow ... for process* option (`2`).
 
 ## Slash commands
 
@@ -489,7 +489,9 @@ Model: my-model
 ### `/permissions [ask|allow|deny]`
 
 Process scope — never persisted, so a resumed session starts from your
-flags again. With no argument it prints the current policy.
+flags again. With no argument it prints the current policy and the approvals
+made with an *Allow ... for process* option, for example
+`ask (file access allowed)`. Each change clears those approvals.
 
 Changing to `allow` from anything else requires an explicit confirmation
 selector, because it disables every future tool prompt for the rest of the
@@ -735,21 +737,36 @@ id.
 
 ## Tools and security
 
-`oi` advertises one built-in tool, `shell`, which takes a single `command`
-string and runs it as `sh -c <command>` in the session working directory,
-with the environment `oi` itself was started with, minus `OI_API_KEY`:
-`oi` removes that variable at startup, so a tool command cannot read the key.
+`oi` advertises four built-in tools:
 
-A command ends when its shell exits. A background process that still holds
+| Tool | Arguments | Behavior |
+| --- | --- | --- |
+| `read` | `path`, optional `offset` and `limit` | Read lines from an existing file, each with its line number. `offset` is the first line (default 1), `limit` the maximum number of lines (default 2000). The output stops at 256 KiB and names the next offset. |
+| `edit` | `path`, `old_text`, `new_text` | Replace an exact block of text in an existing file. If `old_text` is absent or occurs more than once, the tool reports an error and the file does not change. |
+| `write` | `path`, `content` | Create a file or replace its full contents. |
+| `bash` | `command` | Execute the command with `bash -c` in the session working directory. Return the command output and the exit status. |
+
+A relative `path` is relative to the session working directory. The file
+tools do not need a shell: `oi` runs each tool call as a child process of
+its own binary, and only `bash` starts Bash. Command execution therefore
+needs `bash` on `PATH`; without it, a `bash` call fails with
+`error: cannot run bash`, and the file tools still work.
+
+Each tool call runs with the environment `oi` itself was started with, minus
+`OI_API_KEY`: `oi` removes that variable at startup, so a tool cannot read
+the key.
+
+A command ends when Bash exits. A background process that still holds
 the output open gets 500 ms; then `oi` kills the command's process group and
 returns the output it has. A process that must stay alive must leave the
 group, for example with `setsid`.
 
-**That is arbitrary code execution, requested by a model.** Tool arguments
-are produced from model output, which can be influenced by anything in
-context — a web page a previous tool fetched, a file it read, a tool result.
-Treat `--allow-tools` and the *Allow for process* option as "I trust
-whatever ends up in this conversation to run commands as me".
+**`edit`, `write`, and `bash` are changes requested by a model, and `bash` is
+arbitrary code execution.** Tool arguments are produced from model output,
+which can be influenced by anything in context — a web page a previous tool
+fetched, a file it read, a tool result. Treat `--allow-tools` and the
+*Allow ... for process* options as "I trust whatever ends up in this
+conversation to change files or run commands as me".
 
 The policy is process-wide and one of:
 
@@ -759,38 +776,59 @@ The policy is process-wide and one of:
 | `allow` | `--allow-tools`, `/permissions allow` | run without asking |
 | `deny` | `--deny-tools`, `/permissions deny` | refuse every call |
 
-In interactive mode, `ask` prints the full request, then shows a selector
+Under `ask`, each call belongs to one of three kinds:
+
+| Kind | Tools | Under `ask` |
+| --- | --- | --- |
+| read in the project | `read` of a file in the session working directory or below it | runs without a prompt, also in one-shot mode |
+| file access | `edit`, `write`, and `read` of a file outside the project | prompt |
+| command | `bash` | prompt |
+
+The project check follows symbolic links, so a link that points outside the
+project counts as file access.
+
+In interactive mode, a prompt prints the full request, then shows a selector
 before the call runs:
 
 ```
-oi: approve tool shell, command:
+oi: approve tool bash, command:
 ls -la
-Tool: shell
+Tool: bash
 Review the request above before you allow it.
   Allow once
-  Allow for process (skip future prompts)
+  Allow commands for process (skip future command prompts)
 > Deny
 ```
 
-For `shell`, the request is the decoded `command` string; for another tool,
+For `bash`, the request is the decoded `command` string; for another tool,
 it is the raw arguments. Nothing is cut off. *Deny* starts highlighted, so
 Enter alone never runs a tool. `1`, `2`, and `3` pick the options
 directly. Escape or Ctrl+C dismisses the selector as a *deny*, never leaving
-the call hanging. Choosing *Allow for process* is itself the elevation (no
-second confirmation) and prints
-`oi: tool policy set to allow for the rest of this process`.
+the call hanging.
+
+The second option approves only the kind of the call for the rest of the
+process. For a file-access call it is *Allow file access for process* and
+prints `oi: file access allowed for the rest of this process`. For a command
+it is *Allow commands for process* and prints
+`oi: commands allowed for the rest of this process`. Approval for file
+access does not approve commands, and approval for commands does not approve
+file access. `/status` and `/permissions` then show, for example,
+`ask (commands allowed)`. `/permissions ask`, `allow`, or `deny` clears these
+approvals.
 
 The tool name and the printed request are sanitized before being drawn, so
 model output cannot inject escape sequences into the prompt. A bidirectional
 control character shows as `<U+XXXX>`.
 
-In one-shot mode there is nothing to ask, so `ask` **refuses**: the run
-prints `oi: tool permission denied` rather than hanging. Non-interactive
-tool use therefore requires an explicit `--allow-tools`, which is the
-deliberate choice you want it to be:
+In one-shot mode there is nothing to ask, so `ask` **refuses** every call
+that would prompt: the run prints `oi: tool permission denied` rather than
+hanging. A `read` in the project still runs. Other non-interactive tool use
+therefore requires an explicit `--allow-tools`, which is the deliberate
+choice you want it to be:
 
 ```sh
-# runs shell commands the model asks for, unattended -- use with care
+# runs the commands and file changes the model asks for, unattended
+# -- use with care
 oi --allow-tools "Find the largest files in this checkout"
 ```
 
@@ -929,6 +967,7 @@ Documented here so nothing above implies more than exists:
 - Full grapheme-cluster editing (ZWJ sequences, emoji modifiers).
 - A non-ANSI terminal fallback.
 - More than one queued item while a turn runs; the slot holds exactly one.
-- Any built-in tool other than `shell`.
+- Built-in tools other than `read`, `edit`, `write`, and `bash`, such as
+  separate search or file-list tools.
 - A `--version` flag, an implicit config-file location, and any way to put
   the API key in a config file.

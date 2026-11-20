@@ -148,7 +148,8 @@ static const char *model_origin_text(
     return NULL;
 }
 
-static const char *permission_text(enum oi_cli_status_permission permission) {
+const char *oi_cli_status_permission_text(
+    enum oi_cli_status_permission permission) {
     switch (permission) {
     case OI_CLI_STATUS_PERMISSION_UNKNOWN:
         return "(unknown)";
@@ -158,6 +159,12 @@ static const char *permission_text(enum oi_cli_status_permission permission) {
         return "allow";
     case OI_CLI_STATUS_PERMISSION_DENY:
         return "deny";
+    case OI_CLI_STATUS_PERMISSION_ASK_FILE_ACCESS_ALLOWED:
+        return "ask (file access allowed)";
+    case OI_CLI_STATUS_PERMISSION_ASK_COMMANDS_ALLOWED:
+        return "ask (commands allowed)";
+    case OI_CLI_STATUS_PERMISSION_ASK_BOTH_ALLOWED:
+        return "ask (file access and commands allowed)";
     }
     return "(unknown)";
 }
@@ -184,11 +191,18 @@ static const char *activity_text(enum oi_cli_conversation_activity activity) {
     return "(unknown)";
 }
 
-enum oi_cli_status_permission oi_cli_status_permission_from_policy(
-    oi_cli_tool_policy policy) {
-    switch (policy) {
+enum oi_cli_status_permission oi_cli_status_permission_from(
+    const struct oi_cli_permission *permission) {
+    switch (permission->policy) {
     case OI_CLI_TOOLS_ASK:
-        return OI_CLI_STATUS_PERMISSION_ASK;
+        if (permission->file_access_allowed) {
+            return permission->commands_allowed
+                       ? OI_CLI_STATUS_PERMISSION_ASK_BOTH_ALLOWED
+                       : OI_CLI_STATUS_PERMISSION_ASK_FILE_ACCESS_ALLOWED;
+        }
+        return permission->commands_allowed
+                   ? OI_CLI_STATUS_PERMISSION_ASK_COMMANDS_ALLOWED
+                   : OI_CLI_STATUS_PERMISSION_ASK;
     case OI_CLI_TOOLS_ALLOW:
         return OI_CLI_STATUS_PERMISSION_ALLOW;
     case OI_CLI_TOOLS_DENY:
@@ -465,7 +479,8 @@ static oi_status assemble(struct status_writer *writer,
     }
     if (status == OI_OK) {
         status = append_line(writer, "Permissions",
-                             permission_text(snapshot->permission));
+                             oi_cli_status_permission_text(
+                                 snapshot->permission));
     }
     if (status == OI_OK) {
         status = append_timeout(writer, "Request timeout",

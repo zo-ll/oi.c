@@ -610,6 +610,10 @@ static void resolve_permission_body(oi_cli_conversation *conversation,
                                       conversation->config.tool_timeout_ms);
     }
     if (st == OI_OK) {
+        st = oi_tool_call_write_stdin(conversation->tool, call->arguments.data,
+                                      call->arguments.len);
+    }
+    if (st == OI_OK) {
         st = oi_tool_call_close_stdin(conversation->tool);
     }
     if (st != OI_OK) {

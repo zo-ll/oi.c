@@ -1220,7 +1220,7 @@ TEST(tool_loop_executes_and_returns_result) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{"
-        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf "
+        "\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf "
         "tool-ok\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -1234,7 +1234,7 @@ TEST(tool_loop_executes_and_returns_result) {
         fprintf(stderr, "tool success CLI output: %s\n", result.output);
     }
     CHECK_EQ(result.exit_code, 0);
-    CHECK(strstr(result.output, "running tool shell") != NULL);
+    CHECK(strstr(result.output, "running tool bash") != NULL);
     CHECK(strstr(result.output, "tool completed") != NULL);
 }
 
@@ -1242,7 +1242,7 @@ TEST(tool_denial_stops_loop) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_2\",\"type\":\"function\",\"function\":{"
-        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\""
+        "\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\""
         "}}]}}]}\n\n"
         "data: [DONE]\n\n";
     struct run_result result;
@@ -1255,7 +1255,7 @@ TEST(default_ask_policy_denies_safely_without_a_controlling_terminal) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_ask\",\"type\":\"function\",\"function\":{"
-        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\""
+        "\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\""
         "}}]}}]}\n\n"
         "data: [DONE]\n\n";
     size_t tool_len;
@@ -1302,7 +1302,7 @@ TEST(tool_failure_is_returned_to_model) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_3\",\"type\":\"function\",\"function\":{"
-        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"exit 7\\\"}"
+        "\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"exit 7\\\"}"
         "\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -1323,7 +1323,7 @@ TEST(tool_subprocess_does_not_inherit_the_api_key) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_env\",\"type\":\"function\",\"function\":{"
-        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf "
+        "\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf "
         "key=$OI_API_KEY.\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -1400,7 +1400,7 @@ TEST(tool_argument_larger_than_an_arena_block_runs) {
     snprintf(tool_sse, LARGE + 512,
              "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
              "\"index\":0,\"id\":\"call_big\",\"type\":\"function\","
-             "\"function\":{\"name\":\"shell\",\"arguments\":"
+             "\"function\":{\"name\":\"bash\",\"arguments\":"
              "\"{\\\"command\\\":\\\"true # %s\\\"}\"}}]}}]}\n\n"
              "data: [DONE]\n\n",
              filler);
@@ -1419,7 +1419,7 @@ TEST(tool_turn_limit_is_enforced) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_4\",\"type\":\"function\",\"function\":{"
-        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\""
+        "\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"true\\\"}\""
         "}}]}}]}\n\n"
         "data: [DONE]\n\n";
     struct run_result result;
@@ -1837,7 +1837,7 @@ TEST(sigint_cancels_a_running_tool_and_returns_to_the_prompt) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_sigint\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":"
         "\\\"printf started; sleep 3\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -1873,7 +1873,7 @@ TEST(sigint_cancels_a_running_tool_and_returns_to_the_prompt) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "running tool shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "running tool bash", 1));
     {
         struct timespec delay = {0, 300000000L};
         nanosleep(&delay, NULL);
@@ -1932,7 +1932,7 @@ TEST(recoverable_turn_error_returns_to_the_prompt) {
     const char *denied_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_denied\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":"
         "\\\"true\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -3036,7 +3036,7 @@ static void remove_sessions_under(const char *root);
 static const char permission_tool_sse[] =
     "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
     "\"index\":0,\"id\":\"call_ask\",\"type\":\"function\",\"function\":{"
-    "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf "
+    "\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf "
     "tool-ok\\\"}\"}}]}}]}\n\n"
     "data: [DONE]\n\n";
 
@@ -3074,7 +3074,7 @@ TEST(permission_ask_allow_once_lets_the_tool_run) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: bash", 1));
     CHECK(interactive_wait_for(master_fd, &result, "Allow once", 1));
     CHECK(interactive_wait_for(master_fd, &result, "Deny", 1));
 
@@ -3141,7 +3141,7 @@ TEST(permission_ask_shows_the_full_decoded_command_and_enter_denies) {
     snprintf(tool_sse, sizeof tool_sse,
              "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
              "\"index\":0,\"id\":\"call_long\",\"type\":\"function\","
-             "\"function\":{\"name\":\"shell\",\"arguments\":"
+             "\"function\":{\"name\":\"bash\",\"arguments\":"
              "\"{\\\"command\\\":\\\"printf \\\\u0041BC; %s tail-marker\\\"}\""
              "}}]}}]}\n\n"
              "data: [DONE]\n\n",
@@ -3162,13 +3162,13 @@ TEST(permission_ask_shows_the_full_decoded_command_and_enter_denies) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: bash", 1));
     CHECK(interactive_wait_for(master_fd, &result, "Deny", 1));
     CHECK(strstr(result.output, expected) != NULL);
     CHECK(strstr(result.output, "\\u0041") == NULL);
 
     CHECK(write_interactive(master_fd, "\r", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "shell: denied", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "bash: denied", 1));
     CHECK_EQ(count_text(result.output, "ABC"), 1);
 
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -3208,10 +3208,10 @@ TEST(permission_ask_deny_ends_the_turn) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: bash", 1));
 
     CHECK(write_interactive(master_fd, "3", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "shell: denied", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "bash: denied", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
                                1));
 
@@ -3226,7 +3226,7 @@ TEST(permission_ask_deny_ends_the_turn) {
     waitpid(server, NULL, 0);
 }
 
-TEST(permission_ask_allow_for_process_elevates_policy) {
+TEST(permission_ask_allow_for_process_allows_only_that_kind_of_tool) {
     const char *first_answer_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
         "\"first done\"}}]}\n\n"
@@ -3235,7 +3235,15 @@ TEST(permission_ask_allow_for_process_elevates_policy) {
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
         "\"second done\"}}]}\n\n"
         "data: [DONE]\n\n";
+    const char *write_tool_sse =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call_write\",\"type\":\"function\","
+        "\"function\":{\"name\":\"write\",\"arguments\":"
+        "\"{\\\"path\\\":\\\"never-written.txt\\\",\\\"content\\\":"
+        "\\\"x\\\"}\"}}]}}]}\n\n"
+        "data: [DONE]\n\n";
     size_t tool_len;
+    size_t write_len;
     size_t first_answer_len;
     size_t second_answer_len;
     char *tool_response = build_chunked_response(
@@ -3247,10 +3255,13 @@ TEST(permission_ask_allow_for_process_elevates_policy) {
     char *second_answer = build_chunked_response(
         second_answer_sse, strlen(second_answer_sse), "HTTP/1.1 200 OK",
         &second_answer_len);
+    char *write_response = build_chunked_response(
+        write_tool_sse, strlen(write_tool_sse), "HTTP/1.1 200 OK",
+        &write_len);
     const char *responses[] = {tool_response, first_answer, tool_response,
-                              second_answer};
+                              second_answer, write_response};
     size_t lengths[] = {tool_len, first_answer_len, tool_len,
-                       second_answer_len};
+                       second_answer_len, write_len};
     unsigned short port;
     pid_t server;
     pid_t cli;
@@ -3259,10 +3270,11 @@ TEST(permission_ask_allow_for_process_elevates_policy) {
     struct interactive_result result;
     char session_root[128];
 
-    server = start_mock_server_turns(responses, lengths, 4, &port);
+    server = start_mock_server_turns(responses, lengths, 5, &port);
     free(tool_response);
     free(first_answer);
     free(second_answer);
+    free(write_response);
     CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
     memset(&result, 0, sizeof result);
     snprintf(session_root, sizeof session_root,
@@ -3272,17 +3284,27 @@ TEST(permission_ask_allow_for_process_elevates_policy) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: bash", 1));
 
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "Allow commands for process", 1));
     CHECK(write_interactive(master_fd, "2", 1));
     CHECK(interactive_wait_for(
         master_fd, &result,
-        "oi: tool policy set to allow for the rest of this process", 1));
+        "oi: commands allowed for the rest of this process", 1));
     CHECK(interactive_wait_for(master_fd, &result, "first done", 1));
 
     CHECK(write_interactive(master_fd, "run it again\r", 13));
     CHECK(interactive_wait_for(master_fd, &result, "second done", 1));
-    CHECK_EQ(count_text(result.output, "Tool: shell"), 1);
+    CHECK_EQ(count_text(result.output, "Tool: bash"), 1);
+
+    CHECK(write_interactive(master_fd, "write it\r", 10));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: write", 1));
+    CHECK(interactive_wait_for(master_fd, &result,
+                               "Allow file access for process", 1));
+    CHECK(write_interactive(master_fd, "3", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
+                               1));
 
     CHECK(write_interactive(master_fd, "\x04", 1));
     {
@@ -3291,6 +3313,7 @@ TEST(permission_ask_allow_for_process_elevates_policy) {
         result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     }
     CHECK_EQ(result.exit_code, 0);
+    CHECK(access("never-written.txt", F_OK) != 0);
     close(master_fd);
     waitpid(server, NULL, 0);
 }
@@ -3319,7 +3342,7 @@ TEST(permission_ask_ctrl_c_while_awaiting_denies_without_hanging) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: bash", 1));
 
     CHECK(write_interactive(master_fd, "\x03", 1));
     CHECK(interactive_wait_for(master_fd, &result, "oi: turn failed: denied",
@@ -3371,7 +3394,7 @@ TEST(permission_ask_resize_redraws_the_selector) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: bash", 1));
 
     result.output_len = 0;
     resized.ws_row = 24;
@@ -3427,11 +3450,11 @@ TEST(permission_ask_typing_does_not_leak_into_the_draft) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "Tool: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "Tool: bash", 1));
 
     CHECK(write_interactive(master_fd, "xyz", 3));
     CHECK(write_interactive(master_fd, "\r", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "shell: denied", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "bash: denied", 1));
 
     CHECK(write_interactive(master_fd, "\x04", 1));
     {
@@ -4239,7 +4262,7 @@ TEST(permissions_allow_confirmed_elevates_policy) {
 
     CHECK(write_interactive(master_fd, "run it\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
-    CHECK(strstr(result.output, "Tool: shell") == NULL);
+    CHECK(strstr(result.output, "Tool: bash") == NULL);
 
     CHECK(write_interactive(master_fd, "\x04", 1));
     {
@@ -4285,7 +4308,7 @@ TEST(tool_panel_shows_live_output_and_failed_status) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_panel\",\"type\":\"function\",\"function\":{"
-        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf "
+        "\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf "
         "part1; sleep 1; printf part2; exit 7\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -4320,10 +4343,10 @@ TEST(tool_panel_shows_live_output_and_failed_status) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "shell: running", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "bash: running", 1));
     CHECK(interactive_wait_for(master_fd, &result, "part1", 1));
     CHECK(interactive_wait_for(master_fd, &result, "part2", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "shell: failed", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "bash: failed", 1));
     CHECK(interactive_wait_for(master_fd, &result, "finished", 1));
 
     CHECK(write_interactive(master_fd, "\x04", 1));
@@ -4341,7 +4364,7 @@ TEST(tool_panel_survives_malicious_escape_bytes_in_output) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_evil\",\"type\":\"function\",\"function\":{"
-        "\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"printf "
+        "\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf "
         "'\\\\\\\\033[31mred\\\\\\\\033[0m'\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -4394,7 +4417,7 @@ TEST(tool_panel_coexists_with_resize_and_queued_input) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_coexist\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":"
         "\\\"sleep 1\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -4430,7 +4453,7 @@ TEST(tool_panel_coexists_with_resize_and_queued_input) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "shell: running", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "bash: running", 1));
 
     result.output_len = 0;
     resized.ws_row = 24;
@@ -4788,7 +4811,7 @@ TEST(status_reports_a_running_tool_then_returns_to_idle_after_a_cancel) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_status\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":"
         "\\\"printf started; sleep 3\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -4823,7 +4846,7 @@ TEST(status_reports_a_running_tool_then_returns_to_idle_after_a_cancel) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "run it\r", 7));
-    CHECK(interactive_wait_for(master_fd, &result, "running tool shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "running tool bash", 1));
     CHECK(write_interactive(master_fd, "/status\r", 8));
     CHECK(interactive_wait_for(master_fd, &result, "Conversation: tool "
                                                   "running",
@@ -4854,7 +4877,7 @@ TEST(status_reports_a_failed_turn_and_a_model_change) {
     const char *denied_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_denied\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":"
         "\\\"echo hi\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     size_t denied_len;
@@ -6028,7 +6051,7 @@ static void run_one_interactive_tool_turn(const char *session_root) {
     const char *tool_sse =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call_replay\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":"
         "\\\"printf replay-tool-result\\\"}\"}}]}}]}\n\n"
         "data: [DONE]\n\n";
     const char *answer_sse =
@@ -6222,7 +6245,7 @@ TEST(interactive_session_switch_restores_context_and_offers_replay) {
     CHECK(interactive_wait_for(master_fd, &result, "oi: remembered-answer",
                                1));
     CHECK(interactive_wait_for(master_fd, &result, "id: call_replay", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "name: shell", 1));
+    CHECK(interactive_wait_for(master_fd, &result, "name: bash", 1));
     CHECK(interactive_wait_for(
         master_fd, &result,
         "arguments: {\"command\":\"printf replay-tool-result\"}", 1));
@@ -6776,7 +6799,7 @@ int main(void) {
     RUN(permission_ask_allow_once_lets_the_tool_run);
     RUN(permission_ask_deny_ends_the_turn);
     RUN(permission_ask_shows_the_full_decoded_command_and_enter_denies);
-    RUN(permission_ask_allow_for_process_elevates_policy);
+    RUN(permission_ask_allow_for_process_allows_only_that_kind_of_tool);
     RUN(permission_ask_ctrl_c_while_awaiting_denies_without_hanging);
     RUN(permission_ask_resize_redraws_the_selector);
     RUN(permission_ask_typing_does_not_leak_into_the_draft);

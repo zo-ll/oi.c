@@ -268,7 +268,7 @@ TEST(tool_start_boundary_precedes_process_output) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf tool-output; exit 7\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
@@ -292,7 +292,7 @@ TEST(tool_start_boundary_precedes_process_output) {
     CHECK(reactor != NULL);
     CHECK(arena != NULL);
     CHECK(tools != NULL);
-    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
     struct oi_llm_config llm_config = {
         .host = "127.0.0.1",
         .port = api.port,
@@ -349,7 +349,7 @@ TEST(ask_defers_and_resolve_permission_allow_lets_the_tool_run) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf tool-output\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
@@ -373,7 +373,7 @@ TEST(ask_defers_and_resolve_permission_allow_lets_the_tool_run) {
     CHECK(reactor != NULL);
     CHECK(arena != NULL);
     CHECK(tools != NULL);
-    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
     struct oi_llm_config llm_config = {
         .host = "127.0.0.1",
         .port = api.port,
@@ -445,7 +445,7 @@ TEST(ask_defers_and_resolve_permission_deny_produces_a_protocol_valid_result) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf tool-output\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
@@ -460,7 +460,7 @@ TEST(ask_defers_and_resolve_permission_deny_produces_a_protocol_valid_result) {
     CHECK(reactor != NULL);
     CHECK(arena != NULL);
     CHECK(tools != NULL);
-    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
     struct oi_llm_config llm_config = {
         .host = "127.0.0.1",
         .port = api.port,
@@ -529,7 +529,7 @@ TEST(cancel_while_awaiting_permission_repairs_as_not_executed) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf tool-output\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
@@ -544,7 +544,7 @@ TEST(cancel_while_awaiting_permission_repairs_as_not_executed) {
     CHECK(reactor != NULL);
     CHECK(arena != NULL);
     CHECK(tools != NULL);
-    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
     struct oi_llm_config llm_config = {
         .host = "127.0.0.1",
         .port = api.port,
@@ -710,10 +710,10 @@ TEST(cancel_while_tool_running_repairs_messages) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf started; sleep 2\\\"}\"}},"
         "{\"index\":1,\"id\":\"call-2\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf second\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
@@ -730,7 +730,7 @@ TEST(cancel_while_tool_running_repairs_messages) {
     CHECK(reactor != NULL);
     CHECK(arena != NULL);
     CHECK(tools != NULL);
-    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
     struct oi_llm_config llm_config = {
         .host = "127.0.0.1",
         .port = api.port,
@@ -812,7 +812,7 @@ TEST(cancel_from_within_tool_starting_event) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf ran\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
@@ -829,7 +829,7 @@ TEST(cancel_from_within_tool_starting_event) {
     CHECK(reactor != NULL);
     CHECK(arena != NULL);
     CHECK(tools != NULL);
-    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
     struct oi_llm_config llm_config = {
         .host = "127.0.0.1",
         .port = api.port,
@@ -1003,10 +1003,10 @@ TEST(steer_after_a_tool_completes_skips_the_next_one) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf one\\\"}\"}},"
         "{\"index\":1,\"id\":\"call-2\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf two\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
@@ -1023,7 +1023,7 @@ TEST(steer_after_a_tool_completes_skips_the_next_one) {
     CHECK(reactor != NULL);
     CHECK(arena != NULL);
     CHECK(tools != NULL);
-    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
     struct oi_llm_config llm_config = {
         .host = "127.0.0.1",
         .port = api.port,
@@ -1094,7 +1094,7 @@ TEST(steer_after_the_only_tool_prevents_a_second_model_round) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf one\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
@@ -1116,7 +1116,7 @@ TEST(steer_after_the_only_tool_prevents_a_second_model_round) {
     CHECK(reactor != NULL);
     CHECK(arena != NULL);
     CHECK(tools != NULL);
-    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
     struct oi_llm_config llm_config = {
         .host = "127.0.0.1",
         .port = api.port,
@@ -1181,7 +1181,7 @@ TEST(steer_before_any_tool_starts_skips_them_all) {
     const char *first_response =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
         "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
-        "\"function\":{\"name\":\"shell\",\"arguments\":"
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
         "\"{\\\"command\\\":\\\"printf ran\\\"}\"}}]}}]}\n\n"
         "data: {\"choices\":[{\"index\":0,\"delta\":{},"
         "\"finish_reason\":\"tool_calls\"}]}\n\n"
@@ -1198,7 +1198,7 @@ TEST(steer_before_any_tool_starts_skips_them_all) {
     CHECK(reactor != NULL);
     CHECK(arena != NULL);
     CHECK(tools != NULL);
-    CHECK_EQ(oi_cli_tools_register(tools), OI_OK);
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
     struct oi_llm_config llm_config = {
         .host = "127.0.0.1",
         .port = api.port,
@@ -1528,10 +1528,143 @@ TEST(checkpoint_is_rejected_while_busy) {
     mock_api_stop(&api);
 }
 
+static char *run_tool_call(const char *name, const char *arguments) {
+    char first_response[2048];
+    const char *second_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"done\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    char *content = NULL;
+
+    snprintf(first_response, sizeof first_response,
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+             "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+             "\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]}}]}\n\n"
+             "data: [DONE]\n\n",
+             name, arguments);
+    struct mock_turn turns[2] = {
+        {NULL, first_response, 0},
+        {NULL, second_response, 0},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 2));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 5000,
+        .permission = allow_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_OK);
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    for (size_t i = 0; i < messages->len; i++) {
+        if (messages->items[i].role == OI_CLI_MESSAGE_TOOL) {
+            content = strdup(messages->items[i].content.data);
+        }
+    }
+    CHECK(content != NULL);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+    return content;
+}
+
+TEST(bash_runs_a_command_that_needs_bash_syntax) {
+    char *content = run_tool_call(
+        "bash", "{\\\"command\\\":\\\"[[ abc == a* ]] && "
+                "printf bash-syntax-ok\\\"}");
+
+    CHECK(content != NULL && strstr(content, "bash-syntax-ok") != NULL);
+    free(content);
+}
+
+TEST(file_tools_run_without_a_shell_on_the_path) {
+    char path[] = "/tmp/oi-file-tools-XXXXXX";
+    char arguments[512];
+    char *saved_path = getenv("PATH") != NULL ? strdup(getenv("PATH")) : NULL;
+    char *content;
+
+    CHECK(mkdtemp(path) != NULL);
+    CHECK_EQ(setenv("PATH", "/nonexistent", 1), 0);
+
+    snprintf(arguments, sizeof arguments,
+             "{\\\"path\\\":\\\"%s/f.txt\\\",\\\"content\\\":"
+             "\\\"one\\\\ntwo\\\\n\\\"}",
+             path);
+    content = run_tool_call("write", arguments);
+    CHECK(content != NULL && strstr(content, "wrote 8 bytes") != NULL);
+    free(content);
+
+    snprintf(arguments, sizeof arguments,
+             "{\\\"path\\\":\\\"%s/f.txt\\\",\\\"old_text\\\":\\\"two\\\","
+             "\\\"new_text\\\":\\\"2\\\"}",
+             path);
+    content = run_tool_call("edit", arguments);
+    CHECK(content != NULL && strstr(content, "edited") != NULL);
+    free(content);
+
+    snprintf(arguments, sizeof arguments, "{\\\"path\\\":\\\"%s/f.txt\\\"}",
+             path);
+    content = run_tool_call("read", arguments);
+    CHECK_STREQ(content, "     1\tone\n     2\t2\n");
+    free(content);
+
+    content = run_tool_call("bash", "{\\\"command\\\":\\\"true\\\"}");
+    CHECK(content != NULL && strstr(content, "cannot run bash") != NULL);
+    free(content);
+
+    if (saved_path != NULL) {
+        CHECK_EQ(setenv("PATH", saved_path, 1), 0);
+    }
+    free(saved_path);
+    snprintf(arguments, sizeof arguments, "%s/f.txt", path);
+    unlink(arguments);
+    rmdir(path);
+}
+
 int main(void) {
     oi_test_set_deadline(900);
     RUN(start_is_event_driven_and_preserves_context);
     RUN(tool_start_boundary_precedes_process_output);
+    RUN(bash_runs_a_command_that_needs_bash_syntax);
+    RUN(file_tools_run_without_a_shell_on_the_path);
     RUN(ask_defers_and_resolve_permission_allow_lets_the_tool_run);
     RUN(ask_defers_and_resolve_permission_deny_produces_a_protocol_valid_result);
     RUN(cancel_while_awaiting_permission_repairs_as_not_executed);
