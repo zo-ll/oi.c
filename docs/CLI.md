@@ -349,7 +349,7 @@ At the prompt:
 | `End` / `Ctrl+E` | end of the current line |
 | `Backspace` / `Ctrl+H` | delete the code point before the cursor |
 | `Delete` | delete the code point after the cursor |
-| `Ctrl+D` | delete forward; on an **empty** draft, exit |
+| `Ctrl+D` | delete forward; on an **empty** draft at an idle prompt, exit |
 | `Up` / `Down` | input history; with the command menu open, move the selection |
 | `Tab` | complete the highlighted command (no-op with no menu) |
 | `Ctrl+C` | clear the draft |
@@ -368,8 +368,8 @@ Notes:
   4 MiB, oldest dropped first. A single draft is bounded at 1 MiB.
 - **Ctrl+C** at the prompt clears the draft; during a turn it cancels the
   turn; in a selector it cancels the selector (which counts as declining).
-- **Ctrl+D** exits only from an empty draft. Pressed during a turn it does
-  nothing.
+- **Ctrl+D** exits only from an empty draft at an idle prompt. Pressed on an
+  empty draft during a turn, it does nothing.
 - A lone `Escape` is resolved after 40 ms, so it is not mistaken for the
   start of an arrow-key sequence.
 - Cursor arithmetic covers a documented subset of Unicode: combining marks
@@ -432,8 +432,9 @@ immediately even while a turn is active.
 ### `/exit`
 
 Process scope. Ends the run at a safe boundary; typed during a turn it takes
-the pending slot and exits once the turn finishes. Ctrl+D on an empty draft
-is the same thing.
+the pending slot and exits once the turn finishes. At an idle prompt, Ctrl+D
+on an empty draft is the same as `/exit`. During a turn, Ctrl+D on an empty
+draft does nothing.
 
 ### `/status`
 
