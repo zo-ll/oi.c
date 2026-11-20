@@ -23,8 +23,8 @@ Read [references/categories.md](references/categories.md) before you classify.
 
 1. Make sure that the working tree is clean. Make a branch from `main`.
 2. Read `tools/comment-baseline.txt`. Each line is `<count> <path>`.
-3. Use the files or modules that the user names. Otherwise, use every C file
-   and header in the baseline.
+3. Use the files or modules that the user names. Otherwise, use every file in
+   the baseline.
 4. The scripts read C only. Classify `#` comments in the Makefile and in
    `.github/workflows/*.yml` by hand.
 
@@ -51,7 +51,9 @@ python3 .claude/skills/delete-comment/scripts/apply.py /tmp/comments.json docs/a
 The script deletes the comments and writes one
 `NNNN-<module>-comment-records.md` ADR for each module. If an ADR for the module
 exists, merge the new sections into it, delete the new file, and keep the
-existing number.
+existing number. A Decision Record in `include/oi/` goes to `docs/API.md`
+instead, under the section of its header. Read each new `docs/API.md` heading:
+the symbol name comes from a script.
 
 ## 5. Prove it, then file the issues
 

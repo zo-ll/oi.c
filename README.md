@@ -156,8 +156,8 @@ be deprecated for at least one release before removal when practical.
 - `arena` / `json`: session-scoped allocation and incremental JSON;
 - `config`: typed configuration parsing and range validation.
 
-Public headers are in `include/oi`. Ownership and callback lifetime rules
-are documented beside each API.
+Public headers are in `include/oi`. The ownership and callback lifetime
+rules of each API are in [docs/API.md](docs/API.md).
 
 ## License
 

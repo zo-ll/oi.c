@@ -11,8 +11,8 @@ Read each comment with the code around it. Give it one category.
 
 ## Exceptions
 
-- A `D` comment in `include/oi/` stays in the code. It is the public API
-  reference.
+- A `D` comment in `include/oi/` is an API contract, not a decision.
+  `apply.py` puts it in `docs/API.md`, under the section of its header.
 - A comment that a compiler or a tool reads (for example, a fallthrough
   marker) stays until the code no longer needs it. Search for these before
   you apply.

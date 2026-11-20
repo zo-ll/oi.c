@@ -7,6 +7,8 @@ YAML. `make comment-lint` (part of `make check`) fails when a file has
 more comments than `tools/comment-baseline.txt` allows.
 
 - Put the reason for a change in the commit message.
+- Put the contract of a public API (ownership, lifetime, error codes) in
+  `docs/API.md`, under the section of its header.
 - Put a non-obvious decision in an ADR in `docs/adr/`. The
   `NNNN-<module>-comment-records.md` files hold the decisions that were
   comments.
