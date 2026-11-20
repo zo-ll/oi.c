@@ -600,7 +600,7 @@ static oi_status bound_tool_text(const oi_cli_conversation *conversation,
         head_end = (size_t)(newline - text->data) + 1;
     }
     tail_start = character_start(text->data, text->len - (limit - limit / 4));
-    newline = text->data[tail_start - 1] == '\n'
+    newline = tail_start > 0 && text->data[tail_start - 1] == '\n'
                   ? NULL
                   : memchr(text->data + tail_start, '\n',
                            text->len - tail_start);
