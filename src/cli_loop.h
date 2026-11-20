@@ -23,6 +23,7 @@ struct oi_cli_loop_config {
     const struct oi_cli_message_list *initial_context;
     oi_cli_conversation_event_cb on_event;
     void *event_user_data;
+    int print_usage;
 };
 
 struct oi_cli_loop_result {

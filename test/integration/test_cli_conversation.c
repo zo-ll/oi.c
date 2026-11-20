@@ -38,6 +38,7 @@ struct event_sink {
     int awaiting_permission_count;
     int awaiting_permission_position;
     oi_cli_conversation **cancel_on_awaiting_permission;
+    oi_cli_conversation **cancel_on_delta;
     oi_cli_conversation **activity_probe;
     enum oi_cli_conversation_activity activity_at[16];
     int activity_seen[16];
@@ -96,6 +97,9 @@ static oi_status collect_event(
         sink->text_len += event->as.bytes.len;
         sink->text[sink->text_len] = '\0';
         sink->delta_count++;
+        if (sink->cancel_on_delta != NULL) {
+            oi_cli_conversation_cancel(*sink->cancel_on_delta);
+        }
         break;
     case OI_CLI_CONVERSATION_EVENT_RESPONSE_DONE:
         sink->response_done_count++;
@@ -1659,10 +1663,178 @@ TEST(file_tools_run_without_a_shell_on_the_path) {
     rmdir(path);
 }
 
+TEST(usage_adds_up_over_the_requests_of_a_turn) {
+    const char *first_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+        "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"bash\",\"arguments\":"
+        "\"{\\\"command\\\":\\\"true\\\"}\"}}]}}]}\n\n"
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,"
+        "\"completion_tokens\":10,\"prompt_tokens_details\":{"
+        "\"cached_tokens\":40}}}\n\n"
+        "data: [DONE]\n\n";
+    const char *second_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"finished\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[2] = {
+        {NULL, first_response, 0},
+        {NULL, second_response, 0},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 2));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 5000,
+        .permission = allow_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_usage(conversation)->requests, 0);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 200 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_OK);
+
+    const struct oi_cli_usage *usage = oi_cli_conversation_usage(conversation);
+    CHECK_EQ(usage->requests, 2);
+    CHECK_EQ(usage->reported_requests, 1);
+    CHECK_EQ(usage->cached_reported_requests, 1);
+    CHECK_EQ(usage->input_tokens, 100);
+    CHECK_EQ(usage->cached_input_tokens, 40);
+    CHECK_EQ(usage->output_tokens, 10);
+
+    size_t request_len = 0;
+    char *request = mock_api_request(&api, 0, &request_len);
+    CHECK(request != NULL &&
+          strstr(request, "\"stream_options\":{\"include_usage\":true}") !=
+              NULL);
+    free(request);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
+TEST(usage_of_a_cancelled_request_is_counted_once) {
+    const char *first_response =
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":70,"
+        "\"completion_tokens\":5}}\n\n"
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"partial\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    const char *second_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"no usage\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    struct mock_turn turns[2] = {
+        {NULL, first_response, 0},
+        {NULL, second_response, 0},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 2));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    oi_cli_conversation *conversation = NULL;
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+        .cancel_on_delta = &conversation,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 2,
+        .tool_timeout_ms = 1000,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+    };
+    CHECK_EQ(oi_cli_conversation_create(client, reactor, arena, tools,
+                                        &config, NULL, &conversation),
+             OI_OK);
+
+    CHECK_EQ(oi_cli_conversation_start(conversation, "one", 3), OI_OK);
+    for (int i = 0; i < 100 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK(oi_cli_conversation_was_cancelled(conversation));
+    const struct oi_cli_usage *usage = oi_cli_conversation_usage(conversation);
+    CHECK_EQ(usage->requests, 1);
+    CHECK_EQ(usage->reported_requests, 1);
+    CHECK_EQ(usage->input_tokens, 70);
+
+    sink.cancel_on_delta = NULL;
+    sink.turn_done = 0;
+    CHECK_EQ(oi_cli_conversation_start(conversation, "two", 3), OI_OK);
+    for (int i = 0; i < 100 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(usage->requests, 2);
+    CHECK_EQ(usage->reported_requests, 1);
+    CHECK_EQ(usage->input_tokens, 70);
+    CHECK_EQ(usage->output_tokens, 5);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
 int main(void) {
     oi_test_set_deadline(900);
     RUN(start_is_event_driven_and_preserves_context);
     RUN(tool_start_boundary_precedes_process_output);
+    RUN(usage_adds_up_over_the_requests_of_a_turn);
+    RUN(usage_of_a_cancelled_request_is_counted_once);
     RUN(bash_runs_a_command_that_needs_bash_syntax);
     RUN(file_tools_run_without_a_shell_on_the_path);
     RUN(ask_defers_and_resolve_permission_allow_lets_the_tool_run);

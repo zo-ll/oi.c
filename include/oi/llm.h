@@ -15,7 +15,8 @@ typedef void (*oi_llm_delta_cb)(const char *text, size_t len,
 
 typedef enum {
     OI_LLM_EVENT_TEXT,
-    OI_LLM_EVENT_TOOL_CALL
+    OI_LLM_EVENT_TOOL_CALL,
+    OI_LLM_EVENT_USAGE
 } oi_llm_event_type;
 
 typedef struct {
@@ -34,6 +35,12 @@ typedef struct {
             const char *arguments;
             size_t arguments_len;
         } tool_call;
+        struct {
+            size_t input_tokens;
+            size_t cached_input_tokens;
+            size_t output_tokens;
+            int has_cached_input_tokens;
+        } usage;
     } as;
 } oi_llm_event;
 

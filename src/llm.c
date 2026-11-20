@@ -453,6 +453,34 @@ static int emit_text(oi_llm_request *req, const char *text, size_t len) {
     return destroyed != NULL && *destroyed;
 }
 
+static int token_count(const oi_json_value *object, const char *key,
+                       size_t *out) {
+    double value;
+
+    if (oi_json_get_number(oi_json_object_get(object, key), &value) !=
+            OI_OK ||
+        value < 0 || value > 1e15) {
+        return 0;
+    }
+    *out = (size_t)value;
+    return 1;
+}
+
+static int emit_usage(oi_llm_request *req, const oi_json_value *usage,
+                      const char *input_key, const char *output_key,
+                      const char *details_key) {
+    oi_llm_event event = {.type = OI_LLM_EVENT_USAGE};
+
+    if (!token_count(usage, input_key, &event.as.usage.input_tokens) ||
+        !token_count(usage, output_key, &event.as.usage.output_tokens)) {
+        return 0;
+    }
+    event.as.usage.has_cached_input_tokens =
+        token_count(oi_json_object_get(usage, details_key), "cached_tokens",
+                    &event.as.usage.cached_input_tokens);
+    return emit_event(req, &event);
+}
+
 static oi_status record_tool_fragment(oi_llm_request *req, size_t index,
                                       const char *id, size_t id_len,
                                       const char *name, size_t name_len,
@@ -662,6 +690,13 @@ static void handle_responses_event(oi_llm_request *req, const char *data,
                              "response.function_call_arguments.done")) {
         st = handle_responses_arguments(req, root, "arguments", 1);
     } else if (event_type_is(type, type_len, "response.completed")) {
+        if (emit_usage(req,
+                       oi_json_object_get(oi_json_object_get(root, "response"),
+                                          "usage"),
+                       "input_tokens", "output_tokens",
+                       "input_tokens_details")) {
+            return;
+        }
         st = validate_tool_calls(req);
         if (st == OI_OK) {
             req->saw_done = 1;
@@ -731,6 +766,11 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
     if (oi_json_object_get(root, "error") != NULL) {
         st = error_buf_append(req, data, len);
         fail_stream(req, st == OI_OK ? OI_ERR_IO : st);
+        return;
+    }
+
+    if (emit_usage(req, oi_json_object_get(root, "usage"), "prompt_tokens",
+                   "completion_tokens", "prompt_tokens_details")) {
         return;
     }
 

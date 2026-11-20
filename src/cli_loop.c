@@ -5,6 +5,7 @@
 
 #include "cli_conversation.h"
 #include "cli_present.h"
+#include "cli_status.h"
 
 oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
                           oi_arena *arena, oi_tool_registry *tools,
@@ -66,6 +67,14 @@ oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
         }
         fprintf(config->err, "oi: model/tool loop failed (status=%d)\n",
                 (int)st);
+    }
+    if (config->print_usage && conversation != NULL) {
+        char usage[192];
+
+        if (oi_cli_usage_format(oi_cli_conversation_usage(conversation),
+                                usage, sizeof usage) > 0) {
+            fprintf(config->err, "oi: tokens: %s\n", usage);
+        }
     }
     if (st == OI_OK) {
         st = oi_cli_present_take_assistant(

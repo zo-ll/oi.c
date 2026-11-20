@@ -467,6 +467,53 @@ static oi_status append_checkpoint(
                                               : "not compacted");
 }
 
+int oi_cli_usage_format(const struct oi_cli_usage *usage, char *out,
+                        size_t size) {
+    const char *requests = usage->requests == 1 ? "request" : "requests";
+    char cached[64] = "unknown";
+    int len;
+
+    if (usage->requests == 0) {
+        return snprintf(out, size, "no requests yet");
+    }
+    if (usage->reported_requests == 0) {
+        return snprintf(out, size, "unavailable (%zu %s, none reported)",
+                        usage->requests, requests);
+    }
+    if (usage->cached_reported_requests == usage->reported_requests) {
+        snprintf(cached, sizeof cached, "%zu", usage->cached_input_tokens);
+    } else if (usage->cached_reported_requests > 0) {
+        snprintf(cached, sizeof cached, "%zu, unknown for %zu",
+                 usage->cached_input_tokens,
+                 usage->reported_requests - usage->cached_reported_requests);
+    }
+    len = snprintf(out, size, "input %zu (cached %s), output %zu, %s %zu",
+                   usage->input_tokens, cached, usage->output_tokens,
+                   requests, usage->requests);
+    if (len >= 0 && (size_t)len < size &&
+        usage->reported_requests < usage->requests) {
+        len += snprintf(out + len, size - (size_t)len,
+                        " (usage unavailable for %zu)",
+                        usage->requests - usage->reported_requests);
+    }
+    return len;
+}
+
+static oi_status append_usage(struct status_writer *writer,
+                              const struct oi_cli_status_snapshot *snapshot) {
+    char text[192];
+    int len;
+
+    if (!snapshot->usage_known) {
+        return append_line(writer, "Tokens", "(unknown)");
+    }
+    len = oi_cli_usage_format(&snapshot->usage, text, sizeof text);
+    if (len < 0 || (size_t)len >= sizeof text) {
+        return OI_ERR_NOMEM;
+    }
+    return append_line(writer, "Tokens", text);
+}
+
 static oi_status assemble(struct status_writer *writer,
                           const struct oi_cli_status_snapshot *snapshot) {
     oi_status status = append_session(writer, snapshot);
@@ -501,6 +548,9 @@ static oi_status assemble(struct status_writer *writer,
     }
     if (status == OI_OK) {
         status = append_checkpoint(writer, snapshot);
+    }
+    if (status == OI_OK) {
+        status = append_usage(writer, snapshot);
     }
     return status;
 }

@@ -288,6 +288,8 @@ Fires for each streamed assistant-text delta. May fire zero or more times over t
 
 One borrowed streaming event. Every pointer is valid only until the callback returns. TOOL_CALL fields are fragments from one indexed call: a field with length zero was absent from this delta. Callers that need a complete call append fragments by `index`; the stream is rejected unless every call finishes with a non-empty id/name and JSON-object arguments. A call whose arguments are present but empty gets one final "{}" fragment.
 
+USAGE reports the token counts that the provider sent for the request: `prompt_tokens`, `completion_tokens`, and `prompt_tokens_details.cached_tokens` for chat completions, or `input_tokens`, `output_tokens`, and `input_tokens_details.cached_tokens` from `response.completed` for the Responses API. It fires at most once for each usage object in the stream, and only when both the input and the output counts are present. `has_cached_input_tokens` is zero when the provider did not report the cached count; `cached_input_tokens` is then zero and means nothing. A request whose stream has no usage object gets no USAGE event. Chat-completions servers send usage only when the request asks for it with `"stream_options":{"include_usage":true}`. An event callback must check `type`: a new event type can be added at the end of `oi_llm_event_type`.
+
 ### `oi_llm_done_cb`
 
 Fires exactly once, terminating the request (oi_llm_request itself is freed right after this returns -- don't touch it from inside). `status` is OI_OK on a clean completion of the stream. Otherwise: OI_ERR_IO for a network/TLS failure, OI_ERR_PARSE for a malformed response, or

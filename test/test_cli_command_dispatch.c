@@ -217,7 +217,8 @@ TEST(status_reports_unknown_for_everything_a_callback_leaves_alone) {
                 "Conversation: (unknown)\n"
                 "Queue: (unknown)\n"
                 "Checkpoint: (unknown)\n"
-                "Context: (unknown)\n");
+                "Context: (unknown)\n"
+                "Tokens: (unknown)\n");
     free(output);
     fclose(out);
     fclose(err);

@@ -79,7 +79,13 @@ struct oi_cli_status_snapshot {
     size_t queue_bytes;
 
     struct oi_cli_status_checkpoint checkpoint;
+
+    int usage_known;
+    struct oi_cli_usage usage;
 };
+
+int oi_cli_usage_format(const struct oi_cli_usage *usage, char *out,
+                        size_t size);
 
 void oi_cli_status_snapshot_init(struct oi_cli_status_snapshot *snapshot);
 

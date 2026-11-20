@@ -229,6 +229,11 @@ struct tool_event_ctx {
     char text[32];
     size_t text_len;
     int tool_events;
+    int usage_events;
+    size_t input_tokens;
+    size_t cached_input_tokens;
+    size_t output_tokens;
+    int has_cached_input_tokens;
     int done;
     oi_status status;
 };
@@ -248,6 +253,14 @@ static void on_event(const oi_llm_event *event, void *ud) {
     if (event->type == OI_LLM_EVENT_TEXT) {
         append_checked(ctx->text, &ctx->text_len, sizeof ctx->text,
                        event->as.text.data, event->as.text.len);
+        return;
+    }
+    if (event->type == OI_LLM_EVENT_USAGE) {
+        ctx->usage_events++;
+        ctx->input_tokens = event->as.usage.input_tokens;
+        ctx->cached_input_tokens = event->as.usage.cached_input_tokens;
+        ctx->output_tokens = event->as.usage.output_tokens;
+        ctx->has_cached_input_tokens = event->as.usage.has_cached_input_tokens;
         return;
     }
     CHECK_EQ(event->type, OI_LLM_EVENT_TOOL_CALL);
@@ -323,6 +336,68 @@ TEST(structured_tool_call_fragments_are_ordered) {
     oi_arena_destroy(a);
     oi_reactor_destroy(r);
     waitpid(child, NULL, 0);
+}
+
+static void run_chat_stream(const char *sse_body,
+                            struct tool_event_ctx *ctx) {
+    size_t total;
+    char *response = build_chunked_response(sse_body, strlen(sse_body),
+                                             "HTTP/1.1 200 OK", &total);
+    unsigned short port;
+    pid_t child = start_mock_server(response, total, &port);
+    free(response);
+
+    oi_reactor *r = oi_reactor_create();
+    oi_arena *a = oi_arena_create(0);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start_events(client, r, a, "{}", 2, on_event,
+                                          tool_event_done, ctx, &req),
+              OI_OK);
+    run_until(r, &ctx->done, 100);
+    CHECK(ctx->done);
+
+    oi_llm_client_destroy(client);
+    oi_arena_destroy(a);
+    oi_reactor_destroy(r);
+    waitpid(child, NULL, 0);
+}
+
+TEST(chat_stream_reports_usage_from_the_final_chunk) {
+    struct tool_event_ctx ctx = {0};
+    run_chat_stream(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"hi\"}}]}\n\n"
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,"
+        "\"completion_tokens\":9,\"prompt_tokens_details\":{"
+        "\"cached_tokens\":64}}}\n\n"
+        "data: [DONE]\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_STREQ(ctx.text, "hi");
+    CHECK_EQ(ctx.usage_events, 1);
+    CHECK_EQ(ctx.input_tokens, 120);
+    CHECK_EQ(ctx.cached_input_tokens, 64);
+    CHECK(ctx.has_cached_input_tokens);
+    CHECK_EQ(ctx.output_tokens, 9);
+}
+
+TEST(chat_stream_usage_without_cache_details_marks_cache_unknown) {
+    struct tool_event_ctx ctx = {0};
+    run_chat_stream(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"hi\"}}],\"usage\":null}\n\n"
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,"
+        "\"completion_tokens\":2}}\n\n"
+        "data: [DONE]\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_EQ(ctx.usage_events, 1);
+    CHECK_EQ(ctx.input_tokens, 7);
+    CHECK(!ctx.has_cached_input_tokens);
+    CHECK_EQ(ctx.output_tokens, 2);
 }
 
 TEST(empty_tool_call_arguments_arrive_as_an_empty_object) {
@@ -1176,6 +1251,31 @@ TEST(responses_stream_delivers_text) {
     CHECK_STREQ(ctx.text, "Hello");
 }
 
+TEST(responses_stream_reports_usage) {
+    struct tool_event_ctx ctx = {0};
+    run_responses_stream(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{"
+        "\"input_tokens\":321,\"input_tokens_details\":{\"cached_tokens\":"
+        "256},\"output_tokens\":12,\"total_tokens\":333}}}\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_EQ(ctx.usage_events, 1);
+    CHECK_EQ(ctx.input_tokens, 321);
+    CHECK_EQ(ctx.cached_input_tokens, 256);
+    CHECK(ctx.has_cached_input_tokens);
+    CHECK_EQ(ctx.output_tokens, 12);
+}
+
+TEST(responses_stream_without_usage_reports_none) {
+    struct tool_event_ctx ctx = {0};
+    run_responses_stream(
+        "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        &ctx);
+    CHECK_EQ(ctx.status, OI_OK);
+    CHECK_EQ(ctx.usage_events, 0);
+}
+
 TEST(responses_stream_assembles_function_calls) {
     struct tool_event_ctx ctx = {0};
     run_responses_stream(
@@ -1719,6 +1819,8 @@ int main(void) {
     signal(SIGCHLD, SIG_DFL);
     RUN(streaming_success_delivers_deltas);
     RUN(structured_tool_call_fragments_are_ordered);
+    RUN(chat_stream_reports_usage_from_the_final_chunk);
+    RUN(chat_stream_usage_without_cache_details_marks_cache_unknown);
     RUN(empty_tool_call_arguments_arrive_as_an_empty_object);
     RUN(body_that_ends_at_the_close_completes_the_stream);
     RUN(body_cut_short_by_the_close_fails_the_stream);
@@ -1739,6 +1841,8 @@ int main(void) {
     RUN(client_rejects_unsafe_http_fields);
     RUN(long_bearer_token_fits_request_header);
     RUN(responses_stream_delivers_text);
+    RUN(responses_stream_reports_usage);
+    RUN(responses_stream_without_usage_reports_none);
     RUN(responses_stream_assembles_function_calls);
     RUN(responses_empty_arguments_arrive_as_an_empty_object);
     RUN(responses_arguments_can_arrive_only_in_the_done_event);

@@ -48,7 +48,7 @@ static size_t count_lines(const char *text) {
     return lines;
 }
 
-#define STATUS_REPORT_LINES 11u
+#define STATUS_REPORT_LINES 12u
 
 static void init_active(struct oi_cli_status_snapshot *snapshot) {
     oi_cli_status_snapshot_init(snapshot);
@@ -67,6 +67,13 @@ static void init_active(struct oi_cli_status_snapshot *snapshot) {
     snapshot->conversation = OI_CLI_CONVERSATION_ACTIVITY_IDLE;
     snapshot->queue = OI_CLI_STATUS_QUEUE_EMPTY;
     snapshot->checkpoint.known = 1;
+    snapshot->usage_known = 1;
+    snapshot->usage.requests = 2;
+    snapshot->usage.reported_requests = 2;
+    snapshot->usage.cached_reported_requests = 2;
+    snapshot->usage.input_tokens = 1200;
+    snapshot->usage.cached_input_tokens = 800;
+    snapshot->usage.output_tokens = 300;
 }
 
 TEST(rejects_missing_arguments) {
@@ -130,7 +137,8 @@ TEST(output_is_deterministic_and_ordered) {
                 "Conversation: idle\n"
                 "Queue: empty\n"
                 "Checkpoint: none\n"
-                "Context: not compacted\n");
+                "Context: not compacted\n"
+                "Tokens: input 1200 (cached 800), output 300, requests 2\n");
     free(text);
 }
 
@@ -155,7 +163,8 @@ TEST(initialized_snapshot_reports_everything_as_unknown) {
                 "Conversation: (unknown)\n"
                 "Queue: (unknown)\n"
                 "Checkpoint: (unknown)\n"
-                "Context: (unknown)\n");
+                "Context: (unknown)\n"
+                "Tokens: (unknown)\n");
     free(text);
 }
 
@@ -648,7 +657,7 @@ TEST(report_is_exactly_the_contracted_lines) {
         "Session: ",  "Model: ",        "Endpoint: ",
         "Permissions: ", "Request timeout: ", "Tool timeout: ",
         "CWD: ",      "Conversation: ", "Queue: ",
-        "Checkpoint: ", "Context: ",
+        "Checkpoint: ", "Context: ",  "Tokens: ",
     };
     const size_t key_count = sizeof keys / sizeof keys[0];
     struct oi_cli_status_snapshot snapshot;
@@ -671,6 +680,37 @@ TEST(report_is_exactly_the_contracted_lines) {
     CHECK(strstr(text, "api_key") == NULL);
     CHECK(strstr(text, "ca_file") == NULL);
     free(text);
+}
+
+TEST(usage_reports_missing_data_as_unavailable) {
+    struct oi_cli_usage usage = {0};
+    char text[192];
+
+    oi_cli_usage_format(&usage, text, sizeof text);
+    CHECK_STREQ(text, "no requests yet");
+    usage.requests = 3;
+    oi_cli_usage_format(&usage, text, sizeof text);
+    CHECK_STREQ(text, "unavailable (3 requests, none reported)");
+    usage.reported_requests = 2;
+    usage.input_tokens = 50;
+    usage.output_tokens = 7;
+    oi_cli_usage_format(&usage, text, sizeof text);
+    CHECK_STREQ(text, "input 50 (cached unknown), output 7, requests 3 "
+                      "(usage unavailable for 1)");
+    usage.reported_requests = 3;
+    usage.cached_reported_requests = 1;
+    usage.cached_input_tokens = 40;
+    oi_cli_usage_format(&usage, text, sizeof text);
+    CHECK_STREQ(text,
+                "input 50 (cached 40, unknown for 2), output 7, requests 3");
+    usage.cached_reported_requests = 3;
+    usage.cached_input_tokens = 0;
+    oi_cli_usage_format(&usage, text, sizeof text);
+    CHECK_STREQ(text, "input 50 (cached 0), output 7, requests 3");
+
+    struct oi_cli_usage one = {.requests = 1};
+    oi_cli_usage_format(&one, text, sizeof text);
+    CHECK_STREQ(text, "unavailable (1 request, none reported)");
 }
 
 int main(void) {
@@ -697,5 +737,6 @@ int main(void) {
     RUN(ordinary_utf8_survives_sanitization);
     RUN(an_overlong_field_is_bounded_and_marked);
     RUN(report_is_exactly_the_contracted_lines);
+    RUN(usage_reports_missing_data_as_unavailable);
     return oi_test_report();
 }

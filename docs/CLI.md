@@ -240,6 +240,7 @@ is read.
 | `--max-turns N` | model steps per turn, 1-1000, default 8 |
 | `--allow-tools` | run requested tools without asking |
 | `--deny-tools` | refuse every requested tool |
+| `--usage` | after a one-shot run, print the token usage to stderr |
 | `--dry-run` | print the resolved request; no network, no key needed |
 | `-h`, `--help` | usage summary |
 
@@ -453,6 +454,7 @@ Conversation: idle
 Queue: empty
 Checkpoint: none
 Context: not compacted
+Tokens: input 5400 (cached 3200), output 410, requests 3
 ```
 
 - `Session` is a session id, `(not created)` for an interactive session with
@@ -467,6 +469,13 @@ Context: not compacted
   `(steering to a safe boundary)` while steering.
 - `Checkpoint` reports the durable checkpoint's source record range, and
   `Context` whether active context is compacted.
+- `Tokens` adds up the token usage that the provider reported for the model
+  requests of the current conversation: input, the cached part of the input,
+  and output. Usage that the provider does not report is `unavailable` or
+  `unknown`, never zero: `cached 40, unknown for 2` means that 2 requests
+  reported no cached count. Compaction requests are not counted. To get
+  usage from a chat-completions server, each request asks for it with
+  `"stream_options":{"include_usage":true}`.
 
 Every value that could come from a tampered log, a filesystem, or the
 command line is repaired to well-formed UTF-8 and stripped of control bytes
