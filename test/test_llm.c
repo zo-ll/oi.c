@@ -1661,6 +1661,75 @@ TEST(kept_connection_closed_by_the_server_is_replaced_once) {
     close(accepts_fd);
 }
 
+/* Runs one request to completion and returns its status. */
+static oi_status one_request(oi_llm_client *client, oi_reactor *r) {
+    oi_arena *a = oi_arena_create(0);
+    struct stream_ctx ctx = {0};
+    oi_llm_request *req = NULL;
+    CHECK_EQ(oi_llm_request_start(client, r, a, "{}", 2, on_delta, on_done,
+                                   &ctx, &req),
+             OI_OK);
+    run_until(r, &ctx.done, 100);
+    CHECK(ctx.done);
+    oi_arena_destroy(a);
+    return ctx.done_status;
+}
+
+TEST(keep_alive_off_closes_the_kept_connection) {
+    unsigned short port;
+    int accepts_fd;
+    pid_t child = start_keep_alive_server(2, 0, &port, &accepts_fd);
+    struct oi_llm_config cfg = {"127.0.0.1", port, 0, NULL, NULL,
+                                 "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&cfg);
+    oi_llm_client_set_keep_alive(client, 1);
+    oi_reactor *r = oi_reactor_create();
+
+    CHECK_EQ(one_request(client, r), OI_OK);
+    oi_llm_client_set_keep_alive(client, 0);
+    CHECK_EQ(one_request(client, r), OI_OK);
+    CHECK_EQ(count_accepts(accepts_fd), 2);
+
+    oi_llm_client_destroy(client);
+    oi_reactor_destroy(r);
+    kill(child, SIGKILL); /* a failed test leaves it in accept() */
+    waitpid(child, NULL, 0);
+    close(accepts_fd);
+}
+
+TEST(reconfigure_does_not_reuse_the_kept_connection) {
+    unsigned short old_port;
+    unsigned short new_port;
+    int old_accepts_fd;
+    int new_accepts_fd;
+    pid_t old_server =
+        start_keep_alive_server(1, 0, &old_port, &old_accepts_fd);
+    pid_t new_server =
+        start_keep_alive_server(1, 0, &new_port, &new_accepts_fd);
+    struct oi_llm_config old_cfg = {"127.0.0.1", old_port, 0, NULL, NULL,
+                                     "/v1/chat/completions", 0};
+    struct oi_llm_config new_cfg = {"127.0.0.1", new_port, 0, NULL, NULL,
+                                     "/v1/chat/completions", 0};
+    oi_llm_client *client = oi_llm_client_create(&old_cfg);
+    oi_llm_client_set_keep_alive(client, 1);
+    oi_reactor *r = oi_reactor_create();
+
+    CHECK_EQ(one_request(client, r), OI_OK);
+    CHECK_EQ(oi_llm_client_reconfigure(client, &new_cfg, 0), OI_OK);
+    CHECK_EQ(one_request(client, r), OI_OK);
+    CHECK_EQ(count_accepts(old_accepts_fd), 1);
+    CHECK_EQ(count_accepts(new_accepts_fd), 1);
+
+    oi_llm_client_destroy(client);
+    oi_reactor_destroy(r);
+    kill(old_server, SIGKILL); /* a failed test leaves it in accept() */
+    kill(new_server, SIGKILL);
+    waitpid(old_server, NULL, 0);
+    waitpid(new_server, NULL, 0);
+    close(old_accepts_fd);
+    close(new_accepts_fd);
+}
+
 TEST(cancel_null_safe) { oi_llm_request_cancel(NULL); }
 
 int main(void) {
@@ -1704,6 +1773,8 @@ int main(void) {
     RUN(cancel_during_a_hook_wait_stops_the_wait);
     RUN(keep_alive_sends_two_requests_on_one_connection);
     RUN(without_keep_alive_each_request_has_its_own_connection);
+    RUN(keep_alive_off_closes_the_kept_connection);
+    RUN(reconfigure_does_not_reuse_the_kept_connection);
     RUN(kept_connection_closed_by_the_server_is_replaced_once);
     RUN(cancel_null_safe);
     return oi_test_report();
