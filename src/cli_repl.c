@@ -707,36 +707,6 @@ static oi_status dispatch_set_cwd(void *user_data, const char *path,
     return OI_OK;
 }
 
-static int repl_is_space(char value) {
-    return value == ' ' || value == '\t' || value == '\r' || value == '\n';
-}
-
-static void repl_split_first_token(const char *text, size_t len,
-                                   const char **out_token,
-                                   size_t *out_token_len, const char **out_rest,
-                                   size_t *out_rest_len) {
-    size_t token_len = 0;
-    size_t rest_start;
-
-    while (token_len < len && !repl_is_space(text[token_len])) {
-        token_len++;
-    }
-    rest_start = token_len;
-    while (rest_start < len && repl_is_space(text[rest_start])) {
-        rest_start++;
-    }
-    *out_token = text;
-    *out_token_len = token_len;
-    *out_rest = text + rest_start;
-    *out_rest_len = len - rest_start;
-}
-
-static int repl_token_equals(const char *token, size_t token_len,
-                             const char *value) {
-    size_t value_len = strlen(value);
-    return token_len == value_len && memcmp(token, value, value_len) == 0;
-}
-
 struct repl_session_switch_outcome {
     int terminate;
     int switched;
@@ -895,7 +865,8 @@ static oi_status repl_handle_session_switch(
     out_outcome->terminate = 0;
     out_outcome->switched = 0;
     out_outcome->model_origin = OI_CLI_SESSION_MODEL_UNKNOWN;
-    repl_split_first_token(rest, rest_len, &id, &id_len, &extra, &extra_len);
+    oi_cli_command_split_first_token(rest, rest_len, &id, &id_len, &extra,
+                                     &extra_len);
     if (id_len == 0 || extra_len != 0) {
         return fputs("oi: usage: /session switch ID\n", config->err) == EOF ||
                        fflush(config->err) != 0
@@ -1035,7 +1006,8 @@ static oi_status repl_handle_session_delete(
     int terminate = 0;
     oi_status status;
 
-    repl_split_first_token(rest, rest_len, &id, &id_len, &extra, &extra_len);
+    oi_cli_command_split_first_token(rest, rest_len, &id, &id_len, &extra,
+                                     &extra_len);
     if (id_len == 0 || extra_len != 0) {
         return fputs("oi: usage: /session delete ID\n", config->err) == EOF ||
                        fflush(config->err) != 0
@@ -1530,11 +1502,12 @@ have_parsed_command:
                 size_t rest_len = 0;
                 int handled = 0;
 
-                repl_split_first_token(parsed.arguments, parsed.arguments_len,
-                                       &subcommand, &subcommand_len, &rest,
-                                       &rest_len);
+                oi_cli_command_split_first_token(
+                    parsed.arguments, parsed.arguments_len, &subcommand,
+                    &subcommand_len, &rest, &rest_len);
 
-                if (repl_token_equals(subcommand, subcommand_len, "switch")) {
+                if (oi_cli_command_token_equals(subcommand, subcommand_len,
+                                                "switch")) {
                     struct repl_session_switch_outcome outcome;
 
                     handled = 1;
@@ -1554,14 +1527,14 @@ have_parsed_command:
                     if (status == OI_OK && has_switched_context) {
                         active_context = &switched_context;
                     }
-                } else if (repl_token_equals(subcommand, subcommand_len,
-                                             "delete")) {
+                } else if (oi_cli_command_token_equals(
+                               subcommand, subcommand_len, "delete")) {
                     handled = 1;
                     status = repl_handle_session_delete(config, &composer,
                                                         signal_fd, rest,
                                                         rest_len);
-                } else if (repl_token_equals(subcommand, subcommand_len,
-                                             "import")) {
+                } else if (oi_cli_command_token_equals(
+                               subcommand, subcommand_len, "import")) {
                     handled = 1;
                     status = repl_handle_session_import(config, &composer,
                                                         signal_fd, rest,

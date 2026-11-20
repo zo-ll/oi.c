@@ -54,4 +54,12 @@ size_t oi_cli_command_filter(const char *text, size_t text_len,
 oi_status oi_cli_command_parse_text(const char *text, size_t text_len,
                                     struct oi_cli_command_parse *out_parse);
 
+void oi_cli_command_split_first_token(const char *text, size_t len,
+                                      const char **out_token,
+                                      size_t *out_token_len,
+                                      const char **out_rest,
+                                      size_t *out_rest_len);
+int oi_cli_command_token_equals(const char *token, size_t token_len,
+                                const char *value);
+
 #endif

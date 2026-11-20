@@ -74,11 +74,52 @@ TEST(bad_arguments_are_rejected) {
     CHECK_EQ(oi_cli_command_filter(NULL, 0, NULL, 0), 0);
 }
 
+TEST(split_first_token_keeps_the_rest_verbatim) {
+    static const char text[] = "import  /tmp/a dir/b c.oilog";
+    const char *token;
+    const char *rest;
+    size_t token_len;
+    size_t rest_len;
+
+    oi_cli_command_split_first_token(text, sizeof text - 1, &token, &token_len,
+                                     &rest, &rest_len);
+    CHECK(token == text);
+    CHECK_EQ(token_len, 6);
+    CHECK_EQ(rest_len, strlen("/tmp/a dir/b c.oilog"));
+    CHECK(memcmp(rest, "/tmp/a dir/b c.oilog", rest_len) == 0);
+
+    oi_cli_command_split_first_token("list", 4, &token, &token_len, &rest,
+                                     &rest_len);
+    CHECK_EQ(token_len, 4);
+    CHECK_EQ(rest_len, 0);
+
+    {
+        static const char spaced[] = "rename\tid\r\nname";
+
+        oi_cli_command_split_first_token(spaced, sizeof spaced - 1, &token,
+                                         &token_len, &rest, &rest_len);
+        CHECK_EQ(token_len, 6);
+        CHECK_EQ(rest_len, 8);
+        CHECK(memcmp(rest, "id\r\nname", 8) == 0);
+    }
+}
+
+TEST(token_equals_compares_the_whole_token) {
+    CHECK(oi_cli_command_token_equals("switch", 6, "switch"));
+    CHECK(oi_cli_command_token_equals("switchx", 6, "switch"));
+    CHECK(!oi_cli_command_token_equals("switch", 5, "switch"));
+    CHECK(!oi_cli_command_token_equals("switches", 8, "switch"));
+    CHECK(!oi_cli_command_token_equals("delete", 6, "switch"));
+    CHECK(oi_cli_command_token_equals("", 0, ""));
+}
+
 int main(void) {
     RUN(registry_contains_the_agreed_commands);
     RUN(filter_matches_prefixes_only_in_the_first_token);
     RUN(parse_distinguishes_messages_commands_and_literal_slashes);
     RUN(parse_returns_trimmed_borrowed_arguments);
     RUN(bad_arguments_are_rejected);
+    RUN(split_first_token_keeps_the_rest_verbatim);
+    RUN(token_equals_compares_the_whole_token);
     return oi_test_report();
 }
