@@ -1,3 +1,5 @@
+#include <dirent.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +21,26 @@
 #include "oi/llm.h"
 #include "oi/reactor.h"
 #include "oi/session.h"
+
+static void remove_tool_output_dir(const char *directory) {
+    DIR *entries;
+    struct dirent *entry;
+    char path[PATH_MAX];
+
+    if (directory[0] == '\0' || (entries = opendir(directory)) == NULL) {
+        return;
+    }
+    while ((entry = readdir(entries)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0 &&
+            snprintf(path, sizeof path, "%s/%s", directory, entry->d_name) <
+                (int)sizeof path) {
+            unlink(path);
+        }
+    }
+    closedir(entries);
+    rmdir(directory);
+}
 
 static void print_usage(void) {
     printf(
@@ -44,6 +66,10 @@ static void print_usage(void) {
         "  --timeout-ms MS      end-to-end request timeout\n"
         "  --max-turns N        maximum model turns (default: 8)\n"
         "  --allow-tools        run requested tools without prompting\n"
+        "  --tool-output-limit BYTES\n"
+        "                       tool output bytes sent to the model "
+        "(default: 12288,\n"
+        "                       0: no limit)\n"
         "  --deny-tools         reject every requested tool\n"
         "                       (default: ask on a terminal, refuse otherwise)\n"
         "  --usage              print token usage to stderr after a one-shot "
@@ -668,6 +694,8 @@ int main(int argc, char **argv) {
     int dry_run = 0;
     int max_turns = 8;
     int report_usage = 0;
+    long tool_output_limit = 12288;
+    char tool_output_dir[PATH_MAX] = "";
     oi_cli_tool_policy tool_policy = OI_CLI_TOOLS_ASK;
 
     struct {
@@ -697,6 +725,22 @@ int main(int argc, char **argv) {
         }
         if (strcmp(arg, "--deny-tools") == 0) {
             tool_policy = OI_CLI_TOOLS_DENY;
+            continue;
+        }
+        if (strcmp(arg, "--tool-output-limit") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "oi: --tool-output-limit requires a value\n");
+                return 1;
+            }
+            char *end = NULL;
+            long value = strtol(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value < 0 ||
+                value > 1024 * 1024) {
+                fprintf(stderr, "oi: invalid --tool-output-limit value: %s\n",
+                        argv[i]);
+                return 1;
+            }
+            tool_output_limit = value;
             continue;
         }
         if (strcmp(arg, "--max-turns") == 0) {
@@ -1140,12 +1184,28 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    struct oi_cli_permission permission = {.policy = tool_policy};
+    if (tool_output_limit > 0) {
+        const char *temporary = getenv("TMPDIR");
+        int len = snprintf(tool_output_dir, sizeof tool_output_dir,
+                           "%s/oi-tool-output-XXXXXX",
+                           temporary != NULL && temporary[0] != '\0'
+                               ? temporary
+                               : "/tmp");
+        if (len < 0 || (size_t)len >= sizeof tool_output_dir ||
+            mkdtemp(tool_output_dir) == NULL) {
+            tool_output_dir[0] = '\0';
+        }
+    }
+    struct oi_cli_permission permission = {
+        .policy = tool_policy,
+        .output_dir = tool_output_dir[0] != '\0' ? tool_output_dir : NULL,
+    };
     struct oi_cli_loop_config loop_config = {
         .model = cfg.model,
         .max_turns = max_turns,
         .print_usage = report_usage,
         .tool_timeout_ms = cfg.timeout_ms,
+        .tool_output_limit = (size_t)tool_output_limit,
         .permission = &permission,
         .out = stdout,
         .err = stderr,
@@ -1186,6 +1246,7 @@ int main(int argc, char **argv) {
             .model = cfg.model,
             .max_turns = max_turns,
             .tool_timeout_ms = cfg.timeout_ms,
+            .tool_output_limit = (size_t)tool_output_limit,
             .endpoint = &status_endpoint,
             .login = &login,
             .request_timeout_ms = cfg.timeout_ms,
@@ -1259,6 +1320,7 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
+    remove_tool_output_dir(tool_output_dir);
     oi_cli_login_free(&login);
     free(loop_result.assistant_text);
     oi_cli_string_free(&initial_draft);

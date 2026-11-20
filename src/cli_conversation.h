@@ -96,6 +96,8 @@ struct oi_cli_conversation_config {
     void *permission_user_data;
     oi_cli_conversation_event_cb on_event;
     void *event_user_data;
+    size_t tool_output_limit;
+    const char *tool_output_dir;
 };
 
 oi_status oi_cli_conversation_create(

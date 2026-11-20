@@ -24,6 +24,7 @@ struct oi_cli_loop_config {
     oi_cli_conversation_event_cb on_event;
     void *event_user_data;
     int print_usage;
+    size_t tool_output_limit;
 };
 
 struct oi_cli_loop_result {

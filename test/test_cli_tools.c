@@ -75,27 +75,27 @@ TEST(tools_fall_into_categories) {
     oi_arena *arena = oi_arena_create(0);
 
     CHECK_EQ(oi_cli_tool_category_of(
-                 "read", parse(arena, "{\"path\":\"Makefile\"}")),
+                 "read", parse(arena, "{\"path\":\"Makefile\"}"), NULL),
              OI_CLI_TOOL_READ_IN_PROJECT);
     CHECK_EQ(oi_cli_tool_category_of(
-                 "read", parse(arena, "{\"path\":\"src/missing.c\"}")),
+                 "read", parse(arena, "{\"path\":\"src/missing.c\"}"), NULL),
              OI_CLI_TOOL_READ_IN_PROJECT);
     CHECK_EQ(oi_cli_tool_category_of(
-                 "read", parse(arena, "{\"path\":\"/etc/passwd\"}")),
+                 "read", parse(arena, "{\"path\":\"/etc/passwd\"}"), NULL),
              OI_CLI_TOOL_FILE_ACCESS);
     CHECK_EQ(oi_cli_tool_category_of(
-                 "read", parse(arena, "{\"path\":\"../outside\"}")),
+                 "read", parse(arena, "{\"path\":\"../outside\"}"), NULL),
              OI_CLI_TOOL_FILE_ACCESS);
-    CHECK_EQ(oi_cli_tool_category_of("read", parse(arena, "{}")),
-             OI_CLI_TOOL_FILE_ACCESS);
-    CHECK_EQ(oi_cli_tool_category_of(
-                 "edit", parse(arena, "{\"path\":\"Makefile\"}")),
+    CHECK_EQ(oi_cli_tool_category_of("read", parse(arena, "{}"), NULL),
              OI_CLI_TOOL_FILE_ACCESS);
     CHECK_EQ(oi_cli_tool_category_of(
-                 "write", parse(arena, "{\"path\":\"Makefile\"}")),
+                 "edit", parse(arena, "{\"path\":\"Makefile\"}"), NULL),
              OI_CLI_TOOL_FILE_ACCESS);
     CHECK_EQ(oi_cli_tool_category_of(
-                 "bash", parse(arena, "{\"command\":\"true\"}")),
+                 "write", parse(arena, "{\"path\":\"Makefile\"}"), NULL),
+             OI_CLI_TOOL_FILE_ACCESS);
+    CHECK_EQ(oi_cli_tool_category_of(
+                 "bash", parse(arena, "{\"command\":\"true\"}"), NULL),
              OI_CLI_TOOL_COMMAND);
     oi_arena_destroy(arena);
 }
@@ -120,16 +120,16 @@ TEST(links_and_sibling_prefixes_are_outside_the_project) {
     fclose(fopen("plain", "w"));
 
     CHECK_EQ(oi_cli_tool_category_of(
-                 "read", parse(arena, "{\"path\":\"plain\"}")),
+                 "read", parse(arena, "{\"path\":\"plain\"}"), NULL),
              OI_CLI_TOOL_READ_IN_PROJECT);
     CHECK_EQ(oi_cli_tool_category_of(
-                 "read", parse(arena, "{\"path\":\"inside-link\"}")),
+                 "read", parse(arena, "{\"path\":\"inside-link\"}"), NULL),
              OI_CLI_TOOL_FILE_ACCESS);
     CHECK_EQ(oi_cli_tool_category_of(
-                 "read", parse(arena, "{\"path\":\"dangling\"}")),
+                 "read", parse(arena, "{\"path\":\"dangling\"}"), NULL),
              OI_CLI_TOOL_FILE_ACCESS);
     CHECK_EQ(oi_cli_tool_category_of(
-                 "read", parse(arena, "{\"path\":\"../ab/secret\"}")),
+                 "read", parse(arena, "{\"path\":\"../ab/secret\"}"), NULL),
              OI_CLI_TOOL_FILE_ACCESS);
 
     unlink("inside-link");

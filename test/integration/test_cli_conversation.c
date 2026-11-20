@@ -6,6 +6,7 @@
 
 #include "cli_conversation.h"
 #include "cli_message.h"
+#include "cli_tool_run.h"
 #include "cli_tools.h"
 #include "oi/arena.h"
 #include "oi/llm.h"
@@ -1829,6 +1830,126 @@ TEST(usage_of_a_cancelled_request_is_counted_once) {
     mock_api_stop(&api);
 }
 
+TEST(long_tool_output_is_bounded_and_the_rest_can_be_read) {
+    char directory[] = "/tmp/oi-bounded-XXXXXX";
+    char first_response[1024];
+    const char *second_response =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":"
+        "\"done\"}}]}\n\n"
+        "data: [DONE]\n\n";
+    char *content = NULL;
+
+    CHECK(mkdtemp(directory) != NULL);
+    snprintf(first_response, sizeof first_response,
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+             "\"index\":0,\"id\":\"call-1\",\"type\":\"function\","
+             "\"function\":{\"name\":\"bash\",\"arguments\":"
+             "\"{\\\"command\\\":\\\"for i in $(seq 1 2000); do "
+             "if [ $i = 1000 ]; then echo FAILURE-MARKER; "
+             "else echo line-$i; fi; done\\\"}\"}}]}}]}\n\n"
+             "data: [DONE]\n\n");
+    struct mock_turn turns[2] = {
+        {NULL, first_response, 0},
+        {NULL, second_response, 0},
+    };
+    struct mock_api api;
+    CHECK(mock_api_start(&api, turns, 2));
+
+    oi_reactor *reactor = oi_reactor_create();
+    oi_arena *arena = oi_arena_create(64 * 1024);
+    oi_tool_registry *tools = oi_tool_registry_create();
+    CHECK_EQ(oi_cli_tools_register(tools, OI_CLI_BIN), OI_OK);
+    struct oi_llm_config llm_config = {
+        .host = "127.0.0.1",
+        .port = api.port,
+        .use_tls = 0,
+        .api_key = "test",
+        .path = "/v1/chat/completions",
+        .timeout_ms = 5000,
+    };
+    oi_llm_client *client = oi_llm_client_create(&llm_config);
+    struct event_sink sink = {
+        .arena = arena,
+        .tool_start_position = -1,
+        .tool_output_position = -1,
+        .tool_message_position = -1,
+    };
+    struct oi_cli_conversation_config config = {
+        .model = "mock-model",
+        .max_model_steps = 3,
+        .tool_timeout_ms = 5000,
+        .permission = allow_tool,
+        .on_event = collect_event,
+        .event_user_data = &sink,
+        .tool_output_limit = 4096,
+        .tool_output_dir = directory,
+    };
+    oi_cli_conversation *conversation = NULL;
+    CHECK_EQ(oi_cli_conversation_create(
+                 client, reactor, arena, tools, &config, NULL, &conversation),
+             OI_OK);
+    CHECK_EQ(oi_cli_conversation_start(conversation, "run it", 6), OI_OK);
+    for (int i = 0; i < 5000 && !sink.turn_done; i++) {
+        oi_status step_status;
+        CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
+    }
+    CHECK(sink.turn_done);
+    CHECK_EQ(sink.status, OI_OK);
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    for (size_t i = 0; i < messages->len; i++) {
+        if (messages->items[i].role == OI_CLI_MESSAGE_TOOL) {
+            content = strdup(messages->items[i].content.data);
+        }
+    }
+    CHECK(content != NULL);
+    if (content != NULL) {
+        char saved[512];
+        const char *marker = strstr(content, "[oi: lines ");
+        const char *path = marker != NULL ? strstr(marker, directory) : NULL;
+        size_t offset = 0;
+        size_t path_len = 0;
+
+        CHECK(strlen(content) < 4096 + 512);
+        CHECK(strncmp(content, "line-1\n", 7) == 0);
+        CHECK(strstr(content, "line-2000\n") != NULL);
+        CHECK(strstr(content, "FAILURE-MARKER") == NULL);
+        CHECK(marker != NULL);
+        CHECK(path != NULL);
+        if (path != NULL) {
+            path_len = strcspn(path, ":");
+            CHECK(sscanf(path + path_len, ": read it with offset %zu",
+                         &offset) == 1);
+            snprintf(saved, sizeof saved,
+                     "{\"path\":\"%.*s\",\"offset\":%zu,\"limit\":2000}",
+                     (int)path_len, path, offset);
+            FILE *out = tmpfile();
+            CHECK_EQ(oi_cli_tool_run("read", saved, strlen(saved), out), 0);
+            fflush(out);
+            rewind(out);
+            char line[256];
+            int found = 0;
+            while (fgets(line, sizeof line, out) != NULL) {
+                found |= strstr(line, "  1000\tFAILURE-MARKER") != NULL;
+            }
+            CHECK(found);
+            fclose(out);
+            snprintf(saved, sizeof saved, "%.*s", (int)path_len, path);
+            unlink(saved);
+        }
+    }
+    free(content);
+    rmdir(directory);
+
+    oi_cli_conversation_destroy(conversation);
+    oi_llm_client_destroy(client);
+    oi_tool_registry_destroy(tools);
+    oi_arena_destroy(arena);
+    oi_reactor_destroy(reactor);
+    mock_api_stop(&api);
+}
+
 int main(void) {
     oi_test_set_deadline(900);
     RUN(start_is_event_driven_and_preserves_context);
@@ -1837,6 +1958,7 @@ int main(void) {
     RUN(usage_of_a_cancelled_request_is_counted_once);
     RUN(bash_runs_a_command_that_needs_bash_syntax);
     RUN(file_tools_run_without_a_shell_on_the_path);
+    RUN(long_tool_output_is_bounded_and_the_rest_can_be_read);
     RUN(ask_defers_and_resolve_permission_allow_lets_the_tool_run);
     RUN(ask_defers_and_resolve_permission_deny_produces_a_protocol_valid_result);
     RUN(cancel_while_awaiting_permission_repairs_as_not_executed);

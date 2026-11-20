@@ -289,7 +289,8 @@ static oi_status repl_conversation_event(
         turn_input->permission_selected = PERMISSION_OPTION_DENY;
         turn_input->permission_category = oi_cli_tool_category_of(
             event->as.awaiting_permission.name->data,
-            event->as.awaiting_permission.parsed_arguments);
+            event->as.awaiting_permission.parsed_arguments,
+            turn_input->config->permission->output_dir);
         turn_input->dirty = 1;
         break;
     }
@@ -1366,6 +1367,8 @@ oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
 
     conversation_config.max_model_steps = config->max_turns;
     conversation_config.tool_timeout_ms = config->tool_timeout_ms;
+    conversation_config.tool_output_limit = config->tool_output_limit;
+    conversation_config.tool_output_dir = config->permission->output_dir;
     conversation_config.permission = oi_cli_tool_permission;
     conversation_config.permission_user_data = config->permission;
     repl_event_context.present = &present;

@@ -195,25 +195,31 @@ static int resolve_existing(const char *path, char *resolved) {
     return realpath(parent, resolved) != NULL;
 }
 
-static int path_in_project(const char *path) {
+static int path_under(const char *resolved, const char *directory) {
+    size_t len = strlen(directory);
+
+    if (len == 1) {
+        return 1;
+    }
+    return strncmp(resolved, directory, len) == 0 &&
+           (resolved[len] == '\0' || resolved[len] == '/');
+}
+
+static int path_in_project(const char *path, const char *output_dir) {
     char project[PATH_MAX];
     char resolved[PATH_MAX];
-    size_t project_len;
 
     if (getcwd(project, sizeof project) == NULL ||
         !resolve_existing(path, resolved)) {
         return 0;
     }
-    project_len = strlen(project);
-    if (project_len == 1) {
-        return 1;
-    }
-    return strncmp(resolved, project, project_len) == 0 &&
-           (resolved[project_len] == '\0' || resolved[project_len] == '/');
+    return path_under(resolved, project) ||
+           (output_dir != NULL && path_under(resolved, output_dir));
 }
 
 enum oi_cli_tool_category oi_cli_tool_category_of(const char *tool_name,
-                                                  const oi_json_value *args) {
+                                                  const oi_json_value *args,
+                                                  const char *output_dir) {
     const char *path;
     size_t path_len;
 
@@ -221,7 +227,7 @@ enum oi_cli_tool_category oi_cli_tool_category_of(const char *tool_name,
         if (oi_json_get_string(oi_json_object_get(args, "path"), &path,
                                &path_len) == OI_OK &&
             path_len > 0 && strlen(path) == path_len &&
-            path_in_project(path)) {
+            path_in_project(path, output_dir)) {
             return OI_CLI_TOOL_READ_IN_PROJECT;
         }
         return OI_CLI_TOOL_FILE_ACCESS;
@@ -265,7 +271,7 @@ static oi_tool_decision decide(const struct oi_cli_permission *permission,
     case OI_CLI_TOOLS_ASK:
         break;
     }
-    switch (oi_cli_tool_category_of(tool_name, args)) {
+    switch (oi_cli_tool_category_of(tool_name, args, permission->output_dir)) {
     case OI_CLI_TOOL_READ_IN_PROJECT:
         return OI_TOOL_ALLOW;
     case OI_CLI_TOOL_FILE_ACCESS:

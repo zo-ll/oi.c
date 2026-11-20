@@ -35,6 +35,8 @@ oi_status oi_cli_loop_run(oi_llm_client *client, oi_reactor *reactor,
         .permission_user_data = config->permission,
         .on_event = oi_cli_present_event,
         .event_user_data = &present,
+        .tool_output_limit = config->tool_output_limit,
+        .tool_output_dir = config->permission->output_dir,
     };
     oi_cli_conversation *conversation = NULL;
     st = oi_cli_conversation_create(
