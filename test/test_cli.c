@@ -4008,9 +4008,30 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
     int renewal_fd = -1;
     {
         struct pollfd incoming = {listen_fd, POLLIN, 0};
+        char head[4096] = "";
+        size_t head_len = 0;
+
         CHECK_EQ(poll(&incoming, 1, 20000), 1);
-        renewal_fd = accept(listen_fd, NULL, NULL);
+        if (incoming.revents & POLLIN) {
+            renewal_fd = accept(listen_fd, NULL, NULL);
+        }
         CHECK(renewal_fd >= 0);
+        while (renewal_fd >= 0 && strstr(head, "\r\n\r\n") == NULL &&
+               head_len < sizeof head - 1) {
+            struct pollfd request = {renewal_fd, POLLIN, 0};
+            ssize_t n;
+
+            if (poll(&request, 1, 20000) != 1) {
+                break;
+            }
+            n = read(renewal_fd, head + head_len, sizeof head - 1 - head_len);
+            if (n <= 0) {
+                break;
+            }
+            head_len += (size_t)n;
+            head[head_len] = '\0';
+        }
+        CHECK(strncmp(head, "POST /api/accounts/oauth/token ", 31) == 0);
     }
 
     struct timespec before;
