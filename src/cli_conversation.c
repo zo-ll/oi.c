@@ -2,6 +2,7 @@
 
 #include "cli_conversation.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -565,6 +566,9 @@ static int save_tool_output(const char *directory, const struct buffer *text,
     }
     while (written < text->len) {
         ssize_t n = write(fd, text->data + written, text->len - written);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
         if (n <= 0) {
             close(fd);
             unlink(path);
@@ -596,7 +600,10 @@ static oi_status bound_tool_text(const oi_cli_conversation *conversation,
         head_end = (size_t)(newline - text->data) + 1;
     }
     tail_start = character_start(text->data, text->len - (limit - limit / 4));
-    newline = memchr(text->data + tail_start, '\n', text->len - tail_start);
+    newline = text->data[tail_start - 1] == '\n'
+                  ? NULL
+                  : memchr(text->data + tail_start, '\n',
+                           text->len - tail_start);
     if (newline != NULL && (size_t)(newline - text->data) + 1 < text->len) {
         tail_start = (size_t)(newline - text->data) + 1;
     }
@@ -605,12 +612,13 @@ static oi_status bound_tool_text(const oi_cli_conversation *conversation,
     if (last_omitted < first_omitted) {
         last_omitted = first_omitted;
     }
-    if (save_tool_output(conversation->config.tool_output_dir, text, path,
-                         sizeof path)) {
+    int saved = save_tool_output(conversation->config.tool_output_dir, text,
+                                 path, sizeof path);
+    if (saved) {
         marker_len = snprintf(
             marker, sizeof marker,
-            "[oi: lines %zu-%zu (%zu of %zu bytes) are omitted. The full "
-            "output is in %s: read it with offset %zu.]\n",
+            "[oi: lines %zu-%zu (%zu of %zu bytes) are omitted. For this "
+            "run, the full output is in %s: read it with offset %zu.]\n",
             first_omitted, last_omitted, tail_start - head_end, text->len,
             path, first_omitted);
     } else {
@@ -622,6 +630,12 @@ static oi_status bound_tool_text(const oi_cli_conversation *conversation,
     }
     if (marker_len < 0 || (size_t)marker_len >= sizeof marker) {
         return OI_ERR_NOMEM;
+    }
+    if (tail_start - head_end <= (size_t)marker_len) {
+        if (saved) {
+            unlink(path);
+        }
+        return OI_OK;
     }
     st = buffer_append(&bounded, text->data, head_end,
                        OI_CLI_HISTORY_MAX_CONTENT);

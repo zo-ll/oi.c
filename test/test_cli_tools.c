@@ -147,6 +147,36 @@ TEST(links_and_sibling_prefixes_are_outside_the_project) {
     oi_arena_destroy(arena);
 }
 
+TEST(reads_in_the_output_directory_need_no_prompt) {
+    char directory[] = "/tmp/oi-tools-output-XXXXXX";
+    char sibling[64];
+    char path[128];
+    oi_arena *arena = oi_arena_create(0);
+    struct oi_cli_permission permission = {.policy = OI_CLI_TOOLS_ASK};
+
+    CHECK(mkdtemp(directory) != NULL);
+    permission.output_dir = directory;
+    snprintf(path, sizeof path, "{\"path\":\"%s/output-1.txt\"}",
+             directory);
+    CHECK_EQ(oi_cli_tool_category_of("read", parse(arena, path), directory),
+             OI_CLI_TOOL_READ_IN_PROJECT);
+    CHECK_EQ(oi_cli_tool_permission_noninteractive(
+                 "read", parse(arena, path), &permission),
+             OI_TOOL_ALLOW);
+    CHECK_EQ(oi_cli_tool_category_of("read", parse(arena, path), NULL),
+             OI_CLI_TOOL_FILE_ACCESS);
+    snprintf(sibling, sizeof sibling, "%sx", directory);
+    CHECK_EQ(mkdir(sibling, 0700), 0);
+    snprintf(path, sizeof path, "{\"path\":\"%s/f\"}", sibling);
+    CHECK_EQ(oi_cli_tool_category_of("read", parse(arena, path), directory),
+             OI_CLI_TOOL_FILE_ACCESS);
+    CHECK_EQ(oi_cli_tool_category_of("edit", parse(arena, path), directory),
+             OI_CLI_TOOL_FILE_ACCESS);
+    rmdir(sibling);
+    rmdir(directory);
+    oi_arena_destroy(arena);
+}
+
 TEST(file_approval_does_not_approve_commands) {
     oi_arena *arena = oi_arena_create(0);
     oi_json_value *read_inside = parse(arena, "{\"path\":\"Makefile\"}");
@@ -233,6 +263,7 @@ int main(void) {
     RUN(advertised_tools_match_the_registered_tools);
     RUN(tools_fall_into_categories);
     RUN(links_and_sibling_prefixes_are_outside_the_project);
+    RUN(reads_in_the_output_directory_need_no_prompt);
     RUN(file_approval_does_not_approve_commands);
     RUN(interactive_permission_defers_ask_to_the_embedder);
     RUN(noninteractive_permission_never_defers);

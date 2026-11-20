@@ -66,12 +66,12 @@ static void print_usage(void) {
         "  --timeout-ms MS      end-to-end request timeout\n"
         "  --max-turns N        maximum model turns (default: 8)\n"
         "  --allow-tools        run requested tools without prompting\n"
+        "  --deny-tools         reject every requested tool\n"
+        "                       (default: ask on a terminal, refuse otherwise)\n"
         "  --tool-output-limit BYTES\n"
         "                       tool output bytes sent to the model "
         "(default: 12288,\n"
         "                       0: no limit)\n"
-        "  --deny-tools         reject every requested tool\n"
-        "                       (default: ask on a terminal, refuse otherwise)\n"
         "  --usage              print token usage to stderr after a one-shot "
         "run\n"
         "  --tls / --no-tls     use TLS (default: on)\n"
@@ -1191,9 +1191,15 @@ int main(int argc, char **argv) {
                            temporary != NULL && temporary[0] != '\0'
                                ? temporary
                                : "/tmp");
+        char resolved[PATH_MAX];
         if (len < 0 || (size_t)len >= sizeof tool_output_dir ||
             mkdtemp(tool_output_dir) == NULL) {
             tool_output_dir[0] = '\0';
+        } else if (realpath(tool_output_dir, resolved) == NULL) {
+            remove_tool_output_dir(tool_output_dir);
+            tool_output_dir[0] = '\0';
+        } else {
+            strcpy(tool_output_dir, resolved);
         }
     }
     struct oi_cli_permission permission = {

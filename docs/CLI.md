@@ -773,11 +773,12 @@ tool result. A longer result keeps its first quarter and its last three
 quarters, cut at line boundaries, with a marker between them:
 
 ```
-[oi: lines 41-1960 (98304 of 110592 bytes) are omitted. The full output is in /tmp/oi-tool-output-AbC123/output-XyZ789.txt: read it with offset 41.]
+[oi: lines 41-1960 (98304 of 110592 bytes) are omitted. For this run, the full output is in /tmp/oi-tool-output-AbC123/output-XyZ789.txt: read it with offset 41.]
 ```
 
 `oi` saves the full result in a private directory under `$TMPDIR` (or
-`/tmp`) and removes the directory when it exits. A `read` of a file in that
+`/tmp`) and removes the directory when it exits normally. A one-shot run
+that a signal ends, such as Ctrl+C, can leave the directory behind. A `read` of a file in that
 directory runs without a prompt, so the model can look at the omitted lines
 without a second run of the command. The session log keeps the full result.
 A `read` result is not cut this way, because `read` has its own limits.
