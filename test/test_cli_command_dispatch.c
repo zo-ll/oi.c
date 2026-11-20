@@ -846,19 +846,6 @@ TEST(session_reports_unavailable_operations_and_bad_subcommands) {
     CHECK(strstr(text, "/session restore is not available") != NULL);
     free(text);
 
-    CHECK_EQ(dispatch("/session switch sess-1", &context, &result), OI_OK);
-    CHECK_EQ(dispatch("/session delete sess-1", &context, &result), OI_OK);
-    CHECK_EQ(dispatch("/session import /tmp/a.oilog", &context, &result),
-             OI_OK);
-    text = read_stream(err);
-    CHECK(strstr(text, "/session switch requires the interactive REPL") !=
-          NULL);
-    CHECK(strstr(text, "/session delete requires the interactive REPL") !=
-          NULL);
-    CHECK(strstr(text, "/session import requires the interactive REPL") !=
-          NULL);
-    free(text);
-
     CHECK_EQ(dispatch("/session frobnicate", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session current extra", &context, &result), OI_OK);
     CHECK_EQ(dispatch("/session list extra", &context, &result), OI_OK);
@@ -870,9 +857,41 @@ TEST(session_reports_unavailable_operations_and_bad_subcommands) {
     fclose(err);
 }
 
+TEST(repl_owned_commands_are_a_caller_error) {
+    static const char *const commands[] = {
+        "/compact", "/compact 4", "/login", "/session switch sess-1",
+        "/session delete sess-1", "/session import /tmp/a dir/b.oilog",
+    };
+    FILE *out = tmpfile();
+    FILE *err = tmpfile();
+    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_command_context context = {
+        .out = out, .err = err, .model = "m", .permission = &permission,
+    };
+    enum oi_cli_command_result result;
+    char *text;
+
+    CHECK(out != NULL);
+    CHECK(err != NULL);
+    for (size_t i = 0; i < sizeof commands / sizeof commands[0]; i++) {
+        result = OI_CLI_COMMAND_EXIT_REPL;
+        CHECK_EQ(dispatch(commands[i], &context, &result), OI_ERR_INVAL);
+        CHECK_EQ(result, OI_CLI_COMMAND_CONTINUE);
+    }
+    text = read_stream(err);
+    CHECK_STREQ(text, "");
+    free(text);
+    text = read_stream(out);
+    CHECK_STREQ(text, "");
+    free(text);
+    fclose(out);
+    fclose(err);
+}
+
 int main(void) {
     RUN(help_lists_commands_and_exit_requests_exit);
     RUN(help_with_an_argument_prints_usage);
+    RUN(repl_owned_commands_are_a_caller_error);
     RUN(permissions_are_process_scoped_and_validated);
     RUN(status_reports_the_assembled_snapshot);
     RUN(status_reports_unknown_for_everything_a_callback_leaves_alone);
