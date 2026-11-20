@@ -1,6 +1,7 @@
 #ifndef OI_CLI_TOOLS_H
 #define OI_CLI_TOOLS_H
 
+#include "oi/json.h"
 #include "oi/status.h"
 #include "oi/tool.h"
 
@@ -15,6 +16,8 @@ struct oi_cli_permission {
 };
 
 oi_status oi_cli_tools_register(oi_tool_registry *registry);
+
+oi_status oi_cli_tools_write_definitions(oi_json_writer *writer);
 
 oi_tool_decision oi_cli_tool_permission(const char *tool_name,
                                          const oi_json_value *args,
