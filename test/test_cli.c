@@ -4005,9 +4005,34 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    struct timespec pause = {0, 300 * 1000 * 1000};
-    nanosleep(&pause, NULL);
+    int renewal_fd = -1;
+    {
+        struct pollfd incoming = {listen_fd, POLLIN, 0};
+        char head[4096] = "";
+        size_t head_len = 0;
+
+        CHECK_EQ(poll(&incoming, 1, 20000), 1);
+        if (incoming.revents & POLLIN) {
+            renewal_fd = accept(listen_fd, NULL, NULL);
+        }
+        CHECK(renewal_fd >= 0);
+        while (renewal_fd >= 0 && strstr(head, "\r\n\r\n") == NULL &&
+               head_len < sizeof head - 1) {
+            struct pollfd request = {renewal_fd, POLLIN, 0};
+            ssize_t n;
+
+            if (poll(&request, 1, 20000) != 1) {
+                break;
+            }
+            n = read(renewal_fd, head + head_len, sizeof head - 1 - head_len);
+            if (n <= 0) {
+                break;
+            }
+            head_len += (size_t)n;
+            head[head_len] = '\0';
+        }
+        CHECK(strncmp(head, "POST /api/accounts/oauth/token ", 31) == 0);
+    }
 
     struct timespec before;
     struct timespec after;
@@ -4037,6 +4062,7 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
         CHECK(memcmp(saved, credentials, sizeof credentials - 1) == 0);
     }
     close(master_fd);
+    close(renewal_fd);
     close(listen_fd);
     remove_sessions_under(session_root);
     rmdir(session_root);
