@@ -38,6 +38,12 @@ static void drain_request(int cfd) {
     }
 }
 
+/* The response of the server child. A file-scope pointer keeps the
+ * caller's heap block reachable in that child until _exit, so valgrind's
+ * leak check there does not report it; volatile makes the store happen
+ * before the fork. */
+static const char *volatile mock_response;
+
 static pid_t start_mock_server(const char *response, size_t response_len,
                                 unsigned short *out_port) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -57,6 +63,7 @@ static pid_t start_mock_server(const char *response, size_t response_len,
     CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
     *out_port = ntohs(addr.sin_port);
 
+    mock_response = response;
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
@@ -65,7 +72,8 @@ static pid_t start_mock_server(const char *response, size_t response_len,
             drain_request(cfd);
             size_t off = 0;
             while (off < response_len) {
-                ssize_t w = write(cfd, response + off, response_len - off);
+                ssize_t w =
+                    write(cfd, mock_response + off, response_len - off);
                 if (w <= 0) {
                     break;
                 }
@@ -445,18 +453,13 @@ TEST(delta_and_tool_arguments_larger_than_an_arena_block_complete) {
         "data: [DONE]\n\n",
         filler, filler);
     size_t total;
-    char *built = build_chunked_response(sse_body, (size_t)body_len,
-                                          "HTTP/1.1 200 OK", &total);
-    /* Static: the server child below holds no heap block of this test,
-     * which valgrind's leak check in that child would report. */
-    static char response[2 * LARGE + 2048];
-    CHECK(total <= sizeof response);
-    memcpy(response, built, total);
-    free(built);
+    char *response = build_chunked_response(sse_body, (size_t)body_len,
+                                             "HTTP/1.1 200 OK", &total);
     free(sse_body);
     free(filler);
     unsigned short port;
     pid_t child = start_mock_server(response, total, &port);
+    free(response);
 
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
@@ -498,9 +501,9 @@ static size_t arena_use_after_stream(size_t events) {
     char *response = build_chunked_response(sse_body, body_len,
                                              "HTTP/1.1 200 OK", &total);
     unsigned short port;
+    free(sse_body);
     pid_t child = start_mock_server(response, total, &port);
     free(response);
-    free(sse_body);
 
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
