@@ -93,13 +93,22 @@ static long count_hash_lines(const char *s, size_t len) {
     size_t i = 0;
 
     while (i < len) {
-        while (i < len && (s[i] == ' ' || s[i] == '\t')) {
-            i++;
-        }
-        if (i < len && s[i] == '#') {
-            count++;
-        }
+        char quote = 0;
+        int seen = 0;
+        int blank_before = 1;
         while (i < len && s[i] != '\n') {
+            char c = s[i];
+            if (quote != 0) {
+                if (c == quote) {
+                    quote = 0;
+                }
+            } else if (c == '\'' || c == '"') {
+                quote = c;
+            } else if (c == '#' && !seen && blank_before) {
+                count++;
+                seen = 1;
+            }
+            blank_before = c == ' ' || c == '\t';
             i++;
         }
         i++;
