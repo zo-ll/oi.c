@@ -1122,6 +1122,140 @@ static oi_status repl_handle_session_import(
     return OI_OK;
 }
 
+static oi_status repl_print_error(const struct oi_cli_repl_config *config,
+                                  const char *text) {
+    return fputs(text, config->err) == EOF || fflush(config->err) != 0
+               ? OI_ERR_IO
+               : OI_OK;
+}
+
+static oi_status repl_handle_compact(
+    const struct oi_cli_repl_config *config, struct oi_cli_composer *composer,
+    int signal_fd, oi_llm_client *client, oi_reactor *reactor,
+    oi_cli_conversation *conversation,
+    const struct oi_cli_string *current_model, const char *arguments,
+    size_t arguments_len, unsigned int *checkpoints_applied,
+    int *out_terminate) {
+    size_t keep_turns = 8;
+    size_t turns_value = 0;
+    int has_value = 0;
+    size_t prefix_count = 0;
+    size_t total_turns = 0;
+    oi_json_writer *writer = NULL;
+    struct oi_cli_compact_result result;
+    int result_ready = 0;
+    oi_status status;
+
+    *out_terminate = 0;
+    if (oi_cli_compact_parse_turns(arguments, arguments_len, &turns_value,
+                                   &has_value) != OI_OK) {
+        return repl_print_error(config, "oi: usage: /compact [turns]\n");
+    }
+    if (has_value) {
+        keep_turns = turns_value;
+    }
+    if (conversation == NULL) {
+        return repl_print_error(config, "oi: nothing to compact yet\n");
+    }
+
+    const struct oi_cli_message_list *messages =
+        oi_cli_conversation_messages(conversation);
+    status = oi_cli_compact_select_prefix(messages, keep_turns, &prefix_count,
+                                          &total_turns);
+    if (status != OI_OK) {
+        return status;
+    }
+    if (prefix_count == 0) {
+        return fprintf(config->err,
+                       "oi: nothing to compact (%zu turn%s, keeping %zu)\n",
+                       total_turns, total_turns == 1 ? "" : "s",
+                       keep_turns) < 0 ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+
+    status = oi_cli_compact_build_request(messages, prefix_count,
+                                          current_model->data,
+                                          current_model->len, &writer);
+    if (status != OI_OK) {
+        return status;
+    }
+    size_t body_len = 0;
+    const char *body = oi_json_writer_data(writer, &body_len);
+    status = oi_cli_terminal_set_isig(&composer->terminal, 1);
+    if (status == OI_OK) {
+        status = oi_cli_compact_run(client, reactor,
+                                    oi_cli_conversation_arena(conversation),
+                                    signal_fd, body, body_len, &result);
+        result_ready = status == OI_OK;
+        oi_status restore_status =
+            oi_cli_terminal_set_isig(&composer->terminal, 0);
+        if (status == OI_OK && restore_status != OI_OK) {
+            status = restore_status;
+        }
+    }
+    oi_json_writer_destroy(writer);
+    if (status != OI_OK) {
+        if (result_ready) {
+            oi_cli_compact_result_free(&result);
+        }
+        return status;
+    }
+
+    if (result.outcome == OI_CLI_COMPACT_CANCELLED) {
+        *out_terminate = result.terminate_signal != 0;
+        oi_cli_compact_result_free(&result);
+        return *out_terminate
+                   ? OI_OK
+                   : repl_print_error(config, "oi: compaction cancelled\n");
+    }
+    if (result.outcome == OI_CLI_COMPACT_FAILED) {
+        oi_status failed_status = result.status;
+        oi_cli_compact_result_free(&result);
+        return fprintf(config->err, "oi: compaction failed: %s\n",
+                       oi_status_str(failed_status)) < 0 ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+
+    if (config->persist_checkpoint != NULL) {
+        status = config->persist_checkpoint(
+            config->persist_checkpoint_user_data, prefix_count,
+            result.summary, result.summary_len, current_model->data,
+            current_model->len);
+    }
+    if (status != OI_OK) {
+        oi_cli_compact_result_free(&result);
+        if (config->is_durably_failed != NULL &&
+            config->is_durably_failed(config->is_durably_failed_user_data)) {
+            return status;
+        }
+        return fprintf(config->err, "oi: turn failed: %s\n",
+                       oi_status_str(status)) < 0 ||
+                       fflush(config->err) != 0
+                   ? OI_ERR_IO
+                   : OI_OK;
+    }
+    status = oi_cli_conversation_apply_checkpoint_take_summary(
+        conversation, prefix_count, &result.summary, result.summary_len);
+    size_t compacted_turns = total_turns - keep_turns;
+    oi_cli_compact_result_free(&result);
+    if (status != OI_OK) {
+        return status;
+    }
+    (*checkpoints_applied)++;
+    return fprintf(config->out,
+                   "oi: compacted %zu turn%s into a checkpoint "
+                   "(kept last %zu)\n",
+                   compacted_turns, compacted_turns == 1 ? "" : "s",
+                   keep_turns) < 0 ||
+                   fflush(config->out) != 0
+               ? OI_ERR_IO
+               : OI_OK;
+}
+
 oi_status oi_cli_repl_run(oi_llm_client *client, oi_reactor *reactor,
                           oi_arena *arena, oi_tool_registry *tools,
                           const struct oi_cli_repl_config *config) {
@@ -1318,180 +1452,17 @@ have_parsed_command:
                 continue;
             }
             if (parsed.command->id == OI_CLI_COMMAND_COMPACT) {
-                size_t keep_turns = 8;
-                size_t turns_value = 0;
-                int has_value = 0;
+                int compact_terminate = 0;
 
-                status = oi_cli_compact_parse_turns(
-                    parsed.arguments, parsed.arguments_len, &turns_value,
-                    &has_value);
-                if (status != OI_OK) {
-                    status = OI_OK;
-                    if (fputs("oi: usage: /compact [turns]\n",
-                             config->err) == EOF ||
-                        fflush(config->err) != 0) {
-                        status = OI_ERR_IO;
-                        free(prompt);
-                        break;
-                    }
-                    free(prompt);
-                    continue;
-                }
-                if (has_value) {
-                    keep_turns = turns_value;
-                }
-                if (conversation == NULL) {
-                    if (fputs("oi: nothing to compact yet\n",
-                             config->err) == EOF ||
-                        fflush(config->err) != 0) {
-                        status = OI_ERR_IO;
-                        free(prompt);
-                        break;
-                    }
-                    free(prompt);
-                    continue;
-                }
-
-                const struct oi_cli_message_list *compact_messages =
-                    oi_cli_conversation_messages(conversation);
-                size_t prefix_count = 0;
-                size_t total_turns = 0;
-
-                status = oi_cli_compact_select_prefix(
-                    compact_messages, keep_turns, &prefix_count,
-                    &total_turns);
-                if (status == OI_OK && prefix_count == 0) {
-                    if (fprintf(config->err,
-                               "oi: nothing to compact (%zu turn%s, "
-                               "keeping %zu)\n",
-                               total_turns, total_turns == 1 ? "" : "s",
-                               keep_turns) < 0 ||
-                        fflush(config->err) != 0) {
-                        status = OI_ERR_IO;
-                        free(prompt);
-                        break;
-                    }
-                    free(prompt);
-                    continue;
-                }
-                if (status != OI_OK) {
-                    free(prompt);
-                    break;
-                }
-
-                oi_json_writer *compact_writer = NULL;
-                status = oi_cli_compact_build_request(
-                    compact_messages, prefix_count, current_model->data,
-                    current_model->len, &compact_writer);
-                if (status != OI_OK) {
-                    free(prompt);
-                    break;
-                }
-                size_t compact_body_len = 0;
-                const char *compact_body =
-                    oi_json_writer_data(compact_writer, &compact_body_len);
-                struct oi_cli_compact_result compact_result;
-                int compact_result_ready = 0;
-                status = oi_cli_terminal_set_isig(&composer.terminal, 1);
-                if (status == OI_OK) {
-                    status = oi_cli_compact_run(
-                        client, reactor,
-                        oi_cli_conversation_arena(conversation), signal_fd,
-                        compact_body, compact_body_len, &compact_result);
-                    compact_result_ready = status == OI_OK;
-                    oi_status restore_status =
-                        oi_cli_terminal_set_isig(&composer.terminal, 0);
-                    if (status == OI_OK && restore_status != OI_OK) {
-                        status = restore_status;
-                    }
-                }
-                oi_json_writer_destroy(compact_writer);
-                if (status != OI_OK) {
-                    if (compact_result_ready) {
-                        oi_cli_compact_result_free(&compact_result);
-                    }
-                    free(prompt);
-                    break;
-                }
-
-                if (compact_result.outcome == OI_CLI_COMPACT_CANCELLED) {
-                    int terminate = compact_result.terminate_signal != 0;
-                    oi_cli_compact_result_free(&compact_result);
-                    if (terminate) {
-                        free(prompt);
-                        break;
-                    }
-                    if (fputs("oi: compaction cancelled\n", config->err) ==
-                            EOF ||
-                        fflush(config->err) != 0) {
-                        status = OI_ERR_IO;
-                        free(prompt);
-                        break;
-                    }
-                    free(prompt);
-                    continue;
-                }
-                if (compact_result.outcome == OI_CLI_COMPACT_FAILED) {
-                    oi_status failed_status = compact_result.status;
-                    oi_cli_compact_result_free(&compact_result);
-                    if (fprintf(config->err, "oi: compaction failed: %s\n",
-                               oi_status_str(failed_status)) < 0 ||
-                        fflush(config->err) != 0) {
-                        status = OI_ERR_IO;
-                        free(prompt);
-                        break;
-                    }
-                    free(prompt);
-                    continue;
-                }
-
-                status = OI_OK;
-                if (config->persist_checkpoint != NULL) {
-                    status = config->persist_checkpoint(
-                        config->persist_checkpoint_user_data, prefix_count,
-                        compact_result.summary, compact_result.summary_len,
-                        current_model->data, current_model->len);
-                }
-                if (status != OI_OK) {
-                    oi_cli_compact_result_free(&compact_result);
-                    if (config->is_durably_failed != NULL &&
-                        config->is_durably_failed(
-                            config->is_durably_failed_user_data)) {
-                        break;
-                    }
-                    if (fprintf(config->err, "oi: turn failed: %s\n",
-                               oi_status_str(status)) < 0 ||
-                        fflush(config->err) != 0) {
-                        status = OI_ERR_IO;
-                        free(prompt);
-                        break;
-                    }
-                    status = OI_OK;
-                    free(prompt);
-                    continue;
-                }
-                status =
-                    oi_cli_conversation_apply_checkpoint_take_summary(
-                    conversation, prefix_count, &compact_result.summary,
-                    compact_result.summary_len);
-                size_t compacted_turns = total_turns - keep_turns;
-                oi_cli_compact_result_free(&compact_result);
-                if (status != OI_OK) {
-                    free(prompt);
-                    break;
-                }
-                status_context.checkpoints_applied++;
-                if (fprintf(config->out,
-                           "oi: compacted %zu turn%s into a checkpoint "
-                           "(kept last %zu)\n",
-                           compacted_turns, compacted_turns == 1 ? "" : "s",
-                           keep_turns) < 0 ||
-                    fflush(config->out) != 0) {
-                    status = OI_ERR_IO;
-                    free(prompt);
-                    break;
-                }
+                status = repl_handle_compact(
+                    config, &composer, signal_fd, client, reactor,
+                    conversation, current_model, parsed.arguments,
+                    parsed.arguments_len, &status_context.checkpoints_applied,
+                    &compact_terminate);
                 free(prompt);
+                if (status != OI_OK || compact_terminate) {
+                    break;
+                }
                 continue;
             }
             if (parsed.command->id == OI_CLI_COMMAND_SESSION &&
