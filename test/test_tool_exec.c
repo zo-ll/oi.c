@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdint.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -672,6 +673,12 @@ static void cancel_tree_on_output(const void *data, size_t len, void *ud) {
     }
 }
 
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
 static int process_is_running(pid_t pid) {
     char path[64];
     snprintf(path, sizeof path, "/proc/%ld/stat", (long)pid);
@@ -701,14 +708,21 @@ TEST(cancel_kills_descendant_processes) {
                                  &ctx.call),
               OI_OK);
 
-    for (int i = 0; i < 100; i++) {
+    /* Time deadlines, not step counts: each output event ends a step
+     * early, and a sanitizer build on a loaded runner starts /bin/sh
+     * slowly. */
+    int64_t deadline = monotonic_ms() + 10000;
+    while (ctx.descendant == 0 && monotonic_ms() < deadline) {
         oi_status st;
         oi_reactor_step(r, 20, &st);
-        if (ctx.descendant > 0 && !process_is_running(ctx.descendant)) {
-            break;
-        }
     }
     CHECK(ctx.descendant > 0);
+    deadline = monotonic_ms() + 10000;
+    while (ctx.descendant > 0 && process_is_running(ctx.descendant) &&
+           monotonic_ms() < deadline) {
+        struct timespec pause = {0, 10 * 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
     CHECK(!process_is_running(ctx.descendant));
 
     oi_arena_destroy(a);
