@@ -210,7 +210,6 @@ TEST(chunk_missing_trailing_crlf_errors) {
     struct capture c = {0};
     oi_llm_http_parser *p =
         oi_llm_http_parser_create(on_headers_done, on_body, &c);
-    /* "hello" chunk of size 5 but followed by garbage instead of CRLF */
     const char *doc =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX\r\n";
     CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_ERR_PARSE);
@@ -260,8 +259,6 @@ TEST(every_split_point_of_chunked_doc) {
     }
 }
 
-/* Returns oi_llm_http_parser_reusable after `doc`, and after a close when
- * `close_after` is set. */
 static int reusable_after(const char *doc, int close_after) {
     struct capture c = {0};
     oi_llm_http_parser *p =
@@ -284,8 +281,6 @@ TEST(only_a_framed_http_1_1_response_without_close_is_reusable) {
     CHECK(reusable_after("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"
                          "Content-Length: 0\r\n\r\n",
                          0));
-    /* Not reusable: the server ends the connection, an old protocol, a
-     * body that ended at the close, and a body not yet complete. */
     CHECK(!reusable_after("HTTP/1.1 200 OK\r\nConnection: close\r\n"
                           "Content-Length: 2\r\n\r\nok",
                           0));
@@ -330,14 +325,6 @@ TEST(destroy_from_headers_callback_is_safe) {
     CHECK_EQ(ctx.called, 1);
 }
 
-/*
- * Regression tests for three signed-overflow defects found by
- * test/fuzz/fuzz_http.c. Content-Length and chunk-size digits arrive
- * from an untrusted response header and were accumulated into a `long`
- * with no bound, so a long enough digit run was undefined behavior and
- * could leave the body reader with a negative byte count.
- */
-
 TEST(overlong_content_length_errors) {
     struct capture c = {0};
     oi_llm_http_parser *p =
@@ -374,8 +361,6 @@ TEST(empty_content_length_value_errors) {
     oi_llm_http_parser *p =
         oi_llm_http_parser_create(on_headers_done, on_body, &c);
 
-    /* Previously parsed as 0, silently framing the response as having
-     * no body rather than rejecting the malformed header. */
     const char *doc =
         "HTTP/1.1 200 OK\r\n"
         "Content-Length:\r\n"
@@ -407,8 +392,6 @@ TEST(ambiguous_response_framing_errors) {
     }
 }
 
-/* The largest accepted values must still parse, so the bound rejects
- * only genuinely out-of-range input. */
 TEST(large_but_valid_content_length_accepted) {
     struct capture c = {0};
     oi_llm_http_parser *p =
@@ -416,12 +399,12 @@ TEST(large_but_valid_content_length_accepted) {
 
     const char *doc =
         "HTTP/1.1 200 OK\r\n"
-        "Content-Length: 1099511627776\r\n" /* exactly 1 TiB */
+        "Content-Length: 1099511627776\r\n"
         "\r\n";
     CHECK_EQ(feed_byte_by_byte(p, doc, strlen(doc)), OI_OK);
     CHECK(c.headers_done);
     CHECK(!oi_llm_http_parser_failed(p));
-    CHECK(!oi_llm_http_parser_body_done(p)); /* still awaiting the body */
+    CHECK(!oi_llm_http_parser_body_done(p));
 
     oi_llm_http_parser_destroy(p);
 }

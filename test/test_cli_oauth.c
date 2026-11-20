@@ -143,7 +143,6 @@ TEST(token_responses_and_refusals_parse) {
     CHECK_EQ(parse_tokens("<html>", &tokens), OI_ERR_PARSE);
 }
 
-/* header.{"nonce":"n","aud":"c","exp":2000,"sub":"u","email":"e@x"}.sig */
 static const char good_token[] =
     "e30.eyJub25jZSI6Im4iLCJhdWQiOiJjIiwiZXhwIjoyMDAwLCJzdWIiOiJ1IiwiZW1haWwi"
     "OiJlQHgifQ.sig";

@@ -143,10 +143,10 @@ static oi_status parse_line(oi_config *cfg, char *line) {
     char *end = line + strlen(line);
     trim(&start, &end);
     if (start == end) {
-        return OI_OK; /* blank */
+        return OI_OK;
     }
     if (*start == '#') {
-        return OI_OK; /* comment */
+        return OI_OK;
     }
 
     char *eq = memchr(start, '=', (size_t)(end - start));
@@ -169,7 +169,7 @@ static oi_status parse_line(oi_config *cfg, char *line) {
     *value_end = '\0';
 
     if (strcmp(key_start, "api_key") == 0) {
-        return OI_ERR_DENIED; /* secrets don't belong in a config file */
+        return OI_ERR_DENIED;
     }
     return oi_config_set(cfg, key_start, value_start);
 }

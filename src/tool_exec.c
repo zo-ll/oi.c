@@ -24,7 +24,6 @@ struct oi_tool_call {
 
     enum call_state state;
 
-    /* staged for a call awaiting an ASK decision; consumed by spawn() */
     oi_tool_build_argv build_argv;
     void *tool_user_data;
     const oi_json_value *args;
@@ -32,16 +31,14 @@ struct oi_tool_call {
     pid_t pid;
     oi_reactor_process *process;
     oi_reactor_timer *timer;
-    oi_reactor_timer *drain_timer; /* runs from the child's exit */
+    oi_reactor_timer *drain_timer;
     int timeout_ms;
-    int stdin_fd;  /* -1 once closed */
-    int stdin_close_pending; /* close_stdin() called while a write was
-                               * still queued; actually closed once
-                               * on_stdin_event finishes flushing it */
-    int stdout_fd; /* -1 once closed/EOF */
-    int err_fd;    /* -1 once closed/EOF */
+    int stdin_fd;
+    int stdin_close_pending;
+    int stdout_fd;
+    int err_fd;
 
-    char *out_buf; /* queued stdin bytes */
+    char *out_buf;
     size_t out_len;
     size_t out_off;
     size_t out_cap;
@@ -51,12 +48,8 @@ struct oi_tool_call {
     int stdout_eof;
     int exec_failed;
     int exec_errno;
-    int exit_status; /* raw waitpid status, valid once child_exited */
+    int exit_status;
 
-    /* See the identical mechanism in oi_llm_conn/oi_llm_http_parser/
-     * oi_llm_sse_parser: set before invoking on_output, so a reentrant
-     * oi_tool_call_cancel() from within it can signal back that `call`
-     * was freed out from under the still-running dispatch loop. */
     int *destroyed_flag;
 };
 
@@ -178,14 +171,7 @@ static void maybe_finish(oi_tool_call *call) {
     free_call(call);
 }
 
-/*
- * How long stdout may stay open after the child exits. Only a background
- * process that inherited the pipe keeps it open then, and the call must
- * not wait for that process.
- */
 #define OI_TOOL_DRAIN_MS 500
-/* Bounds the last read: a writer outside the process group survives the
- * kill and can fill the pipe without end. */
 #define OI_TOOL_DRAIN_MAX_READS 64
 
 static void terminate_process_group(const oi_tool_call *call);
@@ -212,7 +198,7 @@ OI_DIAG_POP
         if (call->on_output) {
             call->on_output(buf, (size_t)n, call->user_data);
             if (destroyed) {
-                return; /* `call` was freed by a reentrant cancel */
+                return;
             }
         }
     }
@@ -233,9 +219,6 @@ static void on_process_event(oi_reactor *r, pid_t pid, void *ud) {
         rc = waitpid(pid, &status, 0);
     } while (rc < 0 && errno == EINTR);
     if (rc < 0 && errno == ECHILD) {
-        /* The embedder may use SIG_IGN/SA_NOCLDWAIT for SIGCHLD, causing
-         * the kernel to reap children automatically. The native process
-         * watcher still fires, but no exit status remains to collect. */
         status = 0;
         call->exec_failed = 1;
         call->exec_errno = ECHILD;
@@ -250,8 +233,6 @@ static void on_process_event(oi_reactor *r, pid_t pid, void *ud) {
     call->child_exited = 1;
     call->exit_status = status;
     if (!call->stdout_eof && !call->timed_out) {
-        /* On a failed start the call waits for end-of-file, bounded by
-         * its timeout. */
         (void)oi_reactor_timer_start(call->reactor, OI_TOOL_DRAIN_MS,
                                      on_drain_timeout, call,
                                      &call->drain_timer);
@@ -273,8 +254,6 @@ static void kill_and_reap(pid_t pid) {
     }
 }
 
-/* After the collect, the PID is free and can name an unrelated process:
- * only the group, which still holds any grandchildren, gets the signal. */
 static void terminate_process_group(const oi_tool_call *call) {
     if (kill(-call->pid, SIGKILL) != 0 && !call->child_exited) {
         kill(call->pid, SIGKILL);
@@ -301,21 +280,16 @@ static void on_err_event(oi_reactor *r, int fd, int revents, void *ud) {
     ssize_t n = read(call->err_fd, buf, sizeof buf);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-            return; /* wait for the next readiness event */
+            return;
         }
-        /* hard error reading the pipe: no exec-failure info available,
-         * fall through and close it like any other terminal case */
     } else if (n > 0) {
         int e = 0;
         if ((size_t)n >= sizeof e) {
-            memcpy(&e, buf, sizeof e); /* single atomic pipe write on the child side */
+            memcpy(&e, buf, sizeof e);
         }
         call->exec_failed = 1;
         call->exec_errno = e;
     }
-    /* n == 0 (EOF: exec succeeded, the CLOEXEC write end closed itself),
-     * or we just consumed the one failure notice, or a hard error:
-     * nothing more will ever arrive on this fd. */
     oi_reactor_remove(call->reactor, call->err_fd);
     close(call->err_fd);
     call->err_fd = -1;
@@ -341,7 +315,7 @@ OI_DIAG_POP
                 call->on_output(buf, (size_t)n, call->user_data);
             }
             if (destroyed) {
-                return; /* `call` was freed by a reentrant cancel */
+                return;
             }
             continue;
         }
@@ -352,8 +326,6 @@ OI_DIAG_POP
         if (n < 0 && errno == EINTR) {
             continue;
         }
-        /* n == 0 (EOF) or a hard read error: treat both as "no more
-         * output is coming." */
         oi_reactor_remove(call->reactor, call->stdout_fd);
         close(call->stdout_fd);
         call->stdout_fd = -1;
@@ -382,13 +354,11 @@ static void on_stdin_event(oi_reactor *r, int fd, int revents, void *ud) {
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return; /* wait for the next writable event */
+            return;
         }
         if (n < 0 && errno == EINTR) {
             continue;
         }
-        /* hard write error (e.g. EPIPE, the child closed stdin/exited):
-         * give up on further stdin writes and drop whatever's queued. */
         call->out_len = call->out_off = 0;
         oi_reactor_remove(call->reactor, call->stdin_fd);
         close(call->stdin_fd);
@@ -451,13 +421,6 @@ static oi_status spawn(oi_tool_call *call) {
         close(stdout_pipe[0]);
         close(err_pipe[0]);
 
-        /* cli_repl.c blocks SIGWINCH/SIGINT/SIGTERM/SIGHUP process-wide
-         * for its own signalfd; that block survives exec() and would
-         * otherwise be inherited permanently by this tool subprocess,
-         * silently breaking its own signal-awareness (e.g. Ctrl+C not
-         * working as expected for a pager or another interactive program
-         * it invokes). Unblock all four here, mirroring the setpgid reset
-         * already done for process-group membership. */
         sigemptyset(&blocked);
         sigaddset(&blocked, SIGWINCH);
         sigaddset(&blocked, SIGINT);
@@ -571,7 +534,7 @@ oi_status oi_tool_call_start(oi_tool_registry *reg, oi_reactor *r,
     oi_status st = oi_tool_registry_lookup(reg, tool_name, &build_argv,
                                             &tool_ud);
     if (st != OI_OK) {
-        return st; /* OI_ERR_NOTFOUND */
+        return st;
     }
 
     oi_tool_decision decision =
@@ -681,9 +644,6 @@ oi_status oi_tool_call_close_stdin(oi_tool_call *call) {
         return OI_ERR_INVAL;
     }
     if (call->out_off < call->out_len) {
-        /* still draining a queued write: defer the actual close until
-         * on_stdin_event finishes flushing it, so the child sees
-         * everything written before it sees EOF. */
         call->stdin_close_pending = 1;
         return OI_OK;
     }
@@ -715,16 +675,13 @@ void oi_tool_call_cancel(oi_tool_call *call) {
         return;
     }
     if (call->state == CALL_PENDING_PERMISSION) {
-        free(call); /* nothing was ever spawned or registered */
+        free(call);
         return;
     }
     if (call->pid > 0) {
-        /* The child creates a fresh process group before exec, so a tool
-         * cannot leave grandchildren running after its call is cancelled. */
         terminate_process_group(call);
         while (!call->child_exited && waitpid(call->pid, NULL, 0) < 0 &&
                errno == EINTR) {
-            /* SIGKILL has already made termination inevitable. */
         }
     }
     call->on_output = NULL;

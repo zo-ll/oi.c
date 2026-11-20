@@ -1,7 +1,3 @@
-/* struct signalfd_siginfo is a GNU/Linux extension; needs _GNU_SOURCE
- * defined before any header pulls in its own feature-test macros,
- * matching the precedent in reactor_epoll.c for other GNU fd primitives
- * (timerfd, pidfd). */
 #define _GNU_SOURCE
 
 #include "cli_composer.h"
@@ -36,14 +32,6 @@ static void consume_input(unsigned char *input, size_t *input_len,
     *input_len -= consumed;
 }
 
-/*
- * Drains every currently-readable signalfd record, classifying what was
- * seen. Each of SIGWINCH/SIGINT/SIGTERM/SIGHUP is a standard (non-realtime)
- * signal, so at most one of each is ever actually pending -- looping here
- * is defensive, not load-bearing. SIGTERM/SIGHUP win over a same-drain
- * SIGWINCH: there is no point redrawing a frame the caller is about to
- * tear down.
- */
 struct oi_cli_composer_signals {
     int resize;
     int terminate_signal;
@@ -62,9 +50,6 @@ static void drain_signals(int signal_fd,
         case SIGTERM:
         case SIGHUP:
         case SIGINT:
-            /* SIGINT can't ordinarily fire here (raw mode clears ISIG),
-             * but treat a pending one defensively the same as
-             * SIGTERM/SIGHUP rather than silently dropping it. */
             out->terminate_signal = (int)info.ssi_signo;
             break;
         default:
@@ -123,19 +108,13 @@ static int64_t monotonic_ms(void) {
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-/*
- * poll() on the caller's descriptors that also runs `composer->reactor`.
- * It returns like poll() for the caller's descriptors only: reactor work
- * alone runs and the wait goes on, until one of them is ready or
- * `timeout_ms` has passed. Never fails with EINTR.
- */
 static int composer_poll(struct oi_cli_composer *composer,
                          struct pollfd *descriptors, nfds_t count,
                          int timeout_ms) {
     oi_reactor *reactor = composer->reactor;
     int64_t deadline = timeout_ms >= 0 ? monotonic_ms() + timeout_ms : 0;
     for (;;) {
-        struct pollfd all[4]; /* at most 3 from the callers, + the reactor */
+        struct pollfd all[4];
         int wait = timeout_ms;
         if (timeout_ms >= 0) {
             int64_t left = deadline - monotonic_ms();
@@ -247,11 +226,6 @@ oi_status oi_cli_composer_wait_submit(struct oi_cli_composer *composer,
         goto cleanup;
     }
     if (signal_fd >= 0) {
-        /* The draw above already used a freshly-read width; discard any
-         * resize notification queued before this call started so it
-         * doesn't trigger an immediate, redundant second redraw. A
-         * terminate signal queued in that same window must not be lost,
-         * though -- honor it immediately instead. */
         struct oi_cli_composer_signals pending;
 
         drain_signals(signal_fd, &pending);
@@ -282,16 +256,6 @@ oi_status oi_cli_composer_wait_submit(struct oi_cli_composer *composer,
                 break;
             }
         }
-        /* A lone buffered byte that's a valid but incomplete sequence (a
-         * standalone Escape keypress with nothing following yet, or the
-         * first byte of one) breaks the loop above with OI_ERR_AGAIN --
-         * that's an expected "nothing more to decode without further
-         * bytes" signal, not a real error, and must not be mistaken for
-         * one here: the whole point of falling through to the poll()
-         * below is to wait for either more bytes or the escape timeout to
-         * resolve it. Without this, a genuinely standalone Escape press
-         * would incorrectly end this call with OI_ERR_AGAIN instead of
-         * ever reaching that timeout. */
         if (status == OI_ERR_AGAIN) {
             status = OI_OK;
         }
@@ -402,20 +366,6 @@ cleanup:
     return status;
 }
 
-/*
- * Applies one already-decoded event to the editor (mutating state exactly
- * like the idle path does), but never draws and never acts on
- * SUBMIT/EXIT/CTRL_C itself -- just classifies which of those (if any)
- * this event produced, for a busy-mode caller to decide what to do with.
- * oi_cli_prompt_state_apply's own SUBMIT/EXIT handling never mutates the
- * editor by itself (SUBMIT is only actually committed by a later, separate
- * oi_cli_prompt_state_commit call; EXIT only fires when the editor was
- * already empty), so it's safe to let it run unconditionally here and
- * classify the result afterward -- CTRL_C is the one exception (it clears
- * the draft immediately as part of applying it), which is fine: a
- * busy-mode Ctrl+C clearing the in-progress draft alongside cancelling the
- * turn matches the idle Ctrl+C behavior of clearing on its own.
- */
 static oi_status classify_event(struct oi_cli_composer *composer,
                                 const struct oi_cli_input_event *event,
                                 enum oi_cli_composer_action *out_action) {
@@ -652,13 +602,6 @@ oi_status oi_cli_composer_select(
     *out_terminate_signal = 0;
     status = OI_OK;
     if (signal_fd >= 0) {
-        /*
-         * Discard a resize queued before this call started, then draw with
-         * the current width. This drain must precede the draw: draining
-         * afterward can swallow a resize delivered between the draw and the
-         * drain, leaving the selector rendered at a stale width until some
-         * unrelated input causes another redraw.
-         */
         struct oi_cli_composer_signals pending;
 
         drain_signals(signal_fd, &pending);
@@ -709,11 +652,6 @@ oi_status oi_cli_composer_select(
                 break;
             }
         }
-        /* Same normalization as oi_cli_composer_wait_submit's identical
-         * inner/outer loop shape: OI_ERR_AGAIN here just means "nothing
-         * more to decode without further bytes," not a real error -- a
-         * standalone Escape press must fall through to the poll() below
-         * to reach its timeout-based resolution, not end this call early. */
         if (status == OI_ERR_AGAIN) {
             status = OI_OK;
         }
@@ -859,7 +797,6 @@ static int line_entry_event(const struct oi_cli_input_event *event,
         entry->done = 1;
         return 1;
     case OI_CLI_INPUT_BACKSPACE:
-        /* Removes one whole UTF-8 sequence. */
         while (entry->len > 0 &&
                ((unsigned char)entry->text[entry->len - 1] & 0xC0) == 0x80) {
             entry->len--;
@@ -870,7 +807,6 @@ static int line_entry_event(const struct oi_cli_input_event *event,
         }
         return 0;
     case OI_CLI_INPUT_TEXT:
-        /* A paste delivers its newlines as text. */
         if (event->text[0] < 0x20 || event->text[0] == 0x7f) {
             return 0;
         }
@@ -905,7 +841,6 @@ static oi_status draw_line_entry(struct oi_cli_composer *composer,
 }
 
 static void wipe_line_entry(struct line_entry *entry) {
-    /* Volatile so the compiler cannot drop a store to a dying object. */
     volatile char *text = entry->text;
     for (size_t i = 0; i < sizeof entry->text; i++) {
         text[i] = '\0';

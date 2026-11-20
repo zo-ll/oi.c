@@ -72,9 +72,6 @@ void oi_arena_destroy(oi_arena *a) {
     free(a);
 }
 
-/* Advances a->current past a full block, reusing an already-allocated
- * next block left over from before the last reset if one exists, and
- * only calling malloc when the chain needs to grow. */
 static struct oi_block *advance_block(oi_arena *a) {
     if (a->current->next != NULL) {
         a->current = a->current->next;
@@ -90,10 +87,6 @@ static struct oi_block *advance_block(oi_arena *a) {
     return nb;
 }
 
-/* A request larger than one block gets a block of its own, linked at the
- * head: blocks before a->current are never bumped again, so the current
- * block keeps its free space. Only these blocks have a capacity above
- * block_size, which is how oi_arena_reset finds them. */
 static void *alloc_oversize(oi_arena *a, size_t size) {
     struct oi_block *b = block_alloc(size);
     if (b == NULL) {
@@ -121,7 +114,7 @@ void *oi_arena_alloc(oi_arena *a, size_t size) {
         if (b == NULL) {
             return NULL;
         }
-        aligned = 0; /* fresh or just-reset block */
+        aligned = 0;
     }
 
     void *ptr = b->data + aligned;
@@ -133,8 +126,6 @@ void oi_arena_reset(oi_arena *a) {
     if (a == NULL) {
         return;
     }
-    /* Oversize blocks go back to the system: one large allocation must
-     * not pin its memory for the life of the arena. */
     while (a->head->capacity > a->block_size) {
         struct oi_block *oversize = a->head;
         a->head = oversize->next;

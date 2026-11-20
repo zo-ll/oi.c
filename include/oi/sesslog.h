@@ -63,4 +63,4 @@ oi_status oi_sesslog_replay(oi_sesslog *log, oi_sesslog_record_cb cb,
  * the log was intact or lost only a crash tail. NULL-safe. */
 size_t oi_sesslog_damaged_bytes(const oi_sesslog *log);
 
-#endif /* OI_SESSLOG_H */
+#endif

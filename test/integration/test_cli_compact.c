@@ -1,4 +1,3 @@
-/* struct signalfd_siginfo / signalfd(2) are GNU/Linux extensions. */
 #define _GNU_SOURCE
 
 #include "../test.h"
@@ -21,10 +20,6 @@
 #include "oi/llm.h"
 #include "oi/reactor.h"
 
-/* A listening server that accepts one connection and then goes silent --
- * used to hold a request in flight indefinitely so a test can control
- * exactly when (if ever) cancellation fires, with no reliance on real
- * response timing. */
 struct silent_server {
     pid_t pid;
     int port;
@@ -83,7 +78,6 @@ static void stop_silent_server(struct silent_server *server) {
     if (server->pid > 0) {
         kill(server->pid, SIGKILL);
         while (waitpid(server->pid, NULL, 0) < 0 && errno == EINTR) {
-            /* retry */
         }
     }
 }
@@ -383,7 +377,6 @@ TEST(compact_run_rejects_invalid_arguments) {
 }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     RUN(compact_run_produces_a_summary_on_success);
     RUN(compact_run_reports_failed_on_http_error);

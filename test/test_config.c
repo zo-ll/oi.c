@@ -23,8 +23,6 @@ static void write_file(const char *path, const char *content) {
     fclose(f);
 }
 
-/* --- defaults --- */
-
 TEST(defaults_are_sane) {
     oi_config cfg;
     CHECK_EQ(oi_config_init_defaults(&cfg), OI_OK);
@@ -42,8 +40,6 @@ TEST(defaults_are_sane) {
 TEST(init_defaults_rejects_null) {
     CHECK_EQ(oi_config_init_defaults(NULL), OI_ERR_INVAL);
 }
-
-/* --- oi_config_set --- */
 
 TEST(set_string_fields) {
     oi_config cfg;
@@ -72,7 +68,7 @@ TEST(set_overwrites_and_frees_prior_value) {
     oi_config_init_defaults(&cfg);
     CHECK_EQ(oi_config_set(&cfg, "host", "first.example.com"), OI_OK);
     CHECK_EQ(oi_config_set(&cfg, "host", "second.example.com"), OI_OK);
-    CHECK_STREQ(cfg.host, "second.example.com"); /* leak of "first" checked by valgrind */
+    CHECK_STREQ(cfg.host, "second.example.com");
     oi_config_free(&cfg);
 }
 
@@ -99,8 +95,8 @@ TEST(set_int_rejects_garbage) {
     CHECK_EQ(oi_config_set(&cfg, "port", "not-a-number"), OI_ERR_PARSE);
     CHECK_EQ(oi_config_set(&cfg, "port", "80x0"), OI_ERR_PARSE);
     CHECK_EQ(oi_config_set(&cfg, "port", ""), OI_ERR_PARSE);
-    CHECK_EQ(oi_config_set(&cfg, "port", "80 "), OI_ERR_PARSE); /* trailing garbage */
-    CHECK_EQ(cfg.port, 443); /* unchanged on rejection */
+    CHECK_EQ(oi_config_set(&cfg, "port", "80 "), OI_ERR_PARSE);
+    CHECK_EQ(cfg.port, 443);
     oi_config_free(&cfg);
 }
 
@@ -141,8 +137,6 @@ TEST(set_rejects_null_args) {
     oi_config_free(&cfg);
 }
 
-/* --- env --- */
-
 TEST(load_env_reads_api_key) {
     setenv("OI_API_KEY", "sk-from-env", 1);
     oi_config cfg;
@@ -173,8 +167,6 @@ TEST(load_env_overwrites_prior_value) {
     unsetenv("OI_API_KEY");
 }
 
-/* --- file --- */
-
 TEST(load_file_applies_settings) {
     const char *path = fresh_path();
     write_file(path,
@@ -204,9 +196,8 @@ TEST(load_file_forbids_api_key) {
     oi_config cfg;
     oi_config_init_defaults(&cfg);
     CHECK_EQ(oi_config_load_file(&cfg, path), OI_ERR_DENIED);
-    /* the earlier "host" line, before the offending one, still applied */
     CHECK_STREQ(cfg.host, "ok.example");
-    CHECK(cfg.api_key == NULL); /* the forbidden line must not have applied */
+    CHECK(cfg.api_key == NULL);
 
     oi_config_free(&cfg);
     unlink(path);
@@ -247,7 +238,7 @@ TEST(load_file_bad_value_stops_parsing) {
 }
 
 TEST(load_file_missing_is_not_found) {
-    const char *path = fresh_path(); /* unlinked, never written */
+    const char *path = fresh_path();
     oi_config cfg;
     oi_config_init_defaults(&cfg);
     CHECK_EQ(oi_config_load_file(&cfg, path), OI_ERR_NOTFOUND);
@@ -268,19 +259,17 @@ TEST(load_file_empty_and_comment_only_is_ok) {
     oi_config cfg;
     oi_config_init_defaults(&cfg);
     CHECK_EQ(oi_config_load_file(&cfg, path), OI_OK);
-    CHECK_STREQ(cfg.host, "api.openai.com"); /* untouched */
+    CHECK_STREQ(cfg.host, "api.openai.com");
     oi_config_free(&cfg);
     unlink(path);
 }
-
-/* --- free --- */
 
 TEST(free_null_safe) { oi_config_free(NULL); }
 
 TEST(free_on_zeroed_struct_is_safe) {
     oi_config cfg;
     memset(&cfg, 0, sizeof cfg);
-    oi_config_free(&cfg); /* every field NULL -- must not crash */
+    oi_config_free(&cfg);
 }
 
 TEST(free_nulls_out_fields) {
@@ -294,10 +283,8 @@ TEST(free_nulls_out_fields) {
     CHECK(cfg.ca_file == NULL);
     CHECK(cfg.path == NULL);
     CHECK(cfg.model == NULL);
-    oi_config_free(&cfg); /* double-free-safe now that fields are NULL */
+    oi_config_free(&cfg);
 }
-
-/* --- full precedence: defaults -> file -> env -> "CLI" (a second set) --- */
 
 TEST(full_precedence_chain) {
     const char *path = fresh_path();
@@ -308,13 +295,12 @@ TEST(full_precedence_chain) {
     CHECK_EQ(oi_config_init_defaults(&cfg), OI_OK);
     CHECK_EQ(oi_config_load_file(&cfg, path), OI_OK);
     CHECK_EQ(oi_config_load_env(&cfg), OI_OK);
-    /* simulates a CLI flag "--host cli.example", applied last */
     CHECK_EQ(oi_config_set(&cfg, "host", "cli.example"), OI_OK);
 
-    CHECK_STREQ(cfg.host, "cli.example");   /* CLI beat the file */
-    CHECK_STREQ(cfg.model, "file-model");   /* file beat the default */
+    CHECK_STREQ(cfg.host, "cli.example");
+    CHECK_STREQ(cfg.model, "file-model");
     CHECK_EQ(cfg.port, 1111);
-    CHECK_STREQ(cfg.api_key, "sk-env");     /* env, nothing else set it */
+    CHECK_STREQ(cfg.api_key, "sk-env");
 
     oi_config_free(&cfg);
     unlink(path);

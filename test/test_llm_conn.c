@@ -22,9 +22,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Starts a blocking echo server in a forked child, listening on
- * loopback. Returns the child pid (caller must waitpid) and the port it
- * bound to. */
 static pid_t start_echo_server(unsigned short *out_port) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(listen_fd >= 0);
@@ -69,10 +66,6 @@ static pid_t start_echo_server(unsigned short *out_port) {
     return pid;
 }
 
-/* A listening socket that never accepts, so connect() to it fills the
- * kernel backlog behavior predictably is NOT what we want for a
- * "connection refused" test -- instead we bind a socket, learn its
- * port, and close it immediately so nothing is listening there. */
 static unsigned short unused_port(void) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
@@ -84,7 +77,7 @@ static unsigned short unused_port(void) {
     socklen_t alen = sizeof addr;
     getsockname(fd, (struct sockaddr *)&addr, &alen);
     unsigned short port = ntohs(addr.sin_port);
-    close(fd); /* nothing listens here now */
+    close(fd);
     return port;
 }
 
@@ -94,8 +87,6 @@ static void run_until(oi_reactor *r, const int *done_flag, int max_steps) {
         oi_reactor_step(r, 200, &st);
     }
 }
-
-/* --- echo round trip, with a reentrant close from on_data --- */
 
 struct echo_ctx {
     oi_llm_conn *conn;
@@ -109,8 +100,6 @@ struct echo_ctx {
 static void echo_on_connected(oi_llm_conn *c, void *ud) {
     struct echo_ctx *ctx = ud;
     ctx->connected = 1;
-    /* An impossible length must fail before reading caller memory and
-     * leave the connection usable for the real write that follows. */
     CHECK_EQ(oi_llm_conn_write(c, "x", (size_t)-1), OI_ERR_NOMEM);
     oi_status st = oi_llm_conn_write(c, "hello", 5);
     CHECK_EQ(st, OI_OK);
@@ -123,8 +112,6 @@ static void echo_on_data(oi_llm_conn *c, const void *data, size_t len,
     memcpy(ctx->received + ctx->received_len, data, len);
     ctx->received_len += len;
     if (ctx->received_len >= 5) {
-        /* Reentrant close from within the connection's own callback --
-         * exercises the destroyed-flag safety mechanism. */
         oi_llm_conn_close(c);
         ctx->done = 1;
     }
@@ -147,8 +134,6 @@ TEST(connect_write_echo_and_reentrant_close) {
     struct oi_llm_conn_callbacks cbs = {echo_on_connected, echo_on_data,
                                          echo_on_error};
 
-    /* A hostname exercises asynchronous resolution and address fallback
-     * (localhost commonly returns IPv6 before this IPv4 listener). */
     oi_status st = oi_llm_conn_connect(r, "localhost", port, NULL, NULL, &cbs,
                                         &ctx, &ctx.conn);
     CHECK_EQ(st, OI_OK);
@@ -164,8 +149,6 @@ TEST(connect_write_echo_and_reentrant_close) {
     waitpid(child, NULL, 0);
 }
 
-/* --- connection refused --- */
-
 struct error_ctx {
     int error_fired;
     oi_status reason;
@@ -176,7 +159,7 @@ struct error_ctx {
 static void err_on_connected(oi_llm_conn *c, void *ud) {
     (void)c;
     (void)ud;
-    CHECK(0); /* must not connect */
+    CHECK(0);
 }
 
 static void err_on_data(oi_llm_conn *c, const void *data, size_t len,
@@ -232,14 +215,14 @@ TEST(resolver_failure_is_reported_asynchronously) {
     CHECK_EQ(oi_llm_conn_connect(r, "does-not-exist.invalid", 443, NULL, NULL,
                                   &cbs, &ctx, &conn),
               OI_OK);
-    CHECK(!ctx.done); /* connect never blocks to resolve */
+    CHECK(!ctx.done);
     run_until(r, &ctx.done, 100);
     CHECK(ctx.error_fired);
     CHECK_EQ(ctx.reason, OI_ERR_IO);
     CHECK(strncmp(ctx.cause, "could not resolve does-not-exist.invalid: ",
                   strlen("could not resolve does-not-exist.invalid: ")) ==
           0);
-    (void)conn; /* terminal callback closes it */
+    (void)conn;
     oi_reactor_destroy(r);
 }
 
@@ -259,8 +242,6 @@ TEST(cancel_during_resolution_is_silent) {
     CHECK(!ctx.done);
     oi_reactor_destroy(r);
 }
-
-/* --- peer closes after sending some data --- */
 
 struct half_ctx {
     char received[64];
@@ -292,9 +273,6 @@ static void half_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
     ctx->done = 1;
 }
 
-/* Listens on an ephemeral loopback port, accepts one connection, writes
- * `data` to it, then closes immediately -- for testing the "peer sent
- * something and then hung up" path. */
 static pid_t start_write_then_close_server(const char *data, size_t len,
                                             unsigned short *out_port) {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -355,16 +333,11 @@ TEST(peer_close_reports_closed) {
     CHECK(memcmp(ctx.received, "hi", 2) == 0);
     CHECK(ctx.error_fired);
     CHECK_EQ(ctx.reason, OI_ERR_CLOSED);
-    /* fail_conn already closed `conn` via its fallback path, since
-     * half_on_error doesn't close it itself -- closing it again here
-     * would be a double free. */
     (void)conn;
 
     oi_reactor_destroy(r);
     waitpid(child, NULL, 0);
 }
-
-/* --- argument validation --- */
 
 TEST(connect_rejects_bad_args) {
     oi_reactor *r = oi_reactor_create();
@@ -388,9 +361,6 @@ TEST(write_before_connected_rejected) {
     struct echo_ctx ctx = {0};
     struct oi_llm_conn_callbacks cbs = {echo_on_connected, echo_on_data,
                                          echo_on_error};
-    /* Use a no-op connected callback for this test by overriding: skip
-     * writing in on_connected and instead try to write immediately,
-     * before the reactor has had a chance to establish the connection. */
     oi_status st = oi_llm_conn_connect(r, "127.0.0.1", port, NULL, NULL, &cbs,
                                         &ctx, &ctx.conn);
     CHECK_EQ(st, OI_OK);
@@ -433,10 +403,6 @@ TEST(connection_preserves_sigpipe_disposition) {
     waitpid(child, NULL, 0);
 }
 
-/* --- a dead address moves the connect to the next address --- */
-
-/* The test links with -Wl,--wrap=getaddrinfo. A lookup of DEAD_THEN_LIVE
- * returns two loopback addresses: first `dead_port`, then `live_port`. */
 #define DEAD_THEN_LIVE "dead-then-live.test"
 static unsigned short dead_port;
 static unsigned short live_port;
@@ -444,7 +410,6 @@ static unsigned short live_port;
 int __real_getaddrinfo(const char *node, const char *service,
                        const struct addrinfo *hints, struct addrinfo **res);
 
-/* Atomic: a cancelled lookup's resolver thread can still run. */
 static atomic_int getaddrinfo_calls;
 
 int __wrap_getaddrinfo(const char *node, const char *service,
@@ -479,8 +444,6 @@ int __wrap_getaddrinfo(const char *node, const char *service,
     return 0;
 }
 
-/* A listener that never accepts, with its accept queue full: the kernel
- * drops each new SYN, so a connect() to it gets no answer. */
 static int start_dead_listener(unsigned short *out_port, int fillers[4]) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(fd >= 0);
@@ -522,8 +485,6 @@ TEST(dead_address_moves_to_the_next_address) {
     CHECK_EQ(oi_llm_conn_connect(r, DEAD_THEN_LIVE, 1, NULL, NULL, &cbs, &ctx,
                                   &conn),
               OI_OK);
-    /* 6 s: more than the 3 s address timeout, much less than the
-     * kernel's SYN retries on the dead address. */
     run_until(r, &ctx.done, 30);
 
     CHECK(ctx.connected);
@@ -537,14 +498,6 @@ TEST(dead_address_moves_to_the_next_address) {
     waitpid(child, NULL, 0);
 }
 
-/* --- an untrusted certificate names the verify result --- */
-
-/* Serves `connections` TLS connections, one after another, with a fresh
- * self-signed certificate, which the system trust store does not contain.
- * With `ca_path`, it also writes the certificate there as PEM, so a client
- * can trust it, and answers the first read before it closes the socket
- * with no TLS close_notify: with an echo, or with `report_reuse`, with
- * "1" when the client resumed a session and "0" when it did not. */
 static pid_t start_self_signed_tls_server(unsigned short *out_port,
                                           const char *ca_path,
                                           int connections,
@@ -561,7 +514,6 @@ static pid_t start_self_signed_tls_server(unsigned short *out_port,
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
                                (const unsigned char *)"127.0.0.1", -1, -1, 0);
     X509_set_issuer_name(cert, name);
-    /* A client checks an IP host against the subjectAltName, not the CN. */
     X509_EXTENSION *san = X509V3_EXT_conf_nid(NULL, NULL,
                                               NID_subject_alt_name,
                                               "IP:127.0.0.1");
@@ -614,8 +566,6 @@ static pid_t start_self_signed_tls_server(unsigned short *out_port,
             SSL_free(ssl);
             close(cfd);
         }
-        /* Freed so that valgrind's leak check in this child, at _exit,
-         * reports nothing that belongs to the test process. */
         SSL_CTX_free(ctx);
         X509_free(cert);
         EVP_PKEY_free(key);
@@ -653,11 +603,6 @@ TEST(untrusted_certificate_names_the_verify_result) {
     waitpid(child, NULL, 0);
 }
 
-/* --- a TLS round trip through the connection socket BIO --- */
-
-/* The test links with -Wl,--wrap=send and -Wl,--wrap=SSL_CTX_new. liboi's
- * own sends come here; libssl's built-in socket BIO uses write() and never
- * does. */
 static int sends_total;
 static int ssl_ctx_created;
 
@@ -730,8 +675,6 @@ TEST(tls_round_trip_sends_with_msg_nosignal) {
 
     CHECK_EQ(ctx.received_len, (size_t)5);
     CHECK(memcmp(ctx.received, "hello", 5) == 0);
-    /* The handshake and the request: every TLS byte left through send()
-     * with MSG_NOSIGNAL, so no write can raise SIGPIPE. */
     CHECK(sends_total >= 2);
     CHECK_EQ(sends_without_nosignal, 0);
     oi_reactor_destroy(r);
@@ -739,8 +682,6 @@ TEST(tls_round_trip_sends_with_msg_nosignal) {
     waitpid(child, NULL, 0);
     unlink(ca_path);
 }
-
-/* --- connections that share TLS settings share one context --- */
 
 struct reuse_ctx {
     char answer;
@@ -802,12 +743,8 @@ TEST(second_connection_reuses_the_context_and_resumes_the_session) {
     unlink(ca_path);
 }
 
-/* --- a shared address cache skips the second lookup --- */
-
 int __real_clock_gettime(clockid_t clock, struct timespec *now);
 
-/* Added to CLOCK_MONOTONIC for liboi, so a test can pass the address
- * cache's lifetime without a wait. */
 static long monotonic_offset_s;
 
 int __wrap_clock_gettime(clockid_t clock, struct timespec *now) {
@@ -826,8 +763,6 @@ static void cache_on_connected(oi_llm_conn *c, void *ud) {
 }
 
 TEST(address_cache_resolves_once_for_two_connections) {
-    /* Never accepts: the kernel completes both connections from the
-     * listen backlog. */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
@@ -868,8 +803,6 @@ TEST(address_cache_resolves_once_for_two_connections) {
 }
 
 TEST(address_cache_resolves_again_after_60_seconds) {
-    /* Never accepts: the kernel completes both connections from the
-     * listen backlog. */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
@@ -921,7 +854,6 @@ TEST(address_cache_resolves_again_after_60_seconds) {
 }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     signal(SIGCHLD, SIG_DFL);
     RUN(connect_write_echo_and_reentrant_close);

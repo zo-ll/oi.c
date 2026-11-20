@@ -420,9 +420,6 @@ static oi_status apply_checkpoint(
     builder->state.context[0].record_id = record->record_id;
     builder->state.context[0].message = checkpoint;
     builder->state.context_len = remaining + 1;
-    /* Recorded only now that the splice has committed, so a rejected or
-     * failed checkpoint never leaves the state claiming a compacted context
-     * it does not have. */
     builder->state.checkpoint_source_first_record_id = first;
     builder->state.checkpoint_source_last_record_id = last;
     builder->state.has_checkpoint = 1;

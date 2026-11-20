@@ -13,10 +13,6 @@ struct oi_cli_input_history_entry {
     size_t len;
 };
 
-/*
- * Process-scoped submitted-input history. Navigation returns borrowed text
- * valid until the history is mutated or freed.
- */
 struct oi_cli_input_history {
     struct oi_cli_input_history_entry *entries;
     size_t len;

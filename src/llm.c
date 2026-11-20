@@ -13,13 +13,9 @@
 #include "oi/json.h"
 
 #define OI_LLM_MAX_ERROR_BODY (64 * 1024)
-/* How often a request asks a before_request hook that returned
- * OI_ERR_AGAIN again. */
 #define OI_LLM_HOOK_RETRY_MS 20
-/* Bounds on what one stream can make the client hold. A model that goes
- * past them gets OI_ERR_PARSE instead of unbounded memory. */
 #define OI_LLM_MAX_TOOL_CALLS 256
-#define OI_LLM_MAX_TOOL_FIELD (4 * 1024)          /* id or name */
+#define OI_LLM_MAX_TOOL_FIELD (4 * 1024)
 #define OI_LLM_MAX_TOOL_ARGUMENTS (16 * 1024 * 1024)
 
 struct oi_llm_client {
@@ -27,17 +23,15 @@ struct oi_llm_client {
     unsigned short port;
     int use_tls;
     char *ca_file;
-    oi_llm_tls *tls; /* NULL without TLS; shared by every request */
+    oi_llm_tls *tls;
     char *api_key;
     char *path;
     int timeout_ms;
     int responses_api;
     oi_llm_before_request_cb before_request;
     void *before_request_user_data;
-    oi_llm_addr_cache *addresses; /* shared by every request */
+    oi_llm_addr_cache *addresses;
     int keep_alive;
-    /* With keep_alive: the connection of the last complete response, on
-     * the reactor of that request, ready for the next one. */
     oi_llm_conn *idle_conn;
     oi_reactor *idle_reactor;
 };
@@ -56,9 +50,7 @@ struct oi_llm_tool_state {
 };
 
 struct oi_llm_request {
-    oi_llm_client *client; /* borrowed */
-    /* Holds the JSON tree of one SSE event; reset before the next parse,
-     * so a long stream does not grow memory with its event count. */
+    oi_llm_client *client;
     oi_arena *scratch;
 
     oi_llm_delta_cb on_delta;
@@ -66,15 +58,15 @@ struct oi_llm_request {
     oi_llm_done_cb on_done;
     void *user_data;
 
-    oi_reactor *reactor; /* borrowed */
+    oi_reactor *reactor;
     oi_llm_conn *conn;
-    int reused_conn;      /* `conn` came from the client's idle slot */
-    int response_started; /* a response byte arrived on `conn` */
+    int reused_conn;
+    int response_started;
     oi_reactor_timer *timer;
-    oi_reactor_timer *hook_timer; /* set while a hook says OI_ERR_AGAIN */
+    oi_reactor_timer *hook_timer;
     oi_llm_http_parser *http;
-    oi_llm_sse_parser *sse; /* created lazily once we know status is 2xx */
-    oi_json_parser *json;   /* reused (reset) across SSE events */
+    oi_llm_sse_parser *sse;
+    oi_json_parser *json;
 
     char *body;
     size_t body_len;
@@ -86,10 +78,6 @@ struct oi_llm_request {
     size_t error_len;
     size_t error_cap;
 
-    /* Set by req_on_body/handle_sse_event when a sub-step fails; since
-     * oi_llm_http_body_cb is void-returning, this is how that failure
-     * gets back to req_on_data, which is the only place actually
-     * driving completion. */
     int body_cb_failed;
     oi_status body_cb_status;
     int saw_done;
@@ -99,16 +87,8 @@ struct oi_llm_request {
 
     int finished;
 
-    /* Set by req_on_data before invoking oi_llm_http_parser_feed (which
-     * may synchronously call all the way down through the SSE/JSON
-     * layers into the caller's on_delta), so a reentrant
-     * oi_llm_request_cancel() from within on_delta can signal back that
-     * `req` itself was freed. Mirrors the same pattern already used in
-     * oi_llm_conn, oi_llm_http_parser, and oi_llm_sse_parser. */
     int *destroyed_flag;
 };
-
-/* ================= client ================= */
 
 static int valid_http_host(const char *host) {
     if (host[0] == '\0') {
@@ -195,7 +175,7 @@ void oi_llm_client_destroy(oi_llm_client *c) {
     if (c == NULL) {
         return;
     }
-    close_idle_conn(c); /* before the cache that the connection borrows */
+    close_idle_conn(c);
     oi_llm_addr_cache_destroy(c->addresses);
     free(c->host);
     oi_llm_tls_destroy(c->tls);
@@ -222,8 +202,6 @@ oi_status oi_llm_client_reconfigure(oi_llm_client *client,
     struct oi_llm_client previous = *client;
     *client = *fresh;
     *fresh = previous;
-    /* Same trust store: keep the TLS context and its session, so a token
-     * renewal does not cost a CA load and a full handshake. */
     if (client->tls != NULL && fresh->tls != NULL &&
         (client->ca_file == NULL) == (fresh->ca_file == NULL) &&
         (client->ca_file == NULL ||
@@ -250,8 +228,6 @@ void oi_llm_client_set_before_request(oi_llm_client *client,
     client->before_request_user_data = user_data;
 }
 
-/* ================= request lifecycle ================= */
-
 static void request_teardown(oi_llm_request *req) {
     oi_reactor_timer_cancel(req->timer);
     oi_reactor_timer_cancel(req->hook_timer);
@@ -276,7 +252,6 @@ static void request_teardown(oi_llm_request *req) {
     free(req);
 }
 
-/* An idle connection expects nothing: data or a close ends it. */
 static void idle_on_connected(oi_llm_conn *c, void *ud) {
     (void)c;
     (void)ud;
@@ -296,12 +271,10 @@ static void idle_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
     (void)c;
     (void)reason;
     oi_llm_client *client = ud;
-    client->idle_conn = NULL; /* the connection closes itself */
+    client->idle_conn = NULL;
     client->idle_reactor = NULL;
 }
 
-/* Keeps the connection of a complete response for the next request. It
- * runs before on_done, which can start that request at once. */
 static void park_connection(oi_llm_request *req) {
     oi_llm_client *client = req->client;
     if (!client->keep_alive || req->conn == NULL ||
@@ -348,12 +321,10 @@ static void request_timed_out(oi_reactor *reactor, void *ud) {
            req->error_len);
 }
 
-/* ================= error-body accumulation ================= */
-
 static oi_status error_buf_append(oi_llm_request *req, const void *data,
                                    size_t len) {
     if (req->error_len >= OI_LLM_MAX_ERROR_BODY) {
-        return OI_OK; /* silently truncated; we already have plenty */
+        return OI_OK;
     }
     size_t take = len;
     if (take > OI_LLM_MAX_ERROR_BODY - req->error_len) {
@@ -379,10 +350,6 @@ static oi_status error_buf_append(oi_llm_request *req, const void *data,
     return OI_OK;
 }
 
-/* ================= SSE event -> delta extraction ================= */
-
-/* Keeps `*buf` NUL-terminated. The capacity doubles, so a value that
- * arrives in many small fragments costs a logarithmic count of reallocs. */
 static oi_status append_fragment(char **buf, size_t *used, size_t *cap,
                                   size_t max, const char *data, size_t len) {
     if (len > max - *used) {
@@ -470,7 +437,6 @@ static int emit_event(oi_llm_request *req, const oi_llm_event *event) {
     return destroyed != NULL && *destroyed;
 }
 
-/* Returns nonzero when a callback cancelled (and freed) `req`. */
 static int emit_text(oi_llm_request *req, const char *text, size_t len) {
     oi_llm_event event = {
         .type = OI_LLM_EVENT_TEXT,
@@ -487,8 +453,6 @@ static int emit_text(oi_llm_request *req, const char *text, size_t len) {
     return destroyed != NULL && *destroyed;
 }
 
-/* A NULL field was absent from this fragment. Returns OI_ERR_CLOSED when
- * the event callback cancelled (and freed) `req`. */
 static oi_status record_tool_fragment(oi_llm_request *req, size_t index,
                                       const char *id, size_t id_len,
                                       const char *name, size_t name_len,
@@ -571,8 +535,6 @@ static oi_status handle_tool_calls(oi_llm_request *req,
     return OI_OK;
 }
 
-/* Returns OI_ERR_CLOSED when the event callback cancelled (and freed)
- * `req`. */
 static oi_status validate_tool_calls(oi_llm_request *req) {
     for (size_t i = 0; i < req->tools_len; i++) {
         struct oi_llm_tool_state *tool = &req->tools[i];
@@ -580,9 +542,6 @@ static oi_status validate_tool_calls(oi_llm_request *req) {
             tool->arguments == NULL) {
             return OI_ERR_PARSE;
         }
-        /* Some OpenAI-compatible servers send "" for a tool that takes no
-         * arguments. Consumers append fragments, so the empty object goes
-         * out as one more fragment. */
         if (tool->arguments_len == 0) {
             oi_status st = record_tool_fragment(req, tool->index, NULL, 0,
                                                 NULL, 0, "{}", 2);
@@ -646,8 +605,6 @@ static oi_status handle_responses_item_added(oi_llm_request *req,
                                 name_len, NULL, 0);
 }
 
-/* `key` names the member holding the text: fragments arrive under "delta",
- * and the closing event repeats the whole value under "arguments". */
 static oi_status handle_responses_arguments(oi_llm_request *req,
                                             const oi_json_value *root,
                                             const char *key, int only_if_empty) {
@@ -745,7 +702,7 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
             return;
         }
         req->saw_done = 1;
-        return; /* sentinel, not JSON; body_done drives actual completion */
+        return;
     }
     if (req->saw_done) {
         req->body_cb_failed = 1;
@@ -771,8 +728,6 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
         return;
     }
 
-    /* A server can report a failure inside a 200 stream. The event is the
-     * only description of it, so it becomes the error body. */
     if (oi_json_object_get(root, "error") != NULL) {
         st = error_buf_append(req, data, len);
         fail_stream(req, st == OI_OK ? OI_ERR_IO : st);
@@ -793,15 +748,13 @@ static void handle_sse_event(const char *data, size_t len, void *ud) {
     }
     oi_status tool_st = handle_tool_calls(req, tool_calls);
     if (tool_st == OI_ERR_CLOSED) {
-        return; /* request was cancelled reentrantly by on_event */
+        return;
     }
     if (tool_st != OI_OK) {
         req->body_cb_failed = 1;
         req->body_cb_status = tool_st;
     }
 }
-
-/* ================= HTTP parser callbacks ================= */
 
 static void req_on_headers_done(int status_code, void *ud) {
     oi_llm_request *req = ud;
@@ -837,11 +790,7 @@ static void req_on_body(const void *data, size_t len, void *ud) {
     }
 }
 
-/* ================= connection callbacks ================= */
-
-/* Queues the request head and body on `c`. */
 static oi_status send_request(oi_llm_request *req, oi_llm_conn *c) {
-    /* OAuth access tokens are JWTs, which run to several kilobytes. */
     char header[16 * 1024];
     const char *connection = req->client->keep_alive ? "keep-alive" : "close";
     int n;
@@ -887,7 +836,6 @@ static void req_on_connected(oi_llm_conn *c, void *ud) {
     }
 }
 
-/* The HTTP body is complete: settles the request from what it held. */
 static void complete_body(oi_llm_request *req) {
     if (!req->is_success_status) {
         finish(req, OI_ERR_IO, req->http_status, req->error_buf,
@@ -927,8 +875,6 @@ OI_DIAG_POP
 
     oi_status st = oi_llm_http_parser_feed(req->http, data, len);
     if (destroyed) {
-        /* `req` (and everything it owns) was freed by a reentrant
-         * oi_llm_request_cancel() from within a nested on_delta call. */
         return;
     }
     req->destroyed_flag = NULL;
@@ -946,9 +892,6 @@ OI_DIAG_POP
 
 static void req_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
     oi_llm_request *req = ud;
-    /* A kept connection that the server had closed fails before any
-     * response byte: send the request once more, on a new connection.
-     * `c` closes itself after this callback. */
     if (req->reused_conn && !req->response_started) {
         req->reused_conn = 0;
         req->conn = NULL;
@@ -962,32 +905,19 @@ static void req_on_error(oi_llm_conn *c, oi_status reason, void *ud) {
         }
         return;
     }
-    /* A body with no length ends at the close. A close that cut the
-     * stream short still fails: complete_body requires the end marker. */
     if (reason == OI_ERR_CLOSED &&
         oi_llm_http_parser_close(req->http) == OI_OK) {
         complete_body(req);
         return;
     }
-    /* With no response body to show, the cause names the failure. */
     const char *cause = oi_llm_conn_error_cause(c);
     if (cause != NULL && req->error_len == 0 &&
         error_buf_append(req, cause, strlen(cause)) != OI_OK) {
         reason = OI_ERR_NOMEM;
     }
-    /* If already finished (body_done already drove completion in an
-     * earlier on_data call), the connection closing now is just the
-     * expected teardown, not a new failure. */
     finish(req, reason, req->http_status, req->error_buf, req->error_len);
 }
 
-/* ================= public entry point ================= */
-
-/* The part of a start that reads the client: the body in the client's
- * wire format, the parsers, and the connection. It runs only after the
- * before_request hook returned OI_OK, so a hook may reconfigure the
- * client while its request waits. On failure, the caller tears `req`
- * down. */
 static oi_status request_begin(oi_llm_request *req) {
     oi_llm_client *client = req->client;
     if (client->responses_api) {
@@ -1090,7 +1020,6 @@ static oi_status request_start(oi_llm_client *client, oi_reactor *reactor,
     req->on_done = on_done;
     req->user_data = user_data;
 
-    /* The deadline covers a wait for the hook as well. */
     oi_status st = OI_OK;
     if (client->timeout_ms > 0) {
         st = oi_reactor_timer_start(reactor, client->timeout_ms,

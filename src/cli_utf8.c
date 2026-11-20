@@ -185,12 +185,9 @@ static int in_range(uint32_t codepoint, uint32_t low, uint32_t high) {
 }
 
 size_t oi_cli_utf8_codepoint_width(uint32_t codepoint) {
-    /* C0 controls and DEL: defensive -- rendering these literally would
-     * corrupt the display, and they should never advance the column. */
     if (codepoint <= 0x1fU || codepoint == 0x7fU) {
         return 0;
     }
-    /* Combining marks and other zero-width formatting code points. */
     if (in_range(codepoint, 0x0300, 0x036f) ||
         in_range(codepoint, 0x200b, 0x200f) ||
         in_range(codepoint, 0xfe00, 0xfe0f) ||
@@ -198,8 +195,6 @@ size_t oi_cli_utf8_codepoint_width(uint32_t codepoint) {
         in_range(codepoint, 0x20d0, 0x20ff)) {
         return 0;
     }
-    /* East Asian Wide/Fullwidth: a pared-down, documented subset covering
-     * common CJK/Hangul ranges -- not a full Unicode UAX#11 table. */
     if (in_range(codepoint, 0x1100, 0x115f) ||
         in_range(codepoint, 0x2e80, 0x303e) ||
         in_range(codepoint, 0x3041, 0x33ff) ||

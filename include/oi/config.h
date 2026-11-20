@@ -75,4 +75,4 @@ oi_status oi_config_load_file(oi_config *cfg, const char *path);
  * call on an already-defaulted, partially-loaded, or zeroed config. */
 void oi_config_free(oi_config *cfg);
 
-#endif /* OI_CONFIG_H */
+#endif

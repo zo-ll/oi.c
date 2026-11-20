@@ -1,6 +1,3 @@
-/* signalfd(2) is a GNU/Linux extension, needed by the resize test below to
- * create its own SIGWINCH signalfd (mirroring what cli_repl.c owns in
- * production). */
 #define _GNU_SOURCE
 
 #include "cli_composer.h"
@@ -97,10 +94,6 @@ static struct prompt_result run_prompt(const char *input, size_t input_len,
 
         close(master_fd);
         close(result_pipe[0]);
-        /* A plain fork() inherits the test harness's own session/process
-         * group, not one attached to this pty -- a resize test's
-         * TIOCSWINSZ-triggered SIGWINCH has nowhere to go without a real
-         * controlling terminal established here first. */
         if (setsid() < 0 || ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
             result.status = OI_ERR_IO;
             (void)write_all(result_pipe[1], &result, sizeof result);
@@ -263,12 +256,6 @@ TEST(a_standalone_escape_keypress_does_not_end_the_read_with_an_error) {
 
     close(result_pipe[1]);
     wait_for_prompt_output(master_fd);
-    /* A genuinely standalone Escape keypress -- nothing follows it at all
-     * in this write, unlike every other test here that sends a complete
-     * escape sequence in one burst -- must resolve via the composer's own
-     * 40ms escape timeout (decode() returns OI_ERR_AGAIN for a lone 0x1b
-     * byte, since it could be the start of an arrow key) rather than
-     * being mistaken for a real error and ending the read early. */
     CHECK(write_all(master_fd, "\x1b", 1));
     {
         struct timespec delay = {0, (OI_CLI_COMPOSER_ESCAPE_TIMEOUT_MS + 40) *
@@ -409,9 +396,6 @@ TEST(resize_redraws_at_the_new_width_and_preserves_submitted_text) {
     CHECK(write_all(master_fd, "abcdefghij", 10));
     CHECK(wait_for_text(master_fd, &output, "abcdefghij", 2000));
 
-    /* Reset the capture and resize: a fresh "\x1b[J" appearing without any
-     * further keystroke proves the redraw was driven by the resize signal
-     * itself, not by continued typing. */
     memset(&output, 0, sizeof output);
     resized.ws_row = 24;
     resized.ws_col = 8;
@@ -532,10 +516,6 @@ TEST(sigterm_terminates_cleanly_and_restores_the_terminal) {
     close(master_fd);
 }
 
-/* --- feed_raw / resolve_escape_raw / select: the modal-safe decode path,
- * used by a future permission selector that must never mutate the editor
- * (composer->state) while it's showing. --- */
-
 struct raw_event_capture {
     enum oi_cli_input_event_type type;
     size_t text_len;
@@ -635,8 +615,6 @@ TEST(feed_raw_reports_the_event_without_touching_the_editor) {
     CHECK_EQ(result.status, OI_OK);
     CHECK_EQ(result.observed_count, 1);
     CHECK_EQ(result.observed_type, OI_CLI_INPUT_ENTER);
-    /* The whole point of feed_raw: the draft seeded before this call is
-     * still exactly what it was -- ENTER was reported, not applied. */
     CHECK_EQ(result.editor_len, 6);
     CHECK(memcmp(result.editor_data, "keepme", 6) == 0);
 
@@ -688,10 +666,6 @@ TEST(resolve_escape_raw_reports_a_buffered_lone_escape) {
                                           &history);
             if (status == OI_OK) {
                 (void)write_all(ready_pipe[1], &ready_byte, 1);
-                /* A lone Escape byte alone is a valid but incomplete
-                 * sequence (it might be the start of an arrow key) --
-                 * feed_raw must leave it buffered rather than reporting
-                 * it, exactly like oi_cli_composer_feed does. */
                 status = oi_cli_composer_feed_raw(&composer, capture_and_stop,
                                                   &capture);
             }
@@ -750,7 +724,7 @@ static const struct oi_cli_render_line select_options[] = {
 };
 
 TEST(select_arrow_keys_move_and_enter_confirms) {
-    static const char input[] = "\x1b[B\x1b[B\r"; /* Down, Down, Enter */
+    static const char input[] = "\x1b[B\x1b[B\r";
     struct select_result result;
     int result_pipe[2] = {-1, -1};
     int master_fd = -1;
@@ -958,8 +932,7 @@ TEST(select_ctrl_c_cancels) {
 }
 
 TEST(select_typing_plain_text_does_not_leak_into_the_draft) {
-    static const char input[] = "xz\r"; /* not digit shortcuts; confirms
-                                          * at the default selection */
+    static const char input[] = "xz\r";
     struct select_result result;
     int result_pipe[2] = {-1, -1};
     int master_fd = -1;
@@ -1028,9 +1001,6 @@ TEST(select_typing_plain_text_does_not_leak_into_the_draft) {
     CHECK_EQ(result.status, OI_OK);
     CHECK(!result.cancelled);
     CHECK_EQ(result.selected, 0);
-    /* "x"/"z" are not digit shortcuts (no visible effect) and the editor
-     * is never touched by the selector at all -- the pre-seeded draft
-     * must still be there, untouched, after the modal resolves. */
     CHECK_EQ(result.editor_len, 6);
     CHECK(memcmp(result.editor_data, "keepme", 6) == 0);
 
@@ -1122,8 +1092,6 @@ TEST(select_resize_redraws_the_selector) {
     resized.ws_row = 24;
     resized.ws_col = 10;
     CHECK_EQ(ioctl(master_fd, TIOCSWINSZ, &resized), 0);
-    /* A fresh "\x1b[J" appearing with no further keystroke proves the
-     * redraw was driven by the resize signal, not by typing. */
     CHECK(wait_for_text(master_fd, &output, "\x1b[J", 2000));
 
     CHECK(write_all(master_fd, "\r", 1));
@@ -1279,7 +1247,6 @@ static void run_read_line(const char *input, size_t input_len, int masked,
 
     close(result_pipe[1]);
 
-    /* Keeps the first frame too: the checks below read the whole screen. */
     size_t used = 0;
     struct pollfd descriptor = {.fd = master_fd, .events = POLLIN};
     CHECK(poll(&descriptor, 1, 2000) > 0);
@@ -1345,7 +1312,6 @@ TEST(read_line_ctrl_c_cancels_without_text) {
 }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     RUN(read_line_masks_a_paste_and_drops_its_trailing_newline);
     RUN(read_line_backspace_removes_a_whole_utf8_character);

@@ -1,17 +1,3 @@
-/*
- * Documentation drift guard.
- *
- * The user-facing docs restate two things the code owns: the slash-command
- * registry and the key bindings /help prints. Neither restatement can be
- * generated (they are prose with examples around them), so they are checked
- * instead: every command name, usage string, and description in
- * cli_commands.c must appear in docs/CLI.md, and so must every Ctrl+key
- * binding /help mentions. Adding or renaming a command therefore fails the
- * suite until the guide is updated.
- *
- * Doc paths are repository-relative, like OI_CLI_BIN in the Makefile: the
- * test binaries are run from the repository root.
- */
 
 #include "cli_command_dispatch.h"
 #include "cli_commands.h"
@@ -24,11 +10,6 @@
 static const char cli_guide_path[] = "docs/CLI.md";
 static const char readme_path[] = "README.md";
 
-/*
- * Reads a text file with every run of whitespace collapsed to one space, so
- * a phrase the guide wrapped across two lines still matches the single-line
- * string the registry holds.
- */
 static char *read_flattened(const char *path) {
     FILE *file = fopen(path, "r");
     char *text;
@@ -74,7 +55,6 @@ static char *read_flattened(const char *path) {
     return text;
 }
 
-/* Runs /help through the real dispatcher and returns what it printed. */
 static char *capture_help(void) {
     struct oi_cli_command_parse parse;
     struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
@@ -113,7 +93,6 @@ static char *capture_help(void) {
     return text;
 }
 
-/* Reports which string was missing, not just that something was. */
 static void check_contains(const char *haystack, const char *needle,
                            const char *where) {
     if (haystack == NULL || strstr(haystack, needle) == NULL) {
@@ -156,7 +135,6 @@ TEST(guide_documents_every_key_binding_help_mentions) {
         free(help);
         return;
     }
-    /* Every "Ctrl+X" /help prints, whatever the set currently is. */
     for (cursor = strstr(help, "Ctrl+"); cursor != NULL;
          cursor = strstr(cursor + 5, "Ctrl+")) {
         char binding[7];
@@ -164,12 +142,11 @@ TEST(guide_documents_every_key_binding_help_mentions) {
         if (cursor[5] == '\0') {
             break;
         }
-        memcpy(binding, cursor, 5); /* "Ctrl+" */
-        binding[5] = cursor[5];     /* the key it names */
+        memcpy(binding, cursor, 5);
+        binding[5] = cursor[5];
         binding[6] = '\0';
         check_contains(guide, binding, cli_guide_path);
     }
-    /* The two non-key affordances the same summary advertises. */
     check_contains(guide, "//text", cli_guide_path);
     check_contains(guide, "command menu", cli_guide_path);
     free(guide);

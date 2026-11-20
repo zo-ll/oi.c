@@ -61,8 +61,6 @@ static oi_status write_tool_start(FILE *stream,
     return OI_OK;
 }
 
-/* The byte length of the bidirectional control character at `text`
- * (U+061C, U+200E-U+200F, U+202A-U+202E, U+2066-U+2069), else 0. */
 static size_t bidi_control_at(const char *text, size_t len,
                               unsigned *out_codepoint) {
     const unsigned char *b = (const unsigned char *)text;
@@ -82,9 +80,6 @@ static size_t bidi_control_at(const char *text, size_t len,
     return 0;
 }
 
-/* Sanitized like other untrusted text, and with each bidirectional control
- * as a visible <U+XXXX>: such a character can make the terminal show a
- * command in a different order than the shell runs it. */
 static oi_status write_request_text(FILE *stream, const char *text,
                                     size_t len) {
     size_t start = 0;
@@ -116,12 +111,6 @@ static oi_status write_request_text(FILE *stream, const char *text,
     return OI_OK;
 }
 
-/*
- * Writes what the user approves, in full and before the selector: the
- * decoded `command` string when there is one, else the raw arguments. The
- * terminal wraps it and keeps it in scrollback, so no length or JSON
- * escape can hide a part of it.
- */
 static oi_status write_permission_request(
     FILE *stream, const struct oi_cli_conversation_event *event) {
     static const char prefix[] = "oi: approve tool ";
@@ -165,8 +154,6 @@ static oi_status write_permission_request(
 static oi_status write_model_error(
     FILE *stream, const struct oi_cli_conversation_event *event) {
     char header[96];
-    /* http_status 0: no response arrived, and the body names the
-     * connection failure. */
     int header_len =
         event->as.model_error.http_status == 0
             ? snprintf(header, sizeof header, "oi: connection failed: ")
@@ -274,12 +261,6 @@ oi_status oi_cli_present_event(
         if (status != OI_OK) {
             return status;
         }
-        /* Styled (REPL) output already ends with exactly one newline per
-         * line via cli_markdown_block, including a synthesized one for a
-         * final line the model didn't itself terminate -- an unconditional
-         * newline here would add a spurious blank line. One-shot's plain
-         * passthrough has no such per-line bookkeeping, so it still needs
-         * this to guarantee the response ends on its own line. */
         if (present->styling_enabled) {
             return OI_OK;
         }

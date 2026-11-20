@@ -121,7 +121,6 @@ TEST(display_names_are_optional_bounded_and_control_free) {
     memset(oversized_name, 'a', sizeof oversized_name);
     memset(at_limit, 'a', sizeof at_limit);
 
-    /* Unset is the normal state, expressed either way. */
     CHECK_EQ(oi_cli_session_metadata_set(&metadata, "sess-1", 6, "gpt-test",
                                          8, "/tmp", 4, NULL, 0, 1, 1),
              OI_OK);
@@ -131,13 +130,11 @@ TEST(display_names_are_optional_bounded_and_control_free) {
              OI_OK);
     CHECK_EQ(metadata.display_name.len, (size_t)0);
 
-    /* A set name round-trips, spaces and punctuation included. */
     CHECK_EQ(oi_cli_session_metadata_set(&metadata, "sess-1", 6, "gpt-test",
                                          8, "/tmp", 4, "my refactor #2", 14,
                                          1, 1),
              OI_OK);
     CHECK_STREQ(metadata.display_name.data, "my refactor #2");
-    /* Multi-byte UTF-8 is fine: only C0 controls and DEL are refused. */
     CHECK_EQ(oi_cli_session_metadata_set(&metadata, "sess-1", 6, "gpt-test",
                                          8, "/tmp", 4, "caf\xc3\xa9", 5, 1,
                                          1),
@@ -153,8 +150,6 @@ TEST(display_names_are_optional_bounded_and_control_free) {
                                          sizeof oversized_name, 1, 1),
              OI_ERR_INVAL);
 
-    /* A name reaches the terminal unescaped, so control bytes are refused
-     * here rather than left for every consumer to sanitize. */
     CHECK_EQ(oi_cli_session_metadata_set(&metadata, "sess-1", 6, "gpt-test",
                                          8, "/tmp", 4, "two\nlines", 9, 1, 1),
              OI_ERR_INVAL);

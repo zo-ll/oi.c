@@ -20,7 +20,6 @@ static void wipe(char *secret) {
     if (secret == NULL) {
         return;
     }
-    /* Volatile so the compiler cannot drop a store to soon-freed memory. */
     for (volatile char *p = secret; *p != '\0'; p++) {
         *p = '\0';
     }
@@ -88,8 +87,6 @@ oi_status oi_cli_credentials_default_path(char **out_path) {
     }
     return join(home, "/.config/oi/credentials.json", out_path);
 }
-
-/* --- reading --- */
 
 static oi_status read_private_file(const char *path, char **out_data,
                                    size_t *out_len) {
@@ -286,8 +283,6 @@ oi_status oi_cli_credentials_read(const char *path,
     return st;
 }
 
-/* --- writing --- */
-
 #define WRITE(expr)                                                           \
     do {                                                                      \
         oi_status write_status = (expr);                                      \
@@ -424,8 +419,6 @@ oi_status oi_cli_credentials_write(
     oi_json_writer_destroy(writer);
     return st;
 }
-
-/* --- URL parsing --- */
 
 static int url_text_is_safe(const char *text, size_t len) {
     for (size_t i = 0; i < len; i++) {

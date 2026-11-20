@@ -7,15 +7,10 @@
 #include "cli_render_sanitize.h"
 #include "cli_utf8_stream.h"
 
-/*
- * The report under assembly, plus the scratch every sanitized field reuses.
- * One buffer pair for the whole report rather than one per field: fewer
- * allocations, and exactly one place that frees them.
- */
 struct status_writer {
-    struct oi_cli_bytebuf out;   /* the report being assembled */
-    struct oi_cli_bytebuf fixed; /* UTF-8-repaired bytes of one field */
-    struct oi_cli_bytebuf clean; /* the same field, escape-stripped */
+    struct oi_cli_bytebuf out;
+    struct oi_cli_bytebuf fixed;
+    struct oi_cli_bytebuf clean;
 };
 
 static void status_writer_init(struct status_writer *writer) {
@@ -36,7 +31,6 @@ static oi_status append_text(struct status_writer *writer, const char *text) {
 
 static oi_status append_number(struct status_writer *writer,
                                unsigned long long value) {
-    /* Widest unsigned long long is 20 digits; 32 leaves room to spare. */
     char digits[32];
     int written = snprintf(digits, sizeof digits, "%llu", value);
 
@@ -46,20 +40,8 @@ static oi_status append_number(struct status_writer *writer,
     return oi_cli_bytebuf_append(&writer->out, digits, (size_t)written);
 }
 
-/* U+FFFD, the same replacement the UTF-8 repair pass emits for a byte it
- * cannot show -- reused here rather than inventing a second marker. */
 static const char replacement_char[] = "\xEF\xBF\xBD";
 
-/*
- * Appends already-sanitized bytes, replacing the only control bytes the
- * sanitize pass deliberately lets through. It preserves '\n' and '\t'
- * because its usual callers render multi-line streamed output; a `Key:
- * value` line must not inherit that, or an attacker-supplied value could
- * forge a whole extra status line (or shift one into another column).
- *
- * Written against the full C0 range plus DEL rather than just those two, so
- * it stays correct if the sanitize pass' own passthrough set ever widens.
- */
 static oi_status append_flattened(struct status_writer *writer,
                                   const char *data, size_t len) {
     size_t offset = 0;
@@ -91,18 +73,6 @@ static oi_status append_flattened(struct status_writer *writer,
     return OI_OK;
 }
 
-/*
- * Appends one untrusted borrowed string: UTF-8 repair, then the shared
- * escape/control stripper, then line flattening. Bounded first, so a
- * pathological value (a forged model name in a tampered log) cannot produce
- * an unbounded line; the bound is on input bytes and the marker is added
- * only when something was actually dropped.
- *
- * Truncation cuts raw bytes, which can split a multi-byte sequence -- the
- * UTF-8 repair pass then turns that tail into a single U+FFFD, which is
- * exactly what it is for. There is deliberately no attempt to find a
- * character boundary here.
- */
 static oi_status append_untrusted(struct status_writer *writer,
                                   const char *value) {
     struct oi_cli_utf8_stream utf8;
@@ -155,11 +125,9 @@ static const char *session_state_text(
     case OI_CLI_STATUS_SESSION_FAILED:
         break;
     }
-    return NULL; /* the id itself is printed instead */
+    return NULL;
 }
 
-/* NULL means "say nothing about provenance", which is the only honest
- * rendering of an origin nobody tracked. */
 static const char *model_origin_text(
     enum oi_cli_session_model_origin origin) {
     switch (origin) {
@@ -233,17 +201,10 @@ void oi_cli_status_snapshot_init(struct oi_cli_status_snapshot *snapshot) {
         return;
     }
     memset(snapshot, 0, sizeof *snapshot);
-    /* The zero value is already "unknown" for every enum and every borrowed
-     * pointer here; only the deadlines need saying, since 0 is a real state
-     * for them (disabled). Still routed through this function rather than
-     * left to the caller's memset, so there is one place to update when a
-     * field with a meaningful zero is added. */
     snapshot->request_timeout_ms = -1;
     snapshot->tool_timeout_ms = -1;
 }
 
-/* Every line goes through this pair, so no field can silently skip its own
- * failure check and every key is spelled once. */
 static oi_status begin_line(struct status_writer *writer, const char *key) {
     oi_status status = append_text(writer, key);
 
@@ -269,8 +230,6 @@ static oi_status append_session(struct status_writer *writer,
     const char *fixed = session_state_text(snapshot->session_state);
     oi_status status;
 
-    /* An ACTIVE/FAILED state without an id would be a bug in the assembler,
-     * but reporting it plainly beats printing an invalid pointer. */
     if (fixed == NULL && snapshot->session_id == NULL) {
         fixed = "(unknown)";
     }
@@ -312,11 +271,6 @@ static oi_status append_model(struct status_writer *writer,
     return status == OI_OK ? end_line(writer) : status;
 }
 
-/*
- * host/port/path plus TLS on/off, assembled here rather than as a URL: a
- * URL invites a userinfo component, and this line must never be able to
- * carry a credential.
- */
 static oi_status append_endpoint(
     struct status_writer *writer,
     const struct oi_cli_status_snapshot *snapshot) {
@@ -384,7 +338,6 @@ static oi_status append_conversation(
         status = append_text(writer, " (");
     }
     if (status == OI_OK) {
-        /* A fixed vocabulary from oi/status.h, not borrowed text. */
         status = append_text(writer,
                              oi_status_str(snapshot->conversation_status));
     }
@@ -407,12 +360,6 @@ static const char *queue_kind_text(enum oi_cli_status_queue_state queue) {
     return "item";
 }
 
-/*
- * Reports the kind and size of what is queued, never its text. A message
- * queued mid-turn is ordinary user input, and /status is exactly the sort of
- * thing someone runs with a shoulder-surfer or a shared screen recording
- * present.
- */
 static oi_status append_queue(struct status_writer *writer,
                               const struct oi_cli_status_snapshot *snapshot) {
     const char *kind = queue_kind_text(snapshot->queue);
@@ -494,8 +441,6 @@ static oi_status append_checkpoint(
             status = end_line(writer);
         }
     } else if (checkpoint->applied_this_run) {
-        /* Live-only: a session with no durable storage still has its active
-         * context spliced by /compact, and saying "none" would be wrong. */
         status = append_line(writer, "Checkpoint",
                              "applied this run (not persisted)");
     } else {
@@ -504,9 +449,6 @@ static oi_status append_checkpoint(
     if (status != OI_OK) {
         return status;
     }
-    /* Its own line rather than a qualifier on the one above: "is my context
-     * compacted" is the question a user actually has, and it must be
-     * answerable without knowing whether a checkpoint got persisted. */
     return append_line(writer, "Context", checkpoint->context_compacted
                                               ? "compacted"
                                               : "not compacted");

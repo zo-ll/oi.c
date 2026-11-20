@@ -25,8 +25,6 @@ static const char scopes[] =
     "chatgpt.tokens.use.direct";
 static const char token_path[] = "/api/accounts/oauth/token";
 
-/* --- text building --- */
-
 struct text {
     char *data;
     size_t len;
@@ -84,8 +82,6 @@ static oi_status text_finish(struct text *text, char **out) {
     return OI_OK;
 }
 
-/* --- servers --- */
-
 void oi_cli_oauth_server_free(struct oi_cli_oauth_server *server) {
     free(server->host);
     server->host = NULL;
@@ -122,9 +118,6 @@ oi_status oi_cli_oauth_servers(struct oi_cli_oauth_server *out_auth,
     out_api->host = NULL;
     *out_is_test = 0;
     if (test_base != NULL && test_base[0] != '\0') {
-        /* The refresh token goes to this origin, and any environment
-         * (an .envrc in a cloned repository) can set the variable: only a
-         * loopback origin replaces the production servers. */
         st = server_from_url(test_base, out_auth);
         if (st == OI_OK && is_loopback_host(out_auth->host)) {
             st = server_from_url(test_base, out_api);
@@ -146,8 +139,6 @@ oi_status oi_cli_oauth_servers(struct oi_cli_oauth_server *out_auth,
     }
     return st;
 }
-
-/* --- PKCE and identifiers --- */
 
 static oi_status base64url(const unsigned char *bytes, size_t len, char **out) {
     static const char alphabet[] =
@@ -258,8 +249,6 @@ oi_status oi_cli_oauth_host_id(char **out_host_id) {
     return OI_OK;
 }
 
-/* --- authorize URL --- */
-
 static void text_origin(struct text *text,
                         const struct oi_cli_oauth_server *server) {
     char port[16] = "";
@@ -297,8 +286,6 @@ oi_status oi_cli_oauth_authorize_url(const struct oi_cli_oauth_server *auth,
     }
     return text_finish(&url, out_url);
 }
-
-/* --- loopback callback --- */
 
 static int hex_value(char c) {
     if (c >= '0' && c <= '9') {
@@ -402,8 +389,6 @@ oi_status oi_cli_oauth_parse_callback(const char *request,
     return OI_OK;
 }
 
-/* --- JSON documents --- */
-
 static oi_status parse_json(oi_arena *arena, const char *body, size_t len,
                             oi_json_value **out_root) {
     oi_json_parser *parser = oi_json_parser_create(arena);
@@ -457,8 +442,6 @@ static oi_status decode_tokens(const oi_json_value *root,
     if (st == OI_OK) {
         st = dup_member(root, "scope", &out->scope);
     }
-    /* The token endpoint's refusal shape is undocumented: accept a string
-     * "error", a nested "error.code", and a top-level "code". */
     if (st == OI_OK) {
         st = dup_member(root, "error", &out->error);
     }
@@ -642,8 +625,6 @@ oi_status oi_cli_oauth_parse_models(const char *body, size_t body_len,
     return st;
 }
 
-/* --- HTTP --- */
-
 struct http_call {
     oi_llm_http_parser *parser;
     oi_llm_conn *conn;
@@ -651,17 +632,13 @@ struct http_call {
     size_t request_len;
     int http_status;
     int done;
-    int oversize; /* the body went past OI_CLI_OAUTH_MAX_RESPONSE */
-    int request_queued; /* the server can have the request from here on */
+    int oversize;
+    int request_queued;
     oi_status status;
     struct text body;
-    /* Runs once, when the call ends. NULL for the blocking call, which
-     * reads `done` from its own loop. */
     void (*finished)(struct http_call *call);
 };
 
-/* The connection callbacks never touch `call` after this, so `finished`
- * may free it. */
 static void http_finish(struct http_call *call, oi_status status) {
     if (!call->done) {
         call->done = 1;
@@ -679,8 +656,6 @@ static void http_on_headers(int status_code, void *user_data) {
 
 static void http_on_body(const void *data, size_t len, void *user_data) {
     struct http_call *call = user_data;
-    /* Runs inside the parser, which must outlive this call: http_on_data
-     * ends the call after the feed returns. */
     if (call->oversize || call->body.len + len > OI_CLI_OAUTH_MAX_RESPONSE) {
         call->oversize = 1;
         return;
@@ -717,10 +692,10 @@ static void http_on_error(oi_llm_conn *conn, oi_status reason,
                           void *user_data) {
     (void)conn;
     struct http_call *call = user_data;
-    call->conn = NULL; /* closes itself once this callback returns */
+    call->conn = NULL;
     if (reason == OI_ERR_CLOSED &&
         oi_llm_http_parser_close(call->parser) == OI_OK) {
-        reason = OI_OK; /* a body with no length ends at the close */
+        reason = OI_OK;
     }
     http_finish(call, reason);
 }
@@ -829,7 +804,6 @@ oi_status oi_cli_oauth_http(const struct oi_cli_oauth_server *server,
     return *out_body != NULL ? OI_OK : OI_ERR_NOMEM;
 }
 
-/* Turns a token endpoint response into `out`. */
 static oi_status tokens_from_response(int http_status, const char *body,
                                       size_t body_len,
                                       struct oi_cli_oauth_tokens *out) {
@@ -899,12 +873,10 @@ oi_status oi_cli_oauth_refresh(const struct oi_cli_oauth_server *auth,
     return post_token_form(auth, ca_file, &form, out);
 }
 
-/* --- token renewal on the caller's reactor --- */
-
 struct oi_cli_oauth_refresh_call {
-    struct http_call http; /* first: http_finish receives its address */
+    struct http_call http;
     oi_llm_tls *tls;
-    char *request; /* holds the refresh token; wiped before free */
+    char *request;
     oi_reactor_timer *timer;
     oi_cli_oauth_tokens_cb done;
     void *user_data;
@@ -912,7 +884,7 @@ struct oi_cli_oauth_refresh_call {
 
 static void refresh_call_free(struct oi_cli_oauth_refresh_call *call) {
     oi_reactor_timer_cancel(call->timer);
-    oi_llm_conn_close(call->http.conn); /* reentrant-safe; NULL-safe */
+    oi_llm_conn_close(call->http.conn);
     oi_llm_tls_destroy(call->tls);
     oi_llm_http_parser_destroy(call->http.parser);
     if (call->request != NULL) {

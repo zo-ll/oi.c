@@ -34,10 +34,7 @@ static const char responses_path[] = "/v1/responses";
 static const char default_model[] = "gpt-4o-mini";
 static const char usage_url[] = "https://chatgpt.com/settings/usage";
 
-/* Renew this long before expiry, so that a long turn keeps a valid token. */
 #define REFRESH_MARGIN_SECONDS 300.0
-/* A request does not start with a token that has less time than this left;
- * it waits for the renewal instead. */
 #define USABLE_SECONDS 30.0
 #define CALLBACK_TIMEOUT_MS (5 * 60 * 1000)
 #define HEAD_TIMEOUT_MS 3000
@@ -232,7 +229,6 @@ static oi_status adopt_target(struct oi_cli_login *login,
     return OI_OK;
 }
 
-/* Reports through `message`; a non-OK return is a structural failure. */
 static oi_status log_in_with_key(struct oi_cli_login *login,
                                  const struct login_target *target,
                                  const char *key, char *message,
@@ -286,8 +282,6 @@ static oi_status log_in_with_key(struct oi_cli_login *login,
     return OI_OK;
 }
 
-/* --- token renewal --- */
-
 static oi_status adopt_access_token(struct oi_cli_login *login,
                                     const char *access_token,
                                     double expires_at) {
@@ -302,8 +296,6 @@ static oi_status adopt_access_token(struct oi_cli_login *login,
     return st;
 }
 
-/* Takes the credentials lock without waiting: -1 with EAGAIN or EACCES
- * when another process holds it, which means that process is renewing. */
 static int lock_credentials(const char *path) {
     char lock_path[4096];
     if (snprintf(lock_path, sizeof lock_path, "%s.lock", path) >=
@@ -332,7 +324,6 @@ static int lock_credentials(const char *path) {
     return fd;
 }
 
-/* A transient failure is harmless while the current token still works. */
 static oi_status refresh_unavailable(const struct oi_cli_login *login,
                                      double now, const char *reason) {
     if (login->expires_at > now) {
@@ -347,25 +338,17 @@ static oi_status session_ended(const struct oi_cli_login *login) {
     return OI_ERR_DENIED;
 }
 
-/*
- * One renewal on the main reactor. It holds the credentials lock from
- * start to finish, because the server rotates the refresh token and a
- * second process must not reuse the old one. Its result waits here until
- * the next request start adopts it: oi_llm_client_reconfigure is not
- * allowed while a request is in flight, and the before_request hook is
- * the point where none is.
- */
 struct login_renewal {
     struct oi_cli_login *login;
-    struct oi_cli_oauth_refresh_call *call; /* NULL once finished */
+    struct oi_cli_oauth_refresh_call *call;
     int lock_fd;
     struct oi_cli_credentials saved;
     int finished;
-    oi_status status;   /* OI_ERR_NOMEM, or OI_OK */
-    int ended;          /* the server refused the refresh token for good */
-    char *access_token; /* the new token; NULL when the renewal failed */
+    oi_status status;
+    int ended;
+    char *access_token;
     double expires_at;
-    char reason[128];   /* why a renewal failed */
+    char reason[128];
 };
 
 static void renewal_free(struct login_renewal *renewal) {
@@ -385,8 +368,6 @@ static int token_usable(const struct oi_cli_login *login, double now) {
     return login->expires_at - now > USABLE_SECONDS;
 }
 
-/* Runs on the reactor, possibly while a request is in flight: it saves the
- * outcome and leaves the client alone. */
 static void renewal_done(oi_status st, struct oi_cli_oauth_tokens *tokens,
                          void *user_data) {
     struct login_renewal *renewal = user_data;
@@ -440,7 +421,6 @@ static void renewal_done(oi_status st, struct oi_cli_oauth_tokens *tokens,
     renewal->lock_fd = -1;
 }
 
-/* Applies a finished renewal: adopts its token, or reports why not. */
 static oi_status settle_renewal(struct oi_cli_login *login, double now) {
     struct login_renewal *renewal = login->renewal;
     login->renewal = NULL;
@@ -459,7 +439,6 @@ static oi_status settle_renewal(struct oi_cli_login *login, double now) {
     return st;
 }
 
-/* Starts a renewal, or settles at once when it cannot or need not run. */
 static oi_status start_renewal(struct oi_cli_login *login, double now) {
     if (login->credentials_path == NULL) {
         return refresh_unavailable(login, now, "no credentials file");
@@ -473,7 +452,6 @@ static oi_status start_renewal(struct oi_cli_login *login, double now) {
     if (renewal->lock_fd < 0) {
         int busy = errno == EAGAIN || errno == EACCES;
         free(renewal);
-        /* Another process is renewing: read its result at a later start. */
         return busy ? OI_OK
                     : refresh_unavailable(login, now,
                                           "could not lock credentials");
@@ -493,7 +471,6 @@ static oi_status start_renewal(struct oi_cli_login *login, double now) {
         saved->openai_access_token == NULL) {
         st = session_ended(login);
     } else if (saved->openai_expires_at - now > REFRESH_MARGIN_SECONDS) {
-        /* Another process renewed the token before this one took the lock. */
         st = adopt_access_token(login, saved->openai_access_token,
                                 saved->openai_expires_at);
     } else {
@@ -536,13 +513,6 @@ static void interrupt_wait(oi_reactor *reactor, int fd, int revents,
     *(int *)user_data = 1;
 }
 
-/* Steps the reactor until a sent renewal ends, so that its rotated tokens
- * reach the credentials file. The exchange's own 20 s timeout bounds the
- * wait. Ctrl+C ends the wait early and leaves the renewal for the caller
- * to drop, so the file keeps the tokens it had: the REPL keeps SIGINT
- * blocked for the life of the process, so the wait reads it from its own
- * signalfd; where SIGINT is not blocked, it ends the process, and the
- * file is replaced only by rename, so it stays whole. */
 static void finish_sent_renewal(struct oi_cli_login *login) {
     if (!renewal_running_and_sent(login)) {
         return;
@@ -599,12 +569,8 @@ oi_status oi_cli_login_before_request(void *user_data) {
             return st;
         }
     }
-    /* A renewal runs, here or in another process: use the current token
-     * while it still has time left, else make the request wait. */
     return token_usable(login, now) ? OI_OK : OI_ERR_AGAIN;
 }
-
-/* --- ChatGPT sign-in --- */
 
 static int open_callback_listener(void) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -626,7 +592,6 @@ static int open_callback_listener(void) {
     return fd;
 }
 
-/* Tries the usual openers; the URL is on screen if none of them works. */
 static void open_browser(const char *url) {
     static const char script[] =
         "wslview \"$1\" || xdg-open \"$1\" || open \"$1\" || "
@@ -664,10 +629,6 @@ static int64_t monotonic_ms(void) {
 static const struct oi_cli_render_line callback_status_line =
     LINE("Waiting for the browser sign-in (Esc cancels)");
 
-/* Reads through the composer wait, so Esc and signals work while a client
- * is slow. One deadline covers the whole head: a client that sends one
- * byte at a time cannot hold the listener for longer than
- * HEAD_TIMEOUT_MS. */
 static oi_status read_request_head(struct oi_cli_composer *composer,
                                    int signal_fd, int fd, char *head,
                                    size_t size, int *out_cancelled,
@@ -718,8 +679,6 @@ struct chatgpt_wait {
     struct oi_cli_oauth_callback callback;
 };
 
-/* Any local process or web page can reach the listener, so only a
- * callback that carries this attempt's `state` ends the wait. */
 static oi_status wait_for_callback(struct oi_cli_composer *composer,
                                    int signal_fd, int listen_fd,
                                    const char *state,
@@ -897,7 +856,6 @@ static oi_status prepare_chatgpt_flow(const struct oi_cli_login *login,
     if (st == OI_OK && flow->saved.openai_host_id == NULL) {
         st = oi_cli_oauth_host_id(&flow->saved.openai_host_id);
         if (st == OI_OK) {
-            /* The host identity must exist before the first registration. */
             st = oi_cli_credentials_write(login->credentials_path,
                                           &flow->saved);
         }
@@ -926,7 +884,6 @@ static oi_status prepare_chatgpt_flow(const struct oi_cli_login *login,
     return st;
 }
 
-/* Validates the callback; on a refusal, writes `message` and returns 0. */
 static int callback_is_acceptable(const struct chatgpt_flow *flow,
                                   char *message, size_t message_size) {
     const struct oi_cli_oauth_callback *callback = &flow->wait.callback;
@@ -976,7 +933,6 @@ static oi_status store_chatgpt_tokens(struct chatgpt_flow *flow,
     return st;
 }
 
-/* Exchanges the code and installs the login; refusals go to `message`. */
 static oi_status finish_chatgpt_login(struct oi_cli_login *login,
                                       struct oi_cli_composer *composer,
                                       int signal_fd, struct chatgpt_flow *flow,
@@ -1248,13 +1204,6 @@ oi_status oi_cli_login_run(struct oi_cli_login *login,
                            int *out_terminate_signal) {
     char message[768];
     *out_terminate_signal = 0;
-    /* A renewal belongs to the login it started under. A sent one finishes
-     * first, so that its rotated tokens are saved; then it is dropped, so it
-     * cannot write that login's credentials over the new ones, nor adopt
-     * its token after them, and it releases the credentials lock. The raw
-     * prompt turns Ctrl+C into a byte; ISIG makes it the SIGINT that ends
-     * the wait. The wait runs without ISIG too: the save must not depend
-     * on the terminal. */
     int isig = oi_cli_terminal_set_isig(&composer->terminal, 1) == OI_OK;
     finish_sent_renewal(login);
     oi_status st =

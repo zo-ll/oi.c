@@ -19,8 +19,6 @@ void oi_cli_session_metadata_free(struct oi_cli_session_metadata *metadata) {
     memset(metadata, 0, sizeof *metadata);
 }
 
-/* An unset display name is valid; a set one must be bounded and free of
- * control bytes, since /session list echoes it to the terminal as-is. */
 static int display_name_is_valid(const struct oi_cli_string *name) {
     size_t index;
 

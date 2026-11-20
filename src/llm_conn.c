@@ -21,10 +21,6 @@
 
 #include "compat.h"
 
-/* A connect() that has no answer after this time moves to the next
- * address, so a dead route (often IPv6) does not use the full request
- * deadline. The last address has no such timer: it gets the remainder
- * of the request deadline. */
 #define OI_LLM_CONN_ADDRESS_TIMEOUT_MS 3000
 
 enum conn_state {
@@ -37,7 +33,7 @@ enum conn_state {
 struct resolver_job {
     pthread_mutex_t mutex;
     pthread_t thread;
-    struct oi_llm_conn *conn; /* protected by mutex; NULL once abandoned */
+    struct oi_llm_conn *conn;
     char *host;
     char port[6];
     int notify_write;
@@ -52,16 +48,16 @@ struct oi_llm_conn {
     enum conn_state state;
     struct resolver_job *resolver;
     struct addrinfo *addresses;
-    int addresses_copied; /* from copy_addresses, not from getaddrinfo */
+    int addresses_copied;
     struct addrinfo *next_address;
-    oi_llm_addr_cache *cache; /* borrowed; NULL = resolve every time */
+    oi_llm_addr_cache *cache;
     oi_reactor_timer *address_timer;
 
-    oi_llm_tls *tls; /* borrowed; NULL = plain TCP */
+    oi_llm_tls *tls;
     char *host;
     unsigned short port;
-    int connect_errno; /* why the last address failed; 0 = none tried */
-    char cause[256];   /* see oi_llm_conn_error_cause */
+    int connect_errno;
+    char cause[256];
     SSL *ssl;
 
     struct oi_llm_conn_callbacks cbs;
@@ -74,10 +70,6 @@ struct oi_llm_conn {
     int read_needs_write;
     int write_needs_read;
 
-    /* Set by the top-level reactor callback before invoking any of
-     * *cbs, so a reentrant oi_llm_conn_close() from within a callback
-     * can signal back to still-executing internal code that `c` is
-     * gone. See the call-site pattern in fail_conn/read_available. */
     int *destroyed_flag;
 };
 
@@ -121,16 +113,13 @@ static void update_interest(oi_llm_conn *c) {
     oi_reactor_modify(c->reactor, c->fd, interest);
 }
 
-/* --- address cache --- */
-
-/* How long a resolved address list serves later connections. */
 #define OI_LLM_ADDR_CACHE_MS 60000
 
 struct oi_llm_addr_cache {
     char *host;
     unsigned short port;
-    struct addrinfo *addresses; /* from copy_addresses */
-    int64_t expires_ms;         /* CLOCK_MONOTONIC */
+    struct addrinfo *addresses;
+    int64_t expires_ms;
 };
 
 static int64_t monotonic_ms(void) {
@@ -142,13 +131,11 @@ static int64_t monotonic_ms(void) {
 static void free_addresses(struct addrinfo *list) {
     while (list != NULL) {
         struct addrinfo *next = list->ai_next;
-        free(list); /* the sockaddr lives in the same block */
+        free(list);
         list = next;
     }
 }
 
-/* A deep copy that this module frees with free_addresses: getaddrinfo's
- * own lists may only go to freeaddrinfo. ai_canonname is not kept. */
 static struct addrinfo *copy_addresses(const struct addrinfo *list) {
     struct addrinfo *head = NULL;
     struct addrinfo **tail = &head;
@@ -192,7 +179,6 @@ void oi_llm_addr_cache_destroy(oi_llm_addr_cache *cache) {
     }
 }
 
-/* A fresh copy of the cached list for `host` and `port`, or NULL. */
 static struct addrinfo *cache_lookup(oi_llm_addr_cache *cache,
                                      const char *host, unsigned short port) {
     if (cache == NULL || cache->addresses == NULL || cache->port != port ||
@@ -213,7 +199,7 @@ static void cache_store(oi_llm_addr_cache *cache, const char *host,
     if (copy_host == NULL || copy == NULL) {
         free(copy_host);
         free_addresses(copy);
-        return; /* the cache is an optimization; this lookup still works */
+        return;
     }
     cache_clear(cache);
     cache->host = copy_host;
@@ -238,8 +224,6 @@ void oi_llm_conn_close(oi_llm_conn *c) {
         return;
     }
     oi_reactor_timer_cancel(c->address_timer);
-    /* One nonblocking close_notify. Without it, SSL_free marks the session
-     * as not resumable, and the next connection pays a full handshake. */
     if (c->ssl != NULL && c->state == CS_ESTABLISHED) {
         (void)SSL_shutdown(c->ssl);
         ERR_clear_error();
@@ -273,7 +257,6 @@ void oi_llm_conn_close(oi_llm_conn *c) {
     if (c->ssl) {
         SSL_free(c->ssl);
     }
-    /* The request head holds the Authorization header. */
     oi_wipe(c->out_buf, c->out_cap);
     free(c->out_buf);
     release_addresses(c);
@@ -291,8 +274,6 @@ static void set_cause(oi_llm_conn *c, const char *format, ...) {
     va_end(args);
 }
 
-/* Names the TLS failure: an untrusted certificate, an OpenSSL error, or
- * the socket errno under SSL_ERROR_SYSCALL. */
 static void set_tls_cause(oi_llm_conn *c, const char *what) {
     long verify = c->ssl != NULL ? SSL_get_verify_result(c->ssl) : X509_V_OK;
     unsigned long error = ERR_peek_last_error();
@@ -312,9 +293,6 @@ static void set_tls_cause(oi_llm_conn *c, const char *what) {
     ERR_clear_error();
 }
 
-/* Invokes on_error, then closes `c` unless the callback already did so
- * reentrantly. Callers must treat `c` as potentially freed once this
- * returns. */
 static void fail_conn(oi_llm_conn *c, oi_status reason) {
     int *destroyed = c->destroyed_flag;
     if (c->cbs.on_error) {
@@ -326,14 +304,6 @@ static void fail_conn(oi_llm_conn *c, oi_status reason) {
     oi_llm_conn_close(c);
 }
 
-/* --- socket BIO for TLS --- */
-
-/*
- * OpenSSL's socket BIO writes with write(), and a write to a closed peer
- * raises SIGPIPE in the whole process. This BIO sends with MSG_NOSIGNAL,
- * so SSL_write gets EPIPE and the caller's SIGPIPE disposition is never
- * touched. The BIO data is the socket fd; the connection owns the fd.
- */
 static BIO_METHOD *nosigpipe_method;
 static pthread_once_t nosigpipe_once = PTHREAD_ONCE_INIT;
 
@@ -390,7 +360,6 @@ static void make_nosigpipe_method(void) {
     nosigpipe_method = method;
 }
 
-/* Attaches `fd` to `ssl` through the MSG_NOSIGNAL BIO. */
 static oi_status set_nosigpipe_bio(SSL *ssl, int fd) {
     pthread_once(&nosigpipe_once, make_nosigpipe_method);
     if (nosigpipe_method == NULL) {
@@ -402,19 +371,15 @@ static oi_status set_nosigpipe_bio(SSL *ssl, int fd) {
     }
     BIO_set_data(bio, (void *)(intptr_t)fd);
     BIO_set_init(bio, 1);
-    SSL_set_bio(ssl, bio, bio); /* one reference, for both directions */
+    SSL_set_bio(ssl, bio, bio);
     return OI_OK;
 }
 
-/* --- shared TLS settings --- */
-
 struct oi_llm_tls {
-    char *ca_file; /* NULL = system default trust store */
-    SSL_CTX *ctx;  /* made at the first handshake, then shared */
+    char *ca_file;
+    SSL_CTX *ctx;
 };
 
-/* The last session that a server issued on a context, for resumption.
- * One slot: a client talks to one host. */
 struct tls_session_slot {
     char *host;
     unsigned short port;
@@ -446,8 +411,6 @@ static void make_tls_indexes(void) {
     tls_conn_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
 }
 
-/* OpenSSL calls this when a server issues a session (for TLS 1.3, after
- * the handshake). Returns 1 when the slot takes the reference. */
 static int remember_session(SSL *ssl, SSL_SESSION *session) {
     oi_llm_conn *c = SSL_get_ex_data(ssl, tls_conn_index);
     struct tls_session_slot *slot =
@@ -484,7 +447,6 @@ static oi_status make_tls_context(oi_llm_tls *tls) {
         free(slot);
         return OI_ERR_IO;
     }
-    /* From here, SSL_CTX_free frees the slot through tls_slot_free. */
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
     SSL_CTX_set_session_cache_mode(
         ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
@@ -523,15 +485,11 @@ void oi_llm_tls_destroy(oi_llm_tls *tls) {
     if (tls == NULL) {
         return;
     }
-    SSL_CTX_free(tls->ctx); /* an open SSL keeps its own reference */
+    SSL_CTX_free(tls->ctx);
     free(tls->ca_file);
     free(tls);
 }
 
-/* --- raw byte I/O, TLS-transparent --- */
-
-/* Returns >0 bytes transferred, 0 on clean EOF (read only), -1 if it
- * would block (*would_block=1), -2 on a hard error. */
 static long conn_raw_read(oi_llm_conn *c, void *buf, size_t len,
                            int *would_block) {
     *would_block = 0;
@@ -644,9 +602,6 @@ static void read_available(oi_llm_conn *c) {
     }
 }
 
-/* Returns OI_OK if `c` is still alive afterward (queue drained or still
- * pending), or an error status if `c` was closed (by fail_conn) due to a
- * write error. */
 static oi_status flush_write_queue(oi_llm_conn *c) {
     while (c->out_off < c->out_len) {
         int would_block;
@@ -668,8 +623,6 @@ static oi_status flush_write_queue(oi_llm_conn *c) {
     update_interest(c);
     return OI_OK;
 }
-
-/* --- TLS handshake --- */
 
 static oi_status start_tls_handshake(oi_llm_conn *c) {
     if (c->tls->ctx == NULL && make_tls_context(c->tls) != OI_OK) {
@@ -729,7 +682,7 @@ static void drive_tls_handshake(oi_llm_conn *c) {
         c->state = CS_ESTABLISHED;
         oi_reactor_modify(c->reactor, c->fd, OI_EV_READ);
         if (c->cbs.on_connected) {
-            c->cbs.on_connected(c, c->user_data); /* nothing touches c after this */
+            c->cbs.on_connected(c, c->user_data);
         }
         return;
     }
@@ -745,12 +698,8 @@ static void drive_tls_handshake(oi_llm_conn *c) {
     }
 }
 
-/* --- reactor dispatch --- */
-
 static void on_address_timeout(oi_reactor *r, void *user_data);
 
-/* Starts a non-blocking connect to the next address that accepts one and
- * registers it for OI_EV_WRITE. */
 static oi_status connect_next_address(oi_llm_conn *c) {
     int fd = -1;
     while (c->next_address != NULL) {
@@ -777,7 +726,6 @@ static oi_status connect_next_address(oi_llm_conn *c) {
         fd = -1;
     }
     if (fd < 0) {
-        /* Every cached address failed: resolve afresh next time. */
         if (c->cache != NULL && c->addresses_copied) {
             cache_clear(c->cache);
         }
@@ -948,8 +896,6 @@ static void handle_tcp_connecting(oi_llm_conn *c) {
 }
 
 static void handle_established(oi_llm_conn *c, int revents) {
-    /* An error or hangup with no other bit leaves the descriptor ready.
-     * A read reports the error or the EOF and stops the connection. */
     if (revents & (OI_EV_ERROR | OI_EV_HUP)) {
         revents |= OI_EV_READ;
     }
@@ -965,7 +911,7 @@ static void handle_established(oi_llm_conn *c, int revents) {
     }
     if (revents & OI_EV_WRITE) {
         if (flush_write_queue(c) != OI_OK) {
-            return; /* c was closed by flush_write_queue's fail_conn */
+            return;
         }
     }
     if (revents & OI_EV_READ) {
@@ -978,11 +924,6 @@ static void on_fd_event(oi_reactor *r, int fd, int revents, void *user_data) {
     (void)fd;
     oi_llm_conn *c = user_data;
     int destroyed = 0;
-    /* GCC's escape analysis for -Wdangling-pointer can't see that this
-     * is safe: c->destroyed_flag is always cleared before this frame
-     * returns (see below) unless `destroyed` was set, in which case `c`
-     * itself was freed and nothing ever dereferences the stale pointer
-     * again. */
 OI_DIAG_PUSH_IGNORE_DANGLING
     c->destroyed_flag = &destroyed;
 OI_DIAG_POP
@@ -1007,10 +948,6 @@ OI_DIAG_POP
     }
 }
 
-/* --- public API --- */
-
-/* A cache hit skips the resolver thread; the connect still starts from the
- * reactor, so that every callback stays asynchronous. */
 static void start_from_cache(oi_reactor *r, void *user_data) {
     (void)r;
     oi_llm_conn *c = user_data;
@@ -1166,8 +1103,6 @@ oi_status oi_llm_conn_write(oi_llm_conn *c, const void *data, size_t len) {
             }
             new_cap *= 2;
         }
-        /* Not realloc: a moved block would keep a copy of the
-         * Authorization header in freed memory. */
         char *nb = malloc(new_cap);
         if (nb == NULL) {
             return OI_ERR_NOMEM;

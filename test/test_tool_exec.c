@@ -14,7 +14,6 @@
 #include <time.h>
 #include <unistd.h>
 
-/* The Makefile links this binary with --wrap=kill. */
 int __real_kill(pid_t pid, int sig);
 int __wrap_kill(pid_t pid, int sig);
 
@@ -37,8 +36,6 @@ static oi_json_value *parse_json(oi_arena *a, const char *text) {
     oi_json_parser_destroy(p);
     return v;
 }
-
-/* --- test tool argv builders --- */
 
 static oi_status echo_build_argv(const oi_json_value *args, oi_arena *arena,
                                   void *ud, char ***out_argv) {
@@ -151,8 +148,6 @@ static oi_status tree_build_argv(const oi_json_value *args, oi_arena *arena,
     return OI_OK;
 }
 
-/* The shell exits at once; its background child moves to a new session,
- * so the call's process group is empty while stdout stays open. */
 static oi_status orphan_build_argv(const oi_json_value *args,
                                    oi_arena *arena, void *ud,
                                    char ***out_argv) {
@@ -170,7 +165,6 @@ static oi_status orphan_build_argv(const oi_json_value *args,
     return OI_OK;
 }
 
-/* The shell exits at once; its background child holds stdout open. */
 static oi_status background_build_argv(const oi_json_value *args,
                                        oi_arena *arena, void *ud,
                                        char ***out_argv) {
@@ -259,8 +253,6 @@ static oi_tool_decision ask_cb(const char *name, const oi_json_value *args,
     return OI_TOOL_ASK;
 }
 
-/* --- basic run: echo --- */
-
 struct out_ctx {
     char buf[256];
     size_t len;
@@ -310,8 +302,6 @@ TEST(run_echo_captures_output_and_normal_exit) {
     oi_tool_registry_destroy(reg);
 }
 
-/* --- nonzero exit code --- */
-
 TEST(nonzero_exit_code_reported) {
     oi_tool_registry *reg = make_registry();
     oi_reactor *r = oi_reactor_create();
@@ -336,8 +326,6 @@ TEST(nonzero_exit_code_reported) {
     oi_tool_registry_destroy(reg);
 }
 
-/* --- exec failure (missing binary) --- */
-
 TEST(missing_binary_reports_exec_failed) {
     oi_tool_registry *reg = make_registry();
     oi_reactor *r = oi_reactor_create();
@@ -354,15 +342,13 @@ TEST(missing_binary_reports_exec_failed) {
 
     CHECK(ctx.done);
     CHECK_EQ(ctx.kind, OI_TOOL_EXIT_FAILED);
-    CHECK(ctx.code != 0); /* an errno, e.g. ENOENT */
+    CHECK(ctx.code != 0);
     CHECK_EQ(ctx.len, 0u);
 
     oi_arena_destroy(a);
     oi_reactor_destroy(r);
     oi_tool_registry_destroy(reg);
 }
-
-/* --- unknown tool / permission denied / build_argv failure: synchronous --- */
 
 TEST(unknown_tool_rejected_synchronously) {
     oi_tool_registry *reg = make_registry();
@@ -403,8 +389,6 @@ TEST(build_argv_failure_rejected_synchronously) {
     oi_tool_registry_destroy(reg);
 }
 
-/* --- ASK then resolve(allow) --- */
-
 TEST(ask_then_resolve_allow_runs) {
     oi_tool_registry *reg = make_registry();
     oi_reactor *r = oi_reactor_create();
@@ -418,7 +402,7 @@ TEST(ask_then_resolve_allow_runs) {
                                        &call);
     CHECK_EQ(st, OI_OK);
     CHECK(call != NULL);
-    CHECK(!ctx.done); /* nothing runs until resolved */
+    CHECK(!ctx.done);
 
     CHECK_EQ(oi_tool_call_resolve(call, 1), OI_OK);
     run_until(r, &ctx.done, 100);
@@ -431,8 +415,6 @@ TEST(ask_then_resolve_allow_runs) {
     oi_reactor_destroy(r);
     oi_tool_registry_destroy(reg);
 }
-
-/* --- ASK then resolve(deny) --- */
 
 TEST(ask_then_resolve_deny) {
     oi_tool_registry *reg = make_registry();
@@ -447,12 +429,10 @@ TEST(ask_then_resolve_deny) {
     CHECK_EQ(st, OI_OK);
 
     CHECK_EQ(oi_tool_call_resolve(call, 0), OI_ERR_DENIED);
-    /* `call` is now invalid; resolving again would be a use-after-free
-     * by the caller, not something to test. */
 
     int never = 0;
     run_until(r, &never, 5);
-    CHECK(!ctx.done); /* on_done never fires for a denial */
+    CHECK(!ctx.done);
 
     oi_arena_destroy(a);
     oi_reactor_destroy(r);
@@ -462,8 +442,6 @@ TEST(ask_then_resolve_deny) {
 TEST(resolve_on_non_pending_call_rejected) {
     CHECK_EQ(oi_tool_call_resolve(NULL, 1), OI_ERR_INVAL);
 }
-
-/* --- stdin round trip via cat --- */
 
 TEST(cat_echoes_stdin) {
     oi_tool_registry *reg = make_registry();
@@ -533,8 +511,6 @@ TEST(write_stdin_before_running_rejected) {
     oi_tool_registry_destroy(reg);
 }
 
-/* --- cancellation, including reentrant-from-on_output --- */
-
 struct cancel_ctx {
     oi_tool_call *call;
     int output_count;
@@ -553,7 +529,7 @@ static void cancel_on_done(oi_tool_exit_kind kind, int code, void *ud) {
     (void)kind;
     (void)code;
     struct cancel_ctx *ctx = ud;
-    ctx->done_fired = 1; /* must never happen */
+    ctx->done_fired = 1;
 }
 
 TEST(cancel_from_within_on_output) {
@@ -591,15 +567,13 @@ TEST(cancel_kills_long_running_process) {
                                        &ctx, &call);
     CHECK_EQ(st, OI_OK);
 
-    /* Give it a moment to actually be running, then cancel well before
-     * its 5s sleep would finish on its own. */
     oi_status s2;
     oi_reactor_step(r, 100, &s2);
     oi_tool_call_cancel(call);
 
     int never = 0;
     run_until(r, &never, 5);
-    CHECK(!ctx.done); /* on_done must not fire for a cancelled call */
+    CHECK(!ctx.done);
 
     oi_arena_destroy(a);
     oi_reactor_destroy(r);
@@ -708,9 +682,6 @@ TEST(cancel_kills_descendant_processes) {
                                  &ctx.call),
               OI_OK);
 
-    /* Time deadlines, not step counts: each output event ends a step
-     * early, and a sanitizer build on a loaded runner starts /bin/sh
-     * slowly. */
     int64_t deadline = monotonic_ms() + 10000;
     while (ctx.descendant == 0 && monotonic_ms() < deadline) {
         oi_status st;
@@ -757,8 +728,6 @@ TEST(cancel_after_the_child_is_collected_signals_only_the_group) {
     oi_arena *a = oi_arena_create(0);
 
     struct tree_cancel_ctx ctx = {0};
-    /* Either the cancel below or the drain after the child's exit ends
-     * the call; neither may signal the collected PID. */
     record_kills = 1;
     positive_kills = 0;
     CHECK_EQ(oi_tool_call_start(reg, r, a, "orphan", NULL, allow_cb, NULL,
@@ -778,7 +747,6 @@ TEST(cancel_after_the_child_is_collected_signals_only_the_group) {
                 ctx.descendant = (pid_t)second;
             }
         }
-        /* The /proc entry goes away only after the collect. */
         if (shell > 0 && !process_exists(shell) &&
             getpgid(ctx.descendant) == ctx.descendant) {
             break;
@@ -826,7 +794,6 @@ TEST(call_does_not_wait_for_a_background_process) {
     {
         pid_t background = (pid_t)strtol(ctx.buf + 8, NULL, 10);
         CHECK(background > 0);
-        /* The background process was in the call's group. */
         for (int i = 0; i < 100 && process_is_running(background); i++) {
             struct timespec pause = {0, 10000000};
             nanosleep(&pause, NULL);
@@ -840,8 +807,6 @@ TEST(call_does_not_wait_for_a_background_process) {
 }
 
 TEST(cancel_null_safe) { oi_tool_call_cancel(NULL); }
-
-/* --- concurrent calls don't cross-wire --- */
 
 struct multi_ctx {
     int done_count;
@@ -937,9 +902,6 @@ TEST(child_does_not_inherit_other_tool_descriptors) {
 }
 
 TEST(tool_execution_does_not_reap_unrelated_children) {
-    /* Forked before any allocation: under valgrind the child runs its own
-     * leak check at _exit, and at -O2 the parent's heap pointers can live
-     * only in registers that the child's check cannot see. */
     pid_t unrelated = fork();
     CHECK(unrelated >= 0);
     if (unrelated == 0) {
@@ -1034,7 +996,6 @@ TEST(auto_reaped_child_reports_status_unavailable) {
 }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     RUN(run_echo_captures_output_and_normal_exit);
     RUN(nonzero_exit_code_reported);

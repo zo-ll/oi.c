@@ -32,33 +32,15 @@ struct event_sink {
     int tool_outcome_has_raw[8];
     int tool_outcome_count;
     oi_cli_conversation **cancel_on_tool_starting;
-    /* Reentrantly steers (not cancels) from within the named event, for
-     * tests exercising oi_cli_conversation_steer's single check point
-     * without needing precise external timing -- mirrors
-     * cancel_on_tool_starting's existing reentrancy pattern. */
     oi_cli_conversation **steer_on_response_done;
     oi_cli_conversation **steer_on_tool_message;
     int tool_starting_count;
     int awaiting_permission_count;
     int awaiting_permission_position;
-    /* Reentrantly cancels from within the AWAITING_PERMISSION event itself
-     * -- mirrors cancel_on_tool_starting's existing reentrancy pattern, for
-     * a test exercising a cancel that arrives while a call is staged but
-     * not yet resolved, rather than while it's already running. */
     oi_cli_conversation **cancel_on_awaiting_permission;
-    /*
-     * What oi_cli_conversation_activity reported at each event, indexed by
-     * event type. Sampling from inside the callbacks is the only way to
-     * observe the in-flight states at all -- by the time control returns to
-     * the test, every turn is at rest. NULL disables sampling.
-     */
     oi_cli_conversation **activity_probe;
     enum oi_cli_conversation_activity activity_at[16];
     int activity_seen[16];
-    /* Events emitted while the conversation reported CANCELLING -- the
-     * cancel unwind's own partial-response and repair events. Counted
-     * separately because those events share types with ordinary ones, so a
-     * per-type sample cannot distinguish them. */
     int cancelling_event_count;
 };
 
@@ -67,9 +49,6 @@ static oi_status collect_event(
     struct event_sink *sink = user_data;
     int position = sink->event_count++;
 
-    /* Sampled before the reentrant cancel/steer hooks below run, so an
-     * AWAITING_PERMISSION sample describes the staged call rather than the
-     * cancel that this very callback is about to request. */
     if (sink->activity_probe != NULL &&
         (size_t)event->type <
             sizeof sink->activity_at / sizeof sink->activity_at[0]) {
@@ -225,9 +204,6 @@ TEST(start_is_event_driven_and_preserves_context) {
                  &conversation),
              OI_OK);
 
-    /* Nothing has started: the activity of a conversation with no turn is
-     * idle, and so is a NULL one -- what a REPL that has not lazily created
-     * a conversation yet genuinely has. */
     CHECK_EQ(oi_cli_conversation_activity(conversation),
              OI_CLI_CONVERSATION_ACTIVITY_IDLE);
     CHECK_EQ(oi_cli_conversation_activity(NULL),
@@ -252,19 +228,11 @@ TEST(start_is_event_driven_and_preserves_context) {
     CHECK_EQ(sink.message_count, 2);
     CHECK_EQ(sink.response_done_count, 1);
     CHECK(!oi_cli_conversation_is_busy(conversation));
-    /* The stream's JSON lives in the request's own scratch arena: a turn
-     * with no tool call puts nothing in the session arena. */
     CHECK_EQ(sink.arena_used_at_done, 0);
 
-    /* An arriving delta means the request is still open, so the reported
-     * activity has to be "streaming" -- and once the turn completes cleanly
-     * it has to be idle again. */
     CHECK(sink.activity_seen[OI_CLI_CONVERSATION_EVENT_ASSISTANT_DELTA]);
     CHECK_EQ(sink.activity_at[OI_CLI_CONVERSATION_EVENT_ASSISTANT_DELTA],
              OI_CLI_CONVERSATION_ACTIVITY_STREAMING);
-    /* Committing a message is a busy moment with nothing in flight -- the
-     * request has already been released by the time the assistant reply is
-     * committed -- so it reports as working rather than as streaming. */
     CHECK(sink.activity_seen[OI_CLI_CONVERSATION_EVENT_MESSAGE]);
     CHECK_EQ(sink.activity_at[OI_CLI_CONVERSATION_EVENT_MESSAGE],
              OI_CLI_CONVERSATION_ACTIVITY_WORKING);
@@ -442,21 +410,13 @@ TEST(ask_defers_and_resolve_permission_allow_lets_the_tool_run) {
         CHECK(oi_reactor_step(reactor, 100, &step_status) >= 0);
     }
     CHECK_EQ(sink.awaiting_permission_count, 1);
-    /* Nothing has spawned yet: the decision hasn't arrived. */
     CHECK_EQ(sink.tool_start_position, -1);
     CHECK(!sink.turn_done);
-    /* A staged call awaiting a decision is its own reported state, and it
-     * persists for as long as the decision does -- so /status can report it
-     * from outside the callback too. */
     CHECK_EQ(sink.activity_at[OI_CLI_CONVERSATION_EVENT_AWAITING_PERMISSION],
              OI_CLI_CONVERSATION_ACTIVITY_AWAITING_PERMISSION);
     CHECK_EQ(oi_cli_conversation_activity(conversation),
              OI_CLI_CONVERSATION_ACTIVITY_AWAITING_PERMISSION);
 
-    /* Resolved genuinely later, from outside the event callback entirely
-     * -- not reentrantly -- proving the turn really stayed suspended
-     * across an arbitrary gap rather than the decision being available
-     * synchronously all along. */
     CHECK_EQ(oi_cli_conversation_resolve_permission(conversation, 1), OI_OK);
 
     for (int i = 0; i < 200 && !sink.turn_done; i++) {
@@ -469,8 +429,6 @@ TEST(ask_defers_and_resolve_permission_allow_lets_the_tool_run) {
     CHECK(sink.tool_output_position > sink.tool_start_position);
     CHECK(sink.tool_message_position > sink.tool_output_position);
     CHECK_STREQ(sink.text, "finished");
-    /* Output arriving from the child means the process is genuinely running,
-     * which is the one moment "tool running" is the only right answer. */
     CHECK(sink.activity_seen[OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT]);
     CHECK_EQ(sink.activity_at[OI_CLI_CONVERSATION_EVENT_TOOL_OUTPUT],
              OI_CLI_CONVERSATION_ACTIVITY_TOOL_RUNNING);
@@ -540,7 +498,6 @@ TEST(ask_defers_and_resolve_permission_deny_produces_a_protocol_valid_result) {
     CHECK_EQ(sink.awaiting_permission_count, 1);
 
     CHECK_EQ(oi_cli_conversation_resolve_permission(conversation, 0), OI_OK);
-    /* A resolved, non-pending decision can't be resolved twice. */
     CHECK_EQ(oi_cli_conversation_resolve_permission(conversation, 1),
              OI_ERR_INVAL);
 
@@ -550,15 +507,12 @@ TEST(ask_defers_and_resolve_permission_deny_produces_a_protocol_valid_result) {
     }
     CHECK(sink.turn_done);
     CHECK_EQ(sink.status, OI_ERR_DENIED);
-    /* Denied outright: the process never spawned or produced output. */
     CHECK_EQ(sink.tool_starting_count, 0);
     CHECK_EQ(sink.tool_output_position, -1);
     CHECK(sink.tool_message_position > sink.awaiting_permission_position);
     CHECK_EQ(sink.tool_outcome_count, 1);
     CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_DENIED);
     CHECK(!sink.tool_outcome_has_raw[0]);
-    /* A denial ends the turn with a real non-OK status and no cancel, which
-     * is the shape that must report as failed rather than idle. */
     CHECK_EQ(oi_cli_conversation_activity(conversation),
              OI_CLI_CONVERSATION_ACTIVITY_FAILED);
     CHECK_EQ(oi_cli_conversation_last_status(conversation), OI_ERR_DENIED);
@@ -632,9 +586,6 @@ TEST(cancel_while_awaiting_permission_repairs_as_not_executed) {
     CHECK_EQ(sink.tool_starting_count, 0);
     CHECK_EQ(sink.tool_outcome_count, 1);
     CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED);
-    /* A genuine cancel-before-start, not a denial -- resolving it again
-     * afterward must be rejected, the same as any other already-settled
-     * permission request. */
     CHECK_EQ(oi_cli_conversation_resolve_permission(conversation, 1),
              OI_ERR_INVAL);
 
@@ -697,13 +648,6 @@ TEST(cancel_while_streaming_needs_no_repair) {
                                         &config, NULL, &conversation),
              OI_OK);
 
-    /* Cancel immediately after start, before stepping the reactor at all:
-     * nothing async has had a chance to run yet, so this deterministically
-     * cancels while conversation->request != NULL and no assistant message
-     * has been committed -- no *tool* repair is needed or possible, but the
-     * turn still needs an interrupted-turn placeholder assistant message to
-     * keep durable replay's user/assistant alternation intact for the next
-     * turn's user message. */
     CHECK_EQ(oi_cli_conversation_start(conversation, "question one", 12),
              OI_OK);
     CHECK(oi_cli_conversation_is_busy(conversation));
@@ -714,13 +658,6 @@ TEST(cancel_while_streaming_needs_no_repair) {
     CHECK_EQ(sink.status, OI_ERR_CLOSED);
     CHECK_EQ(sink.tool_outcome_count, 0);
 
-    /*
-     * The unwind is observable: the repair message the cancel commits is
-     * emitted while the conversation reports CANCELLING, not while it still
-     * claims to be streaming. And once the unwind finishes the conversation
-     * is idle, not failed -- despite the OI_ERR_CLOSED the cancel carries,
-     * which is exactly the status that must not be reported as a fault.
-     */
     CHECK(sink.cancelling_event_count > 0);
     CHECK_EQ(oi_cli_conversation_activity(conversation),
              OI_CLI_CONVERSATION_ACTIVITY_IDLE);
@@ -733,7 +670,6 @@ TEST(cancel_while_streaming_needs_no_repair) {
     CHECK_EQ(messages->items[1].role, OI_CLI_MESSAGE_ASSISTANT);
     CHECK(strstr(messages->items[1].content.data, "interrupted") != NULL);
 
-    /* The conversation is still fully usable for a next turn. */
     memset(&sink, 0, sizeof sink);
     sink.arena = arena;
     sink.tool_start_position = -1;
@@ -750,8 +686,6 @@ TEST(cancel_while_streaming_needs_no_repair) {
     CHECK_EQ(sink.status, OI_OK);
     CHECK(!oi_cli_conversation_was_cancelled(conversation));
     CHECK_STREQ(sink.text, "partial");
-    /* A clean turn after a cancelled one reports idle for the ordinary
-     * reason (OI_OK), not because the cancel flag is still set. */
     CHECK_EQ(sink.cancelling_event_count, 0);
     CHECK_EQ(oi_cli_conversation_activity(conversation),
              OI_CLI_CONVERSATION_ACTIVITY_IDLE);
@@ -861,8 +795,6 @@ TEST(cancel_while_tool_running_repairs_messages) {
     CHECK_EQ(messages->items[4].role, OI_CLI_MESSAGE_ASSISTANT);
     CHECK(strstr(messages->items[4].content.data, "interrupted") != NULL);
 
-    /* No process is left running past the cancel: give the killed one a
-     * moment, then confirm no further tool output ever arrives. */
     for (int i = 0; i < 5; i++) {
         oi_status step_status;
         oi_reactor_step(reactor, 50, &step_status);
@@ -937,10 +869,6 @@ TEST(cancel_from_within_tool_starting_event) {
     CHECK(!oi_cli_conversation_is_busy(conversation));
     CHECK(oi_cli_conversation_was_cancelled(conversation));
 
-    /* The cancel fired reentrantly from inside the TOOL_STARTING emit,
-     * before conversation->tool was ever assigned: the tool must never
-     * have actually been spawned (no TOOL_OUTPUT), and the repair must
-     * still have happened (NOT_EXECUTED -- nothing was ever running). */
     CHECK_EQ(sink.tool_output_position, -1);
     CHECK_EQ(sink.tool_outcome_count, 1);
     CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_NOT_EXECUTED);
@@ -953,8 +881,6 @@ TEST(cancel_from_within_tool_starting_event) {
     CHECK_EQ(messages->items[3].role, OI_CLI_MESSAGE_ASSISTANT);
     CHECK(strstr(messages->items[3].content.data, "interrupted") != NULL);
 
-    /* Give the reactor a few more steps: if a process had actually been
-     * spawned despite the cancel, it would show up here. */
     for (int i = 0; i < 5; i++) {
         oi_status step_status;
         oi_reactor_step(reactor, 50, &step_status);
@@ -1137,9 +1063,6 @@ TEST(steer_after_a_tool_completes_skips_the_next_one) {
     CHECK_EQ(sink.status, OI_OK);
     CHECK(!oi_cli_conversation_was_cancelled(conversation));
 
-    /* Steering fired reentrantly from call-1's own TOOL message commit
-     * (before start_next_tool ever re-enters for call-2), so call-1 must
-     * have run for real (COMPLETED) while call-2 never started at all. */
     CHECK_EQ(sink.tool_starting_count, 1);
     CHECK_EQ(sink.tool_outcome_count, 2);
     CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_COMPLETED);
@@ -1155,11 +1078,6 @@ TEST(steer_after_a_tool_completes_skips_the_next_one) {
     CHECK_STREQ(messages->items[3].tool_call_id.data, "call-2");
     CHECK(strstr(messages->items[3].content.data, "skipped") != NULL);
 
-    /* A steering bookend, not an interrupted-turn one: RESPONSE_DONE
-     * already fired for real, unlike a genuine cancel, but durable replay
-     * still requires an assistant message with no tool_calls to close out
-     * this turn before anything else (e.g. the queued message's own turn)
-     * can validly follow. */
     CHECK_EQ(messages->items[4].role, OI_CLI_MESSAGE_ASSISTANT);
     CHECK_EQ(messages->items[4].tool_calls_len, (size_t)0);
     CHECK(strstr(messages->items[4].content.data, "queued") != NULL);
@@ -1240,9 +1158,6 @@ TEST(steer_after_the_only_tool_prevents_a_second_model_round) {
     CHECK_EQ(sink.tool_outcome_count, 1);
     CHECK_EQ(sink.tool_outcomes[0], OI_CLI_CONVERSATION_TOOL_COMPLETED);
 
-    /* Give the reactor a few more idle steps: if steering had failed to
-     * suppress the follow-up model round, the second request would show
-     * up here. */
     for (int i = 0; i < 5; i++) {
         oi_status step_status;
         oi_reactor_step(reactor, 50, &step_status);
@@ -1323,9 +1238,6 @@ TEST(steer_before_any_tool_starts_skips_them_all) {
     CHECK_EQ(sink.status, OI_OK);
     CHECK(!oi_cli_conversation_was_cancelled(conversation));
 
-    /* Steered before start_next_tool ever ran for the first time (from
-     * RESPONSE_DONE, which fires before it): the call never started at
-     * all, not even staged. */
     CHECK_EQ(sink.tool_starting_count, 0);
     CHECK_EQ(sink.tool_output_position, -1);
     CHECK_EQ(sink.tool_outcome_count, 1);
@@ -1337,9 +1249,6 @@ TEST(steer_before_any_tool_starts_skips_them_all) {
     CHECK_EQ(messages->items[2].role, OI_CLI_MESSAGE_TOOL);
     CHECK_STREQ(messages->items[2].tool_call_id.data, "call-1");
     CHECK(strstr(messages->items[2].content.data, "skipped") != NULL);
-    /* Steering's own turn-closing bookend -- see
-     * steer_after_a_tool_completes_skips_the_next_one's identical check
-     * for why durable replay requires this. */
     CHECK_EQ(messages->items[3].role, OI_CLI_MESSAGE_ASSISTANT);
     CHECK_EQ(messages->items[3].tool_calls_len, (size_t)0);
     CHECK(strstr(messages->items[3].content.data, "queued") != NULL);
@@ -1543,7 +1452,6 @@ TEST(checkpoint_rejects_invalid_prefix_counts) {
     CHECK_EQ(oi_cli_conversation_apply_checkpoint(NULL, 1, "x", 1),
              OI_ERR_INVAL);
 
-    /* Rejected calls must leave the message list completely untouched. */
     const struct oi_cli_message_list *messages =
         oi_cli_conversation_messages(conversation);
     CHECK_EQ(messages->len, (size_t)4);
@@ -1601,8 +1509,6 @@ TEST(checkpoint_is_rejected_while_busy) {
                                         &config, NULL, &conversation),
              OI_OK);
 
-    /* oi_cli_conversation_start sets busy synchronously before returning,
-     * so this is checked before the reactor is ever stepped. */
     CHECK_EQ(oi_cli_conversation_start(conversation, "question", 8), OI_OK);
     CHECK(oi_cli_conversation_is_busy(conversation));
     CHECK_EQ(oi_cli_conversation_apply_checkpoint(conversation, 1, "x", 1),
@@ -1623,7 +1529,6 @@ TEST(checkpoint_is_rejected_while_busy) {
 }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     RUN(start_is_event_driven_and_preserves_context);
     RUN(tool_start_boundary_precedes_process_output);

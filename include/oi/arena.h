@@ -48,4 +48,4 @@ void oi_arena_reset(oi_arena *a);
  * reset. Useful for tests/diagnostics, not required for correct use. */
 size_t oi_arena_used(const oi_arena *a);
 
-#endif /* OI_ARENA_H */
+#endif

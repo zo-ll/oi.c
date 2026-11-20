@@ -1,20 +1,3 @@
-/*
- * libFuzzer harness for session-log record framing (oi/sesslog.h).
- *
- * The log is the one persistent input the harness parses, and a crashed
- * process can leave arbitrary trailing bytes behind -- so recovery has
- * to cope with a header and record stream it did not write. Each input
- * is dropped on disk verbatim and opened as a log.
- *
- * The interesting property is not just "open() doesn't crash" but that
- * recovery leaves a *usable* log: oi_sesslog_open documents that it
- * truncates a torn trailing record and preserves everything before it.
- * So whenever open succeeds, this replays the log, appends a fresh
- * record, and replays again -- the second pass must return exactly the
- * first pass's records plus the appended one, intact and in order. A
- * recovery that truncated to the wrong offset shows up here as a record
- * count or payload mismatch rather than as silently lost history.
- */
 
 #include <assert.h>
 #include <fcntl.h>
@@ -28,16 +11,11 @@
 
 #define FUZZ_MAX_INPUT (64u * 1024)
 
-/* Payload of the record appended between the two replay passes. */
 static const char probe_record[] = "oi-fuzz-probe";
 
 struct replay_ctx {
     size_t count;
-    /* Digest of every record seen, so the two passes can be compared
-     * without retaining unbounded payload. */
     uint64_t digest;
-    /* Payload of the most recent record, capped -- only used to confirm
-     * the appended probe survived the round trip. */
     char last[sizeof probe_record];
     size_t last_len;
     int last_truncated;
@@ -56,13 +34,9 @@ static void on_record(const void *data, size_t len, void *user_data) {
     struct replay_ctx *ctx = user_data;
 
     ctx->count++;
-    /* FNV-1a over the length and the bytes, so record boundaries are
-     * part of the digest and not just the concatenated payload. */
     ctx->digest = digest_record(ctx->digest, data, len);
 
     if (len <= sizeof ctx->last) {
-        /* A zero-length record replays as (NULL, 0), and memcpy from a
-         * null pointer is undefined even for a zero count. */
         if (len > 0) {
             memcpy(ctx->last, data, len);
         }
@@ -74,8 +48,6 @@ static void on_record(const void *data, size_t len, void *user_data) {
     }
 }
 
-/* One fixed path per process: libFuzzer runs single-threaded, so each
- * iteration can reuse and truncate the same file. */
 static const char *log_path(void) {
     static char path[64];
     if (path[0] == '\0') {
@@ -118,8 +90,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         struct replay_ctx before = {0};
         before.digest = 14695981039346656037ull;
         if (oi_sesslog_replay(log, on_record, &before) == OI_OK) {
-            /* Recovery has run and the log validated, so an append must
-             * land cleanly on the truncated tail. */
             if (oi_sesslog_append(log, probe_record, sizeof probe_record) ==
                 OI_OK) {
                 struct replay_ctx after = {0};

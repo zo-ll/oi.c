@@ -1,28 +1,20 @@
 # Agent working rules: oi.c
 
-## Comments state invariants, never history
+## No code comments
 
-A comment must describe what the code does or why it must be that way —
-something a reader cannot learn from the code itself. It must never
-narrate process or provenance.
+Do not write code comments in C files, headers, the Makefile, or CI
+YAML. `make comment-lint` (part of `make check`) fails when a file has
+more comments than `tools/comment-baseline.txt` allows.
 
-Banned in this repo:
-
-- "added in a later commit", "this commit only ever…", "until a later
-  commit wires up…" — commit history lives in `git log`, not source.
-- "issue #N", "per issue N's module-boundary rule" — issue archaeology.
-  If a rule matters, state the rule; if a boundary matters, say where the
-  boundary is and what belongs to whom.
-- "no longer", "anymore (since …)", "previously …" — current behavior
-  only, with the reason that still holds.
-
-Allowed: cross-references to living docs (`PLAN.md`, `docs/REPL_PLAN.md`),
-and the smallest commit/issue reference when the intent is genuinely
-untraceable without it.
-
-Density model: `src/arena.c` and `src/reactor_*.c`. If a comment would
-survive unchanged after the next feature, keep it; if it would need
-editing, it belongs in the commit message.
+- Put the reason for a change in the commit message.
+- Put a non-obvious decision in an ADR in `docs/adr/`. The
+  `NNNN-<module>-comment-records.md` files hold the decisions that were
+  comments.
+- Make the code say what it does: names, types, small functions, tests.
+- The baseline only goes down. After you delete comments, run
+  `make comment-ratchet` and commit the new baseline.
+- Use the `/delete-comment` skill to classify and remove the comments
+  that remain.
 
 ## Smallest change that works
 

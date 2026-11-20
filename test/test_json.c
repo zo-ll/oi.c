@@ -9,9 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Feeds `doc` to a fresh parser, one byte at a time -- the harshest
- * possible chunking, since a parser correct here is correct for any
- * coarser chunking too. Returns the completed root, or NULL. */
 static oi_json_value *parse_byte_by_byte(oi_arena *arena, const char *doc,
                                           size_t len, oi_status *out_st) {
     oi_json_parser *p = oi_json_parser_create(arena);
@@ -23,19 +20,10 @@ static oi_json_value *parse_byte_by_byte(oi_arena *arena, const char *doc,
         *out_st = st;
     }
     oi_json_value *root = (st == OI_OK) ? oi_json_parser_root(p) : NULL;
-    /* Root must survive after the parser is destroyed: it lives on the
-     * arena, not inside the parser. */
     oi_json_parser_destroy(p);
     return root;
 }
 
-/* Feeds `doc` split at every possible single cut point (i.e. two feed()
- * calls: [0,k) and [k,len)), for every k, plus the whole-buffer and
- * fully-byte-by-byte cases. All must agree the value is done and equal
- * in shape to what byte-by-byte parsing produced (checked by caller via
- * CHECK_EQ on scalar fields, since a general deep-equal isn't needed for
- * these tests). This exercises "split mid-escape / mid-number / etc."
- * without hand-writing every split point per test. */
 static void check_all_split_points_succeed(const char *doc, size_t len) {
     for (size_t k = 0; k <= len; k++) {
         oi_arena *arena = oi_arena_create(0);
@@ -51,8 +39,6 @@ static void check_all_split_points_succeed(const char *doc, size_t len) {
         oi_arena_destroy(arena);
     }
 }
-
-/* --- basic scalars --- */
 
 TEST(parse_null) {
     oi_arena *a = oi_arena_create(0);
@@ -86,15 +72,13 @@ TEST(literal_typo_is_error) {
     oi_arena *a = oi_arena_create(0);
     oi_status st;
     parse_byte_by_byte(a, "nul", 3, &st);
-    CHECK_EQ(st, OI_OK); /* incomplete, not yet wrong */
+    CHECK_EQ(st, OI_OK);
     parse_byte_by_byte(a, "nulx", 4, &st);
     CHECK_EQ(st, OI_ERR_PARSE);
-    parse_byte_by_byte(a, "True", 4, &st); /* JSON is case-sensitive */
+    parse_byte_by_byte(a, "True", 4, &st);
     CHECK_EQ(st, OI_ERR_PARSE);
     oi_arena_destroy(a);
 }
-
-/* --- numbers --- */
 
 struct number_case {
     const char *text;
@@ -110,10 +94,10 @@ TEST(numbers) {
         {"1E10", 1e10, 1},      {"1e+10", 1e10, 1},
         {"1e-10", 1e-10, 1},    {"1.5e3", 1500.0, 1},
         {"0.5", 0.5, 1},        {"-0.5", -0.5, 1},
-        {"01", 0, 0},           /* leading zero */
-        {"1.", 0, 0},           /* trailing dot */
-        {".5", 0, 0},           /* leading dot */
-        {"1e", 0, 0},           /* dangling exponent */
+        {"01", 0, 0},
+        {"1.", 0, 0},
+        {".5", 0, 0},
+        {"1e", 0, 0},
         {"1.2.3", 0, 0},        {"--5", 0, 0},
         {"-", 0, 0},            {"+5", 0, 0},
         {"5-", 0, 0},           {"1e+", 0, 0},
@@ -123,8 +107,6 @@ TEST(numbers) {
         oi_arena *a = oi_arena_create(0);
         size_t len = strlen(cases[i].text);
         oi_status st;
-        /* A bare number needs finish() to disambiguate "more digits
-         * could still come"; feed then finish explicitly here. */
         oi_json_parser *p = oi_json_parser_create(a);
         st = oi_json_parser_feed(p, cases[i].text, len);
         if (st == OI_OK) {
@@ -144,7 +126,6 @@ TEST(numbers) {
 }
 
 TEST(number_terminated_by_following_byte_needs_no_finish) {
-    /* Inside an array, the ',' unambiguously terminates the number. */
     oi_arena *a = oi_arena_create(0);
     oi_status st;
     oi_json_value *v = parse_byte_by_byte(a, "[1,2,3]", 7, &st);
@@ -184,8 +165,6 @@ TEST(finish_on_empty_input_is_error) {
     oi_json_parser_destroy(p);
     oi_arena_destroy(a);
 }
-
-/* --- strings --- */
 
 TEST(simple_string) {
     oi_arena *a = oi_arena_create(0);
@@ -229,14 +208,13 @@ TEST(string_simple_escapes) {
 
 TEST(string_unicode_escape_bmp) {
     oi_arena *a = oi_arena_create(0);
-    /* \u00e9 = e-acute, UTF-8: 0xC3 0xA9 */
     oi_status st;
     oi_json_value *v = parse_byte_by_byte(a, "\"caf\\u00e9\"", 11, &st);
     CHECK_EQ(st, OI_OK);
     const char *ptr;
     size_t len;
     CHECK_EQ(oi_json_get_string(v, &ptr, &len), OI_OK);
-    CHECK_EQ(len, 5u); /* c,a,f, 0xC3,0xA9 */
+    CHECK_EQ(len, 5u);
     CHECK(memcmp(ptr, "caf", 3) == 0);
     CHECK_EQ((unsigned char)ptr[3], 0xC3u);
     CHECK_EQ((unsigned char)ptr[4], 0xA9u);
@@ -244,8 +222,6 @@ TEST(string_unicode_escape_bmp) {
 }
 
 TEST(string_unicode_surrogate_pair) {
-    /* U+1F600 (grinning face) = surrogate pair \ud83d\ude00,
-     * UTF-8: F0 9F 98 80 */
     oi_arena *a = oi_arena_create(0);
     oi_status st;
     oi_json_value *v =
@@ -265,11 +241,11 @@ TEST(string_unicode_surrogate_pair) {
 TEST(string_lone_high_surrogate_errors) {
     oi_arena *a = oi_arena_create(0);
     oi_status st;
-    parse_byte_by_byte(a, "\"\\ud83d\"", 8, &st); /* closes without pair */
+    parse_byte_by_byte(a, "\"\\ud83d\"", 8, &st);
     CHECK_EQ(st, OI_ERR_PARSE);
-    parse_byte_by_byte(a, "\"\\ud83dx\"", 9, &st); /* not followed by \u */
+    parse_byte_by_byte(a, "\"\\ud83dx\"", 9, &st);
     CHECK_EQ(st, OI_ERR_PARSE);
-    parse_byte_by_byte(a, "\"\\ud83d\\n\"", 10, &st); /* wrong escape after */
+    parse_byte_by_byte(a, "\"\\ud83d\\n\"", 10, &st);
     CHECK_EQ(st, OI_ERR_PARSE);
     oi_arena_destroy(a);
 }
@@ -317,8 +293,6 @@ TEST(string_embedded_nul_via_escape) {
     oi_arena_destroy(a);
 }
 
-/* --- containers --- */
-
 TEST(empty_array_and_object) {
     oi_arena *a = oi_arena_create(0);
     oi_status st;
@@ -358,7 +332,7 @@ TEST(array_of_mixed_values) {
     CHECK_EQ(oi_json_type_of(oi_json_array_get(v, 4)), OI_JSON_ARRAY);
     CHECK_EQ(oi_json_type_of(oi_json_array_get(v, 5)), OI_JSON_OBJECT);
 
-    CHECK(oi_json_array_get(v, 6) == NULL); /* out of range */
+    CHECK(oi_json_array_get(v, 6) == NULL);
     oi_arena_destroy(a);
 }
 
@@ -418,8 +392,6 @@ TEST(excessive_nesting_is_rejected) {
     oi_arena_destroy(a);
 }
 
-/* --- structural errors --- */
-
 TEST(structural_errors) {
     static const char *bad[] = {
         "",       "[",      "]",       "{",      "}",
@@ -466,13 +438,10 @@ TEST(sticky_error_state) {
     CHECK_EQ(oi_json_parser_feed(p, "[", 1), OI_OK);
     CHECK_EQ(oi_json_parser_feed(p, ",", 1), OI_ERR_PARSE);
     CHECK(oi_json_parser_failed(p));
-    /* Further feeds keep failing without re-examining input. */
     CHECK_EQ(oi_json_parser_feed(p, "1", 1), OI_ERR_PARSE);
     oi_json_parser_destroy(p);
     oi_arena_destroy(a);
 }
-
-/* --- reset / reuse across multiple values on one parser --- */
 
 TEST(reset_allows_parsing_next_value) {
     oi_arena *a = oi_arena_create(0);
@@ -502,12 +471,8 @@ TEST(reset_allows_parsing_next_value) {
     oi_arena_destroy(a);
 }
 
-/* --- byte-boundary splitting: every cut point of representative docs --- */
-
 TEST(every_split_point_of_representative_docs) {
     static const char *docs[] = {
-        /* Parenthesized so the wrap reads as one document rather than
-         * two array elements with a missing comma (-Wstring-concatenation). */
         ("{\"model\":\"gpt\",\"messages\":[{\"role\":\"user\",\"content\":"
          "\"hi\\nthere\"}],\"n\":1,\"temperature\":0.5,\"stream\":true}"),
         "\"escaped \\\"quote\\\" and \\u00e9 and \\ud83d\\ude00 end\"",
@@ -520,8 +485,6 @@ TEST(every_split_point_of_representative_docs) {
     }
 }
 
-/* --- rejects NULL / zero-length misuse --- */
-
 TEST(create_rejects_null_arena) { CHECK(oi_json_parser_create(NULL) == NULL); }
 
 TEST(destroy_null_safe) { oi_json_parser_destroy(NULL); }
@@ -531,9 +494,6 @@ TEST(accessors_reject_wrong_type_and_null) {
     oi_status st;
     oi_json_value *v = parse_byte_by_byte(a, "1", 1, &st);
     CHECK_EQ(st, OI_OK);
-    /* "1" alone needs finish() in real use; here we just want a NUMBER
-     * value to probe wrong-type accessors against, so reparse using
-     * finish() directly. */
     oi_json_parser *p = oi_json_parser_create(a);
     oi_json_parser_feed(p, "1", 1);
     oi_json_parser_finish(p);
@@ -554,10 +514,8 @@ TEST(accessors_reject_wrong_type_and_null) {
     oi_arena_destroy(a);
 }
 
-/* --- arena interaction: a value larger than a small block_size --- */
-
 TEST(string_larger_than_arena_block_size_parses) {
-    oi_arena *a = oi_arena_create(64); /* deliberately tiny */
+    oi_arena *a = oi_arena_create(64);
     oi_json_parser *p = oi_json_parser_create(a);
     char doc[200];
     const char *text = NULL;
@@ -574,8 +532,6 @@ TEST(string_larger_than_arena_block_size_parses) {
     oi_json_parser_destroy(p);
     oi_arena_destroy(a);
 }
-
-/* ================= writer ================= */
 
 TEST(write_scalars) {
     oi_json_writer *w = oi_json_writer_create();
@@ -694,36 +650,30 @@ TEST(write_output_round_trips_through_parser) {
 
 TEST(write_structural_misuse_is_rejected) {
     oi_json_writer *w = oi_json_writer_create();
-    /* second top-level value */
     CHECK_EQ(oi_json_write_number(w, 1), OI_OK);
     CHECK_EQ(oi_json_write_number(w, 2), OI_ERR_INVAL);
     oi_json_writer_destroy(w);
 
-    /* key outside any object */
     w = oi_json_writer_create();
     CHECK_EQ(oi_json_write_object_key(w, "a", 1), OI_ERR_INVAL);
     oi_json_writer_destroy(w);
 
-    /* value without a preceding key, inside an object */
     w = oi_json_writer_create();
     CHECK_EQ(oi_json_write_object_begin(w), OI_OK);
     CHECK_EQ(oi_json_write_number(w, 1), OI_ERR_INVAL);
     oi_json_writer_destroy(w);
 
-    /* mismatched close */
     w = oi_json_writer_create();
     CHECK_EQ(oi_json_write_array_begin(w), OI_OK);
     CHECK_EQ(oi_json_write_object_end(w), OI_ERR_INVAL);
     oi_json_writer_destroy(w);
 
-    /* closing an object right after a key, with no value */
     w = oi_json_writer_create();
     CHECK_EQ(oi_json_write_object_begin(w), OI_OK);
     CHECK_EQ(oi_json_write_object_key(w, "a", 1), OI_OK);
     CHECK_EQ(oi_json_write_object_end(w), OI_ERR_INVAL);
     oi_json_writer_destroy(w);
 
-    /* close with nothing open */
     w = oi_json_writer_create();
     CHECK_EQ(oi_json_write_array_end(w), OI_ERR_INVAL);
     oi_json_writer_destroy(w);
@@ -790,7 +740,6 @@ TEST(write_many_elements_grows_buffer_and_frames) {
     oi_json_writer_destroy(w);
 }
 
-/* Parses `doc` in one feed call, which takes the plain-run fast path. */
 static oi_json_value *parse_whole(oi_arena *arena, const char *doc,
                                   size_t len, oi_status *out_st) {
     oi_json_parser *p = oi_json_parser_create(arena);
@@ -810,8 +759,8 @@ TEST(string_runs_parse_like_single_bytes) {
         "\"utf-8 \xc3\xa9 \xe2\x82\xac\"",
     };
     static const char *const bad[] = {
-        "\"tab\there\"",          /* raw control byte */
-        "\"\\ud83dx\"",          /* high surrogate then a plain byte */
+        "\"tab\there\"",
+        "\"\\ud83dx\"",
         "\"bad \\q escape\"",
     };
     for (size_t i = 0; i < sizeof good / sizeof good[0]; i++) {
@@ -855,8 +804,6 @@ TEST(write_string_escapes_between_plain_runs) {
     oi_json_writer_destroy(w);
 }
 
-/* A program that embeds liboi can set a locale with a comma radix. The
- * test is a no-op on a host that has none of these locales. */
 TEST(numbers_ignore_the_locale_radix) {
     static const char *const names[] = {"de_DE.UTF-8", "de_DE.utf8",
                                         "fr_FR.UTF-8", "fr_FR.utf8"};

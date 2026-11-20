@@ -427,7 +427,6 @@ TEST(session_setting_records_update_last_known_values) {
     add_message(&history, &record, &message, 5, 1,
                 OI_CLI_HISTORY_MESSAGE_NORMAL, "model",
                 OI_CLI_HISTORY_TOOL_OUTCOME_NONE, 0);
-    /* A later change to the same field wins (last-write). */
     CHECK_EQ(oi_cli_history_record_set_session_setting(
                  &record, 6, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
                  "gpt-second", 10),
@@ -459,7 +458,6 @@ TEST(session_setting_rejected_mid_turn) {
     add_message(&history, &record, &message, 2, 1,
                 OI_CLI_HISTORY_MESSAGE_NORMAL, NULL,
                 OI_CLI_HISTORY_TOOL_OUTCOME_NONE, 0);
-    /* Mid-turn (assistant reply still pending): rejected. */
     CHECK_EQ(oi_cli_history_record_set_session_setting(
                  &record, 3, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
                  "gpt-test", 8),
@@ -522,7 +520,6 @@ TEST(session_setting_rejected_while_input_is_queued) {
     CHECK_EQ(oi_cli_history_record_set_queued_input(&record, 4, 2, "next", 4),
              OI_OK);
     append_record(&history, &record);
-    /* A pending queued item still occupies the between-turns slot. */
     CHECK_EQ(oi_cli_history_record_set_session_setting(
                  &record, 5, OI_CLI_HISTORY_SESSION_SETTING_MODEL,
                  "gpt-test", 8),

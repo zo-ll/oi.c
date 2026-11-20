@@ -223,8 +223,6 @@ TEST(mismatched_backtick_run_length_keeps_scanning_for_a_match) {
     struct oi_cli_bytebuf out_text;
     struct oi_cli_md_span_list spans;
 
-    /* "``a`b``": a length-2 run, then a stray length-1 backtick (not a
-     * match), then the matching length-2 close run. */
     parse("``a`b``", &out_text, &spans);
     check_text(&out_text, "a`b");
     CHECK_EQ(spans.len, (size_t)1);
@@ -255,10 +253,10 @@ TEST(nested_italic_inside_bold_produces_three_flat_spans) {
     parse("**a *b* c**", &out_text, &spans);
     check_text(&out_text, "a b c");
     CHECK_EQ(spans.len, (size_t)3);
-    check_span(&spans, 0, 0, 2, OI_CLI_MD_STYLE_BOLD); /* "a " */
+    check_span(&spans, 0, 0, 2, OI_CLI_MD_STYLE_BOLD);
     check_span(&spans, 1, 2, 1,
-              OI_CLI_MD_STYLE_BOLD | OI_CLI_MD_STYLE_ITALIC); /* "b" */
-    check_span(&spans, 2, 3, 2, OI_CLI_MD_STYLE_BOLD); /* " c" */
+              OI_CLI_MD_STYLE_BOLD | OI_CLI_MD_STYLE_ITALIC);
+    check_span(&spans, 2, 3, 2, OI_CLI_MD_STYLE_BOLD);
 
     oi_cli_bytebuf_free(&out_text);
     oi_cli_md_span_list_free(&spans);
@@ -294,19 +292,12 @@ TEST(multiple_of_three_rule_blocks_incompatible_pairing) {
     struct oi_cli_bytebuf out_text;
     struct oi_cli_md_span_list spans;
 
-    /* "foo*bar**baz*qux**e": the single '*' after "foo" and the '**' after
-     * "bar" are both "can open and close" (intraword-adjacent stars have
-     * no intraword restriction) with lengths 1 and 2 -- their sum (3) is a
-     * multiple of 3 but the lengths individually are not, so CommonMark's
-     * rule forbids that pairing. The single '*' instead matches the later
-     * single '*' after "baz", leaving the first '**' permanently enclosed
-     * (unmatched, literal) and the final '**' unmatched too. */
     parse("foo*bar**baz*qux**e", &out_text, &spans);
     check_text(&out_text, "foobar**bazqux**e");
     CHECK_EQ(spans.len, (size_t)3);
-    check_span(&spans, 0, 0, 3, 0); /* "foo" */
-    check_span(&spans, 1, 3, 8, OI_CLI_MD_STYLE_ITALIC); /* "bar**baz" */
-    check_span(&spans, 2, 11, 6, 0); /* "qux**e" */
+    check_span(&spans, 0, 0, 3, 0);
+    check_span(&spans, 1, 3, 8, OI_CLI_MD_STYLE_ITALIC);
+    check_span(&spans, 2, 11, 6, 0);
 
     oi_cli_bytebuf_free(&out_text);
     oi_cli_md_span_list_free(&spans);

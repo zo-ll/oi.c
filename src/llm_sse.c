@@ -14,11 +14,6 @@ struct oi_llm_sse_parser {
     oi_llm_sse_event_cb on_event;
     void *user_data;
 
-    /* Set by oi_llm_sse_parser_feed before invoking on_event, so a
-     * reentrant oi_llm_sse_parser_destroy() from within that callback
-     * (e.g. the caller cancels an in-flight request as soon as it sees
-     * enough data) can signal back to feed()'s still-running loop that
-     * `p` is gone. Same pattern as oi_llm_conn's destroyed_flag. */
     int *destroyed_flag;
 };
 
@@ -105,7 +100,7 @@ OI_DIAG_POP
             }
             process_line(p);
             if (destroyed) {
-                return OI_OK; /* `p` was freed by a reentrant destroy */
+                return OI_OK;
             }
             p->line_len = 0;
         } else {

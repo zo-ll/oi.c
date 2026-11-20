@@ -47,10 +47,6 @@ void oi_cli_md_delim_list_free(struct oi_cli_md_delim_list *list) {
 
 enum char_class { CLASS_WHITESPACE, CLASS_PUNCTUATION, CLASS_OTHER };
 
-/* ASCII whitespace and ASCII punctuation classification. Bytes >= 0x80
- * (any multi-byte UTF-8 sequence) classify as OTHER -- a documented
- * simplification of CommonMark's full Unicode whitespace/punctuation
- * tables, adequate for the agreed minimal subset. */
 static enum char_class classify_byte(unsigned char c) {
     if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
         c == '\v') {
@@ -63,7 +59,6 @@ static enum char_class classify_byte(unsigned char c) {
     return CLASS_OTHER;
 }
 
-/* Start/end of the text counts as whitespace, per CommonMark. */
 static enum char_class classify_before(const char *text, size_t start) {
     if (start == 0) {
         return CLASS_WHITESPACE;
@@ -140,14 +135,6 @@ oi_status oi_cli_markdown_tokenize(const char *text, size_t len,
     return OI_OK;
 }
 
-/*
- * Resolves backtick code spans: a run of N backticks is closed by the
- * next run of exactly N backticks later in the text. An unmatched run is
- * literal and scanning continues after it. Marks both delimiter runs and
- * everything between them (inclusive) as `guard` -- excluded from
- * emphasis tokenizing -- and the interior alone as CODE-styled and
- * stripped-delimiter.
- */
 static void resolve_code_spans(const char *text, size_t len,
                                unsigned char *stripped, unsigned *style,
                                unsigned char *guard) {
@@ -240,16 +227,6 @@ static int incompatible_multiple_of_three(size_t opener_len, size_t closer_len,
     return !(opener_len % 3 == 0 && closer_len % 3 == 0);
 }
 
-/*
- * Stack-based emphasis matcher (CommonMark's "process emphasis"): walks
- * filtered delimiter runs left to right, matching each closer against the
- * nearest compatible still-open opener, honoring the multiple-of-3 rule.
- * ORs BOLD/ITALIC onto `style` for the fixed interior byte range between
- * a matched pair (the range never changes across repeated partial
- * matches of the same pair, since run positions are fixed -- only how
- * many of a run's own characters are stripped changes), and marks each
- * run's final consumed characters in `stripped`.
- */
 static oi_status match_emphasis(const struct oi_cli_md_delim_run *filtered,
                                 size_t filtered_len, unsigned *style,
                                 unsigned char *stripped) {

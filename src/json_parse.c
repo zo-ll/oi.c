@@ -5,34 +5,28 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Hard cap on container nesting depth: without one, a tiny malicious
- * input of a million '[' characters would grow the frame stack (and,
- * via oi_json_new_array, the arena) without bound. */
 #define OI_JSON_MAX_DEPTH 1000
-/* Hard cap on a single number literal's raw byte length. Real doubles
- * never need more than a few dozen digits; this just stops a
- * pathological "111...1" token from growing unbounded. */
 #define OI_JSON_MAX_NUMBER_LEN 512
 
 enum ps_state {
-    PS_VALUE,           /* between tokens: scanning for the next byte */
+    PS_VALUE,
     PS_STRING,
     PS_STRING_ESCAPE,
     PS_STRING_UNICODE,
     PS_NUMBER,
-    PS_LITERAL,         /* matching true/false/null */
-    PS_DONE,            /* top-level value complete */
+    PS_LITERAL,
+    PS_DONE,
     PS_ERROR
 };
 
 enum frame_kind { FRAME_ARRAY, FRAME_OBJECT };
 
 enum frame_expect {
-    EXPECT_ELEM_OR_CLOSE, /* just opened: a value/key, or the matching close */
-    EXPECT_ELEM,          /* after a comma: a value/key is required */
+    EXPECT_ELEM_OR_CLOSE,
+    EXPECT_ELEM,
     EXPECT_COMMA_OR_CLOSE,
-    EXPECT_COLON,         /* object only, after a key */
-    EXPECT_VALUE          /* object only, after a colon */
+    EXPECT_COLON,
+    EXPECT_VALUE
 };
 
 struct frame {
@@ -53,7 +47,6 @@ struct oi_json_parser {
     size_t depth;
     size_t frame_cap;
 
-    /* string accumulation, shared by keys and string values */
     char *str_buf;
     size_t str_len;
     size_t str_cap;
@@ -63,11 +56,9 @@ struct oi_json_parser {
     unsigned unicode_value;
     int unicode_hex_count;
 
-    /* number accumulation */
     char num_buf[OI_JSON_MAX_NUMBER_LEN];
     size_t num_len;
 
-    /* true/false/null matching */
     const char *literal;
     int literal_index;
 };
@@ -159,8 +150,6 @@ oi_json_value *oi_json_parser_root(const oi_json_parser *p) {
     return p->root;
 }
 
-/* --- scratch buffer growth --- */
-
 static oi_status str_buf_reserve(oi_json_parser *p, size_t additional) {
     if (additional > (size_t)-1 - p->str_len) {
         return OI_ERR_NOMEM;
@@ -227,8 +216,6 @@ static oi_status emit_utf8(oi_json_parser *p, unsigned cp) {
     return str_buf_append_bytes(p, (const char *)buf, (size_t)n);
 }
 
-/* --- frame stack --- */
-
 static oi_status push_frame(oi_json_parser *p, enum frame_kind kind) {
     if (p->depth >= OI_JSON_MAX_DEPTH) {
         p->state = PS_ERROR;
@@ -265,9 +252,6 @@ static oi_status push_frame(oi_json_parser *p, enum frame_kind kind) {
     return OI_OK;
 }
 
-/* A value (scalar, or a container just popped) is complete: attach it to
- * the enclosing array/object, or -- if the stack is empty -- finish the
- * whole document. */
 static oi_status attach_completed(oi_json_parser *p, oi_json_value *value) {
     if (p->depth == 0) {
         p->root = value;
@@ -321,8 +305,6 @@ static oi_status pop_container(oi_json_parser *p) {
     return attach_completed(p, closed);
 }
 
-/* --- value dispatch --- */
-
 static oi_status dispatch_value_start(oi_json_parser *p, unsigned char c) {
     p->parsing_key = 0;
     if (p->depth > 0) {
@@ -330,7 +312,7 @@ static oi_status dispatch_value_start(oi_json_parser *p, unsigned char c) {
         if (top->kind == FRAME_OBJECT &&
             (top->expect == EXPECT_ELEM_OR_CLOSE ||
              top->expect == EXPECT_ELEM)) {
-            if (c != '"') { /* object keys must be strings */
+            if (c != '"') {
                 p->state = PS_ERROR;
                 return OI_ERR_PARSE;
             }
@@ -424,8 +406,6 @@ static oi_status process_between_tokens(oi_json_parser *p, unsigned char c) {
     }
 }
 
-/* --- strings --- */
-
 static oi_status finalize_string_value(oi_json_parser *p) {
     if (p->parsing_key) {
         return attach_completed_key(p);
@@ -455,7 +435,7 @@ static oi_status handle_string_byte(oi_json_parser *p, unsigned char c) {
         return OI_ERR_PARSE;
     }
     if (c < 0x20) {
-        p->state = PS_ERROR; /* raw control chars must be escaped */
+        p->state = PS_ERROR;
         return OI_ERR_PARSE;
     }
     return str_buf_append_byte(p, (char)c);
@@ -533,7 +513,7 @@ static oi_status handle_string_unicode_byte(oi_json_parser *p,
 
     if (p->pending_high_surrogate) {
         if (cp < 0xDC00u || cp > 0xDFFFu) {
-            p->state = PS_ERROR; /* high surrogate not followed by a low one */
+            p->state = PS_ERROR;
             return OI_ERR_PARSE;
         }
         unsigned combined =
@@ -548,13 +528,11 @@ static oi_status handle_string_unicode_byte(oi_json_parser *p,
         return OI_OK;
     }
     if (cp >= 0xDC00u && cp <= 0xDFFFu) {
-        p->state = PS_ERROR; /* lone low surrogate */
+        p->state = PS_ERROR;
         return OI_ERR_PARSE;
     }
     return emit_utf8(p, cp);
 }
-
-/* --- numbers --- */
 
 static int validate_json_number(const char *s, size_t len) {
     size_t i = 0;
@@ -597,9 +575,6 @@ static int validate_json_number(const char *s, size_t len) {
     return i == len;
 }
 
-/* JSON numbers always use '.', but strtod reads the radix of the current
- * locale. An embedding program can set a comma locale, so the parse runs
- * under a thread-local "C" locale. */
 static locale_t c_numeric_locale;
 static pthread_once_t c_numeric_once = PTHREAD_ONCE_INIT;
 
@@ -624,8 +599,7 @@ static oi_status finalize_number(oi_json_parser *p) {
     double value = strtod(p->num_buf, &end);
     uselocale(previous);
     if (end != p->num_buf + p->num_len) {
-        p->state = PS_ERROR; /* defensive: validate_json_number should
-                               * already guarantee this can't happen */
+        p->state = PS_ERROR;
         return OI_ERR_PARSE;
     }
 
@@ -651,8 +625,6 @@ static oi_status handle_number_byte(oi_json_parser *p, unsigned char c,
     return finalize_number(p);
 }
 
-/* --- literals --- */
-
 static oi_status handle_literal_byte(oi_json_parser *p, unsigned char c) {
     if (c != (unsigned char)p->literal[p->literal_index]) {
         p->state = PS_ERROR;
@@ -660,7 +632,7 @@ static oi_status handle_literal_byte(oi_json_parser *p, unsigned char c) {
     }
     p->literal_index++;
     if (p->literal[p->literal_index] != '\0') {
-        return OI_OK; /* still matching */
+        return OI_OK;
     }
 
     oi_json_value *v = (p->literal[0] == 'n')
@@ -672,8 +644,6 @@ static oi_status handle_literal_byte(oi_json_parser *p, unsigned char c) {
     }
     return attach_completed(p, v);
 }
-
-/* --- top-level dispatch --- */
 
 static oi_status step(oi_json_parser *p, unsigned char c, int *consumed) {
     *consumed = 1;
@@ -713,8 +683,6 @@ oi_status oi_json_parser_feed(oi_json_parser *p, const void *bytes,
     const unsigned char *buf = bytes;
     size_t i = 0;
     while (i < len) {
-        /* Inside a string, copy each run of plain bytes in one call; only
-         * a quote, a backslash, or a control byte needs the state machine. */
         if (p->state == PS_STRING && !p->pending_high_surrogate) {
             size_t run = i;
             while (run < len && buf[run] != '"' && buf[run] != '\\' &&
@@ -758,7 +726,7 @@ oi_status oi_json_parser_finish(oi_json_parser *p) {
         if (p->state == PS_DONE) {
             return OI_OK;
         }
-        p->state = PS_ERROR; /* number resolved, but a container is still open */
+        p->state = PS_ERROR;
         return OI_ERR_PARSE;
     }
     p->state = PS_ERROR;

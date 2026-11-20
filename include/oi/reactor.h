@@ -52,7 +52,6 @@ void oi_reactor_destroy(oi_reactor *r);
 oi_status oi_reactor_add(oi_reactor *r, int fd, int interest,
                           oi_reactor_cb cb, void *user_data);
 
-/* Changes the registered interest for an fd already added. */
 oi_status oi_reactor_modify(oi_reactor *r, int fd, int interest);
 
 /* Deregisters `fd`. Safe to call from within that fd's own callback. */
@@ -73,7 +72,6 @@ int oi_reactor_step(oi_reactor *r, int timeout_ms, oi_status *out_status);
  */
 oi_status oi_reactor_run(oi_reactor *r);
 
-/* Requests oi_reactor_run return after the current step. */
 void oi_reactor_stop(oi_reactor *r);
 
 /*
@@ -102,4 +100,4 @@ oi_status oi_reactor_timer_start(oi_reactor *r, int timeout_ms,
  * NULL-safe. Must be called before destroying its reactor. */
 void oi_reactor_timer_cancel(oi_reactor_timer *timer);
 
-#endif /* OI_REACTOR_H */
+#endif

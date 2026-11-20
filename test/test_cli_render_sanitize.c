@@ -45,8 +45,6 @@ static void run_case_split(const unsigned char *in, size_t in_len,
     }
 }
 
-/* Verifies both an unsplit feed and every possible two-call chunk split
- * produce byte-identical output. */
 static void run_case(const char *in, size_t in_len, const char *expected,
                      size_t expected_len) {
     run_case_whole((const unsigned char *)in, in_len,
@@ -140,8 +138,6 @@ TEST(unterminated_escape_at_end_of_turn_is_abandoned) {
 
 TEST(long_unterminated_control_string_hits_cap_and_recovers) {
     size_t filler_len = OI_CLI_SANITIZE_MAX_SEQUENCE + 100;
-    /* ESC + ']' already count as 2 of the cap's budget before the filler
-     * body starts accumulating. */
     size_t consumed_before_cap = OI_CLI_SANITIZE_MAX_SEQUENCE - 2;
     size_t leftover = filler_len - consumed_before_cap;
     static const char prefix[] = "before";

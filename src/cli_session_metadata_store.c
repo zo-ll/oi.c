@@ -64,7 +64,7 @@ oi_status oi_cli_session_metadata_store_read(
         } else if (n < 0 && errno == EINTR) {
             continue;
         } else {
-            st = OI_ERR_PARSE; /* short read: file changed under us */
+            st = OI_ERR_PARSE;
             break;
         }
     }

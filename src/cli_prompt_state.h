@@ -16,10 +16,6 @@ enum oi_cli_prompt_action {
     OI_CLI_PROMPT_ACTION_EXIT
 };
 
-/*
- * Pure prompt interaction state. It owns the current editor and borrows the
- * process-scoped history for its entire lifetime.
- */
 struct oi_cli_prompt_state {
     struct oi_cli_editor editor;
     struct oi_cli_input_history *history;
@@ -38,10 +34,6 @@ oi_status oi_cli_prompt_state_apply(
     const struct oi_cli_input_event *event,
     enum oi_cli_prompt_action *out_action);
 
-/*
- * Copies the current non-empty input into caller-owned storage, appends it to
- * process history, and clears the editor. On failure the editor is unchanged.
- */
 oi_status oi_cli_prompt_state_commit(struct oi_cli_prompt_state *state,
                                      char **out_text, size_t *out_len);
 

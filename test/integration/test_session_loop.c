@@ -1,20 +1,3 @@
-/*
- * End-to-end integration tests: reactor + LLM client + tool execution +
- * session lifecycle, driven against the local mock API server.
- *
- * Where the unit tests exercise one module against hand-fed bytes,
- * these drive the combination the way an embedder would -- a real
- * socket, real HTTP/chunked/SSE framing, a real forked subprocess for
- * the tool, and a real on-disk session log -- with only the model
- * itself faked.
- *
- * One structural note, because it shapes these tests: the library
- * deliberately ships no turn-loop driver (see oi/session.h -- the
- * session module owns identity, arena, and log, not conversation
- * shape), so the loop below *is* the embedder. It builds each request
- * body, consumes the stream, runs the tool, and feeds the result into
- * the next turn.
- */
 
 #include "../test.h"
 #include "mock_api.h"
@@ -37,10 +20,7 @@
     "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},"  \
     "\"required\":[\"text\"]}"
 
-/* What the mock's first turn asks the tool to emit. */
 #define TOOL_TEXT "hello from tool"
-
-/* --- shared helpers --- */
 
 static void run_until(oi_reactor *r, const int *flag, int max_steps) {
     for (int i = 0; i < max_steps && !*flag; i++) {
@@ -82,20 +62,11 @@ static void on_done(oi_status status, int http_status, const char *error_body,
     s->done = 1;
 }
 
-/* --- request building ---
- *
- * The request body is assembled with oi/json.h's writer, which is the
- * path that matters: the tool's output is untrusted bytes going back
- * out over the wire, so its escaping has to be exercised for real
- * rather than sprintf'd into place by the test.
- */
-
 struct msg {
     const char *role;
     const char *content;
 };
 
-/* Returns a malloc'd NUL-terminated body the caller owns. */
 static char *build_body(const struct msg *msgs, size_t nmsgs,
                          size_t *out_len) {
     oi_json_writer *w = oi_json_writer_create();
@@ -139,8 +110,6 @@ static char *build_body(const struct msg *msgs, size_t nmsgs,
     return copy;
 }
 
-/* --- the tool --- */
-
 static char *arena_dup(oi_arena *arena, const char *s, size_t len) {
     char *out = oi_arena_alloc(arena, len + 1);
     if (out == NULL) {
@@ -151,7 +120,6 @@ static char *arena_dup(oi_arena *arena, const char *s, size_t len) {
     return out;
 }
 
-/* Turns {"text": "..."} into `/bin/echo <text>`. */
 static oi_status echo_build_argv(const oi_json_value *args, oi_arena *arena,
                                   void *user_data, char ***out_argv) {
     (void)user_data;
@@ -209,7 +177,6 @@ static void on_tool_done(oi_tool_exit_kind kind, int code, void *ud) {
     t->done = 1;
 }
 
-/* Parses `json` into `arena` and returns the root value. */
 static oi_json_value *parse_into(oi_arena *arena, const char *json) {
     oi_json_parser *p = oi_json_parser_create(arena);
     if (p == NULL) {
@@ -224,8 +191,6 @@ static oi_json_value *parse_into(oi_arena *arena, const char *json) {
     return root;
 }
 
-/* Collects replayed log records so a test can assert on the whole
- * history a restart would see. */
 #define REPLAY_MAX 8
 
 struct replay_sink {
@@ -250,23 +215,6 @@ static void on_record(const void *data, size_t len, void *ud) {
     rs->count++;
 }
 
-/* ================= the full tool-use loop ================= */
-
-/*
- * Turn 1's stream carries content deltas *and* a tool_calls delta. The
- * client documents that it forwards assistant text only and treats a
- * tool-call-only chunk as "nothing to do" -- so this asserts the text
- * arrives intact and the tool-call chunk neither errors nor produces a
- * spurious delta.
- *
- * That documented behavior is also why the tool arguments below are
- * supplied by the test rather than read out of the stream: the client
- * exposes no way for an embedder to see a tool_calls delta, so the
- * model-to-tool hop cannot be closed through the public API today.
- * Everything after that hop -- argument parsing, permission check,
- * subprocess execution, logging, and feeding the result into turn 2 --
- * is the real code path.
- */
 TEST(full_tool_use_loop) {
     const char *turn1 =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\","
@@ -289,8 +237,6 @@ TEST(full_tool_use_loop) {
         "\"stop\"}]}\n\n"
         "data: [DONE]\n\n";
 
-    /* A deliberately small chunk size so SSE events straddle HTTP chunk
-     * boundaries -- the framing layers have to reassemble them. */
     struct mock_turn turns[2] = {{NULL, turn1, 13}, {NULL, turn2, 0}};
     struct mock_api api;
     CHECK(mock_api_start(&api, turns, 2));
@@ -306,8 +252,6 @@ TEST(full_tool_use_loop) {
     CHECK_EQ(oi_tool_registry_add(tools, TOOL_NAME, TOOL_SCHEMA,
                                    echo_build_argv, NULL),
               OI_OK);
-    /* The registry hands the schema back verbatim for the caller to put
-     * in the request's "tools" field. */
     CHECK(oi_tool_registry_schema(tools, TOOL_NAME) != NULL);
     CHECK_STREQ(oi_tool_registry_schema(tools, TOOL_NAME), TOOL_SCHEMA);
 
@@ -322,8 +266,6 @@ TEST(full_tool_use_loop) {
                                  "/v1/chat/completions", 0};
     oi_llm_client *client = oi_llm_client_create(&cfg);
     CHECK(client != NULL);
-
-    /* --- turn 1: user prompt -> assistant text + a tool request --- */
 
     struct msg turn1_msgs[] = {{"user", "Run the echo tool."}};
     size_t body_len = 0;
@@ -343,10 +285,8 @@ TEST(full_tool_use_loop) {
     CHECK_EQ(s1.status, OI_OK);
     CHECK_EQ(s1.http_status, 200);
     CHECK_STREQ(s1.text, "Let me check.");
-    CHECK_EQ(s1.delta_count, 2); /* the tool_calls chunk contributes none */
+    CHECK_EQ(s1.delta_count, 2);
     CHECK_EQ(oi_sesslog_append(log, s1.text, s1.len), OI_OK);
-
-    /* --- run the requested tool --- */
 
     oi_json_value *args = parse_into(arena, "{\"text\":\"" TOOL_TEXT "\"}");
     CHECK(args != NULL);
@@ -366,8 +306,6 @@ TEST(full_tool_use_loop) {
     CHECK_STREQ(t.out, TOOL_TEXT "\n");
     CHECK_EQ(oi_sesslog_append(log, t.out, t.len), OI_OK);
 
-    /* --- turn 2: the tool result goes back to the model --- */
-
     struct msg turn2_msgs[] = {{"user", "Run the echo tool."},
                                 {"assistant", "Let me check."},
                                 {"tool", TOOL_TEXT "\n"}};
@@ -385,27 +323,23 @@ TEST(full_tool_use_loop) {
     CHECK_EQ(s2.status, OI_OK);
     CHECK_STREQ(s2.text, "The tool said: " TOOL_TEXT);
 
-    /* The mock captured what actually went over the wire: the second
-     * request must carry the tool's output, JSON-escaped. */
     char *captured = mock_api_request(&api, 1, NULL);
     CHECK(captured != NULL);
     if (captured != NULL) {
         CHECK(strstr(captured, TOOL_TEXT) != NULL);
-        CHECK(strstr(captured, "\\n") != NULL); /* the newline was escaped */
+        CHECK(strstr(captured, "\\n") != NULL);
         CHECK(strstr(captured, "\"role\":\"tool\"") != NULL);
         free(captured);
     }
 
-    /* --- the log holds the whole turn, in order --- */
-
-    oi_session_destroy(reg, session); /* releases the log's flock */
+    oi_session_destroy(reg, session);
 
     oi_sesslog *reopened = NULL;
     CHECK_EQ(oi_sesslog_open(log_path, &reopened), OI_OK);
     struct replay_sink rs = {0};
     CHECK_EQ(oi_sesslog_replay(reopened, on_record, &rs), OI_OK);
     CHECK(!rs.overflowed);
-    CHECK_EQ(rs.count, 3u); /* request, assistant text, tool output */
+    CHECK_EQ(rs.count, 3u);
     if (rs.count == 3 && !rs.overflowed) {
         CHECK(strstr(rs.records[0], "\"role\":\"user\"") != NULL);
         CHECK_STREQ(rs.records[1], "Let me check.");
@@ -421,10 +355,6 @@ TEST(full_tool_use_loop) {
     unlink(log_path);
 }
 
-/* ================= permission policy ================= */
-
-/* A denied tool must never reach fork/exec, and must report
- * synchronously rather than through the completion callback. */
 TEST(denied_tool_never_executes) {
     oi_reactor *r = oi_reactor_create();
     oi_arena *arena = oi_arena_create(0);
@@ -445,14 +375,11 @@ TEST(denied_tool_never_executes) {
                                  on_tool_output, on_tool_done, &t, &call),
               OI_ERR_DENIED);
 
-    /* Give the reactor a chance to dispatch anything that was wrongly
-     * queued; nothing should have been. */
     int never = 0;
     run_until(r, &never, 5);
     CHECK(!t.done);
     CHECK_EQ(t.len, 0u);
 
-    /* An unregistered name is a distinct, equally synchronous failure. */
     CHECK_EQ(oi_tool_call_start(tools, r, arena, "no_such_tool", args,
                                  permission_from_flag, &decision,
                                  on_tool_output, on_tool_done, &t, &call),
@@ -463,7 +390,6 @@ TEST(denied_tool_never_executes) {
     oi_reactor_destroy(r);
 }
 
-/* A deferred decision runs nothing until it is resolved. */
 TEST(deferred_permission_resolves) {
     oi_reactor *r = oi_reactor_create();
     oi_arena *arena = oi_arena_create(0);
@@ -486,7 +412,7 @@ TEST(deferred_permission_resolves) {
 
     int never = 0;
     run_until(r, &never, 5);
-    CHECK(!t.done); /* still awaiting the decision */
+    CHECK(!t.done);
 
     CHECK_EQ(oi_tool_call_resolve(call, 1), OI_OK);
     run_until(r, &t.done, 200);
@@ -499,14 +425,6 @@ TEST(deferred_permission_resolves) {
     oi_reactor_destroy(r);
 }
 
-/* ================= fault containment ================= */
-
-/*
- * PLAN.md's claim is that a session-level fault tears down that
- * session's resources and leaves the reactor and every other session
- * running. This drives a real API error through the client, fails the
- * session on it, and checks the neighbouring session is untouched.
- */
 TEST(api_error_fails_only_its_own_session) {
     const char *body_500 = "internal error";
     struct mock_turn turns[1] = {
@@ -549,15 +467,12 @@ TEST(api_error_fails_only_its_own_session) {
     CHECK_EQ(s.http_status, 500);
     CHECK_EQ(s.delta_count, 0);
 
-    /* The embedder decides this session is unrecoverable. */
     oi_session_fail(a);
     CHECK_EQ(oi_session_state_of(a), OI_SESSION_FAILED);
     CHECK(oi_session_arena(a) == NULL);
     CHECK(oi_session_log(a) == NULL);
-    /* Still registered, for diagnostics. */
     CHECK(oi_session_lookup(reg, "a") == a);
 
-    /* The neighbour is untouched and still usable. */
     CHECK_EQ(oi_session_state_of(b), OI_SESSION_ACTIVE);
     CHECK(oi_session_arena(b) != NULL);
     CHECK_EQ(oi_sesslog_append(oi_session_log(b), "still here", 10), OI_OK);
@@ -570,12 +485,6 @@ TEST(api_error_fails_only_its_own_session) {
     unlink(path_b);
 }
 
-/* ================= restart / resume ================= */
-
-/*
- * The point of the durable log: a process that dies mid-conversation
- * can reopen the same log by session ID and replay what it had.
- */
 TEST(session_resumes_from_its_log) {
     char log_path[128];
     unique_path(log_path, sizeof log_path, "resume");
@@ -586,11 +495,9 @@ TEST(session_resumes_from_its_log) {
     CHECK_EQ(oi_sesslog_append(oi_session_log(session), "first", 5), OI_OK);
     CHECK_EQ(oi_sesslog_append(oi_session_log(session), "second", 6), OI_OK);
 
-    /* A duplicate ID is refused rather than silently aliasing. */
     oi_session *dup = NULL;
     CHECK_EQ(oi_session_create(reg, "s", log_path, 0, &dup), OI_ERR_EXISTS);
 
-    /* Simulate the restart. */
     oi_session_registry_destroy(reg);
 
     oi_session_registry *reg2 = oi_session_registry_create();
@@ -608,7 +515,6 @@ TEST(session_resumes_from_its_log) {
         CHECK_STREQ(rs.records[1], "second");
     }
 
-    /* Resuming appends to the existing history rather than truncating. */
     CHECK_EQ(oi_sesslog_append(oi_session_log(resumed), "third", 5), OI_OK);
     struct replay_sink rs2 = {0};
     CHECK_EQ(oi_sesslog_replay(oi_session_log(resumed), on_record, &rs2),
@@ -628,7 +534,6 @@ TEST(mock_cleanup_stops_unused_server) {
 }
 
 int main(void) {
-    /* A regression that hangs a child must fail this binary, not CI. */
     oi_test_set_deadline(900);
     RUN(full_tool_use_loop);
     RUN(denied_tool_never_executes);

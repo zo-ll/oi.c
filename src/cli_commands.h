@@ -48,10 +48,6 @@ struct oi_cli_command_parse {
 size_t oi_cli_command_count(void);
 const struct oi_cli_command_definition *oi_cli_command_at(size_t index);
 
-/*
- * Filters command names using the current first token, including its leading
- * slash. Returns the total match count; up to `capacity` indices are written.
- */
 size_t oi_cli_command_filter(const char *text, size_t text_len,
                              size_t *out_indices, size_t capacity);
 

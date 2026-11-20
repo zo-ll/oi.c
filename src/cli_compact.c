@@ -1,5 +1,3 @@
-/* struct signalfd_siginfo / signalfd(2) are GNU/Linux extensions --
- * matches the same _GNU_SOURCE precedent in cli_repl.c. */
 #define _GNU_SOURCE
 
 #include "cli_compact.h"
@@ -83,18 +81,10 @@ oi_status oi_cli_compact_select_prefix(
             seen++;
         }
     }
-    /* Unreachable: compact_turns < total_turns guarantees a USER message at
-     * this position exists. */
     *out_prefix_count = messages->len;
     return OI_OK;
 }
 
-/*
- * Framing for the one-off summarization request: states plainly that the
- * transcript is data to summarize, never instructions, so a prior
- * adversarial tool result or model response embedded in it can't hijack
- * the summarizer.
- */
 static const char system_text[] =
     "You are a context-compaction assistant for a coding CLI agent. The "
     "user message below contains a transcript wrapped in "
@@ -318,14 +308,8 @@ static void compact_on_signal(oi_reactor *r, int fd, int revents,
 
     (void)r;
     (void)revents;
-    /* Each of SIGINT/SIGTERM/SIGHUP is a standard (non-realtime) signal,
-     * so at most one of each is ever actually pending -- looping is
-     * defensive, matching cli_repl.c's handle_turn_signal. */
     while (read(fd, &info, sizeof info) == (ssize_t)sizeof info) {
         if (state->done) {
-            /* on_done already fired for this request in the same reactor
-             * step (both fds became ready together) -- drain only, don't
-             * relabel an already-finished request as cancelled. */
             continue;
         }
         switch (info.ssi_signo) {

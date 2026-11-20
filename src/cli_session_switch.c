@@ -28,8 +28,6 @@ void oi_cli_session_switch_result_free(
     if (result == NULL) {
         return;
     }
-    /* Never destroys `session`: on success the caller owns it, and on any
-     * other outcome the switch already rolled its registration back. */
     oi_cli_history_store_free(&result->store);
     oi_cli_history_replay_state_free(&result->state);
     oi_cli_message_list_free(&result->initial_context);
@@ -40,9 +38,6 @@ void oi_cli_session_switch_result_free(
     oi_cli_session_switch_result_init(result);
 }
 
-/* Appends the schema transition and any interrupted-turn repairs the replay
- * asked for -- the same preparation every other session-open path performs,
- * so a switched-to session is indistinguishable from one opened directly. */
 static oi_status prepare_history(struct oi_cli_history_store *store,
                                  struct oi_cli_history_replay_state *state) {
     oi_status status = OI_OK;
@@ -110,7 +105,6 @@ oi_status oi_cli_session_switch(
     oi_cli_session_switch_result_init(out_result);
     oi_cli_session_switch_result_init(&result);
 
-    /* Cheapest check first, and no I/O for it. */
     if (current_session_id != NULL &&
         strlen(current_session_id) == target_id_len &&
         memcmp(current_session_id, target_id, target_id_len) == 0) {
@@ -132,8 +126,6 @@ oi_status oi_cli_session_switch(
                                     &directory);
     free(root);
     if (status != OI_OK) {
-        /* Both "absent" and "present but not a plain directory" mean there
-         * is nothing here the user can switch to. */
         out_result->outcome = OI_CLI_SESSION_SWITCH_NOT_FOUND;
         return OI_OK;
     }
@@ -151,22 +143,15 @@ oi_status oi_cli_session_switch(
         return status;
     }
 
-    /* From here on, every failure must undo whatever it registered. */
     status = oi_session_create(registry, terminated, history_path, 0,
                                &result.session);
     free(history_path);
     if (status != OI_OK) {
         result.session = NULL;
         oi_cli_session_switch_result_free(&result);
-        /* Running out of memory is structural, not a property of the
-         * target: reporting it as "corrupt" would blame a session that is
-         * perfectly fine and hide a real failure from the caller. */
         if (status == OI_ERR_NOMEM) {
             return status;
         }
-        /* OI_ERR_EXISTS is the flock already being held -- either by
-         * another process, or by this one if the id is somehow already
-         * registered. Either way it is not switchable right now. */
         out_result->outcome = status == OI_ERR_EXISTS
                                   ? OI_CLI_SESSION_SWITCH_BUSY
                                   : OI_CLI_SESSION_SWITCH_CORRUPT;
@@ -182,9 +167,6 @@ oi_status oi_cli_session_switch(
         out_result->outcome = OI_CLI_SESSION_SWITCH_CORRUPT;
         return OI_OK;
     }
-    /* Captured before any append below, so it reflects whether this session
-     * had any pre-existing records at all -- the same convention every
-     * other open path uses to decide is_new_session. */
     is_new_history = result.store.typed_history.len == 0;
 
     status = prepare_history(&result.store, &result.state);
@@ -195,9 +177,6 @@ oi_status oi_cli_session_switch(
         oi_session_destroy(registry, result.session);
         result.session = NULL;
         oi_cli_session_switch_result_free(&result);
-        /* An allocation failure here is structural; a durable-append
-         * failure means this session is not usable. Distinguish so the
-         * REPL does not end over a merely unusable target. */
         if (status == OI_ERR_NOMEM) {
             return status;
         }
@@ -205,16 +184,6 @@ oi_status oi_cli_session_switch(
         return OI_OK;
     }
 
-    /*
-     * restore_settings chdir()s into the target's working directory. If it
-     * then fails, the caller keeps using the old session, so the process
-     * must not be left standing in the target's directory.
-     *
-     * That rollback is only possible if the current directory is known, so
-     * a getcwd failure refuses the switch outright rather than proceeding
-     * into a chdir it could not undo. Better to decline a switch than to
-     * leave the old session running from an unknown directory.
-     */
     saved_cwd = getcwd(NULL, 0);
     if (saved_cwd == NULL) {
         oi_session_destroy(registry, result.session);
@@ -230,7 +199,7 @@ oi_status oi_cli_session_switch(
     oi_cli_session_restore_init(&restore);
     status = oi_cli_session_restore_settings(
         &result.store, &result.state, result.metadata_path, terminated,
-        is_new_history, /*explicit_model=*/NULL, default_model, default_cwd,
+        is_new_history, NULL, default_model, default_cwd,
         diagnostics, &restore);
     if (status == OI_OK) {
         status = oi_cli_string_set(&result.model, restore.model.data,
@@ -243,14 +212,6 @@ oi_status oi_cli_session_switch(
     result.model_origin = restore.model_origin;
     oi_cli_session_restore_free(&restore);
     if (status != OI_OK) {
-        /*
-         * Put the process back where the caller left it. If even that
-         * fails, the old session cannot safely continue -- it would be
-         * running from the target's directory -- so this stops being a
-         * recoverable business outcome and becomes a real error. Reporting
-         * it as merely "corrupt target" would tell the caller to carry on
-         * in a directory it did not choose.
-         */
         int restored = chdir(saved_cwd) == 0;
         if (!restored && diagnostics != NULL) {
             fprintf(diagnostics,
@@ -273,8 +234,6 @@ oi_status oi_cli_session_switch(
     }
     free(saved_cwd);
 
-    /* Committed. Hand everything over in one move; the source is re-inited
-     * rather than freed, since ownership transferred rather than ended. */
     *out_result = result;
     oi_cli_session_switch_result_init(&result);
     out_result->outcome = OI_CLI_SESSION_SWITCH_OK;

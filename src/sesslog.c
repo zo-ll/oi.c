@@ -13,9 +13,6 @@
 
 #define OI_SESSLOG_MAGIC "OISESLOG"
 #define OI_SESSLOG_MAGIC_LEN 8
-/* Version 1 records are [u32 length][payload]. Version 2 records are
- * [u32 length][u32 CRC-32 of the payload][payload]. A new log is version
- * 2; a version 1 log keeps its own record format for its whole life. */
 #define OI_SESSLOG_VERSION_LENGTH_ONLY 1u
 #define OI_SESSLOG_VERSION 2u
 #define OI_SESSLOG_HEADER_LEN (OI_SESSLOG_MAGIC_LEN + 4)
@@ -24,8 +21,6 @@ struct oi_sesslog {
     int fd;
     uint32_t version;
     size_t damaged_bytes;
-    /* The file size after the last complete record. The lifetime flock
-     * keeps other appenders out, so only this handle changes it. */
     off_t size;
 };
 
@@ -33,7 +28,6 @@ static size_t record_head_len(uint32_t version) {
     return version == OI_SESSLOG_VERSION_LENGTH_ONLY ? 4 : 8;
 }
 
-/* CRC-32 (IEEE 802.3, reflected), four bits at a time. */
 static uint32_t crc32_update(uint32_t crc, const unsigned char *data,
                              size_t len) {
     static const uint32_t table[16] = {
@@ -51,8 +45,6 @@ static uint32_t crc32_update(uint32_t crc, const unsigned char *data,
     return ~crc;
 }
 
-/* CRC-32 of `len` bytes at `pos`, read in chunks so a large record needs
- * no buffer of its own size. */
 static oi_status crc32_of_range(int fd, off_t pos, size_t len,
                                 uint32_t *out_crc) {
     unsigned char chunk[16384];
@@ -89,15 +81,6 @@ static void best_effort_truncate(int fd, off_t size) {
     }
 }
 
-/* Walks records from just after the header, bounding every offset
- * against the file's actual size (rather than relying on read() EOF
- * detection), so a length prefix claiming more than what's really
- * there is detected without ever reading past the real end of file.
- *
- * A record that runs past the end of the file is the tail of a write
- * that a crash cut short. An implausible length or a checksum mismatch
- * on a complete record is damage: *out_damaged is set, because the bytes
- * after it can hold more records. */
 static oi_status scan_for_valid_end(int fd, uint32_t version,
                                      off_t file_size, off_t *out_valid_end,
                                      int *out_damaged) {
@@ -111,7 +94,7 @@ static oi_status scan_for_valid_end(int fd, uint32_t version,
             return OI_ERR_IO;
         }
         if ((size_t)n < head_len) {
-            break; /* truncated record head */
+            break;
         }
         uint32_t rec_len = decode_u32le(head);
         if (rec_len > OI_SESSLOG_MAX_RECORD) {
@@ -119,7 +102,7 @@ static oi_status scan_for_valid_end(int fd, uint32_t version,
             break;
         }
         if ((off_t)rec_len > file_size - pos - (off_t)head_len) {
-            break; /* truncated payload */
+            break;
         }
         if (version != OI_SESSLOG_VERSION_LENGTH_ONLY) {
             uint32_t crc;
@@ -139,9 +122,6 @@ static oi_status scan_for_valid_end(int fd, uint32_t version,
     return OI_OK;
 }
 
-/* Copies the whole log to "<path>.corrupt" before a recovery cut removes
- * damaged bytes, so the records after the damage stay recoverable by
- * hand. Replaces an older copy. */
 static oi_status keep_damaged_copy(int fd, const char *path,
                                    off_t file_size) {
     size_t path_len = strlen(path);
@@ -219,8 +199,6 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log) {
         encode_u32le(header + OI_SESSLOG_MAGIC_LEN, OI_SESSLOG_VERSION);
         ssize_t n = write(fd, header, sizeof header);
         if (n != (ssize_t)sizeof header) {
-            /* Keep a failed first write from leaving a file that looks
-             * permanently corrupt to the next open attempt. */
             best_effort_truncate(fd, 0);
             close(fd);
             return OI_ERR_IO;
@@ -252,7 +230,6 @@ oi_status oi_sesslog_open(const char *path, oi_sesslog **out_log) {
         oi_status st2 =
             scan_for_valid_end(fd, version, st.st_size, &valid_end, &damaged);
         if (st2 == OI_OK && damaged) {
-            /* No cut without the copy: a failed copy keeps every byte. */
             st2 = keep_damaged_copy(fd, path, st.st_size);
             damaged_bytes = (size_t)(st.st_size - valid_end);
         }
@@ -317,9 +294,6 @@ oi_status oi_sesslog_append(oi_sesslog *log, const void *data, size_t len) {
     } while (n < 0 && errno == EINTR);
 
     if (n < 0 || (size_t)n != total) {
-        /* The handle stays usable after a short/error write: remove any
-         * partial tail now instead of waiting for a future reopen to
-         * discover and recover it. */
         best_effort_truncate(log->fd, log->size);
         return OI_ERR_IO;
     }
@@ -344,7 +318,7 @@ oi_status oi_sesslog_replay(oi_sesslog *log, oi_sesslog_record_cb cb,
         unsigned char head[8];
         ssize_t n = pread(log->fd, head, head_len, pos);
         if (n != (ssize_t)head_len) {
-            return OI_ERR_IO; /* open() already validated/truncated the file */
+            return OI_ERR_IO;
         }
         uint32_t rec_len = decode_u32le(head);
         if ((off_t)rec_len > st.st_size - pos - (off_t)head_len) {
@@ -364,7 +338,6 @@ oi_status oi_sesslog_replay(oi_sesslog *log, oi_sesslog_record_cb cb,
                 return OI_ERR_IO;
             }
         }
-        /* A record damaged after open is reported, never delivered. */
         if (head_len == 8 &&
             crc32_update(0, payload, rec_len) != decode_u32le(head + 4)) {
             free(payload);

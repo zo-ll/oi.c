@@ -9,8 +9,8 @@
 
 struct frame {
     int is_object;
-    size_t count;         /* members/elements already fully written */
-    int awaiting_value;   /* object only: key written, value still due */
+    size_t count;
+    int awaiting_value;
 };
 
 struct oi_json_writer {
@@ -22,8 +22,8 @@ struct oi_json_writer {
     size_t frame_count;
     size_t frame_cap;
 
-    int have_root; /* top-level value fully written */
-    int failed;    /* sticky: a structural-misuse error occurred */
+    int have_root;
+    int failed;
 };
 
 oi_json_writer *oi_json_writer_create(void) {
@@ -58,7 +58,6 @@ void oi_json_writer_destroy(oi_json_writer *w) {
     if (w == NULL) {
         return;
     }
-    /* The buffer can hold a secret, for example saved credentials. */
     oi_wipe(w->buf, w->len);
     free(w->buf);
     free(w->frames);
@@ -69,7 +68,7 @@ static oi_status ensure_buf(oi_json_writer *w, size_t additional) {
     if (additional > (size_t)-1 - w->len - 1) {
         return OI_ERR_NOMEM;
     }
-    size_t needed = w->len + additional + 1; /* +1 for trailing NUL */
+    size_t needed = w->len + additional + 1;
     if (needed <= w->cap) {
         return OI_OK;
     }
@@ -80,8 +79,6 @@ static oi_status ensure_buf(oi_json_writer *w, size_t additional) {
         }
         new_cap *= 2;
     }
-    /* Not realloc: a moved block would keep a copy of the text in freed
-     * memory, where oi_json_writer_destroy cannot wipe it. */
     char *new_buf = malloc(new_cap);
     if (new_buf == NULL) {
         return OI_ERR_NOMEM;
@@ -130,10 +127,6 @@ static oi_status push_frame(oi_json_writer *w, int is_object) {
     return OI_OK;
 }
 
-/* Validates/updates state for the start of any value (scalar or the
- * opening bracket of a container), including comma insertion for array
- * elements. Object members insert their own comma in
- * oi_json_write_object_key, since it precedes the key, not the value. */
 static oi_status begin_value(oi_json_writer *w) {
     if (w == NULL) {
         return OI_ERR_INVAL;
@@ -164,8 +157,6 @@ static oi_status begin_value(oi_json_writer *w) {
     return OI_OK;
 }
 
-/* Marks the value just written as complete: bumps the parent frame's
- * element count (or, at top level, marks the whole document done). */
 static void end_value(oi_json_writer *w) {
     if (w->frame_count == 0) {
         w->have_root = 1;
@@ -204,7 +195,7 @@ oi_status oi_json_write_bool(oi_json_writer *w, int value) {
 
 oi_status oi_json_write_number(oi_json_writer *w, double value) {
     if (!isfinite(value)) {
-        return OI_ERR_INVAL; /* JSON has no NaN/Infinity literal */
+        return OI_ERR_INVAL;
     }
     oi_status st = begin_value(w);
     if (st != OI_OK) {
@@ -216,9 +207,6 @@ oi_status oi_json_write_number(oi_json_writer *w, double value) {
     if (n < 0 || (size_t)n >= sizeof tmp) {
         return OI_ERR_INVAL;
     }
-    /* "%.17g" writes the radix of the current locale, which can be ',' or
-     * a multibyte sequence. Every other byte it writes is a digit, a sign,
-     * or 'e', so replace the one run of other bytes with '.'. */
     size_t len = 0;
     for (int i = 0; i < n; len++) {
         unsigned char c = (unsigned char)tmp[i];
@@ -241,8 +229,6 @@ oi_status oi_json_write_number(oi_json_writer *w, double value) {
 
 static oi_status append_escaped_string(oi_json_writer *w, const char *s,
                                         size_t len) {
-    /* Each byte can expand to six bytes as a \u00XX escape, plus quotes.
-     * Reject impossible lengths before reading from caller memory. */
     if (len > ((size_t)-1 - 2) / 6) {
         return OI_ERR_NOMEM;
     }
@@ -252,7 +238,6 @@ static oi_status append_escaped_string(oi_json_writer *w, const char *s,
     }
 
     for (size_t i = 0; i < len; i++) {
-        /* Append each run of bytes that need no escape in one call. */
         size_t run = i;
         while (run < len && (unsigned char)s[run] >= 0x20 && s[run] != '"' &&
                s[run] != '\\') {
@@ -302,7 +287,7 @@ static oi_status append_escaped_string(oi_json_writer *w, const char *s,
             out = "\\t";
             out_len = 2;
             break;
-        default: /* a control byte; the run above took every other byte */
+        default:
             snprintf(esc, sizeof esc, "\\u%04x", c);
             out = esc;
             out_len = 6;
@@ -343,7 +328,7 @@ static oi_status begin_container(oi_json_writer *w, int is_object) {
     if (st != OI_OK) {
         return st;
     }
-    end_value(w); /* the container occupies its parent's value slot */
+    end_value(w);
     return push_frame(w, is_object);
 }
 

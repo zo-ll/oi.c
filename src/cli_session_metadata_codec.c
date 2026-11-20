@@ -69,8 +69,6 @@ oi_status oi_cli_session_metadata_encode(
         st = write_key(writer, "display_name", 12);
     }
     if (st == OI_OK) {
-        /* Always emitted, "" when unset, keeping a version 2 object at a
-         * fixed seven fields. */
         st = oi_json_write_string(writer, metadata->display_name.data == NULL
                                               ? ""
                                               : metadata->display_name.data,
@@ -213,10 +211,6 @@ oi_status oi_cli_session_metadata_decode(
                         (version != 1 && version != 2))) {
         st = OI_ERR_PARSE;
     }
-    /* Exact count per version: version 1 has six fields and version 2
-     * adds display_name for seven. Checking the count this way keeps an
-     * unknown or misspelled key a parse error instead of something
-     * silently ignored, which is the whole point of the strict decode. */
     if (st == OI_OK &&
         oi_json_object_len(object) != (version == 2 ? 7u : 6u)) {
         st = OI_ERR_PARSE;
@@ -239,9 +233,6 @@ oi_status oi_cli_session_metadata_decode(
     struct oi_cli_session_metadata replacement;
     oi_cli_session_metadata_init(&replacement);
     if (st == OI_OK) {
-        /* Sets the current schema version regardless of what was read, so
-         * a version 1 file comes back as an in-memory version 2 struct
-         * and the next write emits version 2. */
         st = oi_cli_session_metadata_set(&replacement, session_id,
                                          session_id_len, model, model_len,
                                          cwd, cwd_len, display_name,
