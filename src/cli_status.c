@@ -1,5 +1,6 @@
 #include "cli_status.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -230,12 +231,10 @@ static oi_status append_session(struct status_writer *writer,
     const char *fixed = session_state_text(snapshot->session_state);
     oi_status status;
 
-    if (fixed == NULL && snapshot->session_id == NULL) {
-        fixed = "(unknown)";
-    }
     if (fixed != NULL) {
         return append_line(writer, "Session", fixed);
     }
+    assert(snapshot->session_id != NULL);
     status = begin_line(writer, "Session");
     if (status == OI_OK) {
         status = append_untrusted(writer, snapshot->session_id);

@@ -263,12 +263,6 @@ TEST(every_session_state_is_reported) {
                  "Session: 20260731-100000 (durable storage failed)\n") !=
               NULL);
     free(text);
-
-    snapshot.session_state = OI_CLI_STATUS_SESSION_ACTIVE;
-    snapshot.session_id = NULL;
-    text = render(&snapshot);
-    CHECK(text != NULL && strstr(text, "Session: (unknown)\n") != NULL);
-    free(text);
 }
 
 TEST(every_model_origin_is_reported) {

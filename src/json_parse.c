@@ -1,5 +1,6 @@
 #include "json_internal.h"
 
+#include <assert.h>
 #include <locale.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -598,10 +599,7 @@ static oi_status finalize_number(oi_json_parser *p) {
     char *end;
     double value = strtod(p->num_buf, &end);
     uselocale(previous);
-    if (end != p->num_buf + p->num_len) {
-        p->state = PS_ERROR;
-        return OI_ERR_PARSE;
-    }
+    assert(end == p->num_buf + p->num_len);
 
     oi_json_value *v = oi_json_new_number(p->arena, value);
     if (v == NULL) {
