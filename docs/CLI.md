@@ -368,8 +368,8 @@ Notes:
   4 MiB, oldest dropped first. A single draft is bounded at 1 MiB.
 - **Ctrl+C** at the prompt clears the draft; during a turn it cancels the
   turn; in a selector it cancels the selector (which counts as declining).
-- **Ctrl+D** exits only from an empty draft. Pressed during a turn it does
-  nothing.
+- **Ctrl+D** exits only from an empty draft at an idle prompt. Pressed on an
+  empty draft during a turn, it does nothing.
 - A lone `Escape` is resolved after 40 ms, so it is not mistaken for the
   start of an arrow-key sequence.
 - Cursor arithmetic covers a documented subset of Unicode: combining marks
@@ -433,7 +433,8 @@ immediately even while a turn is active.
 
 Process scope. Ends the run at a safe boundary; typed during a turn it takes
 the pending slot and exits once the turn finishes. At an idle prompt, Ctrl+D
-on an empty draft is the same as `/exit`. During a turn, Ctrl+D does nothing.
+on an empty draft is the same as `/exit`. During a turn, Ctrl+D on an empty
+draft does nothing.
 
 ### `/status`
 
