@@ -4005,9 +4005,13 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
 
     CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
     CHECK(write_interactive(master_fd, "hello\r", 6));
-    CHECK(interactive_wait_for(master_fd, &result, "\r\n", 1));
-    struct timespec pause = {0, 300 * 1000 * 1000};
-    nanosleep(&pause, NULL);
+    int renewal_fd = -1;
+    {
+        struct pollfd incoming = {listen_fd, POLLIN, 0};
+        CHECK_EQ(poll(&incoming, 1, 20000), 1);
+        renewal_fd = accept(listen_fd, NULL, NULL);
+        CHECK(renewal_fd >= 0);
+    }
 
     struct timespec before;
     struct timespec after;
@@ -4037,6 +4041,7 @@ TEST(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal) {
         CHECK(memcmp(saved, credentials, sizeof credentials - 1) == 0);
     }
     close(master_fd);
+    close(renewal_fd);
     close(listen_fd);
     remove_sessions_under(session_root);
     rmdir(session_root);

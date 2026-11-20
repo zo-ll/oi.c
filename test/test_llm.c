@@ -17,20 +17,36 @@
 #include <unistd.h>
 
 static void drain_request(int cfd) {
-    char buf[8192];
-    for (;;) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(cfd, &rfds);
-        struct timeval tv = {0, 150000};
-        int rc = select(cfd + 1, &rfds, NULL, NULL, &tv);
-        if (rc <= 0) {
-            break;
-        }
-        ssize_t n = read(cfd, buf, sizeof buf);
+    char head[8192];
+    size_t len = 0;
+    const char *head_end = NULL;
+
+    while (head_end == NULL && len < sizeof head - 1) {
+        ssize_t n = read(cfd, head + len, sizeof head - 1 - len);
         if (n <= 0) {
-            break;
+            return;
         }
+        len += (size_t)n;
+        head[len] = '\0';
+        head_end = strstr(head, "\r\n\r\n");
+    }
+    if (head_end == NULL) {
+        return;
+    }
+    const char *cl = strstr(head, "Content-Length: ");
+    size_t remaining = cl != NULL && cl < head_end
+                           ? strtoul(cl + 16, NULL, 10)
+                           : 0;
+    size_t body_read = (size_t)(head + len - (head_end + 4));
+    remaining = body_read >= remaining ? 0 : remaining - body_read;
+    while (remaining > 0) {
+        char buf[8192];
+        ssize_t n = read(cfd, buf,
+                         remaining < sizeof buf ? remaining : sizeof buf);
+        if (n <= 0) {
+            return;
+        }
+        remaining -= (size_t)n;
     }
 }
 
@@ -909,8 +925,17 @@ TEST(unterminated_done_sentinel_completes_stream) {
 }
 
 TEST(request_deadline_reports_timeout) {
-    unsigned short port;
-    pid_t child = start_mock_server("", 0, &port);
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof addr;
+    CHECK(listen_fd >= 0);
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK_EQ(bind(listen_fd, (struct sockaddr *)&addr, sizeof addr), 0);
+    CHECK_EQ(listen(listen_fd, 1), 0);
+    CHECK_EQ(getsockname(listen_fd, (struct sockaddr *)&addr, &alen), 0);
+    unsigned short port = ntohs(addr.sin_port);
     oi_reactor *r = oi_reactor_create();
     oi_arena *a = oi_arena_create(0);
     struct oi_llm_config cfg = {
@@ -929,7 +954,7 @@ TEST(request_deadline_reports_timeout) {
     oi_llm_client_destroy(client);
     oi_arena_destroy(a);
     oi_reactor_destroy(r);
-    waitpid(child, NULL, 0);
+    close(listen_fd);
 }
 
 struct cancel_ctx {
