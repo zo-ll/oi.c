@@ -50,6 +50,12 @@ struct oi_cli_conversation {
     int steering;
     oi_tool_call *pending_permission_tool;
     int cancelling;
+    struct oi_cli_usage usage;
+    int request_has_usage;
+    size_t request_input_tokens;
+    size_t request_output_tokens;
+    size_t request_cached_input_tokens;
+    int request_has_cached_input_tokens;
 };
 
 static oi_status buffer_append(struct buffer *buffer, const void *data,
@@ -182,6 +188,11 @@ static oi_status build_request_body(const oi_cli_conversation *conversation,
                                conversation->model.len));
     WRITE(oi_json_write_object_key(writer, "stream", 6));
     WRITE(oi_json_write_bool(writer, 1));
+    WRITE(oi_json_write_object_key(writer, "stream_options", 14));
+    WRITE(oi_json_write_object_begin(writer));
+    WRITE(oi_json_write_object_key(writer, "include_usage", 13));
+    WRITE(oi_json_write_bool(writer, 1));
+    WRITE(oi_json_write_object_end(writer));
     WRITE(oi_json_write_object_key(writer, "messages", 8));
     WRITE(oi_json_write_array_begin(writer));
     for (size_t i = 0; i < conversation->messages.len; i++) {
@@ -709,9 +720,37 @@ static void start_next_tool(oi_cli_conversation *conversation) {
     }
 }
 
+static void add_request_usage(oi_cli_conversation *conversation) {
+    struct oi_cli_usage *usage = &conversation->usage;
+
+    usage->requests++;
+    if (conversation->request_has_usage) {
+        usage->reported_requests++;
+        usage->input_tokens += conversation->request_input_tokens;
+        usage->output_tokens += conversation->request_output_tokens;
+        if (conversation->request_has_cached_input_tokens) {
+            usage->cached_reported_requests++;
+            usage->cached_input_tokens +=
+                conversation->request_cached_input_tokens;
+        }
+    }
+    conversation->request_has_usage = 0;
+    conversation->request_has_cached_input_tokens = 0;
+}
+
 static void on_llm_event(const oi_llm_event *event, void *user_data) {
     oi_cli_conversation *conversation = user_data;
     oi_status st;
+    if (event->type == OI_LLM_EVENT_USAGE) {
+        conversation->request_has_usage = 1;
+        conversation->request_input_tokens = event->as.usage.input_tokens;
+        conversation->request_output_tokens = event->as.usage.output_tokens;
+        conversation->request_cached_input_tokens =
+            event->as.usage.cached_input_tokens;
+        conversation->request_has_cached_input_tokens =
+            event->as.usage.has_cached_input_tokens;
+        return;
+    }
     if (event->type == OI_LLM_EVENT_TEXT) {
         st = buffer_append(&conversation->assistant, event->as.text.data,
                            event->as.text.len,
@@ -747,6 +786,7 @@ static void on_llm_event(const oi_llm_event *event, void *user_data) {
     if (st != OI_OK) {
         oi_llm_request *request = conversation->request;
         conversation->request = NULL;
+        add_request_usage(conversation);
         oi_llm_request_cancel(request);
         finish_turn_with_repair(conversation, st,
                                0);
@@ -759,6 +799,7 @@ static void on_llm_done(oi_status status, int http_status,
     oi_cli_conversation *conversation = user_data;
     conversation->request = NULL;
     conversation->http_status = http_status;
+    add_request_usage(conversation);
     if (status != OI_OK) {
         if (error_body != NULL && error_body_len > 0) {
             struct oi_cli_conversation_event error = {
@@ -837,12 +878,19 @@ static oi_status start_model_request(oi_cli_conversation *conversation) {
     size_t body_len;
     const char *body = oi_json_writer_data(writer, &body_len);
     conversation->model_steps++;
+    conversation->request_has_usage = 0;
+    conversation->request_has_cached_input_tokens = 0;
     st = oi_llm_request_start_events(
         conversation->client, conversation->reactor, conversation->arena,
         body, body_len, on_llm_event, on_llm_done, conversation,
         &conversation->request);
     oi_json_writer_destroy(writer);
     return st;
+}
+
+const struct oi_cli_usage *oi_cli_conversation_usage(
+    const oi_cli_conversation *conversation) {
+    return &conversation->usage;
 }
 
 oi_status oi_cli_conversation_create(
@@ -1015,6 +1063,7 @@ void oi_cli_conversation_cancel(oi_cli_conversation *conversation) {
             };
             (void)emit(conversation, &partial);
         }
+        add_request_usage(conversation);
         oi_llm_request_cancel(request);
     }
     if (conversation->pending_permission_tool != NULL) {

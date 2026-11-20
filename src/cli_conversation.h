@@ -124,6 +124,18 @@ int oi_cli_conversation_is_busy(const oi_cli_conversation *conversation);
 
 enum oi_cli_conversation_activity oi_cli_conversation_activity(
     const oi_cli_conversation *conversation);
+
+struct oi_cli_usage {
+    size_t requests;
+    size_t reported_requests;
+    size_t cached_reported_requests;
+    size_t input_tokens;
+    size_t cached_input_tokens;
+    size_t output_tokens;
+};
+
+const struct oi_cli_usage *oi_cli_conversation_usage(
+    const oi_cli_conversation *conversation);
 int oi_cli_conversation_was_cancelled(const oi_cli_conversation *conversation);
 oi_status oi_cli_conversation_last_status(
     const oi_cli_conversation *conversation);

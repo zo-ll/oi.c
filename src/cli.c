@@ -46,6 +46,8 @@ static void print_usage(void) {
         "  --allow-tools        run requested tools without prompting\n"
         "  --deny-tools         reject every requested tool\n"
         "                       (default: ask on a terminal, refuse otherwise)\n"
+        "  --usage              print token usage to stderr after a one-shot "
+        "run\n"
         "  --tls / --no-tls     use TLS (default: on)\n"
         "  --dry-run            resolve config and print the request, don't send it\n"
         "  -h, --help           show this help\n"
@@ -665,6 +667,7 @@ int main(int argc, char **argv) {
     int cli_use_tls = -1;
     int dry_run = 0;
     int max_turns = 8;
+    int report_usage = 0;
     oi_cli_tool_policy tool_policy = OI_CLI_TOOLS_ASK;
 
     struct {
@@ -682,6 +685,10 @@ int main(int argc, char **argv) {
         }
         if (strcmp(arg, "--dry-run") == 0) {
             dry_run = 1;
+            continue;
+        }
+        if (strcmp(arg, "--usage") == 0) {
+            report_usage = 1;
             continue;
         }
         if (strcmp(arg, "--allow-tools") == 0) {
@@ -1137,6 +1144,7 @@ int main(int argc, char **argv) {
     struct oi_cli_loop_config loop_config = {
         .model = cfg.model,
         .max_turns = max_turns,
+        .print_usage = report_usage,
         .tool_timeout_ms = cfg.timeout_ms,
         .permission = &permission,
         .out = stdout,

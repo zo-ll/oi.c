@@ -133,6 +133,10 @@ static oi_status repl_status_snapshot(
         conversation == NULL ? OI_OK
                              : oi_cli_conversation_last_status(conversation);
     out_snapshot->steering = oi_cli_conversation_is_steering(conversation);
+    out_snapshot->usage_known = 1;
+    if (conversation != NULL) {
+        out_snapshot->usage = *oi_cli_conversation_usage(conversation);
+    }
     out_snapshot->queue = repl_queue_state(context->pending);
     out_snapshot->queue_bytes = context->pending->text_len;
     if (config->status_checkpoint != NULL) {
