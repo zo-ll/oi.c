@@ -10,9 +10,6 @@
 typedef struct oi_llm_client oi_llm_client;
 typedef struct oi_llm_request oi_llm_request;
 
-/* Fires for each streamed assistant-text delta. May fire zero or more
- * times over the life of a request. `text` is borrowed -- copy it if
- * you need it past the callback's return. */
 typedef void (*oi_llm_delta_cb)(const char *text, size_t len,
                                  void *user_data);
 
@@ -21,14 +18,6 @@ typedef enum {
     OI_LLM_EVENT_TOOL_CALL
 } oi_llm_event_type;
 
-/*
- * One borrowed streaming event. Every pointer is valid only until the
- * callback returns. TOOL_CALL fields are fragments from one indexed call:
- * a field with length zero was absent from this delta. Callers that need a
- * complete call append fragments by `index`; the stream is rejected unless
- * every call finishes with a non-empty id/name and JSON-object arguments.
- * A call whose arguments are present but empty gets one final "{}" fragment.
- */
 typedef struct {
     oi_llm_event_type type;
     union {
@@ -50,20 +39,6 @@ typedef struct {
 
 typedef void (*oi_llm_event_cb)(const oi_llm_event *event, void *user_data);
 
-/*
- * Fires exactly once, terminating the request (oi_llm_request itself is
- * freed right after this returns -- don't touch it from inside). `status`
- * is OI_OK on a clean completion of the stream. Otherwise: OI_ERR_IO for
- * a network/TLS failure, OI_ERR_PARSE for a malformed response, or
- * OI_ERR_TIMEOUT when the configured request deadline expires.
- * `http_status` is the HTTP status code (0 if a response was never
- * received at all). `error_body`/`error_body_len` hold the raw response
- * body when the server returned a non-2xx status, or the raw event when
- * a 2xx stream reported an error (truncated at 64KiB). With http_status
- * 0, they hold one line of text that names the connection failure, such
- * as a DNS error or an untrusted certificate. NULL/0 on success, and when
- * there is nothing to report.
- */
 typedef void (*oi_llm_done_cb)(oi_status status, int http_status,
                                 const char *error_body, size_t error_body_len,
                                 void *user_data);
@@ -72,102 +47,39 @@ struct oi_llm_config {
     const char *host;
     unsigned short port;
     int use_tls;
-    const char *ca_file; /* NULL = system default trust store */
-    const char *api_key; /* sent as "Authorization: Bearer <key>"; NULL to omit */
+    const char *ca_file;
+    const char *api_key;
     const char *path;
-    int timeout_ms;      /* end-to-end request deadline; 0 disables */
+    int timeout_ms;
 };
 
-/* Copies everything out of `cfg`; it need not outlive this call. Returns
- * NULL on allocation failure, an invalid port/deadline, a missing/invalid
- * host or path, or control characters in an API key (request-header
- * injection is rejected at this boundary). The returned client must
- * outlive every request started against it. */
 oi_llm_client *oi_llm_client_create(const struct oi_llm_config *cfg);
 
-/*
- * Creates a client for the OpenAI Responses API wire format; `cfg->path`
- * names that route, e.g. "/v1/responses". Callers still pass Chat
- * Completions bodies: "model", "messages", and function "tools" are
- * translated before sending and every other member is dropped. A body
- * that cannot be translated fails the request start with OI_ERR_PARSE.
- * Streams surface through the same callbacks. A terminal failure event
- * reports OI_ERR_IO with that event's JSON as the error body.
- */
 oi_llm_client *oi_llm_client_create_responses(const struct oi_llm_config *cfg);
 void oi_llm_client_destroy(oi_llm_client *client);
 
-/*
- * Replaces a client's endpoint, key, and wire format in place, so that a
- * caller holding the pointer sees the new settings on its next request. No
- * request may be in flight. Returns OI_ERR_INVAL for a configuration
- * oi_llm_client_create would refuse, and then leaves the client unchanged.
- */
 oi_status oi_llm_client_reconfigure(oi_llm_client *client,
                                     const struct oi_llm_config *cfg,
                                     int responses_api);
 
-/*
- * Off by default. When on, a request sends "Connection: keep-alive", and
- * after a complete, length-framed response the client keeps the
- * connection, registered on that request's reactor, for its next request
- * on the same reactor. A kept connection that the server has closed is
- * replaced once, before any response byte. Turning it off closes the kept
- * connection. With keep-alive on, destroy the client (or turn keep-alive
- * off) before the reactor of its last request.
- */
 void oi_llm_client_set_keep_alive(oi_llm_client *client, int enabled);
 
-/*
- * Runs `hook` at the start of every request, before anything is sent, so
- * that a caller can renew a short-lived credential through
- * oi_llm_client_reconfigure. OI_ERR_AGAIN means "not yet": the request
- * starts, waits on its reactor, and runs the hook again every 20 ms until
- * it returns something else. The request does not read the client until
- * the hook returns OI_OK, so the hook may reconfigure the client also
- * while its request waits; the request deadline and
- * oi_llm_request_cancel apply during the wait. Any other non-OK return
- * fails the request: at once from the start call, or through on_done
- * after a wait. The hook survives a reconfigure; NULL removes it.
- */
 typedef oi_status (*oi_llm_before_request_cb)(void *user_data);
 void oi_llm_client_set_before_request(oi_llm_client *client,
                                       oi_llm_before_request_cb hook,
                                       void *user_data);
 
-/*
- * Starts one streaming chat-completion request. `body` is a complete
- * JSON request object (model/messages/tools/etc., with "stream":true
- * already set by the caller) -- it's copied, so it need not outlive this
- * call. `arena` must be non-NULL but receives no allocations: the
- * request parses each streamed event into a private arena that it resets
- * before the next event, so a long stream does not grow memory.
- *
- * Returns the in-flight request via *out_request; `on_delta`/`on_done`
- * fire later, driven by `reactor`.
- */
 oi_status oi_llm_request_start(oi_llm_client *client, oi_reactor *reactor,
                                 oi_arena *arena, const char *body,
                                 size_t body_len, oi_llm_delta_cb on_delta,
                                 oi_llm_done_cb on_done, void *user_data,
                                 oi_llm_request **out_request);
 
-/*
- * Event-capable variant of oi_llm_request_start. Text and structured
- * tool-call fragments are delivered through `on_event`; completion and
- * ownership rules are otherwise identical.
- */
 oi_status oi_llm_request_start_events(
     oi_llm_client *client, oi_reactor *reactor, oi_arena *arena,
     const char *body, size_t body_len, oi_llm_event_cb on_event,
     oi_llm_done_cb on_done, void *user_data, oi_llm_request **out_request);
 
-/*
- * Aborts an in-flight request; on_done will NOT fire. NULL-safe and a
- * no-op if the request already finished. Safe to call from within
- * on_delta; never call it from within on_done (the request is already
- * gone by then).
- */
 void oi_llm_request_cancel(oi_llm_request *req);
 
 #endif

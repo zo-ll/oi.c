@@ -1,6 +1,7 @@
 import json, re, sys, os, collections
 
-KEEP_PREFIXES = ("include/oi/",)
+API_PREFIX = "include/oi/"
+API_DOC = "docs/API.md"
 KEYWORDS = {"if", "for", "while", "return", "sizeof", "switch", "do", "else", "case",
             "CHECK", "CHECK_EQ", "CHECK_STREQ", "RUN", "memset", "memcpy", "free"}
 GROUPS = [("reactor", "reactor"), ("llm_", None), ("cli_history", "cli_history"),
@@ -49,6 +50,52 @@ def symbol_of(lines, l1, l2, nxt):
     return field or "file scope"
 
 
+def declared(lines, l2, trail, nxt):
+    if trail:
+        code = nxt.split('/*')[0].strip()
+        return re.search(r'(\w+)\s*(?:\[[^\]]*\])?\s*[,;]?\s*$', code).group(1)
+    i = l2
+    while not lines[i].strip():
+        i += 1
+    head = lines[i].strip()
+    m = re.match(r'typedef\s+[\w\s\*]*\(\s*\*\s*(\w+)\)', head)
+    if m:
+        return m.group(1)
+    m = re.match(r'typedef\s+(?:struct|enum)\s+(\w+)\s+\w+\s*;', head)
+    if m:
+        return m.group(1)
+    if re.match(r'(typedef\s+)?(struct|enum)\b[^;]*\{', head):
+        name = re.match(r'(?:typedef\s+)?(?:struct|enum)\s+(\w+)', head)
+        if name:
+            return name.group(1)
+        j = i + 1
+        while not re.match(r'\s*\}', lines[j]):
+            j += 1
+        tail = re.match(r'\s*\}\s*(\w+)?', lines[j]).group(1)
+        if tail:
+            return tail
+        first = next(l for l in lines[i + 1:] if l.strip() and not l.strip().startswith(('/*', '*')))
+        return re.match(r'\s*(\w+)', first).group(1) + ' (enum)'
+    m = re.match(r'#define\s+(\w+)', head)
+    if m:
+        return m.group(1)
+    m = re.match(r'[\w\s\*]*?\b(\w+)\s*\(', head)
+    return m.group(1)
+
+
+def add_api_entry(path, symbol, text):
+    doc = open(API_DOC).read()
+    heading = "## `oi/%s`" % path[len(API_PREFIX):]
+    entry = "### `%s`\n\n%s\n" % (symbol, text)
+    if heading not in doc:
+        doc = doc.rstrip() + "\n\n" + heading + "\n"
+    start = doc.index(heading) + len(heading)
+    nxt = doc.find("\n## ", start)
+    end = len(doc) if nxt < 0 else nxt
+    doc = doc[:end].rstrip() + "\n\n" + entry + doc[end:]
+    open(API_DOC, "w").write(doc.rstrip() + "\n")
+
+
 def prose(text):
     body = []
     for raw in text.split("\n"):
@@ -80,8 +127,10 @@ def main(classified, adr_dir, first_number, date):
     for path, cs in by_file.items():
         lines = open(path, encoding="utf-8").read().split("\n")
         for c in cs:
-            c["keep"] = c["cat"] == "D" and path.startswith(KEEP_PREFIXES)
-            if c["cat"] == "D" and not c["keep"]:
+            c["keep"] = False
+            if c["cat"] == "D" and path.startswith(API_PREFIX):
+                add_api_entry(path, declared(lines, c["l2"], c["trail"], c["next"]), prose(c["text"]))
+            elif c["cat"] == "D":
                 key = (symbol_of(lines, c["l1"], c["l2"], c["next"]), path)
                 records[module_of(path)].setdefault(key, []).append(prose(c["text"]))
     written = []
