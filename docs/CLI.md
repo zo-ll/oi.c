@@ -349,7 +349,7 @@ At the prompt:
 | `End` / `Ctrl+E` | end of the current line |
 | `Backspace` / `Ctrl+H` | delete the code point before the cursor |
 | `Delete` | delete the code point after the cursor |
-| `Ctrl+D` | delete forward; on an **empty** draft, exit |
+| `Ctrl+D` | delete forward; on an **empty** draft at an idle prompt, exit |
 | `Up` / `Down` | input history; with the command menu open, move the selection |
 | `Tab` | complete the highlighted command (no-op with no menu) |
 | `Ctrl+C` | clear the draft |
@@ -432,8 +432,8 @@ immediately even while a turn is active.
 ### `/exit`
 
 Process scope. Ends the run at a safe boundary; typed during a turn it takes
-the pending slot and exits once the turn finishes. Ctrl+D on an empty draft
-is the same thing.
+the pending slot and exits once the turn finishes. At an idle prompt, Ctrl+D
+on an empty draft is the same as `/exit`. During a turn, Ctrl+D does nothing.
 
 ### `/status`
 
