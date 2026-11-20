@@ -2,7 +2,10 @@
 #include "test.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static oi_json_value *parse(oi_arena *arena, const char *text) {
     oi_json_parser *parser = oi_json_parser_create(arena);
@@ -97,6 +100,53 @@ TEST(tools_fall_into_categories) {
     oi_arena_destroy(arena);
 }
 
+TEST(links_and_sibling_prefixes_are_outside_the_project) {
+    char root[] = "/tmp/oi-tools-project-XXXXXX";
+    char path[256];
+    char *previous = getcwd(NULL, 0);
+    oi_arena *arena = oi_arena_create(0);
+
+    CHECK(mkdtemp(root) != NULL);
+    snprintf(path, sizeof path, "%s/a", root);
+    CHECK_EQ(mkdir(path, 0700), 0);
+    snprintf(path, sizeof path, "%s/ab", root);
+    CHECK_EQ(mkdir(path, 0700), 0);
+    snprintf(path, sizeof path, "%s/ab/secret", root);
+    fclose(fopen(path, "w"));
+    snprintf(path, sizeof path, "%s/a", root);
+    CHECK_EQ(chdir(path), 0);
+    CHECK_EQ(symlink("../ab/secret", "inside-link"), 0);
+    CHECK_EQ(symlink("missing-target", "dangling"), 0);
+    fclose(fopen("plain", "w"));
+
+    CHECK_EQ(oi_cli_tool_category_of(
+                 "read", parse(arena, "{\"path\":\"plain\"}")),
+             OI_CLI_TOOL_READ_IN_PROJECT);
+    CHECK_EQ(oi_cli_tool_category_of(
+                 "read", parse(arena, "{\"path\":\"inside-link\"}")),
+             OI_CLI_TOOL_FILE_ACCESS);
+    CHECK_EQ(oi_cli_tool_category_of(
+                 "read", parse(arena, "{\"path\":\"dangling\"}")),
+             OI_CLI_TOOL_FILE_ACCESS);
+    CHECK_EQ(oi_cli_tool_category_of(
+                 "read", parse(arena, "{\"path\":\"../ab/secret\"}")),
+             OI_CLI_TOOL_FILE_ACCESS);
+
+    unlink("inside-link");
+    unlink("dangling");
+    unlink("plain");
+    CHECK_EQ(chdir(previous), 0);
+    snprintf(path, sizeof path, "%s/ab/secret", root);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/ab", root);
+    rmdir(path);
+    snprintf(path, sizeof path, "%s/a", root);
+    rmdir(path);
+    rmdir(root);
+    free(previous);
+    oi_arena_destroy(arena);
+}
+
 TEST(file_approval_does_not_approve_commands) {
     oi_arena *arena = oi_arena_create(0);
     oi_json_value *read_inside = parse(arena, "{\"path\":\"Makefile\"}");
@@ -182,6 +232,7 @@ TEST(setting_a_policy_clears_the_process_approvals) {
 int main(void) {
     RUN(advertised_tools_match_the_registered_tools);
     RUN(tools_fall_into_categories);
+    RUN(links_and_sibling_prefixes_are_outside_the_project);
     RUN(file_approval_does_not_approve_commands);
     RUN(interactive_permission_defers_ask_to_the_embedder);
     RUN(noninteractive_permission_never_defers);

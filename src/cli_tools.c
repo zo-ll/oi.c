@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "oi/arena.h"
@@ -173,10 +174,13 @@ static int resolve_existing(const char *path, char *resolved) {
     char *slash;
     char parent[PATH_MAX];
 
+    struct stat link;
+
     if (realpath(path, resolved) != NULL) {
         return 1;
     }
-    if (errno != ENOENT || strlen(path) >= sizeof parent) {
+    if (errno != ENOENT || lstat(path, &link) == 0 ||
+        strlen(path) >= sizeof parent) {
         return 0;
     }
     strcpy(parent, path);

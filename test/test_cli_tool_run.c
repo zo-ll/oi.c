@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static char directory[] = "/tmp/oi-tool-run-XXXXXX";
@@ -104,6 +105,25 @@ TEST(read_reports_bad_requests) {
     free(text);
 }
 
+TEST(read_output_stays_under_its_byte_limit) {
+    FILE *file = fopen("many.txt", "w");
+    char *text;
+
+    CHECK(file != NULL);
+    for (int i = 0; i < 300000 && file != NULL; i++) {
+        putc('\n', file);
+    }
+    if (file != NULL) {
+        fclose(file);
+    }
+    CHECK_EQ(run("read", "{\"path\":\"many.txt\",\"limit\":300000}",
+                 &text),
+             0);
+    CHECK(strlen(text) <= 256u * 1024u + 64u);
+    CHECK(strstr(text, "more lines; next offset") != NULL);
+    free(text);
+}
+
 TEST(edit_replaces_one_exact_block) {
     char *text;
     char *content;
@@ -118,6 +138,29 @@ TEST(edit_replaces_one_exact_block) {
     free(text);
     content = get_file("code.c");
     CHECK_STREQ(content, "int a;\nlong b;\nlong bb;\nint c;\n");
+    free(content);
+}
+
+TEST(edit_keeps_the_mode_and_follows_a_link) {
+    struct stat st;
+    char *text;
+    char *content;
+
+    put_file("target.txt", "before\n");
+    CHECK_EQ(chmod("target.txt", 0640), 0);
+    CHECK_EQ(symlink("target.txt", "link.txt"), 0);
+    CHECK_EQ(run("edit",
+                 "{\"path\":\"link.txt\",\"old_text\":\"before\","
+                 "\"new_text\":\"after\"}",
+                 &text),
+             0);
+    free(text);
+    CHECK_EQ(lstat("link.txt", &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    CHECK_EQ(stat("target.txt", &st), 0);
+    CHECK_EQ(st.st_mode & 07777, 0640);
+    content = get_file("target.txt");
+    CHECK_STREQ(content, "after\n");
     free(content);
 }
 
@@ -182,7 +225,7 @@ TEST(write_creates_and_replaces_files) {
     CHECK_EQ(run("write", "{\"path\":\"no/such/dir/f\",\"content\":\"x\"}",
                  &text),
              1);
-    CHECK(strstr(text, "error: cannot open no/such/dir/f") != NULL);
+    CHECK(strstr(text, "error: cannot write no/such/dir/f") != NULL);
     free(text);
 }
 
@@ -193,7 +236,9 @@ int main(void) {
     CHECK_EQ(chdir(directory), 0);
     RUN(read_returns_numbered_lines_in_a_range);
     RUN(read_reports_bad_requests);
+    RUN(read_output_stays_under_its_byte_limit);
     RUN(edit_replaces_one_exact_block);
+    RUN(edit_keeps_the_mode_and_follows_a_link);
     RUN(edit_leaves_the_file_unchanged_when_the_text_is_absent_or_repeated);
     RUN(write_creates_and_replaces_files);
     unlink("notes.txt");
@@ -202,6 +247,9 @@ int main(void) {
     unlink("twice.txt");
     unlink("overlap.txt");
     unlink("new.txt");
+    unlink("many.txt");
+    unlink("link.txt");
+    unlink("target.txt");
     CHECK_EQ(chdir(previous), 0);
     rmdir(directory);
     free(previous);

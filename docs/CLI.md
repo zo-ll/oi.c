@@ -746,9 +746,13 @@ id.
 | `write` | `path`, `content` | Create a file or replace its full contents. |
 | `bash` | `command` | Execute the command with `bash -c` in the session working directory. Return the command output and the exit status. |
 
-A relative `path` is relative to the session working directory. The file
-tools do not need a shell: `oi` runs each tool call as a child process of
-its own binary, and only `bash` starts Bash. Command execution therefore
+A relative `path` is relative to the session working directory. `edit` and
+`write` write a temporary file next to the target and rename it over the
+target, so a failed or interrupted write leaves the old file unchanged. The
+file keeps its mode, but a hard link to the old file keeps the old contents.
+The file tools do not need a shell: `oi` runs each tool call as a child
+process of its own binary (through `/proc/self/exe`), and only `bash` starts
+Bash. Command execution therefore
 needs `bash` on `PATH`; without it, a `bash` call fails with
 `error: cannot run bash`, and the file tools still work.
 
@@ -785,7 +789,10 @@ Under `ask`, each call belongs to one of three kinds:
 | command | `bash` | prompt |
 
 The project check follows symbolic links, so a link that points outside the
-project counts as file access.
+project, or a link whose target does not exist, counts as file access. The
+project is the session working directory, so start `oi` in the directory you
+want the model to read: in `/` or in your home directory, a `read` of
+`~/.ssh` or `~/.config/oi/credentials.json` also runs without a prompt.
 
 In interactive mode, a prompt prints the full request, then shows a selector
 before the call runs:

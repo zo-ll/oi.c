@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -123,19 +124,23 @@ static int run_read(const oi_json_value *args, FILE *out) {
         return fail(out, "error: cannot read %s: %s\n", path);
     }
     while ((line_len = getline(&line, &capacity, file)) >= 0) {
+        char prefix[32];
+        int prefix_len;
+        size_t shown = (size_t)line_len;
+
         number++;
         if (number < offset || stopped || number - offset >= limit) {
             continue;
         }
-        size_t shown = (size_t)line_len;
-        if (shown > READ_OUTPUT_MAX - written) {
+        prefix_len = snprintf(prefix, sizeof prefix, "%6zu\t", number);
+        if (written + (size_t)prefix_len + shown + 1 > READ_OUTPUT_MAX) {
             if (last > 0) {
                 stopped = 1;
                 continue;
             }
-            shown = READ_OUTPUT_MAX - written;
+            shown = READ_OUTPUT_MAX - written - (size_t)prefix_len - 1;
         }
-        fprintf(out, "%6zu\t", number);
+        fputs(prefix, out);
         fwrite(line, 1, shown, out);
         if (shown < (size_t)line_len) {
             fprintf(out, "\n[line %zu cut at %zu of %zd bytes]\n", number,
@@ -143,7 +148,7 @@ static int run_read(const oi_json_value *args, FILE *out) {
         } else if (line[line_len - 1] != '\n') {
             putc('\n', out);
         }
-        written += shown;
+        written += (size_t)prefix_len + shown + 1;
         last = number;
     }
     free(line);
@@ -203,6 +208,60 @@ static char *read_file(const char *path, int fd, const struct stat *st,
     return data;
 }
 
+static int replace_file(const char *path, const struct stat *existing,
+                        const char *const *parts, const size_t *lens,
+                        size_t count, FILE *out) {
+    char target[PATH_MAX];
+    char temporary[PATH_MAX + 32];
+    mode_t mode;
+    int fd;
+
+    if (realpath(path, target) == NULL) {
+        if (errno != ENOENT || existing != NULL ||
+            strlen(path) >= sizeof target) {
+            return fail(out, "error: cannot write %s: %s\n", path);
+        }
+        strcpy(target, path);
+    }
+    if (existing != NULL) {
+        mode = existing->st_mode & 07777;
+    } else {
+        mode = umask(0);
+        umask(mode);
+        mode = 0666 & ~mode;
+    }
+    snprintf(temporary, sizeof temporary, "%s.oi-tmp-XXXXXX", target);
+    fd = mkostemp(temporary, O_CLOEXEC);
+    if (fd < 0) {
+        return fail(out, "error: cannot write %s: %s\n", path);
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!write_all(fd, parts[i], lens[i])) {
+            goto failed;
+        }
+    }
+    if (fchmod(fd, mode) != 0) {
+        goto failed;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        goto failed;
+    }
+    fd = -1;
+    if (rename(temporary, target) != 0) {
+        goto failed;
+    }
+    return 0;
+
+failed:
+    fail(out, "error: cannot write %s: %s; the file did not change\n", path);
+    if (fd >= 0) {
+        close(fd);
+    }
+    unlink(temporary);
+    return 1;
+}
+
 static int run_edit(const oi_json_value *args, FILE *out) {
     const char *path;
     const char *old_text;
@@ -224,13 +283,13 @@ static int run_edit(const oi_json_value *args, FILE *out) {
               out);
         return 1;
     }
-    int fd = open_regular(path, O_RDWR, out, &st);
+    int fd = open_regular(path, O_RDONLY, out, &st);
     if (fd < 0) {
         return 1;
     }
     data = read_file(path, fd, &st, out, &len);
+    close(fd);
     if (data == NULL) {
-        close(fd);
         return 1;
     }
     char *match = memmem(data, len, old_text, old_len);
@@ -245,22 +304,15 @@ static int run_edit(const oi_json_value *args, FILE *out) {
                 path);
     } else {
         size_t before = (size_t)(match - data);
-        size_t after = len - before - old_len;
+        const char *parts[] = {data, new_text, match + old_len};
+        size_t lens[] = {before, new_len, len - before - old_len};
 
-        if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) != 0 ||
-            !write_all(fd, data, before) ||
-            !write_all(fd, new_text, new_len) ||
-            !write_all(fd, match + old_len, after)) {
-            fail(out, "error: cannot write %s: %s\n", path);
-        } else {
+        status = replace_file(path, &st, parts, lens, 3, out);
+        if (status == 0) {
             fprintf(out, "edited %s\n", path);
-            status = 0;
         }
     }
     free(data);
-    if (close(fd) != 0 && status == 0) {
-        status = fail(out, "error: cannot write %s: %s\n", path);
-    }
     return status;
 }
 
@@ -268,6 +320,8 @@ static int run_write(const oi_json_value *args, FILE *out) {
     const char *path;
     const char *content;
     size_t content_len;
+    struct stat st;
+    int exists;
 
     if (!get_path(args, out, &path)) {
         return 1;
@@ -276,16 +330,14 @@ static int run_write(const oi_json_value *args, FILE *out) {
         fputs("error: content must be a string\n", out);
         return 1;
     }
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
-    if (fd < 0) {
-        return fail(out, "error: cannot open %s: %s\n", path);
+    exists = stat(path, &st) == 0;
+    if (exists && !S_ISREG(st.st_mode)) {
+        fprintf(out, "error: %s is not a regular file\n", path);
+        return 1;
     }
-    if (!write_all(fd, content, content_len)) {
-        close(fd);
-        return fail(out, "error: cannot write %s: %s\n", path);
-    }
-    if (close(fd) != 0) {
-        return fail(out, "error: cannot write %s: %s\n", path);
+    if (replace_file(path, exists ? &st : NULL, &content, &content_len, 1,
+                     out) != 0) {
+        return 1;
     }
     fprintf(out, "wrote %zu bytes to %s\n", content_len, path);
     return 0;
