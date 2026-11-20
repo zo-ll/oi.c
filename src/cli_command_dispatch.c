@@ -515,7 +515,9 @@ oi_status oi_cli_command_dispatch(
     case OI_CLI_COMMAND_HELP:
         return command->arguments_len == 0
                    ? print_help(context->out)
-                   : print_deferred(command->command, context->err);
+                   : fputs("oi: usage: /help\n", context->err) == EOF
+                         ? OI_ERR_IO
+                         : OI_OK;
     case OI_CLI_COMMAND_EXIT:
         if (command->arguments_len != 0) {
             return fputs("oi: usage: /exit\n", context->err) == EOF

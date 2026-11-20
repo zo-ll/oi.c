@@ -59,6 +59,31 @@ TEST(help_lists_commands_and_exit_requests_exit) {
     fclose(err);
 }
 
+TEST(help_with_an_argument_prints_usage) {
+    FILE *out = tmpfile();
+    FILE *err = tmpfile();
+    struct oi_cli_permission permission = {OI_CLI_TOOLS_ASK};
+    struct oi_cli_command_context context = {
+        .out = out, .err = err, .model = "test-model",
+        .permission = &permission,
+    };
+    enum oi_cli_command_result result;
+    char *text;
+
+    CHECK(out != NULL);
+    CHECK(err != NULL);
+    CHECK_EQ(dispatch("/help model", &context, &result), OI_OK);
+    CHECK_EQ(result, OI_CLI_COMMAND_CONTINUE);
+    text = read_stream(err);
+    CHECK_STREQ(text, "oi: usage: /help\n");
+    free(text);
+    text = read_stream(out);
+    CHECK_STREQ(text, "");
+    free(text);
+    fclose(out);
+    fclose(err);
+}
+
 TEST(permissions_are_process_scoped_and_validated) {
     FILE *out = tmpfile();
     FILE *err = tmpfile();
@@ -847,6 +872,7 @@ TEST(session_reports_unavailable_operations_and_bad_subcommands) {
 
 int main(void) {
     RUN(help_lists_commands_and_exit_requests_exit);
+    RUN(help_with_an_argument_prints_usage);
     RUN(permissions_are_process_scoped_and_validated);
     RUN(status_reports_the_assembled_snapshot);
     RUN(status_reports_unknown_for_everything_a_callback_leaves_alone);
