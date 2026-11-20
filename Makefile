@@ -1,29 +1,14 @@
 CC ?= cc
 CSTD = -std=c11 -D_POSIX_C_SOURCE=200809L
 WARN = -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -Werror
-# The default build is what `make install` ships, so it is optimized and
-# hardened. _FORTIFY_SOURCE has no effect without optimization; -U first
-# because some compilers predefine it, and a redefinition fails -Werror.
-# The sanitizer tiers replace CFLAGS with their own -O1 flags.
 CFLAGS ?= -g -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fstack-protector-strong
-# PIE and full RELRO do not depend on CFLAGS or on compiler defaults, so a
-# CFLAGS override still links: -pie needs every object built with -fPIE.
 PIE_CFLAGS = -fPIE
 RELRO_LDFLAGS = -Wl,-z,relro,-z,now
 EXE_LDFLAGS = -pie $(RELRO_LDFLAGS) $(LDFLAGS)
-# -MMD writes a <object>.d dependency file next to each object, so a header
-# edit rebuilds every compile that includes it instead of silently linking
-# stale objects against a new declaration (an ABI drift that the suite then
-# fails with a hard-to-place crash). -MP adds phony per-header targets so a
-# deleted header does not error the next run. The .d files are read back in
-# at the bottom of this file via -include.
 DEPFLAGS = -MMD -MP
 OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null)
 OPENSSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
 INCLUDES = -Iinclude -Isrc $(OPENSSL_CFLAGS)
-# openssl (libssl/libcrypto) is the one deliberate exception to "no
-# build-time dependency beyond a C toolchain" -- see PLAN.md and the
-# issue #4 commit that introduces the LLM client's TLS support.
 LDLIBS = -pthread $(OPENSSL_LIBS)
 
 BUILD = build
@@ -39,11 +24,6 @@ LIB_SRCS = src/reactor.c $(REACTOR_BACKEND) src/arena.c src/json_value.c src/jso
 LIB_OBJS = $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
 LIB = $(BUILD)/liboi.a
 
-# Shared library: built from separately-compiled -fPIC objects in their
-# own subdirectory, so `make lib`'s default (non-PIC) objects for the
-# static archive don't need -fPIC baked into every build (including the
-# sanitizer variants below, which reuse CFLAGS/BUILD overrides and never
-# touch the .so).
 PIC_BUILD = $(BUILD)/pic
 PIC_OBJS = $(LIB_SRCS:src/%.c=$(PIC_BUILD)/%.o)
 LIB_SO = $(BUILD)/liboi.so
@@ -60,12 +40,6 @@ CLI_SRCS = src/cli.c src/cli_loop.c src/cli_tools.c src/cli_message.c src/cli_hi
 CLI_OBJ_BUILD = $(BUILD)/cli
 CLI_OBJS = $(CLI_SRCS:src/%.c=$(CLI_OBJ_BUILD)/%.o)
 
-# Private CLI implementation archive for unit/integration tests. Production
-# still links its complete object list directly, so archive member selection
-# cannot change the real executable's linkage. cli.c owns main(), while
-# cli_loop.c and cli_repl.c are exercised through that real executable rather
-# than linked into private-module tests; excluding all three also means a
-# production-only edit does not relink every CLI test.
 CLI_TEST_SRCS = $(filter-out src/cli.c src/cli_loop.c src/cli_repl.c,$(CLI_SRCS))
 CLI_TEST_OBJS = $(CLI_TEST_SRCS:src/%.c=$(CLI_OBJ_BUILD)/%.o)
 CLI_TEST_LIB = $(BUILD)/liboi_cli_test.a
@@ -94,11 +68,6 @@ install: all
 		"$(DESTDIR)$(LIBDIR)/$(notdir $(LIB_SO))"
 	install -m 644 include/oi/*.h "$(DESTDIR)$(INCLUDEDIR)/oi/"
 
-# Removes exactly what `install` creates, and nothing else: the header
-# directory is removed with rmdir rather than `rm -r`, so an INCLUDEDIR/oi
-# holding anything this project did not install is left alone instead of
-# being deleted along with it. Session data is never touched -- see
-# docs/CLI.md for where it lives and how to remove it deliberately.
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/oi"
 	rm -f "$(DESTDIR)$(LIBDIR)/$(notdir $(LIB))" \
@@ -148,13 +117,8 @@ $(CLI_BIN): $(CLI_OBJS) $(LIB) | $(BUILD)
 $(BUILD)/test_%: test/test_%.c $(LIB) | $(BUILD)
 	$(CC) $(CSTD) $(WARN) $(CFLAGS) $(PIE_CFLAGS) $(INCLUDES) $(DEPFLAGS) -DOI_CLI_BIN=\"$(CLI_BIN)\" $< $(LIB) $(EXE_LDFLAGS) -o $@ $(LDLIBS)
 
-# test_tool_exec records the kill() calls that liboi makes.
 $(BUILD)/test_tool_exec: LDLIBS += -Wl,--wrap=kill
-# test_reactor counts the epoll_ctl calls that liboi makes.
 $(BUILD)/test_reactor: LDLIBS += -Wl,--wrap=epoll_ctl
-# test_llm_conn gives one host name a dead address and a live address,
-# counts the send() calls that carry MSG_NOSIGNAL, counts SSL_CTX_new, and
-# moves the monotonic clock forward.
 $(BUILD)/test_llm_conn: LDLIBS += -Wl,--wrap=getaddrinfo -Wl,--wrap=send \
 	-Wl,--wrap=clock_gettime \
 	-Wl,--wrap=SSL_CTX_new
@@ -168,13 +132,6 @@ $(BUILD)/test_cli_%: test/test_cli_%.c $(CLI_TEST_LIB) $(LIB) | $(BUILD)
 $(BUILD)/test_cli_terminal $(BUILD)/test_cli_composer $(BUILD)/test_cli_login: \
 	LDLIBS += $(PTY_LIBS)
 
-# Tests that touch no PTY, socket, fork, signal, or other global process
-# state, and so are safe to run as the routine edit-test loop (`make quick`).
-#
-# Membership is spelled out rather than derived, deliberately: a test that
-# grows a socket must be moved out of this list by someone who noticed, not
-# silently reclassified by a pattern match. The `tier-audit` target below
-# fails the build if this list plus IMPURE_TESTS stops covering every binary.
 PURE_TESTS = \
 	test_arena test_cli_bytebuf test_cli_command_dispatch test_cli_commands \
 	test_cli_compact test_cli_docs test_cli_editor test_cli_history \
@@ -191,9 +148,6 @@ PURE_TESTS = \
 	test_config test_json test_llm_http test_llm_responses test_llm_sse \
 	test_reactor test_session test_sesslog test_tool_registry
 
-# Tests that do touch that state: PTYs, sockets, forked helpers, or signals.
-# Slower and ordering-sensitive, so they stay out of `quick` and are not
-# candidates for blanket parallelism.
 IMPURE_TESTS = \
 	test_cli test_cli_composer test_cli_login test_cli_sessions \
 	test_cli_terminal \
@@ -209,36 +163,13 @@ $(PURE_TEST_RUNS): run-%: $(BUILD)/%
 	@echo "== $(BUILD)/$* =="
 	@$(BUILD)/$*
 
-# Unit-test runner. A recursive make lets `make -j check` use its jobserver for
-# the explicitly audited pure binaries. The impure binaries always run in one
-# serial loop afterward, so PTYs, sockets, forks, signals, and other
-# process-global behavior never overlap merely because the build was parallel.
 test: $(TEST_BINS) $(CLI_BIN)
 	+@$(MAKE) --no-print-directory --output-sync=target $(PURE_TEST_RUNS)
 	@set -e; for t in $(IMPURE_TEST_BINS); do echo "== $$t =="; $$t; done
 
-# The routine edit-test loop: runs deterministic unit tests only, but still
-# builds $(CLI_BIN). Without that dependency this target passes while
-# production-only sources (src/cli.c, src/cli_repl.c, src/cli_loop.c) no
-# longer compile, since no pure test links them -- a fast tier that cannot
-# notice a broken build is worse than no fast tier.
 quick: $(PURE_TEST_BINS) $(CLI_BIN)
 	+@$(MAKE) --no-print-directory --output-sync=target $(PURE_TEST_RUNS)
 
-# Fails if PURE_TESTS + IMPURE_TESTS stops accounting for every test binary,
-# so a newly added test cannot quietly belong to no tier and go unrun by
-# everything except the full `check`.
-#
-# Checks both halves of the invariant. Set coverage alone is not enough: a
-# test named in both tiers still satisfies "every test is tiered" while
-# actually being run twice by `check` and misfiled in `quick`, so exclusivity
-# is checked separately.
-#
-# Negative cases, each reproducible by editing the lists above and re-running:
-#   missing     -- delete a name from PURE_TESTS
-#   nonexistent -- add a name matching no test/test_*.c
-#   duplicate   -- repeat a name within one tier
-#   overlap     -- add a PURE_TESTS name to IMPURE_TESTS as well
 COMMENT_BASELINE = tools/comment-baseline.txt
 COMMENT_LINT_FILES = $(sort $(wildcard src/*.c src/*.h include/oi/*.h \
 	test/*.c test/*.h test/integration/*.c test/integration/*.h \
@@ -291,10 +222,6 @@ tier-audit:
 	fi; \
 	exit $$status
 
-# Integration tests get their own build subdir so their binaries don't
-# collide with the unit tests' $(BUILD)/test_% pattern rule. Helper
-# headers (mock_api.h) are picked up relative to the source file, so
-# only test_*.c become binaries.
 INTEGRATION_BUILD = $(BUILD)/integration
 INTEGRATION_SRCS = $(wildcard test/integration/test_*.c)
 INTEGRATION_BINS = \
@@ -322,53 +249,12 @@ test-integration: $(INTEGRATION_BINS)
 	fi; \
 	set -e; for t in $(INTEGRATION_BINS); do echo "== $$t =="; $$t; done
 
-# The full automated suite. Sanitizer and valgrind targets run this
-# rather than `test` alone, so instrumentation covers the integration
-# tests too -- they are where the reactor, the socket paths, and the
-# tool subprocesses actually run together.
 check: tier-audit comment-lint
 	+@$(MAKE) --no-print-directory test
 	+@$(MAKE) --no-print-directory test-integration
 
-# The pre-merge and release gate: everything `check` covers, under both
-# compilers and every instrumentation the project has, plus the ABI export
-# check and a bounded fuzz smoke run.
-#
-# The two compiler passes must use separate BUILD trees, and each tree must be
-# deleted immediately before its pass. Three distinct hazards, all of which
-# let this gate pass without a compiler having run:
-#
-#  - Make decides what to rebuild from timestamps, not from the value of CC.
-#    Running both passes against one build/ leaves the second reporting "up to
-#    date" and re-running the first compiler's binaries.
-#  - Separate trees alone are not enough. A build-gcc/ left holding artifacts
-#    from some earlier run -- a stray `make BUILD=build-gcc CC=clang`, an
-#    interrupted pass -- is still "up to date", so the gcc pass compiles
-#    nothing and the stamp then certifies gcc for clang's objects. Deleting
-#    the tree first makes reuse impossible, which is the only thing that makes
-#    the stamp mean anything.
-#  - `$(MAKE) ... check compiler-stamp` names two goals in one sub-make, which
-#    under -j may run concurrently, writing the stamp while compilation is
-#    still going. They are separate $(MAKE) lines instead: lines within a
-#    recipe run in order regardless of -j.
-#
-# The rebuild cost is deliberate. verify is the pre-merge gate, not the edit
-# loop; `check` and `quick` remain incremental.
-#
-# Sequenced rather than parallel: each pass is a full rebuild, and running
-# them concurrently competes for the cores the sanitized tests' own timing
-# assumptions depend on.
 VERIFY_FUZZ_RUNS ?= 200000
 
-# Records which compiler populated this BUILD tree.
-#
-# The stamp names $(CC), which is only the *requested* compiler -- it says
-# nothing about what produced the objects already in the tree. That is
-# trustworthy only because verify deletes each tree immediately before its
-# pass, so the tree it stamps was necessarily built from scratch by that
-# compiler and nothing could have been reused. Do not call this against a
-# tree that was not just rebuilt: it would happily certify someone else's
-# artifacts.
 compiler-stamp: | $(BUILD)
 	@$(CC) --version | head -1 > $(BUILD)/compiler.txt
 
@@ -417,17 +303,6 @@ verify:
 	$(MAKE) fuzz-run FUZZ_RUNS=$(VERIFY_FUZZ_RUNS)
 	@echo "== verify: all gates passed =="
 
-# Records wall time for the compile phase, every test binary, and each tier,
-# so the effect of a change to any of them can be compared rather than
-# guessed at. Writes a Markdown table on stdout.
-# Timings are only meaningful for a build that actually succeeded and tests
-# that actually passed, so a failure fails this target. Measurement output is
-# still printed first -- the point is to see where the time went even on a bad
-# run -- but the exit status never reports success for an incomplete build.
-#
-# Per-binary failures are recorded in a file rather than a shell variable
-# because that loop is piped into sort, and a pipeline's exit status is the
-# last command's.
 timings:
 	@failures=`mktemp`; \
 	echo "| Phase | Seconds |"; \
@@ -486,32 +361,15 @@ abi-check: $(LIB_SO_REAL)
 	rm -f $$exports; \
 	exit $$status
 
-# Sanitizer variants each recurse into a separate BUILD dir with
-# overridden CFLAGS, reusing every rule above unchanged rather than
-# duplicating them.
 asan:
 	$(MAKE) BUILD=build-asan CFLAGS="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" check
 
 ubsan:
 	$(MAKE) BUILD=build-ubsan CFLAGS="-g -O1 -fsanitize=undefined -fno-omit-frame-pointer" check
 
-# TSan is here to catch accidental concurrency assumptions (signal
-# handlers, the forked tool subprocesses) creeping into what is meant to
-# be a single-threaded reactor, not because the harness spawns threads.
-#
-# On kernels that hand out more ASLR entropy than TSan's shadow mapping
-# expects (recent Ubuntu, WSL2), it aborts at startup with "unexpected
-# memory mapping". Either run `setarch -R make tsan`, or lower the
-# entropy globally with `sudo sysctl -w vm.mmap_rnd_bits=28` (what CI
-# does).
 tsan:
 	$(MAKE) BUILD=build-tsan CFLAGS="-g -O1 -fsanitize=thread -fno-omit-frame-pointer" check
 
-# Valgrind runs against a plain (non-sanitizer) build -- ASan and
-# valgrind's instrumentation don't coexist.
-#
-# --trace-children=no keeps it off the tools' exec'd children (/bin/echo
-# and friends), which are not ours to check and would only add noise.
 valgrind: $(TEST_BINS) $(INTEGRATION_BINS) $(CLI_BIN)
 	@set -e; for t in $(TEST_BINS) $(INTEGRATION_BINS); do \
 		echo "== valgrind $$t =="; \
@@ -519,32 +377,20 @@ valgrind: $(TEST_BINS) $(INTEGRATION_BINS) $(CLI_BIN)
 			--trace-children=no $$t; \
 	done
 
-# libFuzzer is a clang feature -- gcc has no -fsanitize=fuzzer -- so the
-# fuzz targets pin their own compiler rather than following CC, which the
-# rest of the build (and CI's gcc matrix entry) is free to set elsewhere.
 FUZZ_CC ?= clang
 FUZZ_BUILD = build-fuzz
 FUZZ_SRCS = $(wildcard test/fuzz/fuzz_*.c)
 FUZZ_BINS = $(FUZZ_SRCS:test/fuzz/%.c=$(FUZZ_BUILD)/%)
-# Iterations per harness for `make fuzz-run`, which exists to catch
-# regressions in CI, not to find new bugs. Override it, or run a built
-# harness directly, for an open-ended campaign.
 FUZZ_RUNS ?= 20000
 
 $(FUZZ_BUILD):
 	mkdir -p $(FUZZ_BUILD)
 
-# Harnesses link the library sources directly rather than $(LIB): the
-# instrumentation must cover the code under test, and $(LIB) is built
-# without it.
 $(FUZZ_BUILD)/%: test/fuzz/%.c $(LIB_SRCS) | $(FUZZ_BUILD)
 	$(FUZZ_CC) $(CSTD) $(WARN) -g -O1 \
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
 		$(INCLUDES) $(DEPFLAGS) $< $(LIB_SRCS) -o $@ $(LDLIBS)
 
-# The CLI-private render/Markdown pipeline doesn't touch the public
-# library, so this harness links only its own dependency chain (the
-# generic pattern rule above pulls in $(LIB_SRCS), which it doesn't need).
 CLI_RENDER_STREAM_SRCS = src/cli_render_stream.c src/cli_render_style.c \
 	src/cli_markdown_block.c src/cli_markdown_inline.c src/cli_markdown.c \
 	src/cli_render_sanitize.c src/cli_utf8_stream.c src/cli_utf8.c \
@@ -555,10 +401,6 @@ $(FUZZ_BUILD)/fuzz_cli_render_stream: test/fuzz/fuzz_cli_render_stream.c $(CLI_R
 		-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer \
 		$(INCLUDES) $(DEPFLAGS) $< $(CLI_RENDER_STREAM_SRCS) -o $@ $(LDLIBS)
 
-# Also CLI-private, plus the JSON parser/writer $(LIB_SRCS) itself needs
-# for record encode/decode (oi_cli_history_record_encode is compiled in
-# even though this harness never calls it, so the writer side is a real
-# link dependency too, not just the parser).
 CLI_HISTORY_REPLAY_FUZZ_SRCS = src/cli_history.c src/cli_history_codec.c \
 	src/cli_history_replay.c src/cli_message.c src/arena.c \
 	src/json_value.c src/json_parse.c src/json_write.c
@@ -573,8 +415,6 @@ fuzz: $(FUZZ_BINS)
 		echo "no fuzz harnesses yet (test/fuzz/fuzz_*.c)"; \
 	fi
 
-# Seed corpora are read-only inputs; newly discovered ones go to a
-# scratch dir under $(FUZZ_BUILD) so a run never dirties the work tree.
 fuzz-run: $(FUZZ_BINS)
 	@set -e; for b in $(FUZZ_BINS); do \
 		name=$$(basename $$b); \
@@ -586,9 +426,6 @@ fuzz-run: $(FUZZ_BINS)
 			$$found $$([ -d $$seeds ] && echo $$seeds); \
 	done
 
-# Dependency files, read back in so header edits rebuild dependents. All
-# build trees are defined above this point; a wildcard that matches nothing
-# (a tree not built yet, or a tree wiped by `clean`) silently includes nothing.
 -include $(wildcard $(BUILD)/*.d $(CLI_OBJ_BUILD)/*.d $(PIC_BUILD)/*.d \
 	$(INTEGRATION_BUILD)/*.d $(FUZZ_BUILD)/*.d)
 
