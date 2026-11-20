@@ -1697,7 +1697,7 @@ TEST(keep_alive_off_closes_the_kept_connection) {
     close(accepts_fd);
 }
 
-TEST(reconfigure_does_not_reuse_the_kept_connection) {
+TEST(reconfigure_closes_the_kept_connection) {
     unsigned short old_port;
     unsigned short new_port;
     int old_accepts_fd;
@@ -1716,15 +1716,26 @@ TEST(reconfigure_does_not_reuse_the_kept_connection) {
 
     CHECK_EQ(one_request(client, r), OI_OK);
     CHECK_EQ(oi_llm_client_reconfigure(client, &new_cfg, 0), OI_OK);
+    /* The old server serves one connection and exits at its EOF, so it
+     * exits only when the reconfigure closes the kept connection. */
+    pid_t exited = 0;
+    for (int i = 0; i < 500 && exited == 0; i++) {
+        struct timespec pause = {0, 10 * 1000 * 1000};
+        nanosleep(&pause, NULL);
+        exited = waitpid(old_server, NULL, WNOHANG);
+    }
+    CHECK_EQ(exited, old_server);
     CHECK_EQ(one_request(client, r), OI_OK);
     CHECK_EQ(count_accepts(old_accepts_fd), 1);
     CHECK_EQ(count_accepts(new_accepts_fd), 1);
 
     oi_llm_client_destroy(client);
     oi_reactor_destroy(r);
-    kill(old_server, SIGKILL); /* a failed test leaves it in accept() */
-    kill(new_server, SIGKILL);
-    waitpid(old_server, NULL, 0);
+    if (exited != old_server) { /* a failed test leaves it in read() */
+        kill(old_server, SIGKILL);
+        waitpid(old_server, NULL, 0);
+    }
+    kill(new_server, SIGKILL); /* a failed test leaves it in accept() */
     waitpid(new_server, NULL, 0);
     close(old_accepts_fd);
     close(new_accepts_fd);
@@ -1774,7 +1785,7 @@ int main(void) {
     RUN(keep_alive_sends_two_requests_on_one_connection);
     RUN(without_keep_alive_each_request_has_its_own_connection);
     RUN(keep_alive_off_closes_the_kept_connection);
-    RUN(reconfigure_does_not_reuse_the_kept_connection);
+    RUN(reconfigure_closes_the_kept_connection);
     RUN(kept_connection_closed_by_the_server_is_replaced_once);
     RUN(cancel_null_safe);
     return oi_test_report();
