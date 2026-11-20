@@ -5,9 +5,13 @@
 #include "oi/arena.h"
 #include "oi/json.h"
 
-#define SHELL_SCHEMA                                                           \
-    "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}," \
-    "\"required\":[\"command\"],\"additionalProperties\":false}"
+#define WRITE(expr)                                                           \
+    do {                                                                      \
+        oi_status write_status = (expr);                                      \
+        if (write_status != OI_OK) {                                          \
+            return write_status;                                              \
+        }                                                                     \
+    } while (0)
 
 static char *arena_copy(oi_arena *arena, const char *data, size_t len) {
     char *copy = oi_arena_alloc(arena, len + 1);
@@ -44,9 +48,77 @@ static oi_status shell_argv(const oi_json_value *args, oi_arena *arena,
     return OI_OK;
 }
 
+static oi_status write_shell_parameters(oi_json_writer *writer) {
+    WRITE(oi_json_write_object_begin(writer));
+    WRITE(oi_json_write_object_key(writer, "type", 4));
+    WRITE(oi_json_write_string(writer, "object", 6));
+    WRITE(oi_json_write_object_key(writer, "properties", 10));
+    WRITE(oi_json_write_object_begin(writer));
+    WRITE(oi_json_write_object_key(writer, "command", 7));
+    WRITE(oi_json_write_object_begin(writer));
+    WRITE(oi_json_write_object_key(writer, "type", 4));
+    WRITE(oi_json_write_string(writer, "string", 6));
+    WRITE(oi_json_write_object_end(writer));
+    WRITE(oi_json_write_object_end(writer));
+    WRITE(oi_json_write_object_key(writer, "required", 8));
+    WRITE(oi_json_write_array_begin(writer));
+    WRITE(oi_json_write_string(writer, "command", 7));
+    WRITE(oi_json_write_array_end(writer));
+    WRITE(oi_json_write_object_key(writer, "additionalProperties", 20));
+    WRITE(oi_json_write_bool(writer, 0));
+    return oi_json_write_object_end(writer);
+}
+
+static const struct {
+    const char *name;
+    const char *description;
+    oi_status (*write_parameters)(oi_json_writer *writer);
+    oi_tool_build_argv build_argv;
+} tools[] = {
+    {"shell", "Execute a shell command", write_shell_parameters, shell_argv},
+};
+
 oi_status oi_cli_tools_register(oi_tool_registry *registry) {
-    return oi_tool_registry_add(registry, "shell", SHELL_SCHEMA, shell_argv,
-                                NULL);
+    for (size_t i = 0; i < sizeof tools / sizeof tools[0]; i++) {
+        oi_json_writer *schema = oi_json_writer_create();
+        oi_status status;
+
+        if (schema == NULL) {
+            return OI_ERR_NOMEM;
+        }
+        status = tools[i].write_parameters(schema);
+        if (status == OI_OK) {
+            status = oi_tool_registry_add(registry, tools[i].name,
+                                          oi_json_writer_data(schema, NULL),
+                                          tools[i].build_argv, NULL);
+        }
+        oi_json_writer_destroy(schema);
+        if (status != OI_OK) {
+            return status;
+        }
+    }
+    return OI_OK;
+}
+
+oi_status oi_cli_tools_write_definitions(oi_json_writer *writer) {
+    for (size_t i = 0; i < sizeof tools / sizeof tools[0]; i++) {
+        WRITE(oi_json_write_object_begin(writer));
+        WRITE(oi_json_write_object_key(writer, "type", 4));
+        WRITE(oi_json_write_string(writer, "function", 8));
+        WRITE(oi_json_write_object_key(writer, "function", 8));
+        WRITE(oi_json_write_object_begin(writer));
+        WRITE(oi_json_write_object_key(writer, "name", 4));
+        WRITE(oi_json_write_string(writer, tools[i].name,
+                                   strlen(tools[i].name)));
+        WRITE(oi_json_write_object_key(writer, "description", 11));
+        WRITE(oi_json_write_string(writer, tools[i].description,
+                                   strlen(tools[i].description)));
+        WRITE(oi_json_write_object_key(writer, "parameters", 10));
+        WRITE(tools[i].write_parameters(writer));
+        WRITE(oi_json_write_object_end(writer));
+        WRITE(oi_json_write_object_end(writer));
+    }
+    return OI_OK;
 }
 
 oi_tool_decision oi_cli_tool_permission(const char *tool_name,

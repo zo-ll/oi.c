@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "cli_history.h"
+#include "cli_tools.h"
 #include "oi/json.h"
 
 struct buffer {
@@ -161,49 +162,6 @@ static oi_status commit_message(
     return st;
 }
 
-static oi_status write_tool_definition(oi_json_writer *writer) {
-    oi_status st;
-#define WRITE(expr)                                                           \
-    do {                                                                      \
-        st = (expr);                                                          \
-        if (st != OI_OK) {                                                    \
-            return st;                                                        \
-        }                                                                     \
-    } while (0)
-    WRITE(oi_json_write_object_begin(writer));
-    WRITE(oi_json_write_object_key(writer, "type", 4));
-    WRITE(oi_json_write_string(writer, "function", 8));
-    WRITE(oi_json_write_object_key(writer, "function", 8));
-    WRITE(oi_json_write_object_begin(writer));
-    WRITE(oi_json_write_object_key(writer, "name", 4));
-    WRITE(oi_json_write_string(writer, "shell", 5));
-    WRITE(oi_json_write_object_key(writer, "description", 11));
-    WRITE(oi_json_write_string(writer, "Execute a shell command", 23));
-    WRITE(oi_json_write_object_key(writer, "parameters", 10));
-    WRITE(oi_json_write_object_begin(writer));
-    WRITE(oi_json_write_object_key(writer, "type", 4));
-    WRITE(oi_json_write_string(writer, "object", 6));
-    WRITE(oi_json_write_object_key(writer, "properties", 10));
-    WRITE(oi_json_write_object_begin(writer));
-    WRITE(oi_json_write_object_key(writer, "command", 7));
-    WRITE(oi_json_write_object_begin(writer));
-    WRITE(oi_json_write_object_key(writer, "type", 4));
-    WRITE(oi_json_write_string(writer, "string", 6));
-    WRITE(oi_json_write_object_end(writer));
-    WRITE(oi_json_write_object_end(writer));
-    WRITE(oi_json_write_object_key(writer, "required", 8));
-    WRITE(oi_json_write_array_begin(writer));
-    WRITE(oi_json_write_string(writer, "command", 7));
-    WRITE(oi_json_write_array_end(writer));
-    WRITE(oi_json_write_object_key(writer, "additionalProperties", 20));
-    WRITE(oi_json_write_bool(writer, 0));
-    WRITE(oi_json_write_object_end(writer));
-    WRITE(oi_json_write_object_end(writer));
-    WRITE(oi_json_write_object_end(writer));
-#undef WRITE
-    return OI_OK;
-}
-
 static oi_status build_request_body(const oi_cli_conversation *conversation,
                                     oi_json_writer **out_writer) {
     oi_json_writer *writer = oi_json_writer_create();
@@ -276,7 +234,7 @@ static oi_status build_request_body(const oi_cli_conversation *conversation,
     WRITE(oi_json_write_array_end(writer));
     WRITE(oi_json_write_object_key(writer, "tools", 5));
     WRITE(oi_json_write_array_begin(writer));
-    WRITE(write_tool_definition(writer));
+    WRITE(oi_cli_tools_write_definitions(writer));
     WRITE(oi_json_write_array_end(writer));
     WRITE(oi_json_write_object_end(writer));
 #undef WRITE
