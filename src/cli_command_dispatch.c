@@ -191,35 +191,6 @@ static oi_status dispatch_cwd(const struct oi_cli_command_parse *command,
     return print_cwd(context->out);
 }
 
-static int is_space(char value) {
-    return value == ' ' || value == '\t' || value == '\r' || value == '\n';
-}
-
-static void split_first_token(const char *text, size_t len,
-                              const char **out_token, size_t *out_token_len,
-                              const char **out_rest, size_t *out_rest_len) {
-    size_t token_len = 0;
-    size_t rest_start;
-
-    while (token_len < len && !is_space(text[token_len])) {
-        token_len++;
-    }
-    rest_start = token_len;
-    while (rest_start < len && is_space(text[rest_start])) {
-        rest_start++;
-    }
-    *out_token = text;
-    *out_token_len = token_len;
-    *out_rest = text + rest_start;
-    *out_rest_len = len - rest_start;
-}
-
-static int token_equals(const char *token, size_t token_len,
-                        const char *value) {
-    size_t value_len = strlen(value);
-    return token_len == value_len && memcmp(token, value, value_len) == 0;
-}
-
 static oi_status print_session_usage(FILE *err) {
     return fputs("oi: usage: /session [list|trash-list|current|switch ID|"
                  "rename ID NAME|trash ID|restore ID|delete ID|import PATH]\n",
@@ -383,7 +354,8 @@ static oi_status dispatch_session_rename(
     char *detail = NULL;
     oi_status status;
 
-    split_first_token(rest, rest_len, &id, &id_len, &name, &name_len);
+    oi_cli_command_split_first_token(rest, rest_len, &id, &id_len, &name,
+                                     &name_len);
     if (id_len == 0 || name_len == 0) {
         return fputs("oi: usage: /session rename ID NAME\n", context->err) ==
                        EOF
@@ -421,7 +393,8 @@ static oi_status dispatch_session_admin(
         const char *extra;
         size_t id_len;
         size_t extra_len;
-        split_first_token(rest, rest_len, &id, &id_len, &extra, &extra_len);
+        oi_cli_command_split_first_token(rest, rest_len, &id, &id_len, &extra,
+                                         &extra_len);
         if (extra_len != 0) {
             return fprintf(context->err, "oi: usage: /session %s ID\n",
                            subcommand) < 0
@@ -452,37 +425,38 @@ static oi_status dispatch_session(const struct oi_cli_command_parse *command,
     if (command->arguments_len == 0) {
         return dispatch_session_list(context, 0);
     }
-    split_first_token(command->arguments, command->arguments_len, &token,
-                      &token_len, &rest, &rest_len);
+    oi_cli_command_split_first_token(command->arguments,
+                                     command->arguments_len, &token,
+                                     &token_len, &rest, &rest_len);
 
-    if (token_equals(token, token_len, "list")) {
+    if (oi_cli_command_token_equals(token, token_len, "list")) {
         return rest_len == 0 ? dispatch_session_list(context, 0)
                              : print_session_usage(context->err);
     }
-    if (token_equals(token, token_len, "trash-list")) {
+    if (oi_cli_command_token_equals(token, token_len, "trash-list")) {
         return rest_len == 0 ? dispatch_session_list(context, 1)
                              : print_session_usage(context->err);
     }
-    if (token_equals(token, token_len, "current")) {
+    if (oi_cli_command_token_equals(token, token_len, "current")) {
         return rest_len == 0 ? dispatch_session_current(context)
                              : print_session_usage(context->err);
     }
-    if (token_equals(token, token_len, "rename")) {
+    if (oi_cli_command_token_equals(token, token_len, "rename")) {
         return dispatch_session_rename(context, rest, rest_len);
     }
-    if (token_equals(token, token_len, "trash")) {
+    if (oi_cli_command_token_equals(token, token_len, "trash")) {
         return dispatch_session_admin(context, rest, rest_len, "trash",
                                       context->session.trash,
                                       "Trashed session %.*s\n");
     }
-    if (token_equals(token, token_len, "restore")) {
+    if (oi_cli_command_token_equals(token, token_len, "restore")) {
         return dispatch_session_admin(context, rest, rest_len, "restore",
                                       context->session.restore,
                                       "Restored session %.*s\n");
     }
-    if (token_equals(token, token_len, "switch") ||
-        token_equals(token, token_len, "delete") ||
-        token_equals(token, token_len, "import")) {
+    if (oi_cli_command_token_equals(token, token_len, "switch") ||
+        oi_cli_command_token_equals(token, token_len, "delete") ||
+        oi_cli_command_token_equals(token, token_len, "import")) {
         return fprintf(context->err,
                        "oi: /session %.*s requires the interactive REPL\n",
                        (int)token_len, token) < 0

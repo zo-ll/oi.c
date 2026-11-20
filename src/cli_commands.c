@@ -31,6 +31,33 @@ static int is_space(char value) {
            value == '\n';
 }
 
+void oi_cli_command_split_first_token(const char *text, size_t len,
+                                      const char **out_token,
+                                      size_t *out_token_len,
+                                      const char **out_rest,
+                                      size_t *out_rest_len) {
+    size_t token_len = 0;
+    size_t rest_start;
+
+    while (token_len < len && !is_space(text[token_len])) {
+        token_len++;
+    }
+    rest_start = token_len;
+    while (rest_start < len && is_space(text[rest_start])) {
+        rest_start++;
+    }
+    *out_token = text;
+    *out_token_len = token_len;
+    *out_rest = text + rest_start;
+    *out_rest_len = len - rest_start;
+}
+
+int oi_cli_command_token_equals(const char *token, size_t token_len,
+                                const char *value) {
+    size_t value_len = strlen(value);
+    return token_len == value_len && memcmp(token, value, value_len) == 0;
+}
+
 size_t oi_cli_command_count(void) {
     return sizeof commands / sizeof commands[0];
 }
