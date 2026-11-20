@@ -457,21 +457,9 @@ static oi_status dispatch_session(const struct oi_cli_command_parse *command,
     if (oi_cli_command_token_equals(token, token_len, "switch") ||
         oi_cli_command_token_equals(token, token_len, "delete") ||
         oi_cli_command_token_equals(token, token_len, "import")) {
-        return fprintf(context->err,
-                       "oi: /session %.*s requires the interactive REPL\n",
-                       (int)token_len, token) < 0
-                   ? OI_ERR_IO
-                   : OI_OK;
+        return OI_ERR_INVAL;
     }
     return print_session_usage(context->err);
-}
-
-static oi_status print_deferred(
-    const struct oi_cli_command_definition *definition, FILE *err) {
-    return fprintf(err, "oi: %s is registered but not implemented yet\n",
-                   definition->name) < 0
-               ? OI_ERR_IO
-               : OI_OK;
 }
 
 oi_status oi_cli_command_dispatch(
@@ -515,9 +503,8 @@ oi_status oi_cli_command_dispatch(
     case OI_CLI_COMMAND_SESSION:
         return dispatch_session(command, context);
     case OI_CLI_COMMAND_COMPACT:
-        return print_deferred(command->command, context->err);
     case OI_CLI_COMMAND_LOGIN:
-        return print_deferred(command->command, context->err);
+        return OI_ERR_INVAL;
     }
     return OI_ERR_INVAL;
 }
