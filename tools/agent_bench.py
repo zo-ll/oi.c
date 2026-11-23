@@ -59,7 +59,10 @@ COUNTS_CHECK = r'''
 int main(void) {
     const char *good[] = {"0", "0042", "9999", "00000000000000000000012"};
     const int values[] = {0, 42, 9999, 12};
-    const char *bad[] = {"", "12jobs", " 5", "+5", "-1", "12 ", "10000", "99999999999999999999"};
+    const char *bad[] = {
+        "", "12jobs", " 5", "+5", "-1", "12 ", "5\n", "5\t", "5\r", "5\v", "5\f",
+        "10000", "99999999999999999999"
+    };
     for (unsigned i = 0; i < sizeof good / sizeof *good; i++)
         if (parse_count(good[i]) != values[i]) return 1;
     for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++)
@@ -138,6 +141,7 @@ def check(task, workspace, reply):
             (["--upper", ""], 0, "\n"),
             ([], 2, ""),
             (["--wrong", "x"], 2, ""),
+            (["--upper", "x", "y"], 2, ""),
         ])
 
 

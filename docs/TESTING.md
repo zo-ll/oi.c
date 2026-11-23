@@ -97,8 +97,18 @@ To inspect the original failure and its position, run `sh test.sh` in its worksp
 The checker does not use the fixture's test script to decide whether the fix passes.
 The checker compiles and executes code from the attempt. Use a disposable environment for untrusted code.
 
-For the `oi` baseline, use revision `1b367a8`: it includes the four tools from #80 and usage reports from #96, but not the output limit from #97.
-Use `f41e453` for the first comparison after the output limit.
+Keep the benchmark script in the checkout that contains it.
+Build the two `oi` binaries in separate worktrees. Use their absolute paths from each fixture workspace.
+The baseline revision `1b367a8` has the four tools from #80 and the usage reports from #96.
+Use `f41e453` to measure the effect of the output limit from #97.
+
+```sh
+git -C "$repo" worktree add --detach "$run/oi-baseline" 1b367a8
+git -C "$repo" worktree add --detach "$run/oi-bounded" f41e453
+make -C "$run/oi-baseline" -j build/oi
+make -C "$run/oi-bounded" -j build/oi
+```
+
 For Pi, select only `read,bash,edit,write`. Disable extensions, MCP, skills, and context file discovery.
 Use the same model, provider, and comparable request settings for all harnesses.
 
