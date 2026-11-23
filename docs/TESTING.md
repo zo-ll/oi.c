@@ -65,6 +65,48 @@ recompiling their source chains.
 They are exercised through the real CLI, and a production-only edit therefore
 does not relink every private-module test.
 
+## Issue #82 agent benchmark
+
+Use `tools/agent_bench.py` to prepare an identical workspace for each attempt.
+The script uses Python 3 and a C11 compiler. The verbose fixture also uses `sh` and `awk`.
+Keep the prompt, final reply, and raw logs outside the workspace.
+
+```sh
+repo=$PWD
+run=$(mktemp -d)
+task=verbose-fix  # or inspect or multi-file
+python3 "$repo/tools/agent_bench.py" prepare "$task" "$run/work" > "$run/prompt.txt"
+```
+
+Run the harness from `$run/work` with the text from `prompt.txt`.
+Save its final assistant reply as `$run/reply.txt`.
+Use the same prompt and a fresh workspace for each harness and attempt.
+
+```sh
+python3 "$repo/tools/agent_bench.py" check "$task" "$run/work" "$run/reply.txt"
+```
+
+| Task | Pass criterion |
+| --- | --- |
+| `inspect` | The reply gives all three source facts. The workspace has no file changes. |
+| `verbose-fix` | The reply quotes the failure line. An independent test compiles and tests the parser. The fixture tests and public header stay unchanged. |
+| `multi-file` | An independent test checks the public function, CLI dispatch, output, and exit status. |
+
+The verbose fixture puts the failure between two blocks that each exceed 50 KiB.
+To inspect the original failure and its position, run `sh test.sh` in its workspace.
+The checker does not use the fixture's test script to decide whether the fix passes.
+The checker compiles and executes code from the attempt. Use a disposable environment for untrusted code.
+
+For the `oi` baseline, use revision `1b367a8`: it includes the four tools from #80 and usage reports from #96, but not the output limit from #97.
+Use `f41e453` for the first comparison after the output limit.
+For Pi, select only `read,bash,edit,write`. Disable extensions, MCP, skills, and context file discovery.
+Use the same model, provider, and comparable request settings for all harnesses.
+
+Record the exact commands, harness revisions, settings, exit status, checker result, elapsed time, and raw usage per attempt.
+Record uncached input, cached input, output, and estimated cost. Include retry and compaction requests.
+Keep missing usage distinct from zero. Report the intended cache condition and the provider's actual cached token count separately.
+Publish failed attempts as well as successful attempts. These fixtures supply no model results or cost claims.
+
 ## Issue #32 measurements
 
 Measurements were taken on 2026-07-30 on the same 24-core development machine.
