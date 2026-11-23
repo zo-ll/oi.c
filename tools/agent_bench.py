@@ -55,32 +55,45 @@ PROMPTS = {
 
 COUNTS_CHECK = r'''
 #include "counts.h"
+#include <stdio.h>
 
 int main(void) {
-    const char *good[] = {"0", "0042", "9999", "00000000000000000000012"};
-    const int values[] = {0, 42, 9999, 12};
-    const char *bad[] = {
-        "", "12jobs", " 5", "+5", "-1", "12 ", "5\n", "5\t", "5\r", "5\v", "5\f",
-        "10000", "99999999999999999999"
-    };
-    for (unsigned i = 0; i < sizeof good / sizeof *good; i++)
-        if (parse_count(good[i]) != values[i]) return 1;
+    const char *bad[] = {"", "10000", "99999999999999999999"};
+    char text[32];
+    for (int value = 0; value < 10000; value++) {
+        snprintf(text, sizeof text, "%d", value);
+        if (parse_count(text) != value) return 1;
+        snprintf(text, sizeof text, "00000000000000000000%d", value);
+        if (parse_count(text) != value) return 1;
+    }
     for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++)
         if (parse_count(bad[i]) != -1) return 1;
+    for (unsigned byte = 1; byte <= 255; byte++) {
+        if (byte >= '0' && byte <= '9') continue;
+        unsigned char prefix[] = {byte, '5', 0};
+        unsigned char suffix[] = {'5', byte, 0};
+        unsigned char middle[] = {'1', byte, '2', 0};
+        if (parse_count((const char *)prefix) != -1 ||
+            parse_count((const char *)suffix) != -1 ||
+            parse_count((const char *)middle) != -1) return 1;
+    }
     return 0;
 }
 '''
 
+RENDER_INPUT = bytes(range(1, 256))
 RENDER_CHECK = r'''
 #include "render.h"
 
 int main(void) {
     void (*print)(const char *) = render_upper;
-    print("Hello Zz! 42 é");
+    print("@INPUT@");
     return 0;
 }
 '''
 
+
+RENDER_CHECK = RENDER_CHECK.replace("@INPUT@", "".join(f"\\x{byte:02x}" for byte in RENDER_INPUT))
 
 RENDER_PROBE = r'''
 #include "render.h"
@@ -101,9 +114,9 @@ def build(workspace, output, *sources, source_text=None):
     subprocess.run(args, cwd=workspace, input=source_text, text=True, check=True, timeout=20)
 
 
-def matches(binary, args, expected_status, expected_stdout):
+def matches(binary, args, expected_status, expected_stdout=None):
     result = subprocess.run([binary, *args], capture_output=True, timeout=5)
-    return (result.returncode, result.stdout) == (expected_status, expected_stdout.encode())
+    return result.returncode == expected_status and (expected_stdout is None or result.stdout == expected_stdout)
 
 
 def unchanged(workspace, task, names):
@@ -126,22 +139,24 @@ def check(task, workspace, reply):
             if FAILURE not in reply or not unchanged(workspace, task, ("counts.h", "test_counts.c", "test.sh")):
                 return False
             build(workspace, binary, "counts.c", source_text=COUNTS_CHECK)
-            return matches(binary, [], 0, "")
+            return matches(binary, [], 0)
 
+        upper = RENDER_INPUT.upper() + b"\n"
         build(workspace, binary, "render.c", source_text=RENDER_CHECK)
-        if not matches(binary, [], 0, "HELLO ZZ! 42 é\n"):
+        if not matches(binary, [], 0, upper):
             return False
         build(workspace, binary, "main.c", source_text=RENDER_PROBE)
-        if not matches(binary, ["--upper", "x"], 0, "upper dispatch: x\n"):
+        if not matches(binary, ["--upper", "x"], 0, b"upper dispatch: x\n"):
             return False
         build(workspace, binary, "main.c", "render.c")
         return all(matches(binary, *case) for case in [
-            (["Hello Zz! 42 é"], 0, "Hello Zz! 42 é\n"),
-            (["--upper", "Hello Zz! 42 é"], 0, "HELLO ZZ! 42 é\n"),
-            (["--upper", ""], 0, "\n"),
-            ([], 2, ""),
-            (["--wrong", "x"], 2, ""),
-            (["--upper", "x", "y"], 2, ""),
+            ([RENDER_INPUT], 0, RENDER_INPUT + b"\n"),
+            (["--upper"], 0, b"--upper\n"),
+            (["--upper", RENDER_INPUT], 0, upper),
+            (["--upper", ""], 0, b"\n"),
+            ([], 2),
+            (["--wrong", "x"], 2),
+            (["--upper", "x", "y"], 2),
         ])
 
 
