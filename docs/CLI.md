@@ -169,16 +169,21 @@ An interactive run without a key still starts, so that you can use `/login`.
 
 ### Saved logins
 
-`/login` opens a menu. Choose a provider, and then choose a method:
+`/login` opens a provider menu. Each provider starts its sign-in directly.
 
-| Provider | API key | OAuth |
-| --- | --- | --- |
-| OpenAI | yes | yes, with your ChatGPT plan |
-| Custom OpenAI-compatible endpoint | yes | not available |
+| Provider | Sign-in method |
+| --- | --- |
+| OpenAI | OAuth with your ChatGPT plan |
+| OpenCode Go | OpenCode API key |
 
-A custom provider also asks for a URL. `https://host/api/v1` becomes
-`https://host/api/v1/chat/completions`. The key entry shows only a character
-count, and the key never reaches the input history or a session file.
+OpenCode Go uses its Chat Completions endpoint and starts with
+`deepseek-v4.1-flash`. Use `/model` to select another compatible model.
+The API key prompt shows only a character count. It does not put the key in
+the input history or a session file. The first request checks the key.
+
+For an OpenAI API key or a custom OpenAI-compatible endpoint, use
+`OI_API_KEY` or `--api-key` and the endpoint options. Existing saved API keys
+and custom endpoints still work.
 
 A login takes effect immediately and is saved in
 `$XDG_CONFIG_HOME/oi/credentials.json`, or `~/.config/oi/credentials.json`.

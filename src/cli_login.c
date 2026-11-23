@@ -21,8 +21,7 @@
 #define LINE(text) {text, sizeof text - 1}
 #define COUNT(lines) (sizeof lines / sizeof lines[0])
 
-enum { PROVIDER_OPENAI = 0, PROVIDER_CUSTOM };
-enum { METHOD_API_KEY = 0, METHOD_OAUTH };
+enum { PROVIDER_OPENAI = 0, PROVIDER_OPENCODE_GO };
 
 static void free_text_secret(char **text) {
     (void)oi_cli_credentials_set(text, NULL);
@@ -32,6 +31,9 @@ static const char openai_host[] = "api.openai.com";
 static const char openai_path[] = "/v1/chat/completions";
 static const char responses_path[] = "/v1/responses";
 static const char default_model[] = "gpt-4o-mini";
+static const char opencode_go_host[] = "opencode.ai";
+static const char opencode_go_path[] = "/inference/go/openai/v1/chat/completions";
+static const char opencode_go_model[] = "deepseek-v4.1-flash";
 static const char usage_url[] = "https://chatgpt.com/settings/usage";
 
 #define REFRESH_MARGIN_SECONDS 300.0
@@ -43,18 +45,8 @@ static const struct oi_cli_render_line provider_header[] = {
     LINE("Log in: choose a provider"),
 };
 static const struct oi_cli_render_line provider_options[] = {
-    LINE("OpenAI"),
-    LINE("Custom OpenAI-compatible endpoint"),
-};
-static const struct oi_cli_render_line method_header[] = {
-    LINE("Choose a login method"),
-};
-static const struct oi_cli_render_line method_options[] = {
-    LINE("API key"),
-    LINE("OAuth"),
-};
-static const struct oi_cli_render_line url_header[] = {
-    LINE("Enter the endpoint URL and press Enter (Esc cancels)"),
+    [PROVIDER_OPENAI] = LINE("OpenAI (Sign in with ChatGPT)"),
+    [PROVIDER_OPENCODE_GO] = LINE("OpenCode Go (API key)"),
 };
 static const struct oi_cli_render_line key_header[] = {
     LINE("Paste the API key and press Enter (Esc cancels)"),
@@ -136,6 +128,20 @@ static oi_status apply_chatgpt(oi_config *cfg,
     return st;
 }
 
+static oi_status apply_opencode_go(oi_config *cfg, const char *key) {
+    oi_status st = oi_config_set(cfg, "host", opencode_go_host);
+    if (st == OI_OK) {
+        st = oi_config_set(cfg, "path", opencode_go_path);
+    }
+    if (st == OI_OK) {
+        st = oi_config_set(cfg, "api_key", key);
+    }
+    if (st == OI_OK && strcmp(cfg->model, default_model) == 0) {
+        st = oi_config_set(cfg, "model", opencode_go_model);
+    }
+    return st;
+}
+
 oi_status oi_cli_login_apply_saved(oi_config *cfg, const char *path,
                                    FILE *err, int *out_oauth,
                                    double *out_expires_at) {
@@ -157,6 +163,8 @@ oi_status oi_cli_login_apply_saved(oi_config *cfg, const char *path,
     }
     if (saved.active == OI_CLI_PROVIDER_CUSTOM) {
         st = apply_custom(cfg, &saved);
+    } else if (saved.active == OI_CLI_PROVIDER_OPENCODE_GO) {
+        st = apply_opencode_go(cfg, saved.opencode_go_api_key);
     } else if (saved.openai_oauth && saved.openai_access_token != NULL) {
         st = apply_chatgpt(cfg, &saved);
         *out_oauth = st == OI_OK;
@@ -169,16 +177,14 @@ oi_status oi_cli_login_apply_saved(oi_config *cfg, const char *path,
 }
 
 struct login_target {
-    int provider;
     const char *host;
     const char *path;
     int port;
     int use_tls;
 };
 
-static oi_status save_credentials(const struct oi_cli_login *login,
-                                  const struct login_target *target,
-                                  const char *key) {
+static oi_status save_opencode_go_key(const struct oi_cli_login *login,
+                                      const char *key) {
     struct oi_cli_credentials saved;
     oi_status st = oi_cli_credentials_read(login->credentials_path, &saved);
     if (st == OI_ERR_NOTFOUND) {
@@ -186,22 +192,8 @@ static oi_status save_credentials(const struct oi_cli_login *login,
     } else if (st != OI_OK) {
         return st;
     }
-    if (target->provider == PROVIDER_OPENAI) {
-        saved.active = OI_CLI_PROVIDER_OPENAI;
-        saved.openai_oauth = 0;
-        st = oi_cli_credentials_set(&saved.openai_api_key, key);
-    } else {
-        saved.active = OI_CLI_PROVIDER_CUSTOM;
-        saved.custom_port = target->port;
-        saved.custom_use_tls = target->use_tls;
-        st = oi_cli_credentials_set(&saved.custom_host, target->host);
-        if (st == OI_OK) {
-            st = oi_cli_credentials_set(&saved.custom_path, target->path);
-        }
-        if (st == OI_OK) {
-            st = oi_cli_credentials_set(&saved.custom_api_key, key);
-        }
-    }
+    saved.active = OI_CLI_PROVIDER_OPENCODE_GO;
+    st = oi_cli_credentials_set(&saved.opencode_go_api_key, key);
     if (st == OI_OK) {
         st = oi_cli_credentials_write(login->credentials_path, &saved);
     }
@@ -229,13 +221,15 @@ static oi_status adopt_target(struct oi_cli_login *login,
     return OI_OK;
 }
 
-static oi_status log_in_with_key(struct oi_cli_login *login,
-                                 const struct login_target *target,
-                                 const char *key, char *message,
-                                 size_t message_size) {
+static oi_status log_in_to_opencode_go(struct oi_cli_login *login,
+                                      const char *key, char *message,
+                                      size_t message_size) {
+    const struct login_target target = {
+        opencode_go_host, opencode_go_path, 443, 1,
+    };
     struct oi_llm_config llm = {
-        target->host, (unsigned short)target->port, target->use_tls,
-        login->ca_file, key, target->path, login->timeout_ms,
+        target.host, (unsigned short)target.port, target.use_tls,
+        login->ca_file, key, target.path, login->timeout_ms,
     };
     if (oi_llm_client_reconfigure(login->client, &llm, 0) != OI_OK) {
         snprintf(message, message_size,
@@ -243,35 +237,25 @@ static oi_status log_in_with_key(struct oi_cli_login *login,
         return OI_OK;
     }
     login->oauth_active = 0;
-    oi_status st = adopt_target(login, target);
+    oi_status st = adopt_target(login, &target);
+    if (st == OI_OK) {
+        st = oi_cli_credentials_set(&login->selected_model, opencode_go_model);
+    }
     if (st != OI_OK) {
         return st;
     }
 
     oi_status saved = login->credentials_path == NULL
                           ? OI_ERR_NOTFOUND
-                          : save_credentials(login, target, key);
-    const char *name =
-        target->provider == PROVIDER_OPENAI ? "OpenAI" : target->host;
+                          : save_opencode_go_key(login, key);
     int used;
     if (saved != OI_OK) {
         used = snprintf(message, message_size,
-                        "oi: logged in to %s for this run only; the key was "
-                        "not saved: %s\n",
-                        name, oi_status_str(saved));
+                        "oi: OpenCode Go key set for this run only; the key "
+                        "was not saved: %s\n", oi_status_str(saved));
     } else {
         used = snprintf(message, message_size,
-                        "oi: logged in to %s with an API key\n", name);
-    }
-    if (!target->use_tls && used > 0 && (size_t)used < message_size) {
-        used += snprintf(message + used, message_size - (size_t)used,
-                         "oi: warning: this endpoint has no TLS, so the key "
-                         "is sent unencrypted\n");
-    }
-    if (target->provider == PROVIDER_CUSTOM && used > 0 &&
-        (size_t)used < message_size) {
-        used += snprintf(message + used, message_size - (size_t)used,
-                         "oi: use /model to choose a model on this endpoint\n");
+                        "oi: OpenCode Go key saved\n");
     }
     if (saved == OI_OK && login->key_from_environment && used > 0 &&
         (size_t)used < message_size) {
@@ -993,7 +977,7 @@ static oi_status finish_chatgpt_login(struct oi_cli_login *login,
         oi_cli_credentials_write(login->credentials_path, &flow->saved);
 
     struct login_target target = {
-        PROVIDER_OPENAI, flow->api.host, responses_path, flow->api.port,
+        flow->api.host, responses_path, flow->api.port,
         flow->api.use_tls,
     };
     st = adopt_target(login, &target);
@@ -1125,7 +1109,6 @@ static oi_status run_dialog(struct oi_cli_login *login,
                             size_t message_size) {
     static const char cancelled_text[] = "oi: login cancelled\n";
     size_t provider = 0;
-    size_t method = 0;
     int cancelled = 0;
 
     snprintf(message, message_size, "%s", cancelled_text);
@@ -1136,48 +1119,14 @@ static oi_status run_dialog(struct oi_cli_login *login,
     if (st != OI_OK || *out_terminate_signal != 0 || cancelled) {
         return st;
     }
-    st = oi_cli_composer_select(composer, signal_fd, method_header,
-                                COUNT(method_header), method_options,
-                                COUNT(method_options), 0, &method, &cancelled,
-                                out_terminate_signal);
-    if (st != OI_OK || *out_terminate_signal != 0 || cancelled) {
-        return st;
-    }
-    if (method == METHOD_OAUTH) {
-        if (provider == PROVIDER_OPENAI) {
-            return log_in_with_chatgpt(login, composer, signal_fd,
-                                       out_terminate_signal, message,
-                                       message_size);
-        }
-        snprintf(message, message_size,
-                 "oi: OAuth is not available for custom endpoints\n");
-        return OI_OK;
+    if (provider == PROVIDER_OPENAI) {
+        return log_in_with_chatgpt(login, composer, signal_fd,
+                                   out_terminate_signal, message,
+                                   message_size);
     }
 
-    struct login_target target = {
-        (int)provider, openai_host, openai_path, 443, 1,
-    };
-    char *url = NULL;
-    char *host = NULL;
-    char *path = NULL;
     char *key = NULL;
     size_t len = 0;
-    if (provider == PROVIDER_CUSTOM) {
-        st = oi_cli_composer_read_line(composer, signal_fd, url_header,
-                                       COUNT(url_header), "URL: ", 0, &url,
-                                       &len, &cancelled, out_terminate_signal);
-        if (st != OI_OK || *out_terminate_signal != 0 || cancelled) {
-            goto done;
-        }
-        if (oi_cli_credentials_parse_url(url, len, &host, &target.port,
-                                         &target.use_tls, &path) != OI_OK) {
-            snprintf(message, message_size,
-                     "oi: login failed: enter a full http or https URL\n");
-            goto done;
-        }
-        target.host = host;
-        target.path = path;
-    }
     st = oi_cli_composer_read_line(composer, signal_fd, key_header,
                                    COUNT(key_header), "API key: ", 1, &key,
                                    &len, &cancelled, out_terminate_signal);
@@ -1189,12 +1138,9 @@ static oi_status run_dialog(struct oi_cli_login *login,
                  "oi: login failed: no API key entered\n");
         goto done;
     }
-    st = log_in_with_key(login, &target, key, message, message_size);
+    st = log_in_to_opencode_go(login, key, message, message_size);
 
 done:
-    free(url);
-    free(host);
-    free(path);
     free_text_secret(&key);
     return st;
 }

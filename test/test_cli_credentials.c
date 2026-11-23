@@ -39,7 +39,9 @@ TEST(round_trip_keeps_every_field_in_a_private_file) {
     make_root();
     struct oi_cli_credentials saved;
     oi_cli_credentials_init(&saved);
-    saved.active = OI_CLI_PROVIDER_CUSTOM;
+    saved.active = OI_CLI_PROVIDER_OPENCODE_GO;
+    CHECK_EQ(oi_cli_credentials_set(&saved.opencode_go_api_key, "go-key"),
+             OI_OK);
     saved.custom_port = 8443;
     saved.custom_use_tls = 1;
     CHECK_EQ(oi_cli_credentials_set(&saved.openai_api_key, "sk-a\"b"), OI_OK);
@@ -59,7 +61,8 @@ TEST(round_trip_keeps_every_field_in_a_private_file) {
 
     struct oi_cli_credentials loaded;
     CHECK_EQ(oi_cli_credentials_read(path, &loaded), OI_OK);
-    CHECK_EQ(loaded.active, OI_CLI_PROVIDER_CUSTOM);
+    CHECK_EQ(loaded.active, OI_CLI_PROVIDER_OPENCODE_GO);
+    CHECK_STREQ(loaded.opencode_go_api_key, "go-key");
     CHECK_STREQ(loaded.openai_api_key, "sk-a\"b");
     CHECK_STREQ(loaded.custom_host, "h.test");
     CHECK_STREQ(loaded.custom_path, "/v1/x");

@@ -10,7 +10,8 @@
 enum oi_cli_provider {
     OI_CLI_PROVIDER_NONE = 0,
     OI_CLI_PROVIDER_OPENAI,
-    OI_CLI_PROVIDER_CUSTOM
+    OI_CLI_PROVIDER_CUSTOM,
+    OI_CLI_PROVIDER_OPENCODE_GO
 };
 
 struct oi_cli_credentials {
@@ -31,6 +32,7 @@ struct oi_cli_credentials {
     char *custom_api_key;
     int custom_port;
     int custom_use_tls;
+    char *opencode_go_api_key;
 };
 
 void oi_cli_credentials_init(struct oi_cli_credentials *credentials);
