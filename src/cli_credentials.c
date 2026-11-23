@@ -45,6 +45,7 @@ void oi_cli_credentials_free(struct oi_cli_credentials *credentials) {
     free_secret(&credentials->openai_email);
     free_secret(&credentials->openai_model);
     free_secret(&credentials->custom_api_key);
+    free_secret(&credentials->opencode_go_api_key);
     free(credentials->custom_host);
     free(credentials->custom_path);
     oi_cli_credentials_init(credentials);
@@ -227,6 +228,8 @@ static oi_status decode_credentials(const oi_json_value *root,
         out->active = OI_CLI_PROVIDER_OPENAI;
     } else if (strcmp(active, "custom") == 0) {
         out->active = OI_CLI_PROVIDER_CUSTOM;
+    } else if (strcmp(active, "opencode-go") == 0) {
+        out->active = OI_CLI_PROVIDER_OPENCODE_GO;
     } else {
         return OI_ERR_PARSE;
     }
@@ -245,7 +248,15 @@ static oi_status decode_credentials(const oi_json_value *root,
     }
     if (st == OI_OK && out->active == OI_CLI_PROVIDER_CUSTOM &&
         custom == NULL) {
-        st = OI_ERR_PARSE;
+        return OI_ERR_PARSE;
+    }
+    if (st == OI_OK) {
+        st = copy_optional_string(root, "opencode_go_api_key",
+                                  &out->opencode_go_api_key);
+    }
+    if (st == OI_OK && out->active == OI_CLI_PROVIDER_OPENCODE_GO &&
+        (out->opencode_go_api_key == NULL || out->opencode_go_api_key[0] == '\0')) {
+        return OI_ERR_PARSE;
     }
     return st;
 }
@@ -305,10 +316,15 @@ static oi_status encode_credentials(
     WRITE(oi_json_write_object_begin(writer));
     WRITE(oi_json_write_object_key(writer, "version", 7));
     WRITE(oi_json_write_number(writer, OI_CLI_CREDENTIALS_VERSION));
-    WRITE(write_member(writer, "active",
-                       credentials->active == OI_CLI_PROVIDER_CUSTOM
-                           ? "custom"
-                           : "openai"));
+    const char *active = "openai";
+    if (credentials->active == OI_CLI_PROVIDER_CUSTOM) {
+        active = "custom";
+    } else if (credentials->active == OI_CLI_PROVIDER_OPENCODE_GO) {
+        active = "opencode-go";
+    }
+    WRITE(write_member(writer, "active", active));
+    WRITE(write_member(writer, "opencode_go_api_key",
+                       credentials->opencode_go_api_key));
     if (credentials->openai_api_key != NULL ||
         credentials->openai_host_id != NULL) {
         WRITE(oi_json_write_object_key(writer, "openai", 6));

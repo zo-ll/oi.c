@@ -4124,9 +4124,6 @@ TEST(oauth_callback_with_a_wrong_state_does_not_end_the_login) {
     CHECK(write_interactive(master_fd, "/login\r", 7));
     CHECK(interactive_wait_for(master_fd, &result, "choose a provider", 1));
     CHECK(write_interactive(master_fd, "\r", 1));
-    CHECK(interactive_wait_for(master_fd, &result, "Choose a login method",
-                               1));
-    CHECK(write_interactive(master_fd, "\x1b[B\r", 4));
     CHECK(interactive_wait_for(master_fd, &result,
                                "Waiting for the browser sign-in", 1));
     {
@@ -4177,9 +4174,6 @@ TEST(oauth_callback_with_a_wrong_state_does_not_end_the_login) {
                                    2));
         CHECK(write_interactive(master_fd, "\r", 1));
         CHECK(interactive_wait_for(master_fd, &result,
-                                   "Choose a login method", 2));
-        CHECK(write_interactive(master_fd, "\x1b[B\r", 4));
-        CHECK(interactive_wait_for(master_fd, &result,
                                    "Waiting for the browser sign-in",
                                    waits + 1));
         snprintf(query, sizeof query, "code=x&state=%s", state);
@@ -4218,6 +4212,66 @@ TEST(oauth_callback_with_a_wrong_state_does_not_end_the_login) {
     close(master_fd);
     remove_sessions_under(session_root);
     rmdir(session_root);
+    rmdir(config_root);
+}
+
+TEST(opencode_go_login_takes_a_key_and_restores_the_endpoint) {
+    int master_fd = -1;
+    int slave_fd = -1;
+    char config_root[] = "/tmp/oi-cli-opencode-go-XXXXXX";
+    char path[128];
+    char *const argv[] = {(char *)OI_BIN, (char *)"--dry-run",
+                          (char *)"test prompt", NULL};
+    char *const override_argv[] = {(char *)OI_BIN, (char *)"--dry-run",
+                                   (char *)"--model", (char *)"other-model",
+                                   (char *)"test prompt", NULL};
+    struct interactive_result result = {0};
+    struct run_result dry;
+
+    CHECK(mkdtemp(config_root) != NULL);
+    CHECK_EQ(openpty(&master_fd, &slave_fd, NULL, NULL, NULL), 0);
+    setenv("XDG_CONFIG_HOME", config_root, 1);
+    pid_t cli = start_interactive_cli(9, slave_fd, config_root);
+    close(slave_fd);
+
+    CHECK(interactive_wait_for(master_fd, &result, "\x1b[?2004h", 1));
+    CHECK(write_interactive(master_fd, "/login\r", 7));
+    CHECK(interactive_wait_for(master_fd, &result, "OpenCode Go (API key)", 1));
+    CHECK(strstr(result.output, "OpenAI (Sign in with ChatGPT)") != NULL);
+    CHECK(write_interactive(master_fd, "\x1b[B\r", 4));
+    CHECK(interactive_wait_for(master_fd, &result, "Paste the API key", 1));
+    CHECK(strstr(result.output, "Choose a login method") == NULL);
+    CHECK(strstr(result.output, "endpoint URL") == NULL);
+    CHECK(write_interactive(master_fd, "go-fixture-key\r", 15));
+    CHECK(interactive_wait_for(master_fd, &result, "OpenCode Go key saved", 1));
+    CHECK(strstr(result.output, "go-fixture-key") == NULL);
+    CHECK(write_interactive(master_fd, "/status\r", 8));
+    CHECK(interactive_wait_for(master_fd, &result, "opencode.ai", 1));
+    CHECK(strstr(result.output, "deepseek-v4.1-flash") != NULL);
+    CHECK(write_interactive(master_fd, "/exit\r", 6));
+    int status = 0;
+    CHECK_EQ(waitpid(cli, &status, 0), cli);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(master_fd);
+
+    unsetenv("OI_API_KEY");
+    run_cli(argv, &dry);
+    CHECK_EQ(dry.exit_code, 0);
+    CHECK(strstr(dry.output, "host: opencode.ai") != NULL);
+    CHECK(strstr(dry.output, "use_tls: true") != NULL);
+    CHECK(strstr(dry.output, "path: /inference/go/openai/v1/chat/completions") !=
+          NULL);
+    CHECK(strstr(dry.output, "model: deepseek-v4.1-flash") != NULL);
+    CHECK(strstr(dry.output, "go-fixture-key") == NULL);
+    run_cli(override_argv, &dry);
+    CHECK_EQ(dry.exit_code, 0);
+    CHECK(strstr(dry.output, "host: opencode.ai") != NULL);
+    CHECK(strstr(dry.output, "model: other-model") != NULL);
+    unsetenv("XDG_CONFIG_HOME");
+    snprintf(path, sizeof path, "%s/oi/credentials.json", config_root);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/oi", config_root);
+    rmdir(path);
     rmdir(config_root);
 }
 
@@ -6807,6 +6861,7 @@ int main(void) {
     RUN(permissions_allow_confirmed_elevates_policy);
     RUN(permissions_allow_when_already_allowed_skips_confirmation);
     RUN(oauth_callback_with_a_wrong_state_does_not_end_the_login);
+    RUN(opencode_go_login_takes_a_key_and_restores_the_endpoint);
     RUN(ctrl_c_cancels_a_turn_that_waits_for_a_token_renewal);
     RUN(token_renewal_runs_beside_the_turn_and_the_next_run_uses_it);
     RUN(sent_renewal_survives_the_turn_end_and_finishes_while_idle);
